@@ -137,6 +137,10 @@ def normalized_raw(raw, calibration, *, gripper=False):
 
 def validate_workspace(workspace):
     fields = {"version", "units", "bounds", "reference", "calibration", "raw_bounds"}
+    if isinstance(workspace, dict) and "workspace_profile" in workspace:
+        if workspace["workspace_profile"] != "left-current-rest-1051-1164":
+            raise ValueError("unknown native workspace profile")
+        fields.add("workspace_profile")
     if (
         not isinstance(workspace, dict)
         or set(workspace) != fields
@@ -191,7 +195,11 @@ def validate_workspace(workspace):
         if any(abs(a - b) > 1e-7 for a, b in zip(endpoints, (bounds["min"], bounds["max"]), strict=True)):
             raise ValueError("native raw/normalized workspace roundtrip differs")
         if key.endswith("elbow_flex.pos"):
-            expected = [2011, 2124] if key.startswith("arm_left_") else [1847, 1960]
+            profiled = "workspace_profile" in workspace and key.startswith("arm_left_")
+            expected = ([1051, 1164] if profiled else [2011, 2124]) if key.startswith("arm_left_") else [1847, 1960]
+            if profiled and (list(cal) != [3, 0, 1845, 864, 3073]
+                             or not bounds["min"] <= workspace["reference"][key] <= bounds["max"]):
+                raise ValueError("current-rest workspace requires its actual calibrated reference")
             if list(raw) != expected:
                 raise ValueError("native elbow workspace differs from demonstrated command bounds")
         maximum_span = 0.2 * (cal[4] - cal[3]) if gripper else math.floor(10 * 4096 / 360)

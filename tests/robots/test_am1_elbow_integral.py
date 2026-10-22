@@ -891,7 +891,7 @@ def test_right_p20_fresh_nonce_requires_absent_global_marker_after_explicit_reti
 LEFT_P_BOOT = "77777777-7777-4777-8777-777777777777"
 
 
-def left_response_p_files(tmp_path, monkeypatch, *, proportional=32):
+def left_response_p_files(tmp_path, monkeypatch, *, proportional=32, workspace_profile=None):
     module = right_p20_module()
     assert callable(getattr(module, "consume_left_response_p_request", None)), (
         "left proportional consumer missing"
@@ -910,15 +910,17 @@ def left_response_p_files(tmp_path, monkeypatch, *, proportional=32):
         "boot_id": LEFT_P_BOOT,
         "expires_at_monotonic_s": module.time.monotonic() + 60.0,
     }
+    if workspace_profile is not None:
+        value.update(workspace_profile=workspace_profile, workload_segment="left-reach")
     request = state / "left-response-p-request.json"
     request.write_bytes(module._right_p20_json(value))
     request.chmod(0o600)
     return module, state, directory, request, value
 
 
-def left_response_p_robot(tmp_path, monkeypatch, *, proportional=32):
+def left_response_p_robot(tmp_path, monkeypatch, *, proportional=32, workspace_profile=None):
     module, state, directory, request, value = left_response_p_files(
-        tmp_path, monkeypatch, proportional=proportional
+        tmp_path, monkeypatch, proportional=proportional, workspace_profile=workspace_profile
     )
     path = module.consume_left_response_p_request(
         state, directory, "physical-live-teleop", RIGHT_P20_RUN, RIGHT_P20_HOST, "a" * 40
@@ -961,6 +963,8 @@ def left_response_p_robot(tmp_path, monkeypatch, *, proportional=32):
         Present_Voltage=119,
         Present_Temperature=28,
     )
+    if workspace_profile is not None:
+        baseline.update(Present_Position=1090, Goal_Position=2050)
     r.left_bus.values.update({(k, ELBOW): v for k, v in baseline.items()})
     from lerobot.robots.alohamini.am1_live_teleop import STATIC
 
@@ -1767,3 +1771,181 @@ def test_right_response_p_uses_frozen_device_protection_and_restores_original_lo
     assert bus.values[("P_Coefficient", RIGHT_RESPONSE_ELBOW)] == 16
     assert bus.values[("Lock", RIGHT_RESPONSE_ELBOW)] == 1 and not trial.restore_required
     assert not any(row[1] == "Protection_Current" for row in writes(bus, RIGHT_RESPONSE_ELBOW))
+
+
+CURRENT_REST_PROFILE = "left-current-rest-1051-1164"
+
+
+def test_current_rest_request_is_exact_opt_in_and_consumed_once(tmp_path, monkeypatch):
+    module, state, directory, request, original = left_response_p_files(
+        tmp_path, monkeypatch, workspace_profile=CURRENT_REST_PROFILE
+    )
+    path = module.consume_left_response_p_request(state, directory, "physical-live-teleop", RIGHT_P20_RUN, RIGHT_P20_HOST, "a" * 40)
+    binding = module.load_left_response_p_binding(path, directory, RIGHT_P20_RUN, RIGHT_P20_HOST)
+    assert binding["request"] == original and binding["request"]["workspace_profile"] == CURRENT_REST_PROFILE
+    assert not request.exists() and (state / ("left-response-p-used-" + original["request_id"] + ".json")).exists()
+    trial = module.AM1LeftResponseProportionalTrial(binding, directory)
+    assert trial.raw_bounds == (1051, 1164)
+
+
+@pytest.mark.parametrize("bad", ["unknown", "null", "gain", "segment", "side", "extra", "version"])
+def test_current_rest_request_cannot_broaden_other_role_or_experiment(tmp_path, monkeypatch, bad):
+    module, state, directory, request, value = left_response_p_files(tmp_path, monkeypatch, workspace_profile=CURRENT_REST_PROFILE)
+    if bad == "unknown":
+        value["workspace_profile"] = "left-current-rest-1000-1200"
+    elif bad == "null":
+        value["workspace_profile"] = None
+    elif bad == "gain":
+        value["proportional"] = 16
+    elif bad == "segment":
+        value["workload_segment"] = "left-maintained"
+    elif bad == "side":
+        value.update(kind="right-response-p", workload_segment="right-peer-fixed")
+    elif bad == "extra":
+        value["raw_bounds"] = [1051, 1164]
+    else:
+        value["version"] = 2
+    request.write_bytes(module._right_p20_json(value))
+    raw = request.read_bytes()
+    with pytest.raises(ValueError):
+        module.consume_left_response_p_request(state, directory, "physical-live-teleop", RIGHT_P20_RUN, RIGHT_P20_HOST, "a" * 40)
+    assert request.read_bytes() == raw and list(directory.iterdir()) == []
+
+
+def test_current_rest_primes_fresh_measured_goal_only_off_and_restores_original_goal_last_lock(tmp_path, monkeypatch):
+    module, r, trial, directory, request, original = left_response_p_robot(tmp_path, monkeypatch, workspace_profile=CURRENT_REST_PROFILE)
+    trial.prepare(r)
+    durable = json.loads(trial.snapshot_path.read_bytes())
+    assert durable["restore_required"] is True and durable["original_registers"]["Goal_Position"] == 2050
+    original_digest = durable["original_settings_sha256"]
+    assert not writes(r.left_bus)
+    trial.disable_torque(r)
+    r.left_bus.values["Present_Position", ELBOW] = 1091  # Actual new receipt, not old baseline1090.
+    observed = []
+    def before_write(register, motor, value):
+        if register in {"Goal_Position", "P_Coefficient"}:
+            saved = json.loads(trial.snapshot_path.read_bytes())
+            assert saved["restore_required"] and saved["original_registers"]["Goal_Position"] == 2050
+            assert r.left_bus.values["Torque_Enable", motor] == 0 and r.left_bus.values["Lock", motor] == 1
+            observed.append((register, value))
+    r.left_bus.before_write = before_write
+    trial.apply(r)
+    assert r.left_bus.values["Goal_Position", ELBOW] == 1091 and r.left_bus.values["P_Coefficient", ELBOW] == 32
+    assert trial.evidence["priming_position"]["value"] == trial.evidence["primed_goal_readback"] == 1091
+    assert trial.evidence["priming_position"]["phase"] == "current_rest_prime"
+    assert trial.receipt["original_settings_sha256"] == original_digest
+    r.left_bus.values["Torque_Enable", ELBOW] = 1
+    trial.verify_active(r)
+    trial.restore(r)
+    assert observed == [("Goal_Position", 1091), ("P_Coefficient", 32), ("P_Coefficient", 16), ("Goal_Position", 2050)]
+    assert r.left_bus.values["Torque_Enable", ELBOW] == 0 and r.left_bus.values["Lock", ELBOW] == 0
+    assert writes(r.left_bus)[-1][1:4] == ("Lock", ELBOW, 0)
+    assert trial.evidence["restored_goal_readback"] == 2050 and not trial.restore_required
+    assert not writes(r.left_bus, OTHER) and not writes(r.right_bus)
+    assert trial.evidence["original_registers"]["Present_Position"] == 1090
+
+
+@pytest.mark.parametrize("fault", ["prime_lost_ack", "prime_cancel", "restore_lost_ack", "restore_failed", "stop", "outside", "status", "torque"])
+def test_current_rest_goal_failure_never_erases_original_obligation_or_enables_motion(tmp_path, monkeypatch, fault):
+    module, r, trial, directory, request, original = left_response_p_robot(tmp_path, monkeypatch, workspace_profile=CURRENT_REST_PROFILE)
+    trial.prepare(r)
+    trial.disable_torque(r)
+    if fault in {"prime_lost_ack", "prime_cancel"}:
+        error = KeyboardInterrupt("prime interrupted") if fault == "prime_cancel" else OSError("prime ACK lost")
+        r.left_bus.fail_writes["Goal_Position", ELBOW, 1090] = (error, True)
+    elif fault == "stop":
+        r._am1_shutdown_in_progress = True
+    elif fault == "outside":
+        r.left_bus.values["Present_Position", ELBOW] = 1165
+    elif fault == "status":
+        r.left_bus.values["Status", ELBOW] = 1
+    elif fault == "torque":
+        r.left_bus.values["Torque_Enable", ELBOW] = 1
+    if fault in {"prime_cancel", "stop", "outside", "status", "torque"}:
+        with pytest.raises((RuntimeError, KeyboardInterrupt)):
+            trial.apply(r)
+        assert r.left_bus.values["P_Coefficient", ELBOW] == 16 and trial.restore_required
+        assert not [row for row in writes(r.left_bus) if row[1] == "Goal_Position"] or fault == "prime_cancel"
+        r.left_bus.values["Status", ELBOW] = 0
+        r.left_bus.values["Torque_Enable", ELBOW] = 0
+    else:
+        trial.apply(r)
+        assert r.left_bus.values["Goal_Position", ELBOW] == 1090
+    if fault in {"restore_lost_ack", "restore_failed"}:
+        r.left_bus.fail_writes["Goal_Position", ELBOW, 2050] = (OSError("originalGoal ACK lost"), fault != "restore_failed")
+    if fault == "restore_failed":
+        with pytest.raises(OSError):
+            trial.restore(r)
+        assert trial.restore_required and r.left_bus.values["Torque_Enable", ELBOW] == 0
+        assert r.left_bus.values["Lock", ELBOW] == 1 and trial.evidence["state"] == "restore_failed"
+    else:
+        trial.restore(r)
+        assert r.left_bus.values["Goal_Position", ELBOW] == 2050 and not trial.restore_required
+    assert not any(row[1] == "Torque_Enable" and row[3] == 1 for row in writes(r.left_bus))
+
+
+def test_current_rest_original_goal_must_still_be_inside_unchanged_calibration(tmp_path, monkeypatch):
+    module, r, trial, directory, request, original = left_response_p_robot(tmp_path, monkeypatch, workspace_profile=CURRENT_REST_PROFILE)
+    r.left_bus.values["Goal_Position", ELBOW] = 3074
+    with pytest.raises(RuntimeError):
+        trial.prepare(r)
+    assert not trial.restore_required and not writes(r.left_bus)
+
+
+@pytest.mark.parametrize("fault", ["slow_raw", "aged_raw", "torque_after_write"])
+def test_current_rest_new_raw_or_off_loss_prevents_p32_and_retains_goal_restoration(tmp_path, monkeypatch, fault):
+    module, r, trial, directory, request, original = left_response_p_robot(tmp_path, monkeypatch, workspace_profile=CURRENT_REST_PROFILE)
+    trial.prepare(r)
+    trial.disable_torque(r)
+    now = [10.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    if fault == "slow_raw":
+        read = r.left_bus.read
+        def slow(register, motor, **kwargs):
+            result = read(register, motor, **kwargs)
+            if register == "Present_Position":
+                now[0] += .041
+            return result
+        r.left_bus.read = slow
+    elif fault == "aged_raw":
+        write = trial._write
+        def aged(register, value, **kwargs):
+            if register == "Goal_Position" and kwargs["phase"] == "prime_current_rest_goal":
+                now[0] += r.AM1_ACTIVATION_MAX_RAW_AGE_S
+            return write(register, value, **kwargs)
+        trial._write = aged
+    else:
+        write = r.left_bus.write
+        def changed(register, motor, value, **kwargs):
+            result = write(register, motor, value, **kwargs)
+            if register == "Goal_Position" and value == 1090:
+                r.left_bus.values["Torque_Enable", motor] = 1
+            return result
+        r.left_bus.write = changed
+    with pytest.raises(RuntimeError):
+        trial.apply(r)
+    assert r.left_bus.values["P_Coefficient", ELBOW] == 16 and trial.restore_required
+    if fault != "torque_after_write":
+        assert not [row for row in writes(r.left_bus) if row[1] == "Goal_Position"]
+    r._am1_shutdown_in_progress = True
+    trial.restore(r)
+    assert r.left_bus.values["Torque_Enable", ELBOW] == 0 and r.left_bus.values["Goal_Position", ELBOW] == 2050
+    assert r.left_bus.values["Lock", ELBOW] == 0 and not trial.restore_required
+
+
+@pytest.mark.parametrize("changed", ["profile", "bounds"])
+def test_current_rest_instance_cannot_escape_immutable_request_corridor(tmp_path, monkeypatch, changed):
+    module, r, trial, directory, request, original = left_response_p_robot(tmp_path, monkeypatch, workspace_profile=CURRENT_REST_PROFILE)
+    trial.prepare(r)
+    trial.disable_torque(r)
+    if changed == "profile":
+        trial.workspace_profile = None
+    else:
+        trial.raw_bounds = (1000, 1200)
+    with pytest.raises(RuntimeError):
+        trial.apply(r)
+    assert not [row for row in writes(r.left_bus) if row[1] in {"Goal_Position", "P_Coefficient"}]
+    assert trial.restore_required and r.left_bus.values["Torque_Enable", ELBOW] == 0
+    trial.workspace_profile, trial.raw_bounds = CURRENT_REST_PROFILE, (1051, 1164)
+    trial.restore(r)
+    assert not trial.restore_required and r.left_bus.values["Goal_Position", ELBOW] == 2050

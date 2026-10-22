@@ -1126,3 +1126,36 @@ def test_right_response_fixed_fence_remains_at_actual_write(monkeypatch, changed
     with pytest.raises(RuntimeError, match="response"):
         control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2, sample=value))
     assert not [event for event in robot.events if event[0] == "action"]
+
+
+@pytest.mark.parametrize("bad", [None, "no_trial", "inactive", "binding", "outside", "gain", "segment", "unknown"])
+def test_current_rest_native_workspace_requires_exact_active_trial_and_keeps_original_reference(monkeypatch, bad):
+    now, identity, owner, robot, control = lane()
+    profile = "left-current-rest-1051-1164"
+    trial = install_left_response_trial(monkeypatch, robot, workload="left-maintained" if bad == "segment" else "left-reach", proportional=16 if bad == "gain" else 32)
+    trial.binding["request"]["workspace_profile"] = "unknown" if bad == "unknown" else profile
+    robot._am1_left_response_p_binding = copy.deepcopy(trial.binding)
+    robot.left_bus.raw["arm_left_elbow_flex"] = 1090
+    robot.left_bus.goals["arm_left_elbow_flex"] = 1090
+    if bad == "no_trial":
+        robot._am1_left_response_p_trial = robot._am1_left_response_p_binding = None
+    elif bad == "inactive":
+        trial.verified = False
+    elif bad == "binding":
+        robot._am1_left_response_p_binding["run_id"] = str(uuid4())
+    elif bad == "outside":
+        robot.left_bus.raw["arm_left_elbow_flex"] = 1165
+        robot.left_bus.goals["arm_left_elbow_flex"] = 1165
+    if bad:
+        with pytest.raises(RuntimeError):
+            control.apply(robot, frame(identity, owner, 0))
+    else:
+        assert control.apply(robot, frame(identity, owner, 0))
+        workspace = copy.deepcopy(control._live_summary["workspace"])
+        assert workspace["workspace_profile"] == profile
+        assert workspace["raw_bounds"]["arm_left_elbow_flex.pos"] == [1051, 1164]
+        assert workspace["raw_bounds"]["arm_right_elbow_flex.pos"] == [1847, 1960]
+        original = copy.deepcopy(workspace["reference"])
+        now[0] += .05
+        assert control.apply(robot, frame(identity, owner, 1, epoch=3, revision=1))
+        assert control._live_summary["workspace"] == workspace and control._live_summary["reference"] == original

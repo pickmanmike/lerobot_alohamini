@@ -1365,6 +1365,17 @@ def workspace(robot, identity, measured, *, goals=None):
     if set(TELEOP_ARM_KEYS) - set(measured):
         raise RuntimeError("AM1 teleop complete actual feedback is unavailable")
     result = {"version": 1, "units": {}, "bounds": {}, "reference": {}, "calibration": {}, "raw_bounds": {}}
+    receipt = response_receipt(robot)
+    profile = None
+    if receipt is not None:
+        side = "left" if receipt["kind"] == "left-response-p" else "right"
+        trial = getattr(robot, "_am1_" + side + "_response_p_trial")
+        profile = trial.binding["request"].get("workspace_profile")
+        if profile is not None:
+            if (side != "left" or profile != "left-current-rest-1051-1164"
+                    or receipt["configured_p"] != 32 or receipt["workload_segment"] != "left-reach"):
+                raise RuntimeError("AM1 current-rest workspace requires its exact active left trial")
+            result["workspace_profile"] = profile
     if goals is None:
         goals = read_groups(robot, ("Goal_Position",))
     for side, bus, names in _groups(robot):
@@ -1380,7 +1391,7 @@ def workspace(robot, identity, measured, *, goals=None):
             if type(q0) not in (int, float) or not math.isfinite(q0):
                 raise RuntimeError("AM1 teleop actual resting pose is invalid")
             if name.endswith("_elbow_flex"):
-                low, high = (2011, 2124) if side == "left" else (1847, 1960)
+                low, high = ((1051, 1164) if profile is not None else (2011, 2124)) if side == "left" else (1847, 1960)
                 if not low <= seed <= high:
                     raise RuntimeError("AM1 teleop actual elbow rest is outside supported bench workspace")
             else:

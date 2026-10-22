@@ -3151,3 +3151,107 @@ def test_left_response_preparation_unknown_ssh_receipt_is_not_replayed(monkeypat
     with pytest.raises(subprocess.TimeoutExpired):
         m.main(["--prepare-left-response-p", "--ssh", "am1-pi", "--config", config])
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("supported", [True, False])
+def test_left_response_preparation_current_rest_requires_installed_profile_validator(tmp_path, monkeypatch, supported):
+    import hashlib
+    from pathlib import Path
+
+    m = module()
+    path, config, gains, _calibration = request_preparation_config(tmp_path, monkeypatch)
+    state = Path(config["physical_state_directory"])
+    native_validate = gains._left_response_p_request
+    validated = []
+
+    def validate(request, source_head):
+        assert not list(state.iterdir()), "installed validation must precede any publication"
+        assert request["workspace_profile"] == "left-current-rest-1051-1164"
+        assert request["source_head"] == source_head == config["host_head"]
+        validated.append(dict(request))
+        if not supported:
+            raise ValueError("Installed source does not support this workspace profile")
+        return native_validate({key: value for key, value in request.items() if key != "workspace_profile"}, source_head)
+
+    monkeypatch.setattr(gains, "_left_response_p_request", validate)
+    monkeypatch.setattr(m.ProtectedHostRun, "start", lambda *args, **kwargs: pytest.fail("no Start"))
+    monkeypatch.setattr(m, "OwnedUnit", lambda *args, **kwargs: pytest.fail("no device process"))
+    if not supported:
+        with pytest.raises(ValueError, match="Installed source"):
+            m.prepare_left_response_p_request(str(path), workspace_profile="left-current-rest-1051-1164")
+        assert len(validated) == 1 and not list(state.iterdir())
+        return
+    result = m.prepare_left_response_p_request(str(path), workspace_profile="left-current-rest-1051-1164")
+    request, raw, _info = gains._right_p20_file(Path(result["path"]))
+    assert request == validated[0] == result["request"]
+    assert set(request) == {"version", "kind", "request_id", "source_head", "proportional", "workload_segment",
+                            "boot_id", "expires_at_monotonic_s", "workspace_profile"}
+    assert request["proportional"] == 32 and request["workload_segment"] == "left-reach"
+    assert raw == gains._right_p20_json(request) and not raw.endswith(b"\n")
+    assert result["sha256"] == hashlib.sha256(raw).hexdigest()
+    assert result["canonical_read_verified"] and result["hardware_started"] is False
+    assert not list(state.glob("*-used-*")) and not list(state.glob(".*.tmp"))
+
+
+@pytest.mark.parametrize("profile", [True, False, "", "current-rest", "left-current-rest-1051-1165", {"min": 1051}])
+def test_left_response_preparation_current_rest_profile_is_closed(tmp_path, monkeypatch, profile):
+    from pathlib import Path
+
+    m = module()
+    path, config, _gains, _calibration = request_preparation_config(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="workspace profile"):
+        m.prepare_left_response_p_request(str(path), workspace_profile=profile)
+    assert not list(Path(config["physical_state_directory"]).iterdir())
+
+
+def test_left_response_preparation_current_rest_cli_relays_explicit_profile_only(tmp_path, monkeypatch, capsys):
+    import io
+    import json
+    import shlex
+    import subprocess
+    import sys
+    from contextlib import redirect_stdout
+
+    m = module()
+    path, config, gains, _calibration = request_preparation_config(tmp_path, monkeypatch)
+    native_config = "/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/7438c74662d59a02/physical.json"
+    native_validate = gains._left_response_p_request
+    seen = []
+
+    def validate(request, source_head):
+        seen.append(dict(request))
+        return native_validate({key: value for key, value in request.items() if key != "workspace_profile"}, source_head)
+
+    monkeypatch.setattr(gains, "_left_response_p_request", validate)
+
+    def remote(args, **options):
+        assert shlex.split(args[7]) == ["/home/pickmanmike/lerobot_alohamini/.venv/bin/python", "-B", "-",
+                                       native_config, "120", "left-current-rest-1051-1164"]
+        assert options["shell"] is False and options["encoding"] == "utf-8"
+        output = io.StringIO()
+        with monkeypatch.context() as context, redirect_stdout(output):
+            context.setattr(sys, "argv", ["-", str(path), "120", "left-current-rest-1051-1164"])
+            context.delattr(m, "prepare_left_response_p_request")
+            exec(compile(options["input"], "<fixed-preparation-relay>", "exec"), {})
+        return SimpleNamespace(stdout=output.getvalue(), stderr="", returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", remote)
+    command = ["--prepare-left-response-p", "--ssh", "am1-pi", "--config", native_config,
+               "--left-response-workspace", "current-rest"]
+    assert m.main(command) == 0
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["request"] == seen[0]
+    assert receipt["request"]["workspace_profile"] == "left-current-rest-1051-1164"
+    assert receipt["request"]["source_head"] == config["host_head"]
+    assert receipt["canonical_read_verified"] and receipt["hardware_started"] is False
+
+
+def test_left_response_preparation_current_rest_cli_rejects_free_bounds_before_ssh(monkeypatch):
+    import subprocess
+
+    m = module()
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: pytest.fail("no SSH on unsupported profile"))
+    with pytest.raises(SystemExit):
+        m.main(["--prepare-left-response-p", "--ssh", "am1-pi", "--config",
+                "/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/7438c74662d59a02/physical.json",
+                "--left-response-workspace", "1051..1165"])

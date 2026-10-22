@@ -884,6 +884,7 @@ def right_p20_settings_valid(proof, run_id=None, host_incarnation=None):
 
 
 LEFT_RESPONSE_P_KIND = "left-response-p"
+LEFT_CURRENT_REST_WORKSPACE_PROFILE = "left-current-rest-1051-1164"
 RIGHT_RESPONSE_P_KIND = "right-response-p"
 
 
@@ -903,8 +904,7 @@ def _response_p_request(value, source_head=None, *, kind):
                 if kind == LEFT_RESPONSE_P_KIND else ("right-peer-fixed",))
     if (
         not isinstance(value, dict)
-        or set(value)
-        != {
+        or set(value) not in ({
             "version",
             "kind",
             "request_id",
@@ -913,7 +913,8 @@ def _response_p_request(value, source_head=None, *, kind):
             "workload_segment",
             "boot_id",
             "expires_at_monotonic_s",
-        }
+        }, {"version", "kind", "request_id", "source_head", "proportional", "workload_segment",
+            "boot_id", "expires_at_monotonic_s", "workspace_profile"})
         or type(value["version"]) is not int
         or value["version"] != 1
         or value["kind"] != kind
@@ -932,6 +933,11 @@ def _response_p_request(value, source_head=None, *, kind):
         or value["expires_at_monotonic_s"] <= 0
     ):
         raise ValueError("Selected elbow response P requires its closed current-source finite comparison request")
+    if "workspace_profile" in value and (
+        kind != LEFT_RESPONSE_P_KIND or value["workspace_profile"] != LEFT_CURRENT_REST_WORKSPACE_PROFILE
+        or value["proportional"] != 32 or value["workload_segment"] != "left-reach"
+    ):
+        raise ValueError("Current-rest profile requires only the explicit LEFT/P32/left-reach request")
     return value
 
 
@@ -1109,6 +1115,9 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
         if self.binding != binding:
             raise ValueError("Selected elbow response P constructor binding differs from its retained original")
         self.proportional = self.binding["request"]["proportional"]
+        self.workspace_profile = self.binding["request"].get("workspace_profile")
+        if self.workspace_profile is not None:
+            self.raw_bounds = (1051, 1164)
         super().__init__(integral=0, snapshot_path=self.directory / (self.kind + "-original.json"))
         self._snapshot = {
             "schema_version": 1,
@@ -1165,8 +1174,12 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
         bus, identity = self._owner(robot)
         expected = {k: self.binding[k] for k in ("run_id", "host_incarnation")}
         expected["recipe"] = "physical-live-teleop"
+        profile = self.binding["request"].get("workspace_profile")
+        expected_bounds = ((1051, 1164) if profile is not None else
+                           (2011, 2124) if self.side == "left" else (1847, 1960))
         if (
-            bus is not self._bus
+            self.workspace_profile != profile or self.raw_bounds != expected_bounds
+            or bus is not self._bus
             or identity != self._identity
             or self.binding != self._snapshot["binding"]
             or getattr(robot, "_am1_" + self.side + "_response_p_trial", None) is not self
@@ -1312,7 +1325,9 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
             or raw_bytes != {"24": 16, "25": 0}
             or any(original[k] != v for k, v in frozen.items())
             or not self.raw_bounds[0] <= original["Present_Position"] <= self.raw_bounds[1]
-            or not self.raw_bounds[0] <= original["Goal_Position"] <= self.raw_bounds[1]
+            or not (self.calibration[3] if self.workspace_profile else self.raw_bounds[0])
+            <= original["Goal_Position"]
+            <= (self.calibration[4] if self.workspace_profile else self.raw_bounds[1])
             or original["Protection_Current"] <= 0
             or not 0 < original["Max_Temperature_Limit"] <= 100
             or not 0 < original["Min_Voltage_Limit"] < original["Max_Voltage_Limit"]
@@ -1333,9 +1348,26 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
 
     def _write(self, register, value, *, phase, reconcile=False):
         allowed = {"Torque_Enable": (0,), "Lock": (0, 1), "P_Coefficient": (16, self.proportional)}
+        goal_write = register == "Goal_Position" and self.workspace_profile is not None
+        if goal_write:
+            if phase == "prime_current_rest_goal":
+                allowed[register] = (self._snapshot["priming_position"]["value"],)
+            elif phase == "restore_original_goal":
+                allowed[register] = (self._snapshot["original_registers"]["Goal_Position"],)
         if register not in allowed or type(value) is not int or value not in allowed[register]:
             raise ValueError("Selected elbow response P transaction cannot write that register/value")
         self._service_boundary()
+        if goal_write:
+            if (not self.restore_required or self._read("Torque_Enable", phase=phase + "_before") != 0
+                    or self._read("Lock", phase=phase + "_before") != 1
+                    or self._read("Status", phase=phase + "_before") != 0):
+                raise RuntimeError("Current-rest Goal write requires actual Torque0/Lock1/status0")
+            if phase == "prime_current_rest_goal":
+                stamp = self._snapshot["priming_position"]["completed_at_monotonic_s"]
+                now = time.monotonic()
+                if (getattr(self._robot, "_am1_shutdown_in_progress", False) is True
+                        or not 0 <= now - stamp < self._robot.AM1_ACTIVATION_MAX_RAW_AGE_S):
+                    raise RuntimeError("Current-rest measured priming position expired or Stop prevailed")
         row = {
             "operation": "write",
             "register": register,
@@ -1365,6 +1397,8 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
             row["completed_at_monotonic_s"] = time.monotonic()
         if self._read(register, phase=phase + "_verify") != value:
             raise RuntimeError("Selected elbow response P write verification failed: " + register)
+        if goal_write and self._read("Torque_Enable", phase=phase + "_after") != 0:
+            raise RuntimeError("Current-rest Goal write lost actual Torque0")
 
     def disable_torque(self, robot):
         if not self._created or not self.restore_required:
@@ -1388,6 +1422,24 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
                 "Selected elbow response P preserved identity/I/D/protection/profile/individual bytes changed"
             )
 
+    def _prime_current_rest_goal(self, robot):
+        self._same_owner(robot)
+        if (getattr(robot, "_am1_shutdown_in_progress", False) is True
+                or self._read("Torque_Enable", phase="current_rest_prime") != 0
+                or self._read("Lock", phase="current_rest_prime") != 1
+                or self._read("Status", phase="current_rest_prime") != 0
+                or abs(self._read("Present_Current", phase="current_rest_prime"))
+                >= self._snapshot["original_registers"]["Protection_Current"]):
+            raise RuntimeError("Current-rest priming requires its healthy stopped owner")
+        present = self._read("Present_Position", phase="current_rest_prime")
+        position = copy.deepcopy(self._snapshot["events"][-1])
+        if (not self.raw_bounds[0] <= present <= self.raw_bounds[1]
+                or position["completed_at_monotonic_s"] - position["started_at_monotonic_s"] > 0.04):
+            raise RuntimeError("Current-rest fresh measured position exceeds its corridor/read budget")
+        self._snapshot["priming_position"] = position
+        self._write("Goal_Position", present, phase="prime_current_rest_goal", reconcile=True)
+        self._snapshot.update(primed_goal_readback=present, primed_at_monotonic_s=time.monotonic())
+
     def apply(self, robot):
         try:
             if (
@@ -1403,6 +1455,10 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
                 for k, v in {"Torque_Enable": 0, "Lock": 1, "P_Coefficient": 16}.items()
             ):
                 raise RuntimeError("Selected elbow response P requires actual Torque0/Lock1/P16 before apply")
+            if self.workspace_profile is not None:
+                self._prime_current_rest_goal(robot)
+                if getattr(robot, "_am1_shutdown_in_progress", False) is True:
+                    raise RuntimeError("Current-rest Stop prevailed before P32 configuration")
             if self.proportional != 16:
                 self._write("P_Coefficient", self.proportional, phase="configure_proportional")
             self._snapshot.update(
@@ -1503,6 +1559,14 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
                 self._write("P_Coefficient", 16, phase="restore_proportional", reconcile=True)
             if self._read("P_Coefficient", phase="restored") != 16:
                 raise RuntimeError("Selected elbow response P original P16 restoration failed")
+            if self.workspace_profile is not None:
+                original_goal = self._snapshot["original_registers"]["Goal_Position"]
+                if self._read("Goal_Position", phase="before_restore_goal") != original_goal:
+                    self._write("Goal_Position", original_goal, phase="restore_original_goal", reconcile=True)
+                if (self._read("Goal_Position", phase="restored_goal") != original_goal
+                        or self._read("Torque_Enable", phase="restored_goal") != 0):
+                    raise RuntimeError("Current-rest original Goal restoration requires actual off/readback")
+                self._snapshot["restored_goal_readback"] = original_goal
             self._preserved(robot, phase="restored")
             self._write(
                 "Lock",

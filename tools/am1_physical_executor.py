@@ -2151,7 +2151,7 @@ def wait_required_camera(camera, observation, cancel, *, sleep=time.sleep):
         sleep(0.05)
 
 
-def prepare_left_response_p_request(config_path, *, ttl_seconds=120):
+def prepare_left_response_p_request(config_path, *, ttl_seconds=120, workspace_profile=None):
     """Prepare only one boot-local left-reach P32 request; never consume or Start it.
 
     This self-contained function is relayed by the PC CLI and imports the installed
@@ -2179,6 +2179,9 @@ def prepare_left_response_p_request(config_path, *, ttl_seconds=120):
 
     if type(ttl_seconds) is not int or not 1 <= ttl_seconds <= 120:
         raise ValueError("Preparation expiry must be within 1–120 seconds")
+    if workspace_profile is not None and (type(workspace_profile) is not str
+            or workspace_profile != "left-current-rest-1051-1164"):
+        raise ValueError("Only the explicit current-rest workspace profile is supported")
     path = Path(config_path)
     if not path.is_absolute() or path.resolve() != path or path.is_symlink():
         raise ValueError("Exact absolute installed physical configuration required")
@@ -2201,6 +2204,8 @@ def prepare_left_response_p_request(config_path, *, ttl_seconds=120):
             "source_head": config["host_head"], "proportional": 32, "workload_segment": "left-reach",
             "boot_id": _left_response_p_boot_id(), "expires_at_monotonic_s": time.monotonic() + ttl_seconds,
         }
+        if workspace_profile is not None:
+            request["workspace_profile"] = workspace_profile
         _left_response_p_request(request, config["host_head"])
         used = state / ("left-response-p-used-" + request["request_id"] + ".json")
         if used.exists() or used.is_symlink():
@@ -2249,12 +2254,16 @@ def main(argv=None):
     parser.add_argument("--ssh", choices=("am1-pi",), required=True)
     parser.add_argument("--config", required=True, help="Existing installed Pi physical.json")
     parser.add_argument("--ttl-seconds", type=int, default=120)
+    parser.add_argument("--left-response-workspace", choices=("current-rest",), default=None,
+                        help="Explicitly select the approved LEFT1051..1164 current-rest corridor and OFF Goal priming")
     args = parser.parse_args(argv)
     if (not 1 <= args.ttl_seconds <= 120
             or re.fullmatch(r"/home/pickmanmike/\.local/share/am1-physical-adapter-01/"
                             r"deployments/[0-9a-f]{16}/physical\.json", args.config) is None
             or str(PurePosixPath(args.config)) != args.config):
         parser.error("Existing installed physical.json and preparation expiry within 1–120 seconds required")
+    profile_args = ["left-current-rest-1051-1164"] if args.left_response_workspace is not None else []
+    profile_keyword = ", workspace_profile=sys.argv[3]" if profile_args else ""
     # Fixed reviewed code, no command/interpreter/source/nonce override. SSH's remote
     # shell receives only quoted fixed arguments, never interpolated source text.
     payload = (
@@ -2263,10 +2272,10 @@ def main(argv=None):
         "'/home/pickmanmike/lerobot_alohamini/src']\n"
         + inspect.getsource(prepare_left_response_p_request)
         + "\nprint(json.dumps(prepare_left_response_p_request(sys.argv[1], "
-        "ttl_seconds=int(sys.argv[2])), sort_keys=True))\n"
+        "ttl_seconds=int(sys.argv[2])" + profile_keyword + "), sort_keys=True))\n"
     )
     remote = shlex.join(["/home/pickmanmike/lerobot_alohamini/.venv/bin/python", "-B", "-",
-                         args.config, str(args.ttl_seconds)])
+                         args.config, str(args.ttl_seconds), *profile_args])
     # An ambiguous SSH receipt is never retried automatically: the pending request
     # may already exist and must remain available for explicit inspection.
     reply = subprocess.run(
