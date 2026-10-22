@@ -1597,3 +1597,226 @@ class AM1RightResponseProportionalTrial(AM1LeftResponseProportionalTrial):
     side, kind, motor = "right", RIGHT_RESPONSE_P_KIND, "arm_right_elbow_flex"
     calibration = (3, 0, -658, 827, 3039)
     raw_bounds = (1847, 1960)
+
+
+def complete_stopped_left_response_p_original(
+    bus, directory, *, run_id, host_incarnation, original_sha256, source_head,
+    completion_id, check_stopped,
+):
+    """Verify one failed pre-P32 original and finish only its original Lock.
+
+    The caller owns the existing stopped maintenance locks/source guard. This
+    never opens a bus, changes P/Goal/torque, revives a trial, or acknowledges
+    native cleanup. The failed original remains immutable.
+    """
+    import re
+
+    directory = Path(directory)
+    AM1ElbowIntegralTrial._private_directory(directory)
+    if (not callable(check_stopped) or type(completion_id) is not str
+            or str(UUID(completion_id)) != completion_id
+            or type(original_sha256) is not str or re.fullmatch("[0-9a-f]{64}", original_sha256) is None):
+        raise ValueError("Stopped completion requires its exact original and fresh identity")
+    target = directory / ("left-response-p-stopped-completion-" + completion_id + ".json")
+    if target.exists() or target.is_symlink():
+        raise ValueError("Stopped completion output must be fresh")
+    binding = load_left_response_p_binding(directory / "left-response-p.json", directory, run_id, host_incarnation)
+    request = _response_p_request(binding["request"], source_head, kind=LEFT_RESPONSE_P_KIND)
+    if request.get("workspace_profile") != "left-current-rest-1051-1164":
+        raise ValueError("Stopped completion requires the exact current-rest request")
+    path = directory / "left-response-p-original.json"
+
+    def original_file():
+        if path.is_symlink() or path.resolve() != path:
+            raise ValueError("Stopped completion original path changed")
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not 0 < info.st_size <= 131072
+                    or os.name != "nt" and (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600)):
+                raise ValueError("Stopped completion requires its owned private bounded original")
+            raw = stream.read(131073)
+        if hashlib.sha256(raw).hexdigest() != original_sha256:
+            raise ValueError("Stopped completion original SHA differs")
+        def unique(pairs):
+            value = {}
+            for key, item in pairs:
+                if key in value:
+                    raise ValueError("Duplicate stopped original field")
+                value[key] = item
+            return value
+        value = json.loads(raw, object_pairs_hook=unique,
+                           parse_constant=lambda _: (_ for _ in ()).throw(ValueError("Nonfinite original")))
+        if (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode() != raw:
+            raise ValueError("Stopped completion original encoding differs")
+        return value
+
+    original = original_file()
+    registers, raw_bytes = original.get("original_registers", {}), original.get("original_bytes")
+    events = original.get("events", [])
+    goal_writes = [row.get("value") for row in events
+                   if row.get("operation") == "write" and row.get("register") == "Goal_Position"]
+    if (original.get("binding") != binding or original.get("kind") != LEFT_RESPONSE_P_KIND
+            or original.get("schema_version") != 1 or original.get("state") != "restore_failed"
+            or original.get("status") != "restore_failed" or original.get("restore_required") is not True
+            or original.get("motor") != ELBOW or original.get("motor_id") != 3
+            or original.get("first_failure", {}).get("type") != "RuntimeError"
+            or original.get("first_failure", {}).get("message") != "Current-rest Goal write lost actual Torque0"
+            or any(key in original for key in ("configured_p_readback", "configured_at_monotonic_s",
+                                               "active_verified", "active_registers"))
+            or set(registers) != set(_LEFT_RESPONSE_P_REGISTERS) or raw_bytes != {"24": 16, "25": 0}
+            or any(type(value) is not int for value in registers.values())
+            or (registers["P_Coefficient"], registers["I_Coefficient"], registers["D_Coefficient"],
+                registers["Lock"], registers["Torque_Enable"], registers["Goal_Position"], registers["Status"])
+            != (16, 0, 32, 0, 0, 2050, 0)
+            or not 1051 <= registers["Present_Position"] <= 1164
+            or goal_writes != [registers["Present_Position"], 2050]
+            or any(row.get("operation") == "write" and
+                   (row.get("register") not in {"Goal_Position", "Torque_Enable", "Lock"}
+                    or row.get("register") == "Torque_Enable" and row.get("value") != 0
+                    or row.get("register") == "Lock" and row.get("value") != 1) for row in events)
+            or any(not any(row.get("operation") == "read" and row.get("register") == "Torque_Enable"
+                           and row.get("phase") == phase and row.get("value") == 1 for row in events)
+                   for phase in ("prime_current_rest_goal_after", "restore_original_goal_after"))
+            or hashlib.sha256(_right_p20_json({"registers": registers, "individual_bytes": raw_bytes})).hexdigest()
+            != original.get("original_settings_sha256")):
+        raise ValueError("Stopped completion is limited to the retained pre-P32 Goal/OFF failure")
+    identity = {"Model_Number": 777, "Firmware_Major_Version": 3, "Firmware_Minor_Version": 10,
+                "ID": 3, "Operating_Mode": 0, "Phase": 12, "Min_Position_Limit": 864,
+                "Max_Position_Limit": 3073, "Homing_Offset": 1845}
+    if any(registers[key] != value for key, value in identity.items()):
+        raise ValueError("Stopped completion original device identity/calibration differs")
+    started = time.monotonic()
+    rows = []
+
+    def check():
+        check_stopped()
+        motor, cal = bus.motors.get(ELBOW), bus.calibration.get(ELBOW)
+        if (not started <= time.monotonic() < started + 20.0
+                or not bus.is_connected or motor is None or type(motor.id) is not int
+                or motor.id != 3 or motor.model != "sts3215"
+                or motor.norm_mode is not MotorNormMode.RANGE_M100_100 or cal is None
+                or any(type(getattr(cal, key)) is not int for key in
+                       ("id", "drive_mode", "homing_offset", "range_min", "range_max"))
+                or tuple(getattr(cal, k) for k in ("id", "drive_mode", "homing_offset", "range_min", "range_max"))
+                != AM1LeftResponseProportionalTrial.calibration):
+            raise RuntimeError("Stopped completion exact connected left owner/calibration changed")
+        if load_left_response_p_binding(directory / "left-response-p.json", directory, run_id, host_incarnation) != binding:
+            raise RuntimeError("Stopped completion immutable consumed binding changed")
+
+    def read(register=None, address=None):
+        row = {"operation": "read", "phase": "stopped_completion",
+               "started_at_monotonic_s": time.monotonic()}
+        if address is None:
+            row["register"] = register
+        else:
+            row.update(address=address, width=1)
+        rows.append(row)
+        try:
+            check()
+            row["started_at_monotonic_s"] = time.monotonic()
+            if address is None:
+                value = bus.read(register, ELBOW, normalize=False, num_retry=0)
+            else:
+                value, _, _ = bus._read(address, 1, 3, num_retry=0, raise_on_error=True,
+                                        err_msg="Stopped completion individual-byte read failed")
+            row.update(value=value, completed_at_monotonic_s=time.monotonic())
+            check()
+            if (type(value) is not int or not 0 <= row["completed_at_monotonic_s"]
+                    - row["started_at_monotonic_s"] <= 0.15):
+                raise RuntimeError("Stopped completion actual read must be a raw integer")
+            return value
+        except BaseException as error:
+            row.update(error_type=type(error).__name__, error=str(error)[:160])
+            raise
+        finally:
+            row.setdefault("completed_at_monotonic_s", time.monotonic())
+
+    attempted = False
+    try:
+        check()
+        actual = {key: read(key) for key in _LEFT_RESPONSE_P_REGISTERS}
+        actual_bytes = {str(address): read(address=address) for address in (24, 25)}
+        dynamic = {"Lock", "Present_Position", "Present_Current", "Present_Voltage", "Present_Temperature"}
+        if (any(actual[key] != registers[key] for key in set(registers) - dynamic)
+                or actual["Lock"] not in (0, 1) or actual_bytes != raw_bytes
+                or not registers["Min_Position_Limit"] <= actual["Present_Position"] <= registers["Max_Position_Limit"]
+                or abs(actual["Present_Current"]) >= registers["Protection_Current"]
+                or not registers["Min_Voltage_Limit"] <= actual["Present_Voltage"] <= registers["Max_Voltage_Limit"]):
+            raise RuntimeError("Stopped completion fresh original settings/Goal/OFF/health differ")
+        if original_file() != original:
+            raise ValueError("Stopped completion retained original changed")
+        if actual["Lock"] == 1:
+            check()
+            attempted = True
+            row = {"operation": "write", "phase": "stopped_completion", "register": "Lock", "value": 0,
+                   "started_at_monotonic_s": time.monotonic()}
+            rows.append(row)
+            try:
+                bus.write("Lock", ELBOW, 0, normalize=False, num_retry=0)
+            except Exception as error:
+                row.update(error_type=type(error).__name__, error=str(error)[:160])
+                try:
+                    actual_lock = read("Lock")
+                except BaseException as read_error:
+                    error.add_note("Stopped completion Lock acknowledgement readback failed")
+                    raise error from read_error
+                if actual_lock != 0:
+                    raise error
+                row["reconciled"] = True
+            finally:
+                row["completed_at_monotonic_s"] = time.monotonic()
+            check()
+        if (read("Lock"), read("Torque_Enable"), read("Goal_Position")) != (0, 0, 2050):
+            raise RuntimeError("Stopped completion final Lock/OFF/Goal readbacks differ")
+        check()
+        if original_file() != original:
+            raise ValueError("Stopped completion original changed before publication")
+        receipt = {"version": 1, "kind": "left-response-p-stopped-completion", "completion_id": completion_id,
+                   "run_id": run_id, "host_incarnation": host_incarnation, "request_sha256": binding["request_sha256"],
+                   "source_head": source_head, "original_sha256": original_sha256,
+                   "original_settings_sha256": original["original_settings_sha256"], "original_lock": 0,
+                   "selected_restoration_verified": True, "native_acknowledged": False, "events": rows,
+                   "started_at_monotonic_s": started, "completed_at_monotonic_s": time.monotonic()}
+        temporary = target.with_name("." + target.name + "." + uuid4().hex + ".tmp")
+        linked = False
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(_right_p20_json(receipt))
+                stream.flush()
+                os.fsync(stream.fileno())
+            check()
+            os.link(temporary, target)
+            linked = True
+            temporary.unlink()
+            AM1ElbowIntegralTrial._sync_directory(directory)
+        except BaseException:
+            if linked:
+                target.unlink()
+            raise
+        finally:
+            temporary.unlink(missing_ok=True)
+        return receipt
+    except BaseException as error:
+        if attempted:
+            try:
+                check()
+                row = {"operation": "write", "phase": "stopped_completion_failed_off", "register": "Torque_Enable",
+                       "value": 0, "started_at_monotonic_s": time.monotonic()}
+                rows.append(row)
+                try:
+                    bus.write("Torque_Enable", ELBOW, 0, normalize=False, num_retry=0)
+                except Exception as off_error:
+                    if read("Torque_Enable") != 0:
+                        raise off_error
+                    row["reconciled"] = True
+                finally:
+                    row["completed_at_monotonic_s"] = time.monotonic()
+                check()
+                if read("Torque_Enable") != 0:
+                    raise RuntimeError("Stopped completion failure containment OFF is unverified")
+            except BaseException as off_error:
+                error.add_note("Stopped completion failure containment: " + type(off_error).__name__ + ": " + str(off_error))
+        error.add_note("Stopped completion original retained; actual events: " + _right_p20_json(rows).decode())
+        raise

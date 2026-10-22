@@ -2751,3 +2751,382 @@ def test_response_baseline_refusal_cannot_qualify_other_origin_or_incomplete_new
         m.load_qualified_proof(config, run)
     assert run == before
     assert not (state / ("reconciliation-ack-" + run["run_id"] + ".json")).exists()
+RESPONSE_GOAL_ORIGIN = "preconfigure-left-response-goal-restore-incomplete-lift-unqualified"
+RESPONSE_GOAL_RUN = "72de22d9-ee93-4f76-809a-f10bd88e512a"
+RESPONSE_GOAL_HOST = "f19de2d7-e77f-4277-9e61-13824813ea31"
+
+
+def response_goal_completion_fixture(tmp_path, monkeypatch, *, already_unlocked=False, lost_ack=False):
+    m, config, run, proof, state, _old, _raw = loader_fixture(tmp_path, monkeypatch)
+    previous = Path(config["run_root"]) / run["run_id"][:8]
+    run.update(
+        run_id=RESPONSE_GOAL_RUN,
+        native_live_at=None,
+        progress_s=0.0,
+        recipe="physical-live-teleop",
+        cleanup="physical_cleanup_unknown",
+    )
+    folder = previous.with_name(RESPONSE_GOAL_RUN[:8])
+    previous.rename(folder)
+    proof.update(
+        run_id=RESPONSE_GOAL_RUN,
+        host_incarnation=RESPONSE_GOAL_HOST,
+        boot_id="4ff03ddb-1495-485c-aae8-33a67d79a98f",
+        original_cleanup_origin=RESPONSE_GOAL_ORIGIN,
+    )
+    config["host_head"] = proof["source"]["motor_head"] = "c4b35ba83acb188f7884db5cfcd686aa41902e16"
+    proof["source"]["original_executor_head"] = "9985a6333abf34081251b6799f1326bb2a53b64e"
+    run["backend_contract"] = copy.deepcopy(config)
+    run["physical_result"].update(
+        backend_incarnation=RESPONSE_GOAL_HOST,
+        run_id=RESPONSE_GOAL_RUN,
+        phase="terminal",
+        cleanup="physical_cleanup_unknown",
+        uncertain=True,
+        native_live_at=None,
+    )
+    cause = "RuntimeError: Current-rest Goal write lost actual Torque0"
+    run["native_first_cause"] = proof["original_first_cause"] = cause
+    trial = copy.deepcopy(ACTUAL114_RESPONSE_BASELINE)
+    trial.update(
+        state="restore_failed",
+        status="restore_failed",
+        restore_required=True,
+        first_failure={
+            "type": "RuntimeError",
+            "message": cause.removeprefix("RuntimeError: "),
+            "traceback": "retained original failure",
+        },
+    )
+    trial["binding"].update(run_id=RESPONSE_GOAL_RUN, host_incarnation=RESPONSE_GOAL_HOST)
+    request = trial["binding"]["request"]
+    request.update(
+        request_id="307a568d-fb85-4db4-b761-29d84e1416fb",
+        source_head=config["host_head"],
+        boot_id=proof["boot_id"],
+        expires_at_monotonic_s=535666.267898183,
+        workspace_profile="left-current-rest-1051-1164",
+    )
+    trial["binding"]["request_sha256"] = hashlib.sha256(canonical(request)).hexdigest()
+    trial["original_registers"].update(Present_Position=1090, Goal_Position=2050, Present_Temperature=27)
+    trial["original_settings_sha256"] = hashlib.sha256(
+        canonical({"registers": trial["original_registers"], "individual_bytes": trial["original_bytes"]})
+    ).hexdigest()
+    for index, event in enumerate(trial["events"]):
+        event.update(
+            started_at_monotonic_s=535574.0 + index * 0.001,
+            completed_at_monotonic_s=535574.0005 + index * 0.001,
+        )
+        event["value"] = (
+            trial["original_registers"][event["register"]]
+            if "register" in event
+            else trial["original_bytes"][str(event["address"])]
+        )
+    trial["prepared_at_monotonic_s"] = 535574.05
+
+    def old_event(operation, register, value, phase):
+        at = 535574.1 + len(trial["events"]) * 0.001
+        row = {
+            "operation": operation,
+            "register": register,
+            "value": value,
+            "phase": phase,
+            "started_at_monotonic_s": at,
+            "completed_at_monotonic_s": at + 0.0005,
+        }
+        trial["events"].append(row)
+        return row
+
+    trial["priming_position"] = copy.deepcopy(
+        old_event("read", "Present_Position", 1090, "current_rest_prime")
+    )
+    for phase, value in (("prime_current_rest_goal", 1090), ("restore_original_goal", 2050)):
+        old_event("read", "Torque_Enable", 0, phase + "_before")
+        old_event("write", "Goal_Position", value, phase)
+        old_event("read", "Goal_Position", value, phase + "_verify")
+        old_event("read", "Torque_Enable", 1, phase + "_after")
+    old_event("write", "Torque_Enable", 0, "restore_failed_torque_off")
+    old_event("read", "Torque_Enable", 0, "restore_failed_torque_off_verify")
+    old_event("write", "Lock", 1, "restore_failed_lock")
+    old_event("read", "Lock", 1, "restore_failed_lock_verify")
+    old = run["physical_result"]["readback"]
+    old.update(
+        run_id=RESPONSE_GOAL_RUN,
+        host_incarnation=RESPONSE_GOAL_HOST,
+        cleanup="physical_cleanup_unknown",
+        uncertain=True,
+        first_cause=cause,
+        cleanup_errors=[cause],
+        provenance="protected-host/actual-motor-readback",
+        first_error_chain=[{"cause": cause, "notes": []}],
+    )
+    old["readback"] = {
+        "verified": False,
+        "buses_closed": True,
+        "lift_readback": "unavailable-or-failed",
+        "selected_gain_restore_required": True,
+        "cleanup_errors": [cause],
+        "left_response_p_trial": trial,
+        "started_at_monotonic_s": 535574.5,
+        "completed_at_monotonic_s": 535574.6,
+        "readbacks": copy.deepcopy(proof["readback"]["readbacks"]),
+    }
+    for index, row in enumerate(old["readback"]["readbacks"]):
+        row.update(
+            read_started_at_monotonic_s=535574.5 + index * 0.001,
+            read_completed_at_monotonic_s=535574.5005 + index * 0.001,
+        )
+
+    def fresh_clock(value):
+        if isinstance(value, dict):
+            return {key: fresh_clock(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [fresh_clock(item) for item in value]
+        return value + 535500 if type(value) is float and 99 <= value <= 100.1 else value
+
+    proof = fresh_clock(proof)
+    proof["camera_release"]["session_id"] = RESPONSE_GOAL_RUN
+    run["physical_result"]["camera_release"] = copy.deepcopy(proof["camera_release"])
+    rows = []
+
+    def completion_row(operation, register, value, **extra):
+        at = 535598.0 + len(rows) * 0.001
+        row = {
+            "operation": operation,
+            "phase": "stopped_completion",
+            "value": value,
+            "started_at_monotonic_s": at,
+            "completed_at_monotonic_s": at + 0.0005,
+            **extra,
+        }
+        if register is not None:
+            row["register"] = register
+        rows.append(row)
+
+    for event in trial["events"][:40]:
+        if "register" in event:
+            completion_row(
+                "read",
+                event["register"],
+                (0 if already_unlocked else 1) if event["register"] == "Lock" else event["value"],
+            )
+        else:
+            completion_row("read", None, event["value"], address=event["address"], width=1)
+    if not already_unlocked:
+        completion_row(
+            "write",
+            "Lock",
+            0,
+            **({"reconciled": True, "error_type": "OSError", "error": "lost receipt"} if lost_ack else {}),
+        )
+        if lost_ack:
+            completion_row("read", "Lock", 0)
+            rows[-2]["completed_at_monotonic_s"] = rows[-1]["completed_at_monotonic_s"] + 0.0001
+    for register, value in (("Lock", 0), ("Torque_Enable", 0), ("Goal_Position", 2050)):
+        completion_row("read", register, value)
+    original_raw = (json.dumps(trial, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+    completion = {
+        "version": 1,
+        "kind": "left-response-p-stopped-completion",
+        "completion_id": str(uuid.uuid4()),
+        "run_id": RESPONSE_GOAL_RUN,
+        "host_incarnation": RESPONSE_GOAL_HOST,
+        "request_sha256": trial["binding"]["request_sha256"],
+        "source_head": config["host_head"],
+        "original_sha256": hashlib.sha256(original_raw).hexdigest(),
+        "original_settings_sha256": trial["original_settings_sha256"],
+        "original_lock": 0,
+        "selected_restoration_verified": True,
+        "native_acknowledged": False,
+        "events": rows,
+        "started_at_monotonic_s": 535598.0,
+        "completed_at_monotonic_s": 535598.1,
+    }
+    proof["selected_restoration"] = {
+        "sha256": hashlib.sha256(canonical(completion)).hexdigest(),
+        "receipt": completion,
+    }
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(m, "time", SimpleNamespace(monotonic=lambda: 535600.1))
+    monkeypatch.setattr(m, "current_boot_id", lambda: proof["boot_id"])
+    return m, config, run, proof, state
+
+
+def publish_response_goal_fixture(config, run, proof, state):
+    folder = Path(config["run_root"]) / run["run_id"][:8]
+    old = run["physical_result"]["readback"]
+    original = canonical(old) + b"\n"
+    (folder / "cleanup.json").write_bytes(original)
+    proof["original_cleanup_sha256"] = hashlib.sha256(original).hexdigest()
+    trial = old["readback"]["left_response_p_trial"]
+    (folder / "left-response-p-original.json").write_bytes(
+        (json.dumps(trial, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+    )
+    completion = proof.get("selected_restoration", {}).get("receipt")
+    if completion:
+        (
+            folder / ("left-response-p-stopped-completion-" + completion["completion_id"] + ".json")
+        ).write_bytes(canonical(completion))
+    claim = canonical({"run_id": run["run_id"], "host_incarnation": proof["host_incarnation"]})
+    proof["original_markers"] = {
+        "cleanup-uncertain.json": {"sha256": hashlib.sha256(original).hexdigest()},
+        "physical-in-progress.json": {"sha256": hashlib.sha256(claim).hexdigest()},
+    }
+    (state / "cleanup-uncertain.json").write_bytes(original)
+    (state / "physical-in-progress.json").write_bytes(claim)
+    camera_raw = canonical(proof["camera_release"]) + b"\n"
+    (Path(config["camera_state"]) / ("release-" + run["run_id"] + ".json")).write_bytes(camera_raw)
+    proof["camera_release_sha256"] = hashlib.sha256(camera_raw).hexdigest()
+    proof["original_terminal_run_sha256"] = hashlib.sha256(canonical(run)).hexdigest()
+    raw = canonical(proof)
+    (state / ("reconciliation-" + run["run_id"] + ".json")).write_bytes(raw)
+    return raw
+
+
+@pytest.mark.parametrize("already_unlocked,lost_ack", [(False, False), (True, False), (False, True)])
+def test_response_goal_completion115_requires_separate_actual_completion_fresh_proof_and_ack(
+    tmp_path, monkeypatch, already_unlocked, lost_ack
+):
+    m, config, run, proof, state = response_goal_completion_fixture(
+        tmp_path, monkeypatch, already_unlocked=already_unlocked, lost_ack=lost_ack
+    )
+    before = copy.deepcopy(run)
+    raw = publish_response_goal_fixture(config, run, proof, state)
+    actual, received, markers = m.load_qualified_proof(config, run)
+    assert actual == proof and received == raw and all(value is not None for value in markers.values())
+    consumed = str(uuid.uuid4())
+    ack = m.archive_and_ack(config, actual, received, markers, str(uuid.uuid4()))
+    assert m.acknowledged_receipt(
+        {**actual, "acknowledgment": {**ack, "consumed_operation_id": consumed}}, run, consumed
+    )
+    assert (
+        run == before
+        and run["uncertain"]
+        and run["physical_result"]["readback"]["readback"]["selected_gain_restore_required"]
+    )
+    assert all(not (state / name).exists() for name in m.MARKERS)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "missing",
+        "generic",
+        "foreign_run",
+        "foreign_host",
+        "source",
+        "request",
+        "original",
+        "settings",
+        "sha",
+        "claimed_ack",
+        "completion_after",
+        "completion_old",
+        "goal_write",
+        "p_write",
+        "final_torque",
+        "final_goal",
+        "final_lock",
+        "missing_read",
+        "backward",
+        "slow",
+        "extra",
+        "no_lift",
+        "stale_thermal",
+        "boot",
+        "missing_file",
+        "changed_file",
+        "changed_original",
+    ],
+)
+def test_response_goal_completion115_never_substitutes_flags_or_unqualified_evidence(
+    tmp_path, monkeypatch, bad
+):
+    m, config, run, proof, state = response_goal_completion_fixture(tmp_path, monkeypatch)
+    completed = proof["selected_restoration"]["receipt"]
+    if bad == "missing":
+        proof.pop("selected_restoration")
+    elif bad == "generic":
+        proof.pop("original_cleanup_origin")
+        proof.pop("selected_restoration")
+    elif bad == "foreign_run":
+        completed["run_id"] = str(uuid.uuid4())
+    elif bad == "foreign_host":
+        completed["host_incarnation"] = str(uuid.uuid4())
+    elif bad == "source":
+        completed["source_head"] = "a" * 40
+    elif bad == "request":
+        completed["request_sha256"] = "a" * 64
+    elif bad == "original":
+        completed["original_sha256"] = "a" * 64
+    elif bad == "settings":
+        completed["original_settings_sha256"] = "a" * 64
+    elif bad == "sha":
+        proof["selected_restoration"]["sha256"] = "a" * 64
+    elif bad == "claimed_ack":
+        completed["native_acknowledged"] = True
+    elif bad == "completion_after":
+        completed["completed_at_monotonic_s"] = proof["started_at_monotonic_s"] + 0.1
+    elif bad == "completion_old":
+        completed["started_at_monotonic_s"] -= 200
+        completed["completed_at_monotonic_s"] -= 200
+    elif bad in {"goal_write", "p_write"}:
+        completed["events"][-4]["register"] = "Goal_Position" if bad == "goal_write" else "P_Coefficient"
+    elif bad == "final_torque":
+        completed["events"][-2]["value"] = 1
+    elif bad == "final_goal":
+        completed["events"][-1]["value"] = 1090
+    elif bad == "final_lock":
+        completed["events"][-3]["value"] = 1
+    elif bad == "missing_read":
+        completed["events"].pop(0)
+    elif bad == "backward":
+        completed["events"][1]["started_at_monotonic_s"] -= 1
+    elif bad == "slow":
+        completed["events"][0]["completed_at_monotonic_s"] += 0.151
+    elif bad == "extra":
+        completed["scope"] = "ordinary operation"
+    elif bad == "no_lift":
+        proof["readback"]["lift_readback"] = "unavailable-or-failed"
+    elif bad == "stale_thermal":
+        proof["readback"]["lift_stationary"]["temperature_ready"] = False
+    elif bad == "boot":
+        proof["boot_id"] = str(uuid.uuid4())
+    if "selected_restoration" in proof and bad != "sha":
+        proof["selected_restoration"]["sha256"] = hashlib.sha256(canonical(completed)).hexdigest()
+    publish_response_goal_fixture(config, run, proof, state)
+    folder = Path(config["run_root"]) / run["run_id"][:8]
+    path = folder / ("left-response-p-stopped-completion-" + completed["completion_id"] + ".json")
+    if bad == "missing_file":
+        path.unlink()
+    elif bad == "changed_file":
+        path.write_bytes(path.read_bytes() + b" ")
+    elif bad == "changed_original":
+        (folder / "left-response-p-original.json").write_bytes(b"changed original")
+    before = copy.deepcopy(run)
+    with pytest.raises((ValueError, KeyError, TypeError, FileNotFoundError)):
+        m.load_qualified_proof(config, run)
+    assert run == before and not (state / ("reconciliation-ack-" + run["run_id"] + ".json")).exists()
+    assert all((state / name).exists() for name in m.MARKERS)
+
+
+@pytest.mark.parametrize("changed", ["completion", "original"])
+def test_response_goal_completion115_changed_after_validation_never_receives_ack(
+    tmp_path, monkeypatch, changed
+):
+    m, config, run, proof, state = response_goal_completion_fixture(tmp_path, monkeypatch)
+    raw = publish_response_goal_fixture(config, run, proof, state)
+    actual, received, markers = m.load_qualified_proof(config, run)
+    folder = Path(config["run_root"]) / run["run_id"][:8]
+    path = folder / (
+        "left-response-p-original.json"
+        if changed == "original"
+        else "left-response-p-stopped-completion-"
+        + proof["selected_restoration"]["receipt"]["completion_id"]
+        + ".json"
+    )
+    path.write_bytes(b"changed")
+    with pytest.raises(ValueError):
+        m.archive_and_ack(config, actual, received, markers, str(uuid.uuid4()))
+    assert received == raw and all((state / name).exists() for name in m.MARKERS)
