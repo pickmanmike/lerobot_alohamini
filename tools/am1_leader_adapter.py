@@ -731,6 +731,21 @@ def recovery_grant_refusal(error):
     )
 
 
+def selected_view_refusal(error):
+    identity = getattr(error, "identity", None)
+    keys = {"run_id", "service_incarnation", "controller_generation", "connection_generation",
+            "host_incarnation", "intent_revision"}
+    return (isinstance(error, CommandRefusedError) and getattr(error, "operation", None) in {"grant", "input"}
+            and isinstance(error.response, dict)
+            and isinstance(identity, dict) and set(identity) == keys
+            and type(identity["intent_revision"]) is int and identity["intent_revision"] >= 0
+            and all(type(identity[key]) is str and identity[key] for key in keys - {"intent_revision"})
+            and error.response.get("uncertain", False) is False
+            and all(type(error.response.get(key)) is type(value) and error.response[key] == value
+                    for key, value in {"accepted": False, "status": "refused", "effect_admitted": False,
+                                       "reason": "required selected view expired"}.items()))
+
+
 def _resume_send_failure(error, identity, operation_id, ws):
     """Only the original current-channel send site can establish this unknown outcome."""
     from aiohttp import ClientConnectionResetError
@@ -2318,7 +2333,9 @@ class SameRunRecovery:
         # This is the existing authenticated owner read, not a WSS freshness
         # guess. Anchor BEFORE the read so HTTP time cannot extend the ceiling.
         mailbox_refusal = expected_pause == "native_input_expired" and refusal_identity is not None
-        if mailbox_refusal:
+        view_refusal = expected_pause == "required_view_expired" and refusal_identity is not None
+        bound_refusal = mailbox_refusal or view_refusal
+        if bound_refusal:
             binding = {"run_id": self.original["run"]["run_id"], "service_incarnation": self.original["service"],
                        "controller_generation": self.original["controller"]["controller_generation"],
                        "connection_generation": self.client.connection,
@@ -2333,6 +2350,9 @@ class SameRunRecovery:
             ):
                 raise RuntimeError("original mailbox input refusal identity changed")
         requested = time.monotonic()
+        if view_refusal:
+            clock["held_view_ceiling"] = min(clock.get("held_view_ceiling", float("inf")), requested + 8,
+                                              wall_deadline if wall_deadline is not None else float("inf"))
         request_ceiling = min(wall_deadline if wall_deadline is not None else float("inf"),
                               clock.get("held_view_ceiling", float("inf")))
         state = (
@@ -2365,6 +2385,37 @@ class SameRunRecovery:
             }
         )
         self.check(state, history=False)
+        if view_refusal:
+            while state["run"]["status"] == "running":
+                self.check(state)
+                current, evidence = state["run"], state.get("evidence", {})
+                if (self.client.connection != refusal_identity["connection_generation"]
+                    or current.get("intent_revision") != refusal_identity["intent_revision"]
+                    or not all(evidence.get(key) is True for key in ("feedback", "required_observation", "native_ack"))
+                    or _latest_run_event(state, refusal_identity).get("kind") in {"pause", "stop", "handoff", "released", "revoked"}):
+                    raise RuntimeError("original selected-view refusal binding changed before ordinary HOLD")
+                budget = min(clock["held_view_ceiling"], clock["ceiling"], clock["native_ceiling"]) - time.monotonic()
+                if budget <= 0:
+                    raise TimeoutError("original selected-view ordinary HOLD ceiling exhausted")
+                if renewal_check:
+                    renewal_check()
+                await asyncio.sleep(min(.05, budget))
+                read_at = time.monotonic()
+                budget = min(clock["held_view_ceiling"], clock["ceiling"], clock["native_ceiling"]) - read_at
+                if budget <= 0:
+                    raise TimeoutError("original selected-view ordinary HOLD ceiling exhausted")
+                state = (await asyncio.wait_for(self.client.get("state"), budget))["snapshot"]
+                self.client.snapshot = state
+                self.check(state)
+                native_remaining = state["run"].get("remaining_s")
+                if (type(native_remaining) not in (int, float) or not math.isfinite(native_remaining)
+                    or not 0 < native_remaining <= clock["remaining"]):
+                    raise RuntimeError("original selected-view native remaining clock changed")
+                clock["remaining"] = native_remaining
+                clock["native_ceiling"] = min(clock["native_ceiling"], read_at + native_remaining)
+                self.record({"event": "owner_rejoin_state", "snapshot": state,
+                             "request_started_at_monotonic_s": read_at,
+                             "response_observed_at_monotonic_s": time.monotonic()})
         binding_context = grant_context or resume_context
         if binding_context is not None and native_remaining > binding_context["snapshot"]["run"]["remaining_s"]:
             raise RuntimeError("original grant native remaining clock increased")
@@ -2380,7 +2431,7 @@ class SameRunRecovery:
                 or state["run"]["intent_revision"] != identity["intent_revision"] + 2
                 or _latest_run_event(state, identity) != interrupted.event):
                 raise RuntimeError("fresh authority for superseding ordinary pause changed")
-        if mailbox_refusal and (
+        if bound_refusal and (
             self.client.connection != refusal_identity["connection_generation"]
             or state["run"]["status"] != "paused"
             or type(state["run"].get("intent_revision")) is not int
@@ -2568,7 +2619,7 @@ class SameRunRecovery:
                 )
         self.check(state)  # A cleared descriptor alone never proves a closed episode.
         timeout = None if local_ceiling is None else max(0, local_ceiling - time.monotonic())
-        if mailbox_refusal and self.client.connection != refusal_identity["connection_generation"]:
+        if bound_refusal and self.client.connection != refusal_identity["connection_generation"]:
             raise RuntimeError("original mailbox input refusal connection changed before Resume")
         if renewal_check:
             renewal_check()
@@ -2579,6 +2630,14 @@ class SameRunRecovery:
                 raise TimeoutError("original rejoin ceiling exhausted")
             if renewal_check:
                 renewal_check()
+            if view_refusal:
+                event = _latest_run_event(snapshot, refusal_identity)
+                if (event.get("kind") in {"pause", "stop", "handoff", "released", "revoked", "presence_expired"}
+                    or snapshot["run"].get("status") == "paused"
+                    and event == _latest_run_event(state, refusal_identity)
+                    and snapshot["run"].get("intent_revision") != refusal_identity["intent_revision"] +
+                        (1 if self.client.connection == refusal_identity["connection_generation"] else 2)):
+                    raise RuntimeError("original selected-view ordinary HOLD intent superseded")
             try:
                 self.check(snapshot)
             except RuntimeError as original:
@@ -3902,10 +3961,12 @@ async def run(args):
                     await rejoin(until=peer_baseline_until)
                     continue
                 mailbox = mailbox_input_refusal(error)
-                if not (recovery_grant_refusal(error) or mailbox):
+                view = selected_view_refusal(error)
+                if not (recovery_grant_refusal(error) or mailbox or view):
                     raise
                 await rejoin(require_episode=True, refusal_identity=error.identity,
-                             expected_pause="native_input_expired" if mailbox else None, until=peer_baseline_until)
+                             expected_pause="native_input_expired" if mailbox else "required_view_expired" if view else None,
+                             until=peer_baseline_until)
                 continue
             if sent is None:
                 if workload:
