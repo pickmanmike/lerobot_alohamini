@@ -1727,7 +1727,7 @@ def _view_admitted(snapshot):
 
 
 def _qualified_command_reference(client, workspace):
-    """Use an actual current HOLD command, never turn an outlying measurement into a Goal."""
+    """Read a current HOLD origin as data; required view still gates Resume/input."""
     state = client.snapshot or {}
     run, evidence, live = state.get("run") or {}, state.get("evidence") or {}, _live(state)
     ack, owner = evidence.get("accepted_host_action") or {}, state.get("controller") or {}
@@ -1745,7 +1745,7 @@ def _qualified_command_reference(client, workspace):
         or owner.get("device_id") != client.device or owner.get("controller_generation") != client.generation
         or not all(evidence.get(key) is True for key in
                    ("feedback", "required_observation", "hold_acknowledged", "pose_aligned", "native_ack"))
-        or evidence.get("active_acknowledged") is not False or not _view_admitted(state)
+        or evidence.get("active_acknowledged") is not False
         or type(revision) is not int or revision < 0
         or type(ack.get("intent_revision")) is not int or ack["intent_revision"] != revision
         or type(evidence.get("acknowledged_intent_revision")) is not int

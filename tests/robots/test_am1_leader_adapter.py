@@ -2415,7 +2415,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal", "peer_start_normal", "peer_start_bench", "peer_bench_unqualified_view", "peer_bench_local_loss", "peer_normal_unqualified_view"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal", "peer_start_normal", "peer_start_bench", "peer_bench_unqualified_view", "peer_bench_local_loss", "peer_normal_unqualified_view", "held_command120_view_later", "held_command120_view_never", "held_command120_local_loss"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause):
     import asyncio
     import copy
@@ -2435,6 +2435,17 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
     a.run.update(backend_incarnation=e.host_incarnation, recovery_episodes=0, status="paused")
     a._teleop_view = {"run_id": e.run_id, "qualified_until": 10.5, "role": "chest"}
     healthy, epoch, commands = [True], [0], []
+    held120 = cause.startswith("held_command120_")
+    if held120:
+        e.desired = "hold"
+        a.run.update(accepted_at=8., startup_deadline=188., bench_continuity=False)
+        e.sample["ack"]["live_input"]["workspace"] = held_command119_workspace()
+        a._teleop_view = {"run_id": e.run_id, "qualified_until": 9.5, "role": "chest"}
+        if cause == "held_command120_view_never":
+            # Clip the existing qualification to actual remaining native time,
+            # retaining the original9â†’309 ceiling rather than adding a timer.
+            a.clock = e.clock = lambda: 308.85
+            a.controller["expires"] = 310.
     cursor_ready = [cause != "runner_initial_cursor_pending"]
     if not cursor_ready[0]:
         e.desired = "hold"
@@ -2472,6 +2483,15 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 "acquired_at_monotonic_s": a.clock(),
             },
         )
+        if held120:
+            native = held_command119_workspace()
+            live.update(workspace=native, reference=copy.deepcopy(native["reference"]),
+                        cursor={**native["reference"], "arm_left_shoulder_lift.pos": 100.}, body=dict(m.ZERO_BODY))
+            live["accepted_target"] = dict(live["cursor"])
+            value["measured_positions"] = copy.deepcopy(native["reference"])
+            value["accepted_host_action"]["accepted_action"] = {"mode": "raw_goal_hold", "body_velocity": 0.}
+            if cause == "held_command120_local_loss":
+                value["required_observation"] = False
         if not cursor_ready[0]:
             for key in ("cursor", "cursor_intent_revision", "cursor_feedback_sequence"):
                 live.pop(key, None)
@@ -2631,6 +2651,75 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 assert not any(event["kind"] == "presence_expired" for event in a.events)
                 return
             client.generation, client.connection = ids["controller_generation"], ids["connection_generation"]
+            if held120:
+                original_post, original_send = client.post, m.send_leader_sample
+                programme_created, view_published = asyncio.Event(), asyncio.Event()
+                observed = []
+                original_selected = m.SelectedLeftWorkload
+                class Selected(original_selected):
+                    def __init__(self, *args, **kwargs):
+                        super().__init__(*args, **kwargs)
+                        programme_created.set()
+                class RunnerSession(m.SessionClient):
+                    def __new__(cls, *_args):
+                        return client
+                async def already_attached():
+                    assert client.ws is not None and not client.ws.closed
+                async def post(path, body):
+                    if path == "start":
+                        assert body.get("bench_continuity", False) is False
+                        a.run["operation_id"] = body["operation_id"]
+                        client.snapshot = a.snapshot()
+                        return {"accepted": True, "run_id": e.run_id, "operation_id": body["operation_id"]}
+                    if path == "stop":
+                        a.run.update(status="stopped", cleanup="physical_readback_verified", uncertain=False)
+                        return {"accepted": True}
+                    return await original_post(path, body)
+                async def publish_view():
+                    await programme_created.wait()
+                    await asyncio.sleep(.06)
+                    assert not any(op in {"resume", "grant", "input"} for op, _ in commands)
+                    a._teleop_view = {"run_id": e.run_id, "qualified_until": a.clock()+.5, "role": "chest"}
+                    view_published.set()
+                async def first_sample(*args, **kwargs):
+                    assert view_published.is_set() and m._view_admitted(client.snapshot)
+                    assert client.snapshot["evidence"]["active_acknowledged"] is True
+                    result = await original_send(*args, **kwargs)
+                    assert result[2]["accepted"] is True and result[1]["target"]["arm_left_shoulder_lift.pos"] == 100.
+                    observed.append(copy.deepcopy(result))
+                    raise RuntimeError("Actual120 fresh first-input boundary")
+                client.attach, client.post = already_attached, post
+                monkeypatch.setattr(m, "SessionClient", RunnerSession)
+                monkeypatch.setattr(m, "SelectedLeftWorkload", Selected)
+                monkeypatch.setattr(m, "send_leader_sample", first_sample)
+                args = type("Args", (), {"source": "virtual-leaders", "output": str(tmp_path / "run"),
+                    "url": gateway.origin, "ca": cert, "storage_state": storage, "next_start_seconds": None,
+                    "workload_segment": "left-reach", "duration_seconds": 180., "interrupt_at_seconds": None})()
+                if cause == "held_command120_view_later":
+                    qualification = asyncio.create_task(publish_view())
+                    with pytest.raises(RuntimeError, match="Actual120 fresh first-input"):
+                        await m.run(args)
+                    assert programme_created.is_set() and len(observed) == 1
+                    assert observed[0][0]["expires"]-observed[0][0]["issued"] == .25
+                elif cause == "held_command120_view_never":
+                    entered_at = asyncio.get_running_loop().time()
+                    with pytest.raises(TimeoutError):
+                        await m.run(args)
+                    elapsed = asyncio.get_running_loop().time()-entered_at
+                    assert programme_created.is_set() and .1 <= elapsed < .8
+                else:
+                    with pytest.raises(RuntimeError, match="qualified native held command unavailable"):
+                        await m.run(args)
+                    assert not programme_created.is_set()
+                if cause != "held_command120_view_later":
+                    assert observed == [] and not any(op in {"resume", "grant", "input"} for op, _ in commands)
+                assert a.run["native_live_at"] == 9. and a.run["deadline"] == 309.
+                rows = [json.loads(v) for v in (tmp_path / "run/frames.jsonl").read_text().splitlines()]
+                admitted = next(v["snapshot"] for v in rows if v["event"] == "native_admitted")
+                assert admitted["run"]["bench_continuity"] is False
+                assert m._live(admitted)["required_view"] == {"required": True, "qualified": False,
+                    "role": "chest", "cause": "required_view_expired"}
+                return
             if cause in {"peer_bench_unqualified_view", "peer_bench_local_loss", "peer_normal_unqualified_view"}:
                 bench = cause.startswith("peer_bench_")
                 assert m._peer_options("left-peer-maintained", "left", -1, 52, bench=bench)
