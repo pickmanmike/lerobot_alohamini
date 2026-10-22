@@ -3255,3 +3255,94 @@ def test_left_response_preparation_current_rest_cli_rejects_free_bounds_before_s
         m.main(["--prepare-left-response-p", "--ssh", "am1-pi", "--config",
                 "/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/7438c74662d59a02/physical.json",
                 "--left-response-workspace", "1051..1165"])
+
+
+@pytest.mark.parametrize("supported", [True, False])
+def test_left_shoulder_startup_preparation_validates_installed_support_before_publication(tmp_path, monkeypatch, supported):
+    from pathlib import Path
+    m = module()
+    path, config, gains, _ = request_preparation_config(tmp_path, monkeypatch)
+    state = Path(config["physical_state_directory"])
+    native_validate = gains._left_response_p_request
+    seen = []
+    def validate(request, source_head):
+        assert not list(state.iterdir())
+        seen.append(dict(request))
+        if not supported:
+            raise ValueError("Installed startup allowance unavailable")
+        return native_validate(request, source_head)
+    monkeypatch.setattr(gains, "_left_response_p_request", validate)
+    monkeypatch.setattr(m.ProtectedHostRun, "start", lambda *a, **k: pytest.fail("no Start"))
+    monkeypatch.setattr(m, "OwnedUnit", lambda *a, **k: pytest.fail("no device process"))
+    if not supported:
+        with pytest.raises(ValueError, match="Installed startup"):
+            m.prepare_left_response_p_request(str(path), workspace_profile="left-current-rest-1051-1164",
+                                             left_shoulder_startup_degrees=1)
+        assert len(seen) == 1 and not list(state.iterdir())
+        return
+    result = m.prepare_left_response_p_request(str(path), workspace_profile="left-current-rest-1051-1164",
+                                              left_shoulder_startup_degrees=1)
+    assert result["request"] == seen[0]
+    assert result["request"]["left_shoulder_startup_degrees"] == 1
+    assert gains._right_p20_file(Path(result["path"]))[0] == result["request"]
+    assert result["hardware_started"] is False
+    assert not list(state.glob("*-used-*")) and not list(state.glob(".*.tmp"))
+
+
+@pytest.mark.parametrize("degrees,profile", [(True, "left-current-rest-1051-1164"),
+    (False, "left-current-rest-1051-1164"), (.5, "left-current-rest-1051-1164"),
+    (1.000001, "left-current-rest-1051-1164"), (2, "left-current-rest-1051-1164"),
+    ("1", "left-current-rest-1051-1164"), (float("nan"), "left-current-rest-1051-1164"),
+    (float("inf"), "left-current-rest-1051-1164"), (1, None)])
+def test_left_shoulder_startup_preparation_rejects_free_bounds_and_missing_profile(tmp_path, monkeypatch, degrees, profile):
+    from pathlib import Path
+    m = module()
+    path, config, _, _ = request_preparation_config(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="startup"):
+        m.prepare_left_response_p_request(str(path), workspace_profile=profile,
+                                         left_shoulder_startup_degrees=degrees)
+    assert not list(Path(config["physical_state_directory"]).iterdir())
+
+
+def test_left_shoulder_startup_cli_relays_exact_opt_in_and_canonical_request(tmp_path, monkeypatch, capsys):
+    import io
+    import json
+    import shlex
+    import subprocess
+    import sys
+    from contextlib import redirect_stdout
+    m = module()
+    path, config, _, _ = request_preparation_config(tmp_path, monkeypatch)
+    native_config = "/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/7438c74662d59a02/physical.json"
+    calls = []
+    def remote(args, **options):
+        calls.append(args)
+        assert shlex.split(args[7]) == ["/home/pickmanmike/lerobot_alohamini/.venv/bin/python", "-B", "-",
+                                       native_config, "120", "left-current-rest-1051-1164", "1"]
+        assert options["shell"] is False
+        output = io.StringIO()
+        with monkeypatch.context() as context, redirect_stdout(output):
+            context.setattr(sys, "argv", ["-", str(path), "120", "left-current-rest-1051-1164", "1"])
+            context.delattr(m, "prepare_left_response_p_request")
+            exec(compile(options["input"], "<fixed-preparation-relay>", "exec"), {})
+        return SimpleNamespace(stdout=output.getvalue(), stderr="", returncode=0)
+    monkeypatch.setattr(subprocess, "run", remote)
+    assert m.main(["--prepare-left-response-p", "--ssh", "am1-pi", "--config", native_config,
+                   "--left-response-workspace", "current-rest", "--left-shoulder-startup-degrees", "1"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["request"]["left_shoulder_startup_degrees"] == 1
+    assert result["request"]["workspace_profile"] == "left-current-rest-1051-1164"
+    assert result["request"]["source_head"] == config["host_head"]
+    assert result["hardware_started"] is False and len(calls) == 1
+
+
+@pytest.mark.parametrize("extra", [["--left-shoulder-startup-degrees", "1"],
+    ["--left-response-workspace", "current-rest", "--left-shoulder-startup-degrees", "0.5"],
+    ["--left-response-workspace", "current-rest", "--left-shoulder-startup-degrees", "2"]])
+def test_left_shoulder_startup_cli_refuses_missing_profile_or_free_bound_before_ssh(monkeypatch, extra):
+    import subprocess
+    m = module()
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("no SSH for unsupported startup allowance"))
+    with pytest.raises(SystemExit):
+        m.main(["--prepare-left-response-p", "--ssh", "am1-pi", "--config",
+                "/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/7438c74662d59a02/physical.json", *extra])

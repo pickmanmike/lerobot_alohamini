@@ -2151,7 +2151,8 @@ def wait_required_camera(camera, observation, cancel, *, sleep=time.sleep):
         sleep(0.05)
 
 
-def prepare_left_response_p_request(config_path, *, ttl_seconds=120, workspace_profile=None):
+def prepare_left_response_p_request(config_path, *, ttl_seconds=120, workspace_profile=None,
+                                    left_shoulder_startup_degrees=None):
     """Prepare only one boot-local left-reach P32 request; never consume or Start it.
 
     This self-contained function is relayed by the PC CLI and imports the installed
@@ -2182,6 +2183,12 @@ def prepare_left_response_p_request(config_path, *, ttl_seconds=120, workspace_p
     if workspace_profile is not None and (type(workspace_profile) is not str
             or workspace_profile != "left-current-rest-1051-1164"):
         raise ValueError("Only the explicit current-rest workspace profile is supported")
+    if left_shoulder_startup_degrees is not None and (
+        type(left_shoulder_startup_degrees) not in (int, float)
+        or left_shoulder_startup_degrees != 1
+        or workspace_profile != "left-current-rest-1051-1164"
+    ):
+        raise ValueError("Left shoulder startup allowance requires exactly 1 degree and the current-rest workspace")
     path = Path(config_path)
     if not path.is_absolute() or path.resolve() != path or path.is_symlink():
         raise ValueError("Exact absolute installed physical configuration required")
@@ -2206,6 +2213,8 @@ def prepare_left_response_p_request(config_path, *, ttl_seconds=120, workspace_p
         }
         if workspace_profile is not None:
             request["workspace_profile"] = workspace_profile
+        if left_shoulder_startup_degrees is not None:
+            request["left_shoulder_startup_degrees"] = left_shoulder_startup_degrees
         _left_response_p_request(request, config["host_head"])
         used = state / ("left-response-p-used-" + request["request_id"] + ".json")
         if used.exists() or used.is_symlink():
@@ -2255,8 +2264,12 @@ def main(argv=None):
     parser.add_argument("--config", required=True, help="Existing installed Pi physical.json")
     parser.add_argument("--ttl-seconds", type=int, default=120)
     parser.add_argument("--left-response-workspace", choices=("current-rest",), default=None,
-                        help="Explicitly select the approved LEFT1051..1164 current-rest corridor and OFF Goal priming")
+                        help="Explicitly select the approved LEFT1051..1164 corridor and ordinary measured-q startup")
+    parser.add_argument("--left-shoulder-startup-degrees", type=int, choices=(1,), default=None,
+                        help="Explicit temporary 1-degree inward LEFT shoulder startup allowance for current-rest only")
     args = parser.parse_args(argv)
+    if args.left_shoulder_startup_degrees is not None and args.left_response_workspace is None:
+        parser.error("Left shoulder startup allowance requires --left-response-workspace current-rest")
     if (not 1 <= args.ttl_seconds <= 120
             or re.fullmatch(r"/home/pickmanmike/\.local/share/am1-physical-adapter-01/"
                             r"deployments/[0-9a-f]{16}/physical\.json", args.config) is None
@@ -2264,6 +2277,8 @@ def main(argv=None):
         parser.error("Existing installed physical.json and preparation expiry within 1–120 seconds required")
     profile_args = ["left-current-rest-1051-1164"] if args.left_response_workspace is not None else []
     profile_keyword = ", workspace_profile=sys.argv[3]" if profile_args else ""
+    startup_args = ["1"] if args.left_shoulder_startup_degrees is not None else []
+    startup_keyword = ", left_shoulder_startup_degrees=int(sys.argv[4])" if startup_args else ""
     # Fixed reviewed code, no command/interpreter/source/nonce override. SSH's remote
     # shell receives only quoted fixed arguments, never interpolated source text.
     payload = (
@@ -2272,10 +2287,10 @@ def main(argv=None):
         "'/home/pickmanmike/lerobot_alohamini/src']\n"
         + inspect.getsource(prepare_left_response_p_request)
         + "\nprint(json.dumps(prepare_left_response_p_request(sys.argv[1], "
-        "ttl_seconds=int(sys.argv[2])" + profile_keyword + "), sort_keys=True))\n"
+        "ttl_seconds=int(sys.argv[2])" + profile_keyword + startup_keyword + "), sort_keys=True))\n"
     )
     remote = shlex.join(["/home/pickmanmike/lerobot_alohamini/.venv/bin/python", "-B", "-",
-                         args.config, str(args.ttl_seconds), *profile_args])
+                         args.config, str(args.ttl_seconds), *profile_args, *startup_args])
     # An ambiguous SSH receipt is never retried automatically: the pending request
     # may already exist and must remain available for explicit inspection.
     reply = subprocess.run(

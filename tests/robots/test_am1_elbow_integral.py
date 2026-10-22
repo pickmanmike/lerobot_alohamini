@@ -891,7 +891,7 @@ def test_right_p20_fresh_nonce_requires_absent_global_marker_after_explicit_reti
 LEFT_P_BOOT = "77777777-7777-4777-8777-777777777777"
 
 
-def left_response_p_files(tmp_path, monkeypatch, *, proportional=32, workspace_profile=None):
+def left_response_p_files(tmp_path, monkeypatch, *, proportional=32, workspace_profile=None, left_shoulder_startup_degrees=None):
     module = right_p20_module()
     assert callable(getattr(module, "consume_left_response_p_request", None)), (
         "left proportional consumer missing"
@@ -912,15 +912,18 @@ def left_response_p_files(tmp_path, monkeypatch, *, proportional=32, workspace_p
     }
     if workspace_profile is not None:
         value.update(workspace_profile=workspace_profile, workload_segment="left-reach")
+    if left_shoulder_startup_degrees is not None:
+        value["left_shoulder_startup_degrees"] = left_shoulder_startup_degrees
     request = state / "left-response-p-request.json"
     request.write_bytes(module._right_p20_json(value))
     request.chmod(0o600)
     return module, state, directory, request, value
 
 
-def left_response_p_robot(tmp_path, monkeypatch, *, proportional=32, workspace_profile=None):
+def left_response_p_robot(tmp_path, monkeypatch, *, proportional=32, workspace_profile=None, left_shoulder_startup_degrees=None):
     module, state, directory, request, value = left_response_p_files(
-        tmp_path, monkeypatch, proportional=proportional, workspace_profile=workspace_profile
+        tmp_path, monkeypatch, proportional=proportional, workspace_profile=workspace_profile,
+        left_shoulder_startup_degrees=left_shoulder_startup_degrees,
     )
     path = module.consume_left_response_p_request(
         state, directory, "physical-live-teleop", RIGHT_P20_RUN, RIGHT_P20_HOST, "a" * 40
@@ -2186,3 +2189,110 @@ def test_current_rest_normal_activation_p_failure_retains_original_without_any_g
     assert r.left_bus.values["P_Coefficient", ELBOW] == 16 and r.left_bus.values["Lock", ELBOW] == 0
     assert r.left_bus.values["Torque_Enable", ELBOW] == 0
     assert r.left_bus.values["Goal_Position", ELBOW] == 2050 and not trial.restore_required
+
+
+@pytest.mark.parametrize("degrees", [1, 1.0])
+def test_left_shoulder_startup_request_is_explicit_one_use_and_retained(tmp_path, monkeypatch, degrees):
+    module, r, trial, directory, request, value = left_response_p_robot(
+        tmp_path, monkeypatch, workspace_profile=CURRENT_REST_PROFILE,
+        left_shoulder_startup_degrees=degrees,
+    )
+    assert not request.exists()
+    assert trial.binding["request"]["left_shoulder_startup_degrees"] == 1
+    assert module.load_left_response_p_binding(
+        directory / "left-response-p.json", directory, RIGHT_P20_RUN, RIGHT_P20_HOST
+    )["request"] == value
+    with pytest.raises(RuntimeError):
+        trial.normal_rest_startup_degrees(r)
+    trial.prepare(r)
+    trial.disable_torque(r)
+    trial.apply(r)
+    boundary = list(r.left_bus.events)
+    assert trial.normal_rest_startup_degrees(r) == 1
+    assert r.left_bus.events == boundary, "startup authority fence must perform no device I/O"
+    request.write_bytes(module._right_p20_json(value))
+    request.chmod(0o600)
+    with pytest.raises(ValueError, match="retired"):
+        module.consume_left_response_p_request(
+            request.parent, directory, "physical-live-teleop", RIGHT_P20_RUN, RIGHT_P20_HOST, "a" * 40
+        )
+
+
+@pytest.mark.parametrize("degrees", [None, True, False, 0, .5, 1.000001, 2, "1", {}, float("nan"), float("inf"), -float("inf")])
+def test_left_shoulder_startup_request_rejects_nonexact_values(tmp_path, monkeypatch, degrees):
+    module, _, directory, request, value = left_response_p_files(
+        tmp_path, monkeypatch, workspace_profile=CURRENT_REST_PROFILE
+    )
+    original = request.read_bytes()
+    value["left_shoulder_startup_degrees"] = degrees
+    with pytest.raises(ValueError):
+        module._left_response_p_request(value, "a" * 40)
+    assert request.read_bytes() == original and not list(directory.iterdir())
+
+
+@pytest.mark.parametrize("bad", ["profile_absent", "profile_other", "gain", "segment", "side", "source"])
+def test_left_shoulder_startup_request_cannot_broaden_other_authority(tmp_path, monkeypatch, bad):
+    module, state, directory, request, value = left_response_p_files(
+        tmp_path, monkeypatch, workspace_profile=CURRENT_REST_PROFILE,
+        left_shoulder_startup_degrees=1,
+    )
+    if bad == "profile_absent":
+        del value["workspace_profile"]
+    elif bad == "profile_other":
+        value["workspace_profile"] = "left-current-rest-1000-1200"
+    elif bad == "gain":
+        value["proportional"] = 16
+    elif bad == "segment":
+        value["workload_segment"] = "left-maintained"
+    elif bad == "side":
+        value.update(kind="right-response-p", workload_segment="right-peer-fixed")
+    else:
+        value["source_head"] = "b" * 40
+    request.write_bytes(module._right_p20_json(value))
+    original = request.read_bytes()
+    with pytest.raises(ValueError):
+        module.consume_left_response_p_request(
+            state, directory, "physical-live-teleop", RIGHT_P20_RUN, RIGHT_P20_HOST, "a" * 40
+        )
+    assert request.read_bytes() == original and not list(directory.iterdir())
+
+
+def test_left_shoulder_startup_default_stays_half_degree_for_existing_current_rest(tmp_path, monkeypatch):
+    _, r, trial, _, _, _ = left_response_p_robot(
+        tmp_path, monkeypatch, workspace_profile=CURRENT_REST_PROFILE
+    )
+    trial.prepare(r)
+    trial.disable_torque(r)
+    trial.apply(r)
+    assert "left_shoulder_startup_degrees" not in trial.binding["request"]
+    assert trial.normal_rest_startup_degrees(r) == .5
+
+
+@pytest.mark.parametrize("changed", ["request", "request_removed", "robot_binding", "profile", "stop", "restored"])
+def test_left_shoulder_startup_authority_cannot_survive_mutation_or_stop(tmp_path, monkeypatch, changed):
+    _, r, trial, _, _, _ = left_response_p_robot(
+        tmp_path, monkeypatch, workspace_profile=CURRENT_REST_PROFILE,
+        left_shoulder_startup_degrees=1,
+    )
+    trial.prepare(r)
+    trial.disable_torque(r)
+    trial.apply(r)
+    assert trial.normal_rest_startup_degrees(r) == 1
+    if changed == "request":
+        trial.binding["request"]["left_shoulder_startup_degrees"] = 2
+    elif changed == "request_removed":
+        del trial.binding["request"]["left_shoulder_startup_degrees"]
+    elif changed == "robot_binding":
+        import copy
+        r._am1_left_response_p_binding = copy.deepcopy(trial.binding)
+        del r._am1_left_response_p_binding["request"]["left_shoulder_startup_degrees"]
+    elif changed == "profile":
+        trial.workspace_profile = None
+    elif changed == "stop":
+        r._am1_shutdown_in_progress = True
+    else:
+        trial.restore(r)
+    boundary = list(r.left_bus.events)
+    with pytest.raises(RuntimeError):
+        trial.normal_rest_startup_degrees(r)
+    assert r.left_bus.events == boundary

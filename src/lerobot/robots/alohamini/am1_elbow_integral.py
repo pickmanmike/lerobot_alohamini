@@ -914,7 +914,9 @@ def _response_p_request(value, source_head=None, *, kind):
             "boot_id",
             "expires_at_monotonic_s",
         }, {"version", "kind", "request_id", "source_head", "proportional", "workload_segment",
-            "boot_id", "expires_at_monotonic_s", "workspace_profile"})
+            "boot_id", "expires_at_monotonic_s", "workspace_profile"},
+            {"version", "kind", "request_id", "source_head", "proportional", "workload_segment",
+             "boot_id", "expires_at_monotonic_s", "workspace_profile", "left_shoulder_startup_degrees"})
         or type(value["version"]) is not int
         or value["version"] != 1
         or value["kind"] != kind
@@ -938,6 +940,14 @@ def _response_p_request(value, source_head=None, *, kind):
         or value["proportional"] != 32 or value["workload_segment"] != "left-reach"
     ):
         raise ValueError("Current-rest profile requires only the explicit LEFT/P32/left-reach request")
+    if "left_shoulder_startup_degrees" in value and (
+        kind != LEFT_RESPONSE_P_KIND or value.get("workspace_profile") != LEFT_CURRENT_REST_WORKSPACE_PROFILE
+        or value["proportional"] != 32 or value["workload_segment"] != "left-reach"
+        or type(value["left_shoulder_startup_degrees"]) not in (int, float)
+        or not math.isfinite(value["left_shoulder_startup_degrees"])
+        or value["left_shoulder_startup_degrees"] != 1
+    ):
+        raise ValueError("Left shoulder startup allowance requires exactly 1 degree on the current-rest LEFT/P32 request")
     return value
 
 
@@ -1412,6 +1422,19 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
                 or self._snapshot.get("configured_p_readback") != 32
                 or getattr(robot, "_am1_shutdown_in_progress", False) is True):
             raise RuntimeError("Current-rest ordinary activation owner/phase changed or Stop prevailed")
+
+    def normal_rest_startup_degrees(self, robot):
+        """Read-free request authority for the separate, unchanged shoulder rest role."""
+        self.require_normal_activation_owner(robot)
+        request = self.binding["request"]
+        if "left_shoulder_startup_degrees" not in request:
+            return 0.5
+        degrees = request["left_shoulder_startup_degrees"]
+        if (type(degrees) not in (int, float) or not math.isfinite(degrees) or degrees != 1
+                or request.get("workspace_profile") != LEFT_CURRENT_REST_WORKSPACE_PROFILE
+                or request.get("proportional") != 32 or request.get("workload_segment") != "left-reach"):
+            raise RuntimeError("Left shoulder startup request authority changed")
+        return 1.0
 
     def qualify_normal_activation(self, robot, all_goals):
         self.require_normal_activation_owner(robot)

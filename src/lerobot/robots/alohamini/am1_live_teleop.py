@@ -1043,9 +1043,9 @@ def verify_settings(robot):
 def qualify_rest(robot, bus, name, calibration, *, phase, present_raw):
     """Acquire the supported shoulder rest without widening its command range.
 
-    The half-degree limit bounds the initial inward command displacement. It is
-    an operating bound, not an encoder-accuracy or mechanical-clearance claim.
-    Other joints and the historical diagnostic endpoint path keep their rules.
+    The ordinary half-degree initial inward bound may be explicitly selected as
+    one degree by the retained current-rest action request. This operating bound
+    does not change legal goals, calibration, health checks or other joint roles.
     """
     def refuse(reason):
         raise RuntimeError("AM1 arm activation refused: normal-rest " + reason)
@@ -1061,6 +1061,23 @@ def qualify_rest(robot, bus, name, calibration, *, phase, present_raw):
     ):
         refuse("protected role/mapping/calibration differs")
     binding = copy.deepcopy(robot._am1_teleop_binding)
+    trial = robot._am1_current_rest_activation_trial()
+    bound_degrees = 0.5 if trial is None else trial.normal_rest_startup_degrees(robot)
+    allowance_request = None if trial is None else {
+        "request_id": trial.binding["request"]["request_id"],
+        "request_sha256": trial.binding["request_sha256"],
+    }
+
+    def check_allowance():
+        current = robot._am1_current_rest_activation_trial()
+        if (current is not trial
+                or (0.5 if current is None else current.normal_rest_startup_degrees(robot)) != bound_degrees
+                or current is not None and {
+                    "request_id": current.binding["request"]["request_id"],
+                    "request_sha256": current.binding["request_sha256"],
+                } != allowance_request):
+            refuse("startup allowance authority changed")
+
     baseline = robot._am1_teleop_settings["left"]["registers"]
     expected = {register: baseline[register][name] for register in STATIC}
     started = time.monotonic()
@@ -1069,7 +1086,8 @@ def qualify_rest(robot, bus, name, calibration, *, phase, present_raw):
         "phase": phase,
         "binding": binding,
         "calibration": list(calibration),
-        "operating_displacement_bound_degrees": 0.5,
+        "operating_displacement_bound_degrees": bound_degrees,
+        "startup_allowance_request": copy.deepcopy(allowance_request),
         "initial_measured_raw": present_raw,
         "qualified": False,
         "samples": [],
@@ -1079,17 +1097,20 @@ def qualify_rest(robot, bus, name, calibration, *, phase, present_raw):
     robot._am1_teleop_rest_evidence.append(proof)
 
     def read(register):
+        check_allowance()
         refresh_startup_temperatures(robot)
         began = time.monotonic()
         if not started <= began < deadline:
             refuse("acquisition deadline expired")
         value = robot._read_am1_activation_raw(bus, register, name, phase="normal_rest_" + phase, num_retry=0)
         ended = time.monotonic()
+        check_allowance()
         if not began <= ended <= began + 0.04 or ended >= deadline:
             refuse("register read exceeded its original40ms budget")
         return value
 
     def seed_for(raw):
+        check_allowance()
         if raw < calibration[3]:
             refuse("lower endpoint is outside the supported rest role")
         seed = max(calibration[3], min(calibration[4], raw))
@@ -1100,9 +1121,9 @@ def qualify_rest(robot, bus, name, calibration, *, phase, present_raw):
             or not math.isfinite(cap)
             or cap <= 0
             or displacement > math.floor(cap * (calibration[4] - calibration[3]) / 200)
-            or displacement > math.floor(0.5 * bus.model_resolution_table["sts3215"] / 360)
+            or displacement > math.floor(bound_degrees * bus.model_resolution_table["sts3215"] / 360)
         ):
-            refuse("rest-to-legal-seed displacement exceeds the half-degree or measured-error bound")
+            refuse("rest-to-legal-seed displacement exceeds the selected operating or measured-error bound")
         return seed
 
     try:
@@ -1111,6 +1132,8 @@ def qualify_rest(robot, bus, name, calibration, *, phase, present_raw):
             and entry["qualified"]
             and entry["binding"] == binding
             and tuple(entry["calibration"]) == calibration
+            and entry["operating_displacement_bound_degrees"] == bound_degrees
+            and entry.get("startup_allowance_request") == allowance_request
             for entry in robot._am1_teleop_rest_evidence
         ):
             refuse("post-home endpoint needs its original before-home qualification")

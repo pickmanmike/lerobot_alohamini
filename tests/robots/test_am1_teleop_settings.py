@@ -466,7 +466,7 @@ def test_fault_note_malformed_baseline_timing_cannot_replace_proven_guard(activa
     assert snapshot["comparison"]["units"] == "raw_register"
 
 
-def resting_robot(activation, monkeypatch, raw=3225):
+def resting_robot(activation, monkeypatch, raw=3225, *, before_configure=None):
     from lerobot.motors import MotorCalibration
     from lerobot.motors.feetech import FeetechMotorsBus
 
@@ -484,7 +484,7 @@ def resting_robot(activation, monkeypatch, raw=3225):
             }.items()
         }
     )
-    robot = configured_robot(activation)
+    robot = configured_robot(activation, before_configure=before_configure)
     robot.config.max_relative_target = 20.0
     robot._joint_hold_goal, robot._gripper_hold_goal = {}, {}
     for bus in (robot.left_bus, robot.right_bus):
@@ -2046,3 +2046,87 @@ def test_response_fixed_dual_selection_refuses_before_startup_io(activation, mon
     with pytest.raises(RuntimeError, match="only one selected elbow"):
         configured_robot(activation, before_configure=attach)
     assert activation.events == before
+
+
+def approved_startup_rest_robot(activation, tmp_path, monkeypatch, *, raw=3232):
+    """Real retained transaction and ordinary rest owner; only register I/O is fake."""
+    import copy
+    from tests.robots.test_am1_elbow_integral import (
+        CURRENT_REST_PROFILE, ELBOW, left_response_p_robot,
+    )
+
+    _, bound, trial, _, _, _ = left_response_p_robot(
+        tmp_path, monkeypatch, workspace_profile=CURRENT_REST_PROFILE,
+        left_shoulder_startup_degrees=1,
+    )
+    def before_configure(source):
+        source._am1_teleop_binding = copy.deepcopy(bound._am1_teleop_binding)
+        source.left_bus.calibration[ELBOW] = copy.deepcopy(bound.left_bus.calibration[ELBOW])
+        source.left_bus.registers.update({key: value for key, value in bound.left_bus.values.items()
+                                         if key[1] == ELBOW})
+    robot = resting_robot(activation, monkeypatch, raw, before_configure=before_configure)
+    robot._am1_protected_cleanup = True
+    robot._am1_selected_joint_evidence_enabled = False
+    robot._am1_left_response_p_binding = copy.deepcopy(bound._am1_left_response_p_binding)
+    robot._am1_left_response_p_trial = trial
+    robot.left_bus._read = bound.left_bus._read
+    bound._am1_left_response_p_trial = None
+    trial.prepare(robot)
+    trial.disable_torque(robot)
+    trial.apply(robot)
+    activation.events.clear()
+    return robot, trial
+
+
+@pytest.mark.parametrize("raw", [3232, 3234])
+def test_explicit_one_degree_startup_request_only_seeds_legal_inward_goal(
+    activation, tmp_path, monkeypatch, raw,
+):
+    robot, trial = approved_startup_rest_robot(activation, tmp_path, monkeypatch, raw=raw)
+    robot.activate_motors()
+    shoulder = "arm_left_shoulder_lift"
+    assert [row[4] for row in activation.events
+            if row[0] == "write" and row[2:4] == ("Goal_Position", shoulder)] == [3223]
+    assert robot.left_bus.calibration[shoulder].range_max == 3223
+    proof = robot._am1_teleop_rest_evidence
+    assert [entry["phase"] for entry in proof] == ["before_home", "after_home"]
+    assert all(entry["qualified"] and len(entry["samples"]) >= 9
+               and entry["window_s"] >= .4 and entry["operating_displacement_bound_degrees"] == 1
+               for entry in proof)
+    assert all(entry["startup_allowance_request"] == {
+        "request_id": trial.binding["request"]["request_id"],
+        "request_sha256": trial.binding["request_sha256"],
+    } for entry in proof)
+    robot._safe_shutdown(close_buses=True)
+    assert not trial.restore_required
+    assert robot.left_bus.registers["P_Coefficient", trial.motor] == 16
+    assert robot.left_bus.registers["Lock", trial.motor] == 0
+
+
+@pytest.mark.parametrize("problem", ["over_one_degree", "moving", "status", "voltage", "stop", "binding"])
+def test_one_degree_startup_retains_bound_health_and_current_authority(
+    activation, tmp_path, monkeypatch, problem,
+):
+    robot, trial = approved_startup_rest_robot(activation, tmp_path, monkeypatch)
+    shoulder = "arm_left_shoulder_lift"
+    if problem == "over_one_degree":
+        robot.left_bus.registers["Present_Position", shoulder] = 3235
+    else:
+        def changed(register, name):
+            if name != shoulder or register != "Moving":
+                return
+            if problem == "stop":
+                robot._am1_shutdown_in_progress = True
+            elif problem == "binding":
+                robot._am1_left_response_p_binding["request"]["left_shoulder_startup_degrees"] = .5
+            else:
+                key, value = {"moving": ("Moving", 1), "status": ("Status", 1),
+                              "voltage": ("Present_Voltage", 39)}[problem]
+                robot.left_bus.registers[key, shoulder] = value
+        robot.left_bus.on_read = changed
+    with pytest.raises(RuntimeError, match="activation failed"):
+        robot.activate_motors()
+    assert activation.home_calls == 0
+    assert not [row for row in activation.events if row[0] == "write" and row[2] == "Goal_Position"]
+    assert not [row for row in activation.events if row[0] == "write"
+                and row[2] == "Torque_Enable" and row[3].startswith("arm_") and row[4] == 1]
