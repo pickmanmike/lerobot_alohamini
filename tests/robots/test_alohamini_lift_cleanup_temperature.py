@@ -94,11 +94,11 @@ def test_cleanup_expiration_drops_only_genuinely_expired_peaks_and_requires_new_
     window.update(35, FIRST_CLEANUP, expire_old_slots=True)
     retained = list(window.samples)
     result = window.update(35, SECOND_CLEANUP, expire_old_slots=True)
-    assert list(window.samples) == retained[1:]
+    assert list(window.samples) == retained[1:-1] + [(SECOND_CLEANUP, 35)]
     assert result["count"] == 4 and result["ready"] is False
     assert window._origin_ns == round(ORIGIN * 1e9)
     assert window._last_sample_at == SECOND_CLEANUP and window.outliers == 3
-    assert window.samples[-1][0] == FIRST_CLEANUP  # Equal same-slot read is no new vote.
+    assert window.samples[-1][0] == SECOND_CLEANUP  # Equal maximum has a new receipt, still one slot vote.
     fresh = window.update(35, SECOND_CLEANUP + 0.052, expire_old_slots=True)
     assert fresh["count"] == 5 and fresh["ready"]
     assert fresh["span_s"] <= 0.5
@@ -114,11 +114,25 @@ def test_expiration_keeps_an_exactly_half_second_old_peak():
     assert all(0.5 - stamp <= 0.5 for stamp, _ in window.samples)
 
 
-@pytest.mark.parametrize("stamp", [LAST_LIVE, LAST_LIVE - 0.001, LAST_LIVE + 0.501])
-def test_cleanup_expiration_does_not_accept_replayed_backward_or_stale_raw_reply(stamp):
+@pytest.mark.parametrize("stamp", [LAST_LIVE, LAST_LIVE - 0.001])
+def test_cleanup_expiration_does_not_accept_replayed_or_backward_raw_reply(stamp):
     window = recorded_window()
     with pytest.raises(feedback.ComparisonRefusal, match="timestamp"):
         window.update(35, stamp, expire_old_slots=True)
+
+
+def test_cleanup_forward_gap_refills_five_real_slots_without_extending_collection_budget():
+    window = recorded_window()
+    origin, outliers = window._origin_ns, window.outliers
+    first = LAST_LIVE + 0.501
+    receipts = [first+index*.101 for index in range(5)]
+    for index, stamp in enumerate(receipts):
+        result = window.update(35, stamp, expire_old_slots=True)
+        assert result["count"] == index+1 and result["ready"] is (index == 4)
+    assert {stamp for stamp, _ in window.samples} == set(receipts)
+    assert len({(round(stamp*1e9)-origin)//round(.1*1e9) for stamp in receipts}) == 5
+    assert receipts[-1]-receipts[0] <= 1.0
+    assert window._origin_ns == origin and window.outliers == outliers
 
 
 def test_operational_cleanup_exact_gap_uses_clone_and_leaves_live_history_unchanged(cleanup_robot):
@@ -143,7 +157,8 @@ def test_missing_occupied_slots_wait_for_five_genuine_new_cleanup_slots(cleanup_
     began = clock.now
     op.cleanup_readback()
     rows = samples(emitted)
-    assert rows[0]["temperature_window"]["count"] == 1
+    assert rows[0]["temperature_window"]["count"] == 2  # LAST_LIVE is still fresh beside the new slot.
+    assert rows[0]["temperature_window"]["ready"] is False
     assert rows[-1]["temperature_window"]["count"] == 5
     assert rows[-1]["temperature_window"]["ready"]
     slots = {(round(row["sample_monotonic_s"] * 1e9) - before["origin"]) // round(0.1 * 1e9) for row in rows}

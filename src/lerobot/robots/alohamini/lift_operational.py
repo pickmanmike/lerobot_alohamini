@@ -78,7 +78,8 @@ class TemperatureWindow:
         ):
             self.refuse("temperature: invalid numeric feedback or timestamp.")
         if self._last_sample_at is not None and (
-            now <= self._last_sample_at or now - self._last_sample_at > self.MAX_AGE_S
+            now <= self._last_sample_at
+            or expire_old_slots is not True and now - self._last_sample_at > self.MAX_AGE_S
         ):
             self.refuse("temperature: repeated, backward or stale feedback timestamp.")
         if type(expire_old_slots) is not bool:
