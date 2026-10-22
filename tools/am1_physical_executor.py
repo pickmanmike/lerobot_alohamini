@@ -2149,3 +2149,135 @@ def wait_required_camera(camera, observation, cancel, *, sleep=time.sleep):
         if observation.evidence()["qualified"]:
             return
         sleep(0.05)
+
+
+def prepare_left_response_p_request(config_path, *, ttl_seconds=120):
+    """Prepare only one boot-local left-reach P32 request; never consume or Start it.
+
+    This self-contained function is relayed by the PC CLI and imports the installed
+    validators. It does not require deploying this CLI into the physical runtime.
+    """
+    import hashlib
+    import os
+    import time
+    import uuid
+    from pathlib import Path
+
+    from lerobot.robots.alohamini.am1_elbow_integral import (
+        AM1ElbowIntegralTrial,
+        _left_response_p_boot_id,
+        _left_response_p_request,
+        _right_p20_file,
+        _right_p20_json,
+    )
+    from tools.am1_camera_viewer import load_private
+    from tools.am1_physical_executor import ProtectedHostRun
+    from tools.am1_physical_reconciliation import (
+        _publish_no_replace,
+        acquire_stopped_guard,
+    )
+
+    if type(ttl_seconds) is not int or not 1 <= ttl_seconds <= 120:
+        raise ValueError("Preparation expiry must be within 1–120 seconds")
+    path = Path(config_path)
+    if not path.is_absolute() or path.resolve() != path or path.is_symlink():
+        raise ValueError("Exact absolute installed physical configuration required")
+    config = load_private(path)
+    provider = ProtectedHostRun(config)
+    provider._validate_source()
+    state = Path(config["physical_state_directory"])
+    AM1ElbowIntegralTrial._private_directory(state)
+    guard = acquire_stopped_guard(config)
+    temporary = None
+    try:
+        forbidden = [state / name for name in (
+            "cleanup-uncertain.json", "physical-in-progress.json",
+            "left-response-p-request.json", "right-response-p-request.json",
+            "response12-right-p20-request.json")]
+        if any(p.exists() or p.is_symlink() for p in forbidden):
+            raise ValueError("Stopped known-clean state and no pending response request required")
+        request = {
+            "version": 1, "kind": "left-response-p", "request_id": str(uuid.uuid4()),
+            "source_head": config["host_head"], "proportional": 32, "workload_segment": "left-reach",
+            "boot_id": _left_response_p_boot_id(), "expires_at_monotonic_s": time.monotonic() + ttl_seconds,
+        }
+        _left_response_p_request(request, config["host_head"])
+        used = state / ("left-response-p-used-" + request["request_id"] + ".json")
+        if used.exists() or used.is_symlink():
+            raise ValueError("Fresh preparation nonce was already retired")
+        raw = _right_p20_json(request)
+        temporary = state / (".left-response-p-prepare-" + request["request_id"] + ".tmp")
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if _right_p20_file(temporary)[1] != raw:
+            raise ValueError("Canonical preparation readback differs")
+        if (request["boot_id"] != _left_response_p_boot_id()
+                or not 0 <= time.monotonic() < request["expires_at_monotonic_s"]):
+            raise ValueError("Preparation boot or original expiry changed before publication")
+        if any(p.exists() or p.is_symlink() for p in forbidden):
+            raise ValueError("Physical state or pending request changed during preparation")
+        pending = state / "left-response-p-request.json"
+        _publish_no_replace(temporary, pending)
+        AM1ElbowIntegralTrial._sync_directory(state)
+        if _right_p20_file(pending)[1] != raw:
+            raise ValueError("Published canonical preparation readback differs")
+        return {"path": str(pending), "sha256": hashlib.sha256(raw).hexdigest(), "request": request,
+                "canonical_read_verified": True, "hardware_started": False}
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
+        guard.close()
+
+
+def main(argv=None):
+    """Administrative PC relay only; the persistent execution path is unchanged."""
+    import argparse
+    import inspect
+    import re
+    import shlex
+    import subprocess
+    from pathlib import PurePosixPath
+
+    from tools.am1_session_ipc import strict_json
+
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    parser.add_argument("--prepare-left-response-p", action="store_true", required=True,
+                        help="Prepare a fresh temporary P32 left-reach request without starting hardware")
+    parser.add_argument("--ssh", choices=("am1-pi",), required=True)
+    parser.add_argument("--config", required=True, help="Existing installed Pi physical.json")
+    parser.add_argument("--ttl-seconds", type=int, default=120)
+    args = parser.parse_args(argv)
+    if (not 1 <= args.ttl_seconds <= 120
+            or re.fullmatch(r"/home/pickmanmike/\.local/share/am1-physical-adapter-01/"
+                            r"deployments/[0-9a-f]{16}/physical\.json", args.config) is None
+            or str(PurePosixPath(args.config)) != args.config):
+        parser.error("Existing installed physical.json and preparation expiry within 1–120 seconds required")
+    # Fixed reviewed code, no command/interpreter/source/nonce override. SSH's remote
+    # shell receives only quoted fixed arguments, never interpolated source text.
+    payload = (
+        "import json, sys\n"
+        "sys.path[:0] = ['/home/pickmanmike/am1_physical_trial', "
+        "'/home/pickmanmike/lerobot_alohamini/src']\n"
+        + inspect.getsource(prepare_left_response_p_request)
+        + "\nprint(json.dumps(prepare_left_response_p_request(sys.argv[1], "
+        "ttl_seconds=int(sys.argv[2])), sort_keys=True))\n"
+    )
+    remote = shlex.join(["/home/pickmanmike/lerobot_alohamini/.venv/bin/python", "-B", "-",
+                         args.config, str(args.ttl_seconds)])
+    # An ambiguous SSH receipt is never retried automatically: the pending request
+    # may already exist and must remain available for explicit inspection.
+    reply = subprocess.run(
+        ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", args.ssh, remote],
+        input=payload, text=True, encoding="utf-8", capture_output=True, timeout=30, check=True, shell=False,
+    )
+    if len(reply.stdout) > 4096 or type(strict_json(reply.stdout)) is not dict:
+        raise ValueError("Bounded preparation receipt unavailable; do not retry or overwrite pending authority")
+    print(reply.stdout.strip())
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
