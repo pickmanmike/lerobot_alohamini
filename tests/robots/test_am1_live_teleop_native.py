@@ -1159,3 +1159,130 @@ def test_current_rest_native_workspace_requires_exact_active_trial_and_keeps_ori
         now[0] += .05
         assert control.apply(robot, frame(identity, owner, 1, epoch=3, revision=1))
         assert control._live_summary["workspace"] == workspace and control._live_summary["reference"] == original
+
+
+def current_rest119_lane(monkeypatch, *, explicit=True):
+    """Actual119 measured rest and original legal hold through the real native lane."""
+    from lerobot.robots.alohamini.am1_live_teleop import before_write
+    now, identity, owner, robot, control = lane()
+    trial = install_left_response_trial(monkeypatch, robot, workload="left-reach")
+    trial.binding["request"]["workspace_profile"] = "left-current-rest-1051-1164"
+    if explicit:
+        trial.binding["request"]["left_shoulder_startup_degrees"] = 1
+    robot._am1_left_response_p_binding = copy.deepcopy(trial.binding)
+    shoulder, elbow = "arm_left_shoulder_lift", "arm_left_elbow_flex"
+    robot.left_bus.calibration[shoulder] = MotorCalibration(2, 0, 515, 848, 3223)
+    robot.left_bus.raw[shoulder], robot.left_bus.goals[shoulder] = 3231, 3223
+    robot.left_bus.raw[elbow] = robot.left_bus.goals[elbow] = 1090
+    # The real teleop owner holds its literal existing Goal rather than reseeding PP.
+    robot.hold_follower_arms = lambda: robot.events.append(("hold",))
+    robot._am1_live_before_write = lambda: before_write(control, robot)
+    assert control.apply(robot, frame(identity, owner, 0))
+    return now, identity, owner, robot, control, trial
+
+
+def current_rest119_sample(control, **kwargs):
+    value = sample(control, **kwargs)
+    value["target"] = dict(control._live_summary["cursor"])
+    value["target"]["arm_left_elbow_flex.pos"] = control._live_summary["workspace"]["bounds"]["arm_left_elbow_flex.pos"]["max"]
+    return value
+
+
+def test_current_rest119_legal_original_shoulder_hold_keeps_measured_reference_and_no_extra_reads(monkeypatch):
+    now, identity, owner, robot, control, _ = current_rest119_lane(monkeypatch)
+    original = copy.deepcopy(control._live_summary)
+    shoulder = "arm_left_shoulder_lift.pos"
+    assert original["reference"][shoulder] == pytest.approx(100.67368421052635)
+    assert original["cursor"][shoulder] == 100.
+    calls = []
+    for bus in (robot.left_bus, robot.right_bus):
+        read = bus.sync_read
+        monkeypatch.setattr(bus, "sync_read", lambda *a, _read=read, **k: calls.append(a[0]) or _read(*a, **k))
+    value = current_rest119_sample(control)
+    now[0] += .05
+    assert control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2, sample=value))
+    action = next(event[1] for event in robot.events if event[0] == "action")
+    assert action[shoulder] == 100.
+    assert calls == [], "the original Goal comparator must use retained reads only"
+    assert control._live_summary["workspace"] == original["workspace"]
+    assert control._live_summary["reference"] == original["reference"]
+    assert control._live_summary["live_deadline_monotonic_s"] == original["live_deadline_monotonic_s"]
+
+
+def test_current_rest119_original_goal_survives_pause_and_refuses_cumulative_goal_cursor_creep(monkeypatch):
+    from lerobot.robots.alohamini.am1_live_teleop import _left_response_target_valid
+    now, identity, owner, robot, control, _ = current_rest119_lane(monkeypatch)
+    workspace = copy.deepcopy(control._live_summary["workspace"])
+    shoulder = "arm_left_shoulder_lift"
+    assert _left_response_target_valid(robot, control, current_rest119_sample(control))
+    for revision, goal in ((1, 3222), (2, 3221)):
+        robot.left_bus.goals[shoulder] = goal
+        now[0] += .05
+        rebound = dict(owner, connection_generation=str(uuid4()))
+        assert control.apply(robot, frame(identity, rebound, revision, revision=revision, epoch=1+2*revision))
+        value = current_rest119_sample(control)
+        assert _left_response_target_valid(robot, control, value) is (goal == 3222)
+    assert control._live_summary["workspace"] == workspace
+    assert control._live_summary["reference"] == workspace["reference"]
+    assert not [event for event in robot.events if event[0] == "action"]
+
+
+@pytest.mark.parametrize("changed", ["robot_binding", "control_binding", "calibration", "request", "trial", "lost_trial", "workspace", "stop"])
+def test_current_rest119_original_goal_anchor_rejects_changed_owner_or_authority(monkeypatch, changed):
+    from lerobot.robots.alohamini.am1_live_teleop import _left_response_target_valid
+    _, _, _, robot, control, trial = current_rest119_lane(monkeypatch)
+    value = current_rest119_sample(control)
+    if changed == "robot_binding":
+        robot._am1_teleop_binding["host_incarnation"] = str(uuid4())
+    elif changed == "control_binding":
+        control.binding["run_id"] = str(uuid4())
+    elif changed == "calibration":
+        robot.left_bus.calibration["arm_left_shoulder_lift"].homing_offset += 1
+    elif changed == "request":
+        del trial.binding["request"]["left_shoulder_startup_degrees"]
+        robot._am1_left_response_p_binding = copy.deepcopy(trial.binding)
+    elif changed == "trial":
+        robot._am1_left_response_p_trial = copy.copy(trial)
+    elif changed == "lost_trial":
+        robot._am1_left_response_p_trial = robot._am1_left_response_p_binding = None
+    elif changed == "workspace":
+        control._live_summary["workspace"].pop("workspace_profile")
+    else:
+        robot._am1_shutdown_in_progress = True
+    with pytest.raises(RuntimeError, match="response|hold|binding|calibration|Stop"):
+        _left_response_target_valid(robot, control, value)
+    assert not [event for event in robot.events if event[0] == "action"]
+
+
+def test_current_rest119_absent_temporary_request_retains_original_measured_policy(monkeypatch):
+    from lerobot.robots.alohamini.am1_live_teleop import _left_response_target_valid
+    _, _, _, robot, control, _ = current_rest119_lane(monkeypatch, explicit=False)
+    assert not _left_response_target_valid(robot, control, current_rest119_sample(control))
+
+
+def test_current_rest119_anchor_does_not_allow_other_nonselected_joint_or_old_input(monkeypatch):
+    from lerobot.robots.alohamini.am1_live_teleop import _left_response_target_valid
+    now, identity, owner, robot, control, _ = current_rest119_lane(monkeypatch)
+    value = current_rest119_sample(control)
+    value["target"]["arm_right_wrist_flex.pos"] += .21
+    assert not _left_response_target_valid(robot, control, value)
+    stale = current_rest119_sample(control, expiry=now[0])
+    assert not control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2, sample=stale))
+    assert not [event for event in robot.events if event[0] == "action"]
+
+@pytest.mark.parametrize("changed", ["target", "stop"])
+def test_current_rest119_original_goal_fence_is_rechecked_before_native_write(monkeypatch, changed):
+    now, identity, owner, robot, control, _ = current_rest119_lane(monkeypatch)
+    send = robot.send_action
+    def changed_before_write(action):
+        if changed == "target":
+            control.live_sample["target"]["arm_left_shoulder_lift.pos"] -= .2
+        else:
+            robot._am1_shutdown_in_progress = True
+        return send(action)
+    robot.send_action = changed_before_write
+    value = current_rest119_sample(control)
+    now[0] += .05
+    with pytest.raises(RuntimeError, match="response|hold|Stop"):
+        control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2, sample=value))
+    assert not [event for event in robot.events if event[0] == "action"]

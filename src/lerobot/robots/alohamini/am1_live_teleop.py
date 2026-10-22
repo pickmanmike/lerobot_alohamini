@@ -990,9 +990,49 @@ def response_receipt(robot):
     return left_response_receipt(robot) or right_response_receipt(robot)
 
 
+def _current_rest_shoulder_reference(robot, control, workspace, receipt, *, goals=None):
+    """Freeze the original admitted literal Goal; later Pause/cursor values cannot renew it."""
+    trial = getattr(robot, "_am1_left_response_p_trial", None)
+    request = {} if trial is None else trial.binding["request"]
+    degrees = request.get("left_shoulder_startup_degrees")
+    enabled = (receipt is not None and receipt["kind"] == "left-response-p"
+               and receipt["configured_p"] == 32 and receipt["workload_segment"] == "left-reach"
+               and request.get("workspace_profile") == workspace.get("workspace_profile") == "left-current-rest-1051-1164"
+               and type(degrees) in (int, float) and degrees == 1)
+    anchor = getattr(control, "_teleop_original_shoulder_goal", None)
+    if not enabled and anchor is None:
+        return None
+    name = "arm_left_shoulder_lift"
+    calibration = robot._am1_activation_calibration(robot.left_bus, name)
+    if (not enabled or getattr(robot, "_am1_shutdown_in_progress", False) is True
+            or calibration != (2, 0, 515, 848, 3223)
+            or tuple(workspace["calibration"][name]) != calibration
+            or robot.left_bus.motors[name].id != 2 or robot.left_bus.motors[name].model != "sts3215"
+            or robot._am1_teleop_binding != {**control.binding, "recipe": RECIPE}):
+        raise RuntimeError("AM1 current-rest original shoulder hold binding/calibration changed or Stop prevailed")
+    binding = tuple(sorted(control.binding.items()))
+    authority = json.dumps(trial.binding, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    if anchor is None:
+        if goals is None:
+            raise RuntimeError("AM1 current-rest original shoulder hold acquisition is unavailable")
+        raw = goals["left"]["registers"]["Goal_Position"][name]
+        if type(raw) is not int or not calibration[3] <= raw <= calibration[4]:
+            raise RuntimeError("AM1 current-rest original shoulder hold Goal is outside unchanged calibration")
+        anchor = control._teleop_original_shoulder_goal = (
+            trial, robot.left_bus, binding, calibration, raw, authority)
+    if (anchor[0] is not trial or anchor[1] is not robot.left_bus or anchor[2] != binding
+            or anchor[3] != calibration or anchor[5] != authority):
+        raise RuntimeError("AM1 current-rest original shoulder hold owner/request changed")
+    from examples.alohamini.am1_live_teleop import normalized_raw
+
+    return normalized_raw(anchor[4], calibration)
+
+
 def _left_response_target_valid(robot, control, sample):
     receipt = response_receipt(robot)
     if receipt is None:
+        if getattr(control, "_teleop_original_shoulder_goal", None) is not None:
+            raise RuntimeError("AM1 current-rest original shoulder hold response authority disappeared")
         return True
     from examples.alohamini.am1_live_teleop import ZERO_BODY
 
@@ -1001,6 +1041,7 @@ def _left_response_target_valid(robot, control, sample):
     if set(sample["body"]) != set(ZERO_BODY) or any(sample["body"][key] != 0 for key in ZERO_BODY):
         return False
     workspace = control._live_summary["workspace"]
+    shoulder_reference = _current_rest_shoulder_reference(robot, control, workspace, receipt)
     side = "left" if receipt["kind"] == "left-response-p" else "right"
     allowed = {"arm_" + side + "_elbow_flex.pos"}
     if receipt["workload_segment"] == "left-reach":
@@ -1009,6 +1050,8 @@ def _left_response_target_valid(robot, control, sample):
         if key in allowed:
             continue
         cal = workspace["calibration"][key.removesuffix(".pos")]
+        if key == "arm_left_shoulder_lift.pos" and shoulder_reference is not None:
+            reference = shoulder_reference
         tick = (100 if key.endswith("_gripper.pos") else 200) / (cal[4] - cal[3])
         if abs(sample["target"][key] - reference) > tick + 1e-9:
             return False
@@ -1564,6 +1607,8 @@ def apply_frame(control, robot, command, marker_key):
         if "workspace" not in control._live_summary:
             control._live_summary["workspace"] = workspace(robot, control.binding, measured, goals=goals)
             control._live_summary["reference"] = dict(control._live_summary["workspace"]["reference"])
+            _current_rest_shoulder_reference(robot, control, control._live_summary["workspace"],
+                                            response_receipt(robot), goals=goals)
         if marker["live_admitted"] and "live_admitted_at_monotonic_s" not in control._live_summary:
             now = control.clock()
             control._live_summary.update(

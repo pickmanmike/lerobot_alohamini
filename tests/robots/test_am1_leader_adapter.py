@@ -730,7 +730,7 @@ def test_real_wss_clean_close_ends_qualified_wait_before_timeout(tmp_path):
         "bench_program_finish", "bench_program_finish_failed",
         "peer_fixed_baseline_ready", "peer_fixed_baseline_missing", "peer_fixed_baseline_native", "peer_fixed_baseline_blocked",
         "normal_program_finish", "normal_program_finish_failed", "normal_program_finish_combined_body",
-        "normal_program_finish_left_maintained", "normal_program_finish_left_reach", "normal_program_finish_left_supported", "normal_program_finish_left_opposite", "usb_finite_finish", "usb_finite_finish_failed", "usb_quit_finish", "usb_quit_empty_finish",
+        "normal_program_finish_left_maintained", "normal_program_finish_left_reach", "normal_program_finish_left_reach_held", "normal_program_finish_left_supported", "normal_program_finish_left_opposite", "usb_finite_finish", "usb_finite_finish_failed", "usb_quit_finish", "usb_quit_empty_finish",
     ],
 )
 def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
@@ -930,6 +930,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 w["bounds"]["arm_left_shoulder_lift.pos"]["rate_per_s"] = 3.
             if failure == "normal_program_finish_left_opposite":
                 w["bounds"]["arm_left_elbow_flex.pos"]["rate_per_s"] = 3.
+            if failure == "normal_program_finish_left_reach_held":
+                w = held_command119_workspace()
             value = {
                 "service_incarnation": "service",
                 "controller": {"device_id": "device", "controller_generation": "control"},
@@ -973,6 +975,17 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 },
             }
 
+            if failure == "normal_program_finish_left_reach_held":
+                value["run"].update(status="paused", intent_revision=0)
+                live = value["run"]["live_input"]
+                live.update(cursor={**w["reference"], "arm_left_shoulder_lift.pos": 100.},
+                            cursor_intent_revision=0)
+                live["accepted_target"] = dict(live["cursor"])
+                value["evidence"].update(active_acknowledged=False, acknowledged_intent_revision=0)
+                value["evidence"]["accepted_host_action"].update(
+                    intent_revision=0, epoch=1, acquired_at_monotonic_s=1.,
+                    accepted_action={"mode": "raw_goal_hold", "body_velocity": 0.})
+                live["body"] = dict(m.ZERO_BODY)
             if peer_wait_case:
                 value["service_incarnation"] = peer_template["service_incarnation"]
                 value["run"]["backend_incarnation"] = peer_template["run"]["backend_incarnation"]
@@ -1482,7 +1495,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 args.bench_continuity = False
             if failure == "normal_program_finish_combined_body":
                 args.workload_segment = "combined-body"
-            if failure in {"normal_program_finish_left_maintained", "normal_program_finish_left_reach"}:
+            if failure in {"normal_program_finish_left_maintained", "normal_program_finish_left_reach", "normal_program_finish_left_reach_held"}:
                 args.workload_segment = "left-maintained" if failure.endswith("maintained") else "left-reach"
             if failure == "normal_program_finish_left_supported":
                 args.workload_segment = "left-supported-reach"
@@ -1516,7 +1529,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                     super().__init__(*args, **kwargs)
                     self.duration_s = .001  # Reporting seam only; real Native held proof is exercised below.
             monkeypatch.setattr(am1_teleop_workload, "TeleopWorkload", ShortProgramme)
-            if failure in {"normal_program_finish_left_maintained", "normal_program_finish_left_reach", "normal_program_finish_left_supported", "normal_program_finish_left_opposite"}:
+            if failure in {"normal_program_finish_left_maintained", "normal_program_finish_left_reach", "normal_program_finish_left_reach_held", "normal_program_finish_left_supported", "normal_program_finish_left_opposite"}:
                 original_selected = m.SelectedLeftWorkload
                 class ShortSelected(original_selected):
                     def __init__(self, *args, **kwargs):
@@ -1544,7 +1557,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                     assert start["workload_segment"] == summary["workload_segment"] == "combined-body"
                     assert start["program_active_seconds"] == 64.5
                     assert start["bench_continuity"] is False
-                if failure in {"normal_program_finish_left_maintained", "normal_program_finish_left_reach"}:
+                if failure in {"normal_program_finish_left_maintained", "normal_program_finish_left_reach", "normal_program_finish_left_reach_held"}:
                     expected = "left-maintained" if failure.endswith("maintained") else "left-reach"
                     assert start["workload_segment"] == summary["workload_segment"] == expected
                     assert start["program_active_seconds"] == (16. if expected == "left-maintained" else 20.)
@@ -1554,6 +1567,11 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                     assert summary["selected_profile"]["reference"] == plan["reference"]
                     assert summary["selected_profile"]["endpoint_normalized"] == plan["endpoint_normalized"]
                     assert start["bench_continuity"] is False
+                    if failure == "normal_program_finish_left_reach_held":
+                        shoulder = "arm_left_shoulder_lift.pos"
+                        assert session.inputs[0]["target"][shoulder] == 100.
+                        assert plan["reference"][shoulder] == pytest.approx(100.67368421052635)
+                        assert plan["command_reference"][shoulder] == 100.
                 if failure == "normal_program_finish_left_supported":
                     assert start["workload_segment"] == summary["workload_segment"] == "left-supported-reach"
                     assert start["program_active_seconds"] == 28. and start["bench_continuity"] is False
@@ -9609,3 +9627,146 @@ def test_peer_fixed_v1_cannot_credit_active_p32_without_trial(selected_p):
     state["evidence"]["accepted_host_action"]["teleop_elbow_settings"]["left"]["active"][4] = 32
     with pytest.raises(RuntimeError, match="baseline"):
         task.observe_peer_baseline(state)
+
+
+def held_command119_workspace():
+    m = adapter()
+    native = workspace()
+    shoulder, elbow = "arm_left_shoulder_lift.pos", "arm_left_elbow_flex.pos"
+    native["workspace_profile"] = "left-current-rest-1051-1164"
+    native["calibration"][shoulder[:-4]] = [2, 0, 515, 848, 3223]
+    native["raw_bounds"][shoulder] = [3110, 3223]
+    native["bounds"][shoulder].update(min=m.normalized_raw(3110, native["calibration"][shoulder[:-4]]),
+                                     max=100., rate_per_s=4.)
+    native["reference"][shoulder] = m.normalized_raw(3231, native["calibration"][shoulder[:-4]])
+    native["calibration"][elbow[:-4]] = [3, 0, 1845, 864, 3073]
+    native["raw_bounds"][elbow] = [1051, 1164]
+    native["bounds"][elbow].update(min=m.normalized_raw(1051, native["calibration"][elbow[:-4]]),
+                                  max=m.normalized_raw(1164, native["calibration"][elbow[:-4]]), rate_per_s=3.)
+    native["reference"][elbow] = m.normalized_raw(1090, native["calibration"][elbow[:-4]])
+    return native
+
+
+def held_command119_client():
+    import copy
+    from types import SimpleNamespace
+    m = adapter()
+    native = held_command119_workspace()
+    run, host, service, generation = (str(uuid4()) for _ in range(4))
+    cursor = {**native["reference"], "arm_left_shoulder_lift.pos": 100.}
+    state = {"service_incarnation": service,
+             "controller": {"device_id": "device", "controller_generation": generation},
+             "run": {"run_id": run, "recipe": "physical-live-teleop", "backend_incarnation": host,
+                     "status": "paused", "uncertain": False, "native_live_at": 100., "deadline": 400.,
+                     "remaining_s": 299.75, "intent_revision": 0, "recovery": None,
+                     "first_cause": None, "native_first_cause": None,
+                     "live_input": {"workspace": native, "reference": copy.deepcopy(native["reference"]),
+                                    "cursor": cursor, "accepted_target": dict(cursor), "cursor_intent_revision": 0,
+                                    "body": dict(m.ZERO_BODY), "required_view": {"required": True, "qualified": True}}},
+             "events": [{"kind": "start", "run_id": run, "service_incarnation": service, "at": 100.}],
+             "evidence": {"feedback": True, "native_ack": True, "hold_acknowledged": True,
+                          "pose_aligned": True, "required_observation": True, "active_acknowledged": False,
+                          "acknowledged_intent_revision": 0,
+                          "accepted_host_action": {"run_id": run, "host_incarnation": host, "state": "paused",
+                                                   "intent_revision": 0, "epoch": 1,
+                                                   "acquired_at_monotonic_s": 100.2,
+                                                   "accepted_action": {"mode": "raw_goal_hold", "body_velocity": 0.}}}}
+    return SimpleNamespace(snapshot=state, device="device", generation=generation), native
+
+
+def test_held_command119_keeps_measured_reference_and_fixed_selected_targets_through_rejoin():
+    import copy
+    m = adapter()
+    client, native = held_command119_client()
+    original = copy.deepcopy(client.snapshot)
+    commands = m._qualified_command_reference(client, native)
+    task = m.SelectedLeftWorkload(native, segment="left-reach", command_reference=commands)
+    elbow, shoulder = "arm_left_elbow_flex.pos", "arm_left_shoulder_lift.pos"
+    plan = task.plan()
+    assert plan["reference"] == native["reference"] == original["run"]["live_input"]["reference"]
+    assert plan["command_reference"][shoulder] == 100. and plan["reference"][shoulder] > 100.
+    assert plan["command_reference"][elbow] == native["reference"][elbow]
+    now = [10.]
+    producer = m.FrameProducer(task, clock=lambda: now[0])
+    producer.workspace, producer.native_cursor = native, dict(commands)
+    task.elapsed_s = 7.
+    first = producer.capture({"grant_id": str(uuid4())})
+    assert first["target"][shoulder] == 100. and not producer.clutch.last_clamps
+    assert first["target"][elbow] == plan["endpoint_normalized"]
+    task.freeze()
+    producer.native_cursor[elbow] += 1.
+    producer.reacquire = True
+    now[0] = 11.
+    second = producer.capture({"grant_id": str(uuid4())})
+    assert second["target"] == first["target"] and second["body"] == m.ZERO_BODY
+    assert second["source"]["sample_seq"] == 2
+    assert task.plan()["reference"] == plan["reference"] and task.plan()["endpoint_normalized"] == plan["endpoint_normalized"]
+    assert client.snapshot == original and client.snapshot["run"]["deadline"] == 400.
+    with pytest.raises(ValueError, match="normalized"):
+        m.SelectedLeftWorkload(native, segment="left-reach")
+
+
+@pytest.mark.parametrize("fault", ["missing", "stale", "future", "run", "host", "owner", "revision", "cursor_revision",
+                                   "no_hold", "local_camera", "pause", "stop", "illegal_cursor", "different_target", "workspace"])
+def test_held_command119_rejects_missing_stale_foreign_or_unqualified_command_origin(fault):
+    import copy
+    m = adapter()
+    client, native = held_command119_client()
+    state = client.snapshot
+    live, evidence = state["run"]["live_input"], state["evidence"]
+    ack = evidence["accepted_host_action"]
+    if fault == "missing":
+        live.pop("cursor")
+    elif fault in {"stale", "future"}:
+        ack["acquired_at_monotonic_s"] = 98. if fault == "stale" else 101.
+    elif fault in {"run", "host"}:
+        ack["run_id" if fault == "run" else "host_incarnation"] = str(uuid4())
+    elif fault == "owner":
+        state["controller"]["controller_generation"] = str(uuid4())
+    elif fault == "revision":
+        ack["intent_revision"] = 1
+    elif fault == "cursor_revision":
+        live["cursor_intent_revision"] = 1
+    elif fault in {"no_hold", "local_camera"}:
+        evidence["hold_acknowledged" if fault == "no_hold" else "required_observation"] = False
+    elif fault in {"pause", "stop"}:
+        state["events"][0]["kind"] = fault
+    elif fault == "illegal_cursor":
+        live["cursor"]["arm_left_shoulder_lift.pos"] = 100.1
+    elif fault == "different_target":
+        live["accepted_target"]["arm_left_shoulder_lift.pos"] = 99.
+    else:
+        live["workspace"] = copy.deepcopy(native)
+        live["workspace"]["reference"]["arm_left_wrist_flex.pos"] += 1.
+    with pytest.raises((RuntimeError, ValueError), match="held|HOLD|target|workspace"):
+        m._qualified_command_reference(client, native)
+
+
+def test_held_command119_never_substitutes_an_unsupported_selected_reference():
+    m = adapter()
+    client, native = held_command119_client()
+    commands = m._qualified_command_reference(client, native)
+    native["reference"]["arm_left_elbow_flex.pos"] = native["bounds"]["arm_left_elbow_flex.pos"]["max"] + 1.
+    with pytest.raises(ValueError):
+        m.SelectedLeftWorkload(native, segment="left-reach", command_reference=commands)
+
+
+@pytest.mark.parametrize("segment", ["left-reach", "left-supported-reach"])
+def test_held_command119_legal_selected_cursor_shift_cannot_replace_measured_q0(segment):
+    m = adapter()
+    client, native = held_command119_client()
+    selected = ["arm_left_elbow_flex.pos", "arm_left_gripper.pos"]
+    if segment == "left-supported-reach":
+        native["reference"]["arm_left_shoulder_lift.pos"] = 99.
+        client.snapshot["run"]["live_input"]["reference"]["arm_left_shoulder_lift.pos"] = 99.
+        selected.append("arm_left_shoulder_lift.pos")
+    for key in ("arm_left_elbow_flex.pos", "arm_left_gripper.pos"):
+        client.snapshot["run"]["live_input"]["cursor"][key] += 1.
+        client.snapshot["run"]["live_input"]["accepted_target"][key] += 1.
+    commands = m._qualified_command_reference(client, native)
+    task = m.SelectedLeftWorkload(native, segment=segment, command_reference=commands)
+    action = {"arm_" + key: value for key, value in task.get_action().items()}
+    assert action["arm_left_shoulder_lift.pos"] == (99. if segment == "left-supported-reach" else 100.)
+    for key in selected:
+        assert action[key] == task.plan()["reference"][key] == native["reference"][key]
+        assert action[key] != commands[key]
