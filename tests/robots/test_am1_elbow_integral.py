@@ -1812,7 +1812,7 @@ def test_current_rest_request_cannot_broaden_other_role_or_experiment(tmp_path, 
     assert request.read_bytes() == raw and list(directory.iterdir()) == []
 
 
-def test_current_rest_primes_fresh_measured_goal_only_off_and_restores_original_goal_last_lock(tmp_path, monkeypatch):
+def test_current_rest_original_goal_is_evidence_while_gain_restores_lock_last(tmp_path, monkeypatch):
     module, r, trial, directory, request, original = left_response_p_robot(tmp_path, monkeypatch, workspace_profile=CURRENT_REST_PROFILE)
     trial.prepare(r)
     durable = json.loads(trial.snapshot_path.read_bytes())
@@ -1820,7 +1820,7 @@ def test_current_rest_primes_fresh_measured_goal_only_off_and_restores_original_
     original_digest = durable["original_settings_sha256"]
     assert not writes(r.left_bus)
     trial.disable_torque(r)
-    r.left_bus.values["Present_Position", ELBOW] = 1091  # Actual new receipt, not old baseline1090.
+    r.left_bus.values["Present_Position", ELBOW] = 1091
     observed = []
     def before_write(register, motor, value):
         if register in {"Goal_Position", "P_Coefficient"}:
@@ -1830,49 +1830,53 @@ def test_current_rest_primes_fresh_measured_goal_only_off_and_restores_original_
             observed.append((register, value))
     r.left_bus.before_write = before_write
     trial.apply(r)
-    assert r.left_bus.values["Goal_Position", ELBOW] == 1091 and r.left_bus.values["P_Coefficient", ELBOW] == 32
-    assert trial.evidence["priming_position"]["value"] == trial.evidence["primed_goal_readback"] == 1091
-    assert trial.evidence["priming_position"]["phase"] == "current_rest_prime"
+    assert r.left_bus.values["Goal_Position", ELBOW] == 2050 and r.left_bus.values["P_Coefficient", ELBOW] == 32
+    assert "priming_position" not in trial.evidence and "primed_goal_readback" not in trial.evidence
     assert trial.receipt["original_settings_sha256"] == original_digest
+    # Real ordinary activation is exercised in test_am1_pre_activation; this
+    # transaction-only check preserves the owner's current volatile command.
+    r.left_bus.values["Goal_Position", ELBOW] = 1091
     r.left_bus.values["Torque_Enable", ELBOW] = 1
-    trial.verify_active(r)
     trial.restore(r)
-    assert observed == [("Goal_Position", 1091), ("P_Coefficient", 32), ("P_Coefficient", 16), ("Goal_Position", 2050)]
+    assert observed == [("P_Coefficient", 32), ("P_Coefficient", 16)]
     assert r.left_bus.values["Torque_Enable", ELBOW] == 0 and r.left_bus.values["Lock", ELBOW] == 0
     assert writes(r.left_bus)[-1][1:4] == ("Lock", ELBOW, 0)
-    assert trial.evidence["restored_goal_readback"] == 2050 and not trial.restore_required
+    assert r.left_bus.values["Goal_Position", ELBOW] == 1091 and not trial.restore_required
     assert not writes(r.left_bus, OTHER) and not writes(r.right_bus)
     assert trial.evidence["original_registers"]["Present_Position"] == 1090
 
 
-@pytest.mark.parametrize("fault", ["prime_lost_ack", "prime_cancel", "restore_lost_ack", "restore_failed", "stop", "outside", "status", "torque"])
-def test_current_rest_goal_failure_never_erases_original_obligation_or_enables_motion(tmp_path, monkeypatch, fault):
+@pytest.mark.parametrize("fault", ["gain_lost_ack", "gain_cancel", "restore_lost_ack", "restore_failed", "stop", "current", "status", "torque"])
+def test_current_rest_gain_failure_preserves_original_obligation_without_goal_writes(tmp_path, monkeypatch, fault):
     module, r, trial, directory, request, original = left_response_p_robot(tmp_path, monkeypatch, workspace_profile=CURRENT_REST_PROFILE)
     trial.prepare(r)
     trial.disable_torque(r)
-    if fault in {"prime_lost_ack", "prime_cancel"}:
-        error = KeyboardInterrupt("prime interrupted") if fault == "prime_cancel" else OSError("prime ACK lost")
-        r.left_bus.fail_writes["Goal_Position", ELBOW, 1090] = (error, True)
+    if fault in {"gain_lost_ack", "gain_cancel"}:
+        error = KeyboardInterrupt("gain interrupted") if fault == "gain_cancel" else OSError("gain ACK lost")
+        r.left_bus.fail_writes["P_Coefficient", ELBOW, 32] = (error, True)
     elif fault == "stop":
         r._am1_shutdown_in_progress = True
-    elif fault == "outside":
-        r.left_bus.values["Present_Position", ELBOW] = 1165
+    elif fault == "current":
+        r.left_bus.values["Present_Current", ELBOW] = 310
     elif fault == "status":
         r.left_bus.values["Status", ELBOW] = 1
     elif fault == "torque":
         r.left_bus.values["Torque_Enable", ELBOW] = 1
-    if fault in {"prime_cancel", "stop", "outside", "status", "torque"}:
-        with pytest.raises((RuntimeError, KeyboardInterrupt)):
+    if fault in {"gain_lost_ack", "gain_cancel", "stop", "current", "status", "torque"}:
+        with pytest.raises((RuntimeError, OSError, KeyboardInterrupt)):
             trial.apply(r)
-        assert r.left_bus.values["P_Coefficient", ELBOW] == 16 and trial.restore_required
-        assert not [row for row in writes(r.left_bus) if row[1] == "Goal_Position"] or fault == "prime_cancel"
+        assert trial.restore_required
+        if fault not in {"gain_lost_ack", "gain_cancel"}:
+            assert r.left_bus.values["P_Coefficient", ELBOW] == 16
         r.left_bus.values["Status", ELBOW] = 0
+        r.left_bus.values["Present_Current", ELBOW] = 0
         r.left_bus.values["Torque_Enable", ELBOW] = 0
     else:
         trial.apply(r)
-        assert r.left_bus.values["Goal_Position", ELBOW] == 1090
+        assert r.left_bus.values["P_Coefficient", ELBOW] == 32
+    assert not [row for row in writes(r.left_bus) if row[1] == "Goal_Position"]
     if fault in {"restore_lost_ack", "restore_failed"}:
-        r.left_bus.fail_writes["Goal_Position", ELBOW, 2050] = (OSError("originalGoal ACK lost"), fault != "restore_failed")
+        r.left_bus.fail_writes["P_Coefficient", ELBOW, 16] = (OSError("original P ACK lost"), fault != "restore_failed")
     if fault == "restore_failed":
         with pytest.raises(OSError):
             trial.restore(r)
@@ -1892,42 +1896,16 @@ def test_current_rest_original_goal_must_still_be_inside_unchanged_calibration(t
     assert not trial.restore_required and not writes(r.left_bus)
 
 
-@pytest.mark.parametrize("fault", ["slow_raw", "aged_raw", "torque_after_write"])
-def test_current_rest_new_raw_or_off_loss_prevents_p32_and_retains_goal_restoration(tmp_path, monkeypatch, fault):
-    module, r, trial, directory, request, original = left_response_p_robot(tmp_path, monkeypatch, workspace_profile=CURRENT_REST_PROFILE)
+@pytest.mark.parametrize("phase,value", [("prime_current_rest_goal", 1090), ("restore_original_goal", 2050), ("ordinary_goal", 1091)])
+def test_current_rest_transaction_cannot_write_goal_in_any_phase(tmp_path, monkeypatch, phase, value):
+    _, r, trial, _, _, _ = left_response_p_robot(tmp_path, monkeypatch, workspace_profile=CURRENT_REST_PROFILE)
     trial.prepare(r)
     trial.disable_torque(r)
-    now = [10.0]
-    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
-    if fault == "slow_raw":
-        read = r.left_bus.read
-        def slow(register, motor, **kwargs):
-            result = read(register, motor, **kwargs)
-            if register == "Present_Position":
-                now[0] += .041
-            return result
-        r.left_bus.read = slow
-    elif fault == "aged_raw":
-        write = trial._write
-        def aged(register, value, **kwargs):
-            if register == "Goal_Position" and kwargs["phase"] == "prime_current_rest_goal":
-                now[0] += r.AM1_ACTIVATION_MAX_RAW_AGE_S
-            return write(register, value, **kwargs)
-        trial._write = aged
-    else:
-        write = r.left_bus.write
-        def changed(register, motor, value, **kwargs):
-            result = write(register, motor, value, **kwargs)
-            if register == "Goal_Position" and value == 1090:
-                r.left_bus.values["Torque_Enable", motor] = 1
-            return result
-        r.left_bus.write = changed
-    with pytest.raises(RuntimeError):
-        trial.apply(r)
-    assert r.left_bus.values["P_Coefficient", ELBOW] == 16 and trial.restore_required
-    if fault != "torque_after_write":
-        assert not [row for row in writes(r.left_bus) if row[1] == "Goal_Position"]
-    r._am1_shutdown_in_progress = True
+    trial.apply(r)
+    before = list(r.left_bus.events)
+    with pytest.raises(ValueError):
+        trial._write("Goal_Position", value, phase=phase, reconcile=True)
+    assert r.left_bus.events == before and trial.restore_required
     trial.restore(r)
     assert r.left_bus.values["Torque_Enable", ELBOW] == 0 and r.left_bus.values["Goal_Position", ELBOW] == 2050
     assert r.left_bus.values["Lock", ELBOW] == 0 and not trial.restore_required
@@ -2159,3 +2137,52 @@ def test_stopped_115_prewrite_fault_preserves_completed_and_failed_actual_rows(t
         assert rows[-1]["address"] == 25 and "value" not in rows[-1]
     assert not writes(r.left_bus) and trial.snapshot_path.read_bytes() == original
     assert not list(directory.glob("left-response-p-stopped-completion-*.json"))
+
+
+def test_current_rest_normal_activation_transaction_never_writes_goal_even_when_goal_can_enable(tmp_path, monkeypatch):
+    _, r, trial, _, _, _ = left_response_p_robot(tmp_path, monkeypatch, workspace_profile=CURRENT_REST_PROFILE)
+    original_write = r.left_bus.write
+    def observed_goal_transition(register, motor, value, **kwargs):
+        result = original_write(register, motor, value, **kwargs)
+        if register == "Goal_Position":
+            r.left_bus.values["Torque_Enable", motor] = 1
+        return result
+    r.left_bus.write = observed_goal_transition
+    trial.prepare(r)
+    trial.disable_torque(r)
+    trial.apply(r)
+    assert r.left_bus.values["P_Coefficient", ELBOW] == 32
+    assert r.left_bus.values["Torque_Enable", ELBOW] == 0
+    assert r.left_bus.values["Goal_Position", ELBOW] == 2050
+    assert trial.evidence["original_registers"]["Goal_Position"] == 2050
+    assert not [row for row in writes(r.left_bus) if row[1] == "Goal_Position"]
+    # Ordinary activation/task owns this volatile Goal; the P transaction must
+    # never replay the stale original command at shutdown.
+    r.left_bus.values["Goal_Position", ELBOW] = 1091
+    r.left_bus.values["Torque_Enable", ELBOW] = 1
+    trial.restore(r)
+    assert r.left_bus.values["Goal_Position", ELBOW] == 1091
+    assert r.left_bus.values["Torque_Enable", ELBOW] == 0
+    assert r.left_bus.values["P_Coefficient", ELBOW] == 16
+    assert writes(r.left_bus)[-1][1:4] == ("Lock", ELBOW, 0)
+    assert not trial.restore_required and not [row for row in writes(r.left_bus) if row[1] == "Goal_Position"]
+
+
+@pytest.mark.parametrize("failure", ["gain_ack", "cancel", "stop"])
+def test_current_rest_normal_activation_p_failure_retains_original_without_any_goal_write(tmp_path, monkeypatch, failure):
+    _, r, trial, _, _, _ = left_response_p_robot(tmp_path, monkeypatch, workspace_profile=CURRENT_REST_PROFILE)
+    trial.prepare(r)
+    trial.disable_torque(r)
+    if failure == "stop":
+        r._am1_shutdown_in_progress = True
+    else:
+        error = KeyboardInterrupt("P configuration cancelled") if failure == "cancel" else OSError("P ACK lost")
+        r.left_bus.fail_writes["P_Coefficient", ELBOW, 32] = (error, failure == "cancel")
+    with pytest.raises((RuntimeError, OSError, KeyboardInterrupt)):
+        trial.apply(r)
+    assert trial.restore_required and trial.evidence["original_registers"]["Goal_Position"] == 2050
+    assert not [row for row in writes(r.left_bus) if row[1] == "Goal_Position"]
+    trial.restore(r)
+    assert r.left_bus.values["P_Coefficient", ELBOW] == 16 and r.left_bus.values["Lock", ELBOW] == 0
+    assert r.left_bus.values["Torque_Enable", ELBOW] == 0
+    assert r.left_bus.values["Goal_Position", ELBOW] == 2050 and not trial.restore_required

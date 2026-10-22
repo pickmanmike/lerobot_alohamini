@@ -1005,6 +1005,20 @@ class AlohaMini(Robot):
             )
         return present
 
+    def _am1_current_rest_activation_trial(self):
+        trial = getattr(self, "_am1_left_response_p_trial", None)
+        binding = getattr(self, "_am1_left_response_p_binding", None)
+        requests = [value.get("request", {}) for value in
+                    (binding, getattr(trial, "binding", None)) if isinstance(value, dict)]
+        if (getattr(trial, "workspace_profile", None) is None
+                and not any("workspace_profile" in request for request in requests)):
+            return None
+        from .am1_elbow_integral import AM1LeftResponseProportionalTrial
+        if type(trial) is not AM1LeftResponseProportionalTrial:
+            raise RuntimeError("Current-rest ordinary activation requires its exact retained left trial")
+        trial.require_normal_activation_owner(self)
+        return trial
+
     def _seed_qualified_am1_activation_goals(
         self, qualified: list[tuple[FeetechMotorsBus, dict[str, tuple[int, int, int, int, int]]]],
     ) -> None:
@@ -1019,22 +1033,47 @@ class AlohaMini(Robot):
                 )
             all_goals.append((bus, present_positions))
         self._require_am1_activation_fresh("after_home")
-        # Both buses qualify before the first goal write, then every seeded goal
-        # is verified before the first arm/base torque enable. The protected
+        current_rest = self._am1_current_rest_activation_trial()
+        activation = None if current_rest is None else current_rest.qualify_normal_activation(self, all_goals)
+        # Both buses qualify before the first measured-q Goal write. A Goal may
+        # change observed torque state; this is ordinary owned activation, not
+        # a promise of continuous Torque0 through the seed batch. The protected
         # endpoint case uses only its freshly qualified within-bound command.
         protected = self._am1_protected_live_spec() is not None
         seed_writes = {}
         for bus, present_positions in all_goals:
             for name, present in present_positions.items():
+                if current_rest is not None:
+                    self._am1_current_rest_activation_trial()
+                    self._require_am1_activation_fresh("after_home")
                 started = time.monotonic() if protected else None
-                write_register(bus, "Goal_Position", name, present)
+                selected = current_rest is not None and bus is self.left_bus and name == current_rest.motor
+                row = None
+                if selected:
+                    row = activation["goal_write"] = {"value": present, "started_at_monotonic_s": time.monotonic()}
+                try:
+                    write_register(bus, "Goal_Position", name, present)
+                except BaseException as error:
+                    if row is not None:
+                        row.update(error_type=type(error).__name__, error=str(error))
+                    raise
+                finally:
+                    if row is not None:
+                        row["completed_at_monotonic_s"] = time.monotonic()
                 if protected:
                     seed_writes[name] = {"raw_goal": present, "write_started_at": started,
                                          "write_completed_at": time.monotonic()}
                 self._refresh_am1_startup_lift_feedback()
         for bus, present_positions in all_goals:
             for name, expected in present_positions.items():
-                actual = self._read_am1_activation_raw(bus, "Goal_Position", name, phase="seed_readback")
+                if current_rest is not None:
+                    self._am1_current_rest_activation_trial()
+                    self._require_am1_activation_fresh("after_home")
+                try:
+                    actual = self._read_am1_activation_raw(bus, "Goal_Position", name, phase="seed_readback")
+                finally:
+                    if current_rest is not None and bus is self.left_bus and name == current_rest.motor:
+                        activation["goal_readback"] = dict(self._am1_activation_readbacks[-1])
                 if actual != expected:
                     raise RuntimeError(
                         f"AM1 arm activation refused: '{name}' measured goal readback {actual} differs from {expected}."
@@ -1108,6 +1147,7 @@ class AlohaMini(Robot):
                     if bus is None:
                         continue
                     for name in names:
+                        self._am1_current_rest_activation_trial()
                         self._require_am1_activation_fresh("after_home")
                         set_torque_enabled(bus, (name,), enabled=True)
             elbow_trial = getattr(self, "_am1_elbow_integral_trial", None)

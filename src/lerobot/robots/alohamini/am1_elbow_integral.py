@@ -1348,26 +1348,9 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
 
     def _write(self, register, value, *, phase, reconcile=False):
         allowed = {"Torque_Enable": (0,), "Lock": (0, 1), "P_Coefficient": (16, self.proportional)}
-        goal_write = register == "Goal_Position" and self.workspace_profile is not None
-        if goal_write:
-            if phase == "prime_current_rest_goal":
-                allowed[register] = (self._snapshot["priming_position"]["value"],)
-            elif phase == "restore_original_goal":
-                allowed[register] = (self._snapshot["original_registers"]["Goal_Position"],)
         if register not in allowed or type(value) is not int or value not in allowed[register]:
             raise ValueError("Selected elbow response P transaction cannot write that register/value")
         self._service_boundary()
-        if goal_write:
-            if (not self.restore_required or self._read("Torque_Enable", phase=phase + "_before") != 0
-                    or self._read("Lock", phase=phase + "_before") != 1
-                    or self._read("Status", phase=phase + "_before") != 0):
-                raise RuntimeError("Current-rest Goal write requires actual Torque0/Lock1/status0")
-            if phase == "prime_current_rest_goal":
-                stamp = self._snapshot["priming_position"]["completed_at_monotonic_s"]
-                now = time.monotonic()
-                if (getattr(self._robot, "_am1_shutdown_in_progress", False) is True
-                        or not 0 <= now - stamp < self._robot.AM1_ACTIVATION_MAX_RAW_AGE_S):
-                    raise RuntimeError("Current-rest measured priming position expired or Stop prevailed")
         row = {
             "operation": "write",
             "register": register,
@@ -1397,8 +1380,6 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
             row["completed_at_monotonic_s"] = time.monotonic()
         if self._read(register, phase=phase + "_verify") != value:
             raise RuntimeError("Selected elbow response P write verification failed: " + register)
-        if goal_write and self._read("Torque_Enable", phase=phase + "_after") != 0:
-            raise RuntimeError("Current-rest Goal write lost actual Torque0")
 
     def disable_torque(self, robot):
         if not self._created or not self.restore_required:
@@ -1422,23 +1403,44 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
                 "Selected elbow response P preserved identity/I/D/protection/profile/individual bytes changed"
             )
 
-    def _prime_current_rest_goal(self, robot):
-        self._same_owner(robot)
-        if (getattr(robot, "_am1_shutdown_in_progress", False) is True
-                or self._read("Torque_Enable", phase="current_rest_prime") != 0
-                or self._read("Lock", phase="current_rest_prime") != 1
-                or self._read("Status", phase="current_rest_prime") != 0
-                or abs(self._read("Present_Current", phase="current_rest_prime"))
-                >= self._snapshot["original_registers"]["Protection_Current"]):
-            raise RuntimeError("Current-rest priming requires its healthy stopped owner")
-        present = self._read("Present_Position", phase="current_rest_prime")
-        position = copy.deepcopy(self._snapshot["events"][-1])
+    def require_normal_activation_owner(self, robot):
+        """Read-free fence while the ordinary owner seeds its fresh measured goals."""
+        self._retained_owner(robot)
+        if (self.workspace_profile != LEFT_CURRENT_REST_WORKSPACE_PROFILE or self.side != "left"
+                or self.proportional != 32 or not self.restore_required
+                or self._snapshot.get("state") != "configured"
+                or self._snapshot.get("configured_p_readback") != 32
+                or getattr(robot, "_am1_shutdown_in_progress", False) is True):
+            raise RuntimeError("Current-rest ordinary activation owner/phase changed or Stop prevailed")
+
+    def qualify_normal_activation(self, robot, all_goals):
+        self.require_normal_activation_owner(robot)
+        matching = [values for bus, values in all_goals if bus is self._bus]
+        if len(matching) != 1 or type(matching[0].get(self.motor)) is not int:
+            raise RuntimeError("Current-rest ordinary activation needs its exact selected measured map")
+        present = matching[0][self.motor]
+        rows = getattr(robot, "_am1_activation_readbacks", ())
+        def one(register):
+            actual = [row for row in rows if row.get("phase") == "after_home"
+                      and row.get("motor") == self.motor and row.get("register") == register]
+            if len(actual) != 1:
+                raise RuntimeError("Current-rest original after-home raw qualification is unavailable")
+            return actual[0]
+        position, torque = one("Present_Position"), one("Torque_Enable")
+        now = time.monotonic()
         if (not self.raw_bounds[0] <= present <= self.raw_bounds[1]
-                or position["completed_at_monotonic_s"] - position["started_at_monotonic_s"] > 0.04):
-            raise RuntimeError("Current-rest fresh measured position exceeds its corridor/read budget")
-        self._snapshot["priming_position"] = position
-        self._write("Goal_Position", present, phase="prime_current_rest_goal", reconcile=True)
-        self._snapshot.update(primed_goal_readback=present, primed_at_monotonic_s=time.monotonic())
+                or position.get("raw") != present or torque.get("raw") != 0
+                or any("unavailable" in row or any(type(row.get(key)) not in (int, float)
+                       or not math.isfinite(row[key]) for key in ("read_started_at", "read_completed_at"))
+                       for row in (position, torque))
+                or not 0 <= torque["read_started_at"] <= torque["read_completed_at"]
+                <= position["read_started_at"] <= position["read_completed_at"] <= now
+                or now - position["read_started_at"] >= robot.AM1_ACTIVATION_MAX_RAW_AGE_S):
+            raise RuntimeError("Current-rest fresh after-home position/OFF/corridor qualification refused")
+        evidence = {"policy": "ordinary-fresh-measured-after-home",
+                    "position": copy.deepcopy(position), "torque_off": copy.deepcopy(torque)}
+        self._snapshot["normal_activation"] = evidence
+        return evidence  # The existing owner records its actual write/readback, without extra I/O.
 
     def apply(self, robot):
         try:
@@ -1455,10 +1457,13 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
                 for k, v in {"Torque_Enable": 0, "Lock": 1, "P_Coefficient": 16}.items()
             ):
                 raise RuntimeError("Selected elbow response P requires actual Torque0/Lock1/P16 before apply")
-            if self.workspace_profile is not None:
-                self._prime_current_rest_goal(robot)
-                if getattr(robot, "_am1_shutdown_in_progress", False) is True:
-                    raise RuntimeError("Current-rest Stop prevailed before P32 configuration")
+            if self.workspace_profile is not None and (
+                self._read("Status", phase="before_apply") != 0
+                or abs(self._read("Present_Current", phase="before_apply"))
+                >= self._snapshot["original_registers"]["Protection_Current"]
+                or getattr(robot, "_am1_shutdown_in_progress", False) is True
+            ):
+                raise RuntimeError("Current-rest P configuration requires its healthy stopped owner")
             if self.proportional != 16:
                 self._write("P_Coefficient", self.proportional, phase="configure_proportional")
             self._snapshot.update(
@@ -1473,6 +1478,21 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
         try:
             if getattr(robot, "_am1_shutdown_in_progress", False) is True:
                 raise RuntimeError("Selected elbow response P cannot qualify active settings during shutdown")
+            if self.workspace_profile is not None:
+                self.require_normal_activation_owner(robot)
+                evidence = self._snapshot.get("normal_activation") or {}
+                position, write, readback = (evidence.get(key) or {} for key in
+                                             ("position", "goal_write", "goal_readback"))
+                expected = position.get("raw")
+                if (type(expected) is not int or not self.raw_bounds[0] <= expected <= self.raw_bounds[1]
+                        or write.get("value") != expected or readback.get("raw") != expected
+                        or readback.get("phase") != "seed_readback" or readback.get("motor") != self.motor
+                        or readback.get("register") != "Goal_Position" or "unavailable" in readback
+                        or any(key in write for key in ("error", "error_type"))
+                        or not position["read_completed_at"] <= write.get("started_at_monotonic_s", -1)
+                        <= write.get("completed_at_monotonic_s", -1) <= readback.get("read_started_at", -1)
+                        <= readback.get("read_completed_at", -1) <= time.monotonic()):
+                    raise RuntimeError("Current-rest ordinary fresh measured Goal acknowledgement is unavailable")
             self._preserved(robot, phase="active")
             actual = {
                 k: self._read(k, phase="active")
@@ -1559,14 +1579,8 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
                 self._write("P_Coefficient", 16, phase="restore_proportional", reconcile=True)
             if self._read("P_Coefficient", phase="restored") != 16:
                 raise RuntimeError("Selected elbow response P original P16 restoration failed")
-            if self.workspace_profile is not None:
-                original_goal = self._snapshot["original_registers"]["Goal_Position"]
-                if self._read("Goal_Position", phase="before_restore_goal") != original_goal:
-                    self._write("Goal_Position", original_goal, phase="restore_original_goal", reconcile=True)
-                if (self._read("Goal_Position", phase="restored_goal") != original_goal
-                        or self._read("Torque_Enable", phase="restored_goal") != 0):
-                    raise RuntimeError("Current-rest original Goal restoration requires actual off/readback")
-                self._snapshot["restored_goal_readback"] = original_goal
+            # Goal is the ordinary owner's volatile command, not a gain-setting
+            # rollback. Keep its original as evidence; never replay a stale Goal.
             self._preserved(robot, phase="restored")
             self._write(
                 "Lock",
