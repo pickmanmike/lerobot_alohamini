@@ -2911,3 +2911,619 @@ def test_initial_empty_real_client_worker_keeps_startup_hold_deadline_and_cancel
         e.close()
         e.worker.join(2)
         assert not e.worker.is_alive() and host.finished == 1
+
+
+def request_preparation_config(tmp_path, monkeypatch):
+    import hashlib
+    import json
+    import socket
+    import subprocess
+    import uuid
+    from pathlib import Path
+
+    from lerobot.robots.alohamini import am1_elbow_integral as gains
+    from tools import am1_physical_reconciliation as reconciliation
+
+    state = tmp_path / ".local/state/am1-session"
+    state.mkdir(parents=True, mode=0o700)
+    calibration = tmp_path / "calibration.json"
+    calibration.write_bytes(b"original calibration")
+    config = {key: str(tmp_path / key) for key in (
+        "host_repository", "host_python", "camera_repository", "camera_python", "camera_config",
+        "camera_credentials", "camera_binary", "camera_state", "run_root", "source_pins")}
+    config.update(version=1, machine="AM1-test", host_head="927c17aa52bdf8da3e0ab53d7a122bbb3749b816",
+                  camera_head="b" * 40, physical_state_directory=str(state), shoulder_amplitude=1.5,
+                  calibration_files={str(calibration): hashlib.sha256(calibration.read_bytes()).hexdigest()})
+    path = tmp_path / "physical.json"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    path.chmod(0o600)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(socket, "gethostname", lambda: config["machine"])
+    def git(args, **kwargs):
+        assert args[:2] == ["git", "-C"]
+        side = "host" if args[2] == config["host_repository"] else "camera"
+        return config[side + "_head"] + "\n" if args[3:] == ["rev-parse", "HEAD"] else ""
+    monkeypatch.setattr(subprocess, "check_output", git)
+    boot = "77777777-7777-4777-8777-777777777777"
+    monkeypatch.setattr(gains, "_left_response_p_boot_id", lambda: boot)
+    guard = SimpleNamespace(close=lambda: None)
+    monkeypatch.setattr(reconciliation, "acquire_stopped_guard", lambda value: guard)
+    monkeypatch.setattr(uuid, "uuid4", lambda: uuid.UUID("66666666-6666-4666-8666-666666666666"))
+    return path, config, gains, calibration
+
+
+def test_left_response_preparation_canonical_once_only_and_no_hardware(tmp_path, monkeypatch):
+    import hashlib
+    from pathlib import Path
+
+    from tests.robots.test_am1_elbow_integral import RIGHT_P20_HOST, RIGHT_P20_RUN
+
+    m = module()
+    assert callable(getattr(m, "prepare_left_response_p_request", None)), "canonical preparation missing"
+    path, config, gains, _calibration = request_preparation_config(tmp_path, monkeypatch)
+    monkeypatch.setattr(m.ProtectedHostRun, "start", lambda *args, **kwargs: pytest.fail("no Start"))
+    monkeypatch.setattr(m, "OwnedUnit", lambda *args, **kwargs: pytest.fail("no owned device process"))
+    started = gains.time.monotonic()
+    result = m.prepare_left_response_p_request(str(path), ttl_seconds=120)
+    pending = Path(result["path"])
+    request, raw, info = gains._right_p20_file(pending)
+    assert result["hardware_started"] is False and result["canonical_read_verified"] is True
+    assert result["request"] == request
+    assert request["kind"] == "left-response-p" and request["proportional"] == 32
+    assert request["workload_segment"] == "left-reach" and request["source_head"] == config["host_head"]
+    assert request["boot_id"] == gains._left_response_p_boot_id()
+    assert started < request["expires_at_monotonic_s"] <= gains.time.monotonic() + 120
+    assert raw == gains._right_p20_json(request) and not raw.endswith(b"\n")
+    assert result["sha256"] == hashlib.sha256(raw).hexdigest() and info.st_nlink == 1
+    directory = tmp_path / RIGHT_P20_RUN[:8]
+    directory.mkdir(mode=0o700)
+    descriptor = gains.consume_left_response_p_request(
+        pending.parent, directory, "physical-live-teleop", RIGHT_P20_RUN, RIGHT_P20_HOST, config["host_head"])
+    assert descriptor.exists() and not pending.exists()
+    assert gains.load_left_response_p_binding(descriptor, directory, RIGHT_P20_RUN, RIGHT_P20_HOST)["request"] == request
+    with pytest.raises(ValueError, match="retired"):
+        m.prepare_left_response_p_request(str(path))
+    assert not pending.exists()
+
+
+@pytest.mark.parametrize("obstruction", ["left-response-p-request.json", "right-response-p-request.json",
+    "response12-right-p20-request.json", "cleanup-uncertain.json", "physical-in-progress.json",
+    "calibration", "source", "boot_changed", "expired"])
+def test_left_response_preparation_refuses_without_overwrite(tmp_path, monkeypatch, obstruction):
+    from pathlib import Path
+
+    m = module()
+    assert callable(getattr(m, "prepare_left_response_p_request", None)), "canonical preparation missing"
+    path, config, gains, calibration = request_preparation_config(tmp_path, monkeypatch)
+    state = Path(config["physical_state_directory"])
+    original = b"retained original"
+    if obstruction.endswith(".json"):
+        (state / obstruction).write_bytes(original)
+    elif obstruction == "calibration":
+        calibration.write_bytes(b"changed calibration")
+    elif obstruction == "source":
+        import subprocess
+
+        monkeypatch.setattr(subprocess, "check_output", lambda *args, **kwargs: "wrong head")
+    elif obstruction == "boot_changed":
+        values = iter([gains._left_response_p_boot_id(), "88888888-8888-4888-8888-888888888888"])
+        monkeypatch.setattr(gains, "_left_response_p_boot_id", lambda: next(values))
+    else:
+        values = iter([100., 221.])
+        monkeypatch.setattr(gains.time, "monotonic", lambda: next(values))
+    with pytest.raises((ValueError, RuntimeError, FileExistsError)):
+        m.prepare_left_response_p_request(str(path))
+    if obstruction.endswith(".json"):
+        assert (state / obstruction).read_bytes() == original
+    assert not (state / "left-response-p-request.json").exists() or obstruction == "left-response-p-request.json"
+    assert not list(state.glob("*-used-*")) and not list(state.glob(".*.tmp"))
+
+
+@pytest.mark.parametrize("ttl", [0, 121, True, float("nan"), float("inf")])
+def test_left_response_preparation_ttl_is_closed(tmp_path, monkeypatch, ttl):
+    m = module()
+    assert callable(getattr(m, "prepare_left_response_p_request", None)), "canonical preparation missing"
+    path, config, _gains, _calibration = request_preparation_config(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="120"):
+        m.prepare_left_response_p_request(str(path), ttl_seconds=ttl)
+    from pathlib import Path
+
+    assert not list(Path(config["physical_state_directory"]).iterdir())
+
+
+def test_left_response_preparation_cli_uses_only_fixed_reviewed_ssh_payload(monkeypatch, capsys):
+    import json
+    import shlex
+    import subprocess
+
+    m = module()
+    assert callable(getattr(m, "main", None)), "preparation CLI missing"
+    config = "/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/c5adf5f6c29e909a/physical.json"
+    calls = []
+    def run(args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(returncode=0, stdout=json.dumps({"prepared": True}), stderr="")
+    monkeypatch.setattr(subprocess, "run", run)
+    assert m.main(["--prepare-left-response-p", "--ssh", "am1-pi", "--config", config]) == 0
+    args, options = calls.pop()
+    assert args[:7] == ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "am1-pi"]
+    assert shlex.split(args[7]) == ["/home/pickmanmike/lerobot_alohamini/.venv/bin/python", "-B", "-", config, "120"]
+    assert options["shell"] is False and options["timeout"] == 30 and options["text"] is True
+    assert options.get("encoding") == "utf-8", "Windows stdin must preserve the native Python source bytes"
+    assert "def prepare_left_response_p_request(" in options["input"]
+    assert "/home/pickmanmike/am1_physical_trial" in options["input"]
+    assert "consume_left_response_p_request" not in options["input"]
+    assert json.loads(capsys.readouterr().out) == {"prepared": True}
+    for changed in (["--ssh", "am1-pi;echo"], ["--config", config + "';echo bad"],
+                    ["--config", "../../etc/passwd"], ["--ttl-seconds", "121"]):
+        with pytest.raises((SystemExit, ValueError)):
+            m.main(["--prepare-left-response-p", "--ssh", "am1-pi", "--config", config, *changed])
+        assert not calls
+
+
+@pytest.mark.parametrize("boundary", ["publication_race", "published_readback", "active_owner", "symlink",
+                                    "legacy_symlink"])
+def test_left_response_preparation_atomic_publication_and_guard_release(tmp_path, monkeypatch, boundary):
+    from pathlib import Path
+
+    from tools import am1_physical_reconciliation as reconciliation
+
+    m = module()
+    path, config, gains, _calibration = request_preparation_config(tmp_path, monkeypatch)
+    state = Path(config["physical_state_directory"])
+    pending = state / "left-response-p-request.json"
+    closed = []
+    def guard(value):
+        if boundary == "active_owner":
+            raise RuntimeError("Another physical owner is active")
+        return SimpleNamespace(close=lambda: closed.append(True))
+    monkeypatch.setattr(reconciliation, "acquire_stopped_guard", guard)
+    if boundary == "publication_race":
+        publish = reconciliation._publish_no_replace
+        def race(temporary, target):
+            assert not target.exists()
+            assert gains._right_p20_file(temporary)[0]["proportional"] == 32
+            target.write_bytes(b"other preserved request")
+            publish(temporary, target)
+        monkeypatch.setattr(reconciliation, "_publish_no_replace", race)
+    elif boundary == "published_readback":
+        read = gains._right_p20_file
+        def failed_read(target):
+            if target == pending:
+                raise ValueError("Published receipt unavailable")
+            return read(target)
+        monkeypatch.setattr(gains, "_right_p20_file", failed_read)
+    elif boundary in ("symlink", "legacy_symlink"):
+        redirected = pending if boundary == "symlink" else state / "response12-right-p20-request.json"
+        is_symlink = Path.is_symlink
+        monkeypatch.setattr(Path, "is_symlink", lambda target: target == redirected or is_symlink(target))
+    with pytest.raises((ValueError, RuntimeError, FileExistsError)):
+        m.prepare_left_response_p_request(str(path))
+    assert closed == ([] if boundary == "active_owner" else [True])
+    assert not list(state.glob("*.tmp")) and not list(state.glob("*-used-*"))
+    if boundary == "publication_race":
+        assert pending.read_bytes() == b"other preserved request"
+    elif boundary == "published_readback":
+        # Ambiguous preparation preserves the once-only request; never delete/retry it.
+        assert gains._right_p20_json(__import__("json").loads(pending.read_bytes())) == pending.read_bytes()
+    else:
+        assert not pending.exists()
+        if boundary == "legacy_symlink":
+            assert redirected.is_symlink() and not redirected.exists()
+
+
+def test_left_response_preparation_relay_executes_without_new_installed_helper(tmp_path, monkeypatch, capsys):
+    import io
+    import json
+    import subprocess
+    import sys
+    from contextlib import redirect_stdout
+
+    m = module()
+    path, _config, _gains, _calibration = request_preparation_config(tmp_path, monkeypatch)
+    native_config = "/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/c5adf5f6c29e909a/physical.json"
+    def remote(args, **options):
+        output = io.StringIO()
+        with monkeypatch.context() as context, redirect_stdout(output):
+            # Map only the native fixture pathname for this Windows test; the actual
+            # relay argv/path is checked separately. Installed runtime lacks the CLI.
+            context.setattr(sys, "argv", ["-", str(path), "120"])
+            context.delattr(m, "prepare_left_response_p_request")
+            exec(compile(options["input"], "<fixed-preparation-relay>", "exec"), {})
+        return SimpleNamespace(stdout=output.getvalue(), stderr="", returncode=0)
+    monkeypatch.setattr(subprocess, "run", remote)
+    assert m.main(["--prepare-left-response-p", "--ssh", "am1-pi", "--config", native_config]) == 0
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["canonical_read_verified"] and receipt["hardware_started"] is False
+    assert receipt["request"]["proportional"] == 32 and receipt["request"]["workload_segment"] == "left-reach"
+
+
+def test_left_response_preparation_unknown_ssh_receipt_is_not_replayed(monkeypatch):
+    import subprocess
+
+    m = module()
+    calls = []
+    def timeout(args, **options):
+        calls.append(args)
+        raise subprocess.TimeoutExpired(args, options["timeout"])
+    monkeypatch.setattr(subprocess, "run", timeout)
+    config = "/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/c5adf5f6c29e909a/physical.json"
+    with pytest.raises(subprocess.TimeoutExpired):
+        m.main(["--prepare-left-response-p", "--ssh", "am1-pi", "--config", config])
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("supported", [True, False])
+def test_left_response_preparation_current_rest_requires_installed_profile_validator(tmp_path, monkeypatch, supported):
+    import hashlib
+    from pathlib import Path
+
+    m = module()
+    path, config, gains, _calibration = request_preparation_config(tmp_path, monkeypatch)
+    state = Path(config["physical_state_directory"])
+    native_validate = gains._left_response_p_request
+    validated = []
+
+    def validate(request, source_head):
+        assert not list(state.iterdir()), "installed validation must precede any publication"
+        assert request["workspace_profile"] == "left-current-rest-1051-1164"
+        assert request["source_head"] == source_head == config["host_head"]
+        validated.append(dict(request))
+        if not supported:
+            raise ValueError("Installed source does not support this workspace profile")
+        return native_validate({key: value for key, value in request.items() if key != "workspace_profile"}, source_head)
+
+    monkeypatch.setattr(gains, "_left_response_p_request", validate)
+    monkeypatch.setattr(m.ProtectedHostRun, "start", lambda *args, **kwargs: pytest.fail("no Start"))
+    monkeypatch.setattr(m, "OwnedUnit", lambda *args, **kwargs: pytest.fail("no device process"))
+    if not supported:
+        with pytest.raises(ValueError, match="Installed source"):
+            m.prepare_left_response_p_request(str(path), workspace_profile="left-current-rest-1051-1164")
+        assert len(validated) == 1 and not list(state.iterdir())
+        return
+    result = m.prepare_left_response_p_request(str(path), workspace_profile="left-current-rest-1051-1164")
+    request, raw, _info = gains._right_p20_file(Path(result["path"]))
+    assert request == validated[0] == result["request"]
+    assert set(request) == {"version", "kind", "request_id", "source_head", "proportional", "workload_segment",
+                            "boot_id", "expires_at_monotonic_s", "workspace_profile"}
+    assert request["proportional"] == 32 and request["workload_segment"] == "left-reach"
+    assert raw == gains._right_p20_json(request) and not raw.endswith(b"\n")
+    assert result["sha256"] == hashlib.sha256(raw).hexdigest()
+    assert result["canonical_read_verified"] and result["hardware_started"] is False
+    assert not list(state.glob("*-used-*")) and not list(state.glob(".*.tmp"))
+
+
+@pytest.mark.parametrize("profile", [True, False, "", "current-rest", "left-current-rest-1051-1165", {"min": 1051}])
+def test_left_response_preparation_current_rest_profile_is_closed(tmp_path, monkeypatch, profile):
+    from pathlib import Path
+
+    m = module()
+    path, config, _gains, _calibration = request_preparation_config(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="workspace profile"):
+        m.prepare_left_response_p_request(str(path), workspace_profile=profile)
+    assert not list(Path(config["physical_state_directory"]).iterdir())
+
+
+def test_left_response_preparation_current_rest_cli_relays_explicit_profile_only(tmp_path, monkeypatch, capsys):
+    import io
+    import json
+    import shlex
+    import subprocess
+    import sys
+    from contextlib import redirect_stdout
+
+    m = module()
+    path, config, gains, _calibration = request_preparation_config(tmp_path, monkeypatch)
+    native_config = "/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/7438c74662d59a02/physical.json"
+    native_validate = gains._left_response_p_request
+    seen = []
+
+    def validate(request, source_head):
+        seen.append(dict(request))
+        return native_validate({key: value for key, value in request.items() if key != "workspace_profile"}, source_head)
+
+    monkeypatch.setattr(gains, "_left_response_p_request", validate)
+
+    def remote(args, **options):
+        assert shlex.split(args[7]) == ["/home/pickmanmike/lerobot_alohamini/.venv/bin/python", "-B", "-",
+                                       native_config, "120", "left-current-rest-1051-1164"]
+        assert options["shell"] is False and options["encoding"] == "utf-8"
+        output = io.StringIO()
+        with monkeypatch.context() as context, redirect_stdout(output):
+            context.setattr(sys, "argv", ["-", str(path), "120", "left-current-rest-1051-1164"])
+            context.delattr(m, "prepare_left_response_p_request")
+            exec(compile(options["input"], "<fixed-preparation-relay>", "exec"), {})
+        return SimpleNamespace(stdout=output.getvalue(), stderr="", returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", remote)
+    command = ["--prepare-left-response-p", "--ssh", "am1-pi", "--config", native_config,
+               "--left-response-workspace", "current-rest"]
+    assert m.main(command) == 0
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["request"] == seen[0]
+    assert receipt["request"]["workspace_profile"] == "left-current-rest-1051-1164"
+    assert receipt["request"]["source_head"] == config["host_head"]
+    assert receipt["canonical_read_verified"] and receipt["hardware_started"] is False
+
+
+def test_left_response_preparation_current_rest_cli_rejects_free_bounds_before_ssh(monkeypatch):
+    import subprocess
+
+    m = module()
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: pytest.fail("no SSH on unsupported profile"))
+    with pytest.raises(SystemExit):
+        m.main(["--prepare-left-response-p", "--ssh", "am1-pi", "--config",
+                "/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/7438c74662d59a02/physical.json",
+                "--left-response-workspace", "1051..1165"])
+
+
+@pytest.mark.parametrize("supported", [True, False])
+def test_left_shoulder_startup_preparation_validates_installed_support_before_publication(tmp_path, monkeypatch, supported):
+    from pathlib import Path
+    m = module()
+    path, config, gains, _ = request_preparation_config(tmp_path, monkeypatch)
+    state = Path(config["physical_state_directory"])
+    native_validate = gains._left_response_p_request
+    seen = []
+    def validate(request, source_head):
+        assert not list(state.iterdir())
+        seen.append(dict(request))
+        if not supported:
+            raise ValueError("Installed startup allowance unavailable")
+        return native_validate(request, source_head)
+    monkeypatch.setattr(gains, "_left_response_p_request", validate)
+    monkeypatch.setattr(m.ProtectedHostRun, "start", lambda *a, **k: pytest.fail("no Start"))
+    monkeypatch.setattr(m, "OwnedUnit", lambda *a, **k: pytest.fail("no device process"))
+    if not supported:
+        with pytest.raises(ValueError, match="Installed startup"):
+            m.prepare_left_response_p_request(str(path), workspace_profile="left-current-rest-1051-1164",
+                                             left_shoulder_startup_degrees=1)
+        assert len(seen) == 1 and not list(state.iterdir())
+        return
+    result = m.prepare_left_response_p_request(str(path), workspace_profile="left-current-rest-1051-1164",
+                                              left_shoulder_startup_degrees=1)
+    assert result["request"] == seen[0]
+    assert result["request"]["left_shoulder_startup_degrees"] == 1
+    assert gains._right_p20_file(Path(result["path"]))[0] == result["request"]
+    assert result["hardware_started"] is False
+    assert not list(state.glob("*-used-*")) and not list(state.glob(".*.tmp"))
+
+
+@pytest.mark.parametrize("degrees,profile", [(True, "left-current-rest-1051-1164"),
+    (False, "left-current-rest-1051-1164"), (.5, "left-current-rest-1051-1164"),
+    (1.000001, "left-current-rest-1051-1164"), (2, "left-current-rest-1051-1164"),
+    ("1", "left-current-rest-1051-1164"), (float("nan"), "left-current-rest-1051-1164"),
+    (float("inf"), "left-current-rest-1051-1164"), (1, None)])
+def test_left_shoulder_startup_preparation_rejects_free_bounds_and_missing_profile(tmp_path, monkeypatch, degrees, profile):
+    from pathlib import Path
+    m = module()
+    path, config, _, _ = request_preparation_config(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="startup"):
+        m.prepare_left_response_p_request(str(path), workspace_profile=profile,
+                                         left_shoulder_startup_degrees=degrees)
+    assert not list(Path(config["physical_state_directory"]).iterdir())
+
+
+def test_left_shoulder_startup_cli_relays_exact_opt_in_and_canonical_request(tmp_path, monkeypatch, capsys):
+    import io
+    import json
+    import shlex
+    import subprocess
+    import sys
+    from contextlib import redirect_stdout
+    m = module()
+    path, config, _, _ = request_preparation_config(tmp_path, monkeypatch)
+    native_config = "/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/7438c74662d59a02/physical.json"
+    calls = []
+    def remote(args, **options):
+        calls.append(args)
+        assert shlex.split(args[7]) == ["/home/pickmanmike/lerobot_alohamini/.venv/bin/python", "-B", "-",
+                                       native_config, "120", "left-current-rest-1051-1164", "1"]
+        assert options["shell"] is False
+        output = io.StringIO()
+        with monkeypatch.context() as context, redirect_stdout(output):
+            context.setattr(sys, "argv", ["-", str(path), "120", "left-current-rest-1051-1164", "1"])
+            context.delattr(m, "prepare_left_response_p_request")
+            exec(compile(options["input"], "<fixed-preparation-relay>", "exec"), {})
+        return SimpleNamespace(stdout=output.getvalue(), stderr="", returncode=0)
+    monkeypatch.setattr(subprocess, "run", remote)
+    assert m.main(["--prepare-left-response-p", "--ssh", "am1-pi", "--config", native_config,
+                   "--left-response-workspace", "current-rest", "--left-shoulder-startup-degrees", "1"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["request"]["left_shoulder_startup_degrees"] == 1
+    assert result["request"]["workspace_profile"] == "left-current-rest-1051-1164"
+    assert result["request"]["source_head"] == config["host_head"]
+    assert result["hardware_started"] is False and len(calls) == 1
+
+
+@pytest.mark.parametrize("extra", [["--left-shoulder-startup-degrees", "1"],
+    ["--left-response-workspace", "current-rest", "--left-shoulder-startup-degrees", "0.5"],
+    ["--left-response-workspace", "current-rest", "--left-shoulder-startup-degrees", "2"]])
+def test_left_shoulder_startup_cli_refuses_missing_profile_or_free_bound_before_ssh(monkeypatch, extra):
+    import subprocess
+    m = module()
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("no SSH for unsupported startup allowance"))
+    with pytest.raises(SystemExit):
+        m.main(["--prepare-left-response-p", "--ssh", "am1-pi", "--config",
+                "/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/7438c74662d59a02/physical.json", *extra])
+
+@pytest.fixture
+def readiness_gate_case(tmp_path, monkeypatch):
+    """Run the real startup gate with file replay and inert unit/client boundaries."""
+    from pathlib import Path
+    from lerobot.robots.alohamini import alohamini_client
+    from examples.alohamini.am1_session_contract import RECIPES
+    m = module()
+    _, config, _, _ = request_preparation_config(tmp_path, monkeypatch)
+    provider = m.ProtectedHostRun(config)
+    monkeypatch.setattr(provider, "_validate_source", lambda: None)
+    provider.observation = SimpleNamespace(evidence=lambda: {"qualified": True})
+    state = SimpleNamespace(now=0.0, deadline=.6, steps=0, initial_log=b"", append=b"",
+                            socket_at_start=False, socket_step=1, fault=None, fault_step=1,
+                            clients=[], reads=[], host=None, camera=None, provider=provider)
+    run_id="28122793-8395-4d47-9491-29a6cfc00d9a"
+    incarnation="751e9680-ce4c-40fd-a4e5-cf2b61ae8160"
+    run_directory=Path(config["run_root"]) / run_id[:8]
+    logpath=run_directory / "host-runtime.log"
+    socketpath=run_directory / "observation.sock"
+    original_open=Path.open
+
+    class Reader:
+        def __init__(self, stream):
+            self.stream=stream
+        def __enter__(self):
+            self.stream.__enter__()
+            return self
+        def __exit__(self, *args):
+            return self.stream.__exit__(*args)
+        def seek(self, *args):
+            return self.stream.seek(*args)
+        def read(self, size=-1):
+            state.reads.append((self.stream.tell(), size))
+            return self.stream.read(size)
+
+    def opened(path, mode="r", *args, **kwargs):
+        stream=original_open(path, mode, *args, **kwargs)
+        return Reader(stream) if path == logpath and mode == "rb" else stream
+    monkeypatch.setattr(Path, "open", opened)
+
+    def unit(name, *args, **kwargs):
+        result=SimpleNamespace(returncode=None)
+        result.poll=lambda: result.returncode
+        if "-host-" in name:
+            state.host=result
+            logpath.write_bytes(state.initial_log)
+            if state.socket_at_start:
+                socketpath.touch()
+        else:
+            state.camera=result
+        return result
+    monkeypatch.setattr(m, "OwnedUnit", unit)
+
+    class Client:
+        def __init__(self, config):
+            self.connected=False
+            state.clients.append(self)
+        def connect(self, *, cancel_check):
+            cancel_check()
+            self.connected=True
+    monkeypatch.setattr(alohamini_client, "AlohaMiniClient", Client)
+
+    def cancel():
+        if state.fault == "stop" and state.steps >= state.fault_step:
+            raise m.StartupCancelledError("physical startup cancelled by Stop")
+        if state.now >= state.deadline:
+            raise RuntimeError("physical startup deadline expired")
+
+    def sleep(seconds):
+        assert seconds == .05
+        state.steps += 1
+        state.now += seconds
+        if state.steps == 1 and state.append:
+            with original_open(logpath, "ab") as stream:
+                stream.write(state.append)
+        if state.steps == state.socket_step:
+            socketpath.touch()
+        if state.steps == state.fault_step and state.fault in {"host", "camera"}:
+            getattr(state, state.fault).returncode=1
+    monkeypatch.setattr(m.time, "sleep", sleep)
+    state.start=lambda: provider.start(run_id, incarnation, RECIPES["physical-live-teleop"], cancel)
+    state.logpath, state.socketpath = logpath, socketpath
+    try:
+        yield state
+    finally:
+        for stream in (provider.host_log, provider.camera_log):
+            if stream is not None:
+                stream.close()
+
+
+def test_readiness_gate_replays_actual118_output_burst_before_socket(readiness_gate_case):
+    case=readiness_gate_case
+    ready=b'[LIFT OPERATIONAL] {"phase":"operational_ready"}'
+    # Actual118: ready line ends at203637; receipts end at266824. The first
+    # routine lift record then removes readiness from the previous64k tail.
+    case.initial_log=b"x" * 203225 + ready + b" " * (412-len(ready)-1) + b"\n" + b"s" * 63187
+    case.append=b"c" * 94 + b"l" * 1364
+    assert len(case.initial_log) == 266824
+    assert b'"operational_ready"' not in (case.initial_log+case.append)[-64000:]
+    case.start()
+    assert len(case.clients) == 1 and case.clients[0].connected
+    assert case.reads[0][0] == 0
+    assert all(0 < size <= 64000 for _, size in case.reads)
+    assert [at for at, _ in case.reads] == sorted(set(at for at, _ in case.reads))
+
+
+def test_readiness_gate_latches_marker_while_its_socket_is_absent(readiness_gate_case):
+    case=readiness_gate_case
+    case.initial_log=b'[LIFT OPERATIONAL] {"phase":"operational_ready"}\n'
+    case.append=b"l" * 128000
+    case.socket_step=3
+    case.start()
+    assert case.steps == 3 and case.clients[0].connected
+    assert len(case.reads) == 1, "latched readiness must not depend on later output volume"
+
+
+def test_readiness_gate_matches_marker_split_across_bounded_reads(readiness_gate_case):
+    case=readiness_gate_case
+    case.initial_log=b"x" * 63991 + b'"operational_ready"' + b"\n"
+    case.socket_at_start=True
+    case.start()
+    assert case.clients[0].connected
+    assert case.reads == [(0, 64000), (64000, 64000)]
+
+
+@pytest.mark.parametrize("fault,pattern", [("stop", "cancelled by Stop"),
+    ("deadline", "startup deadline expired"), ("host", "host exited during startup"),
+    ("camera", "camera exited during startup")])
+def test_readiness_gate_retains_stop_deadline_and_owned_exit_fences(readiness_gate_case, fault, pattern):
+    case=readiness_gate_case
+    case.initial_log=b'[LIFT OPERATIONAL] {"phase":"operational_ready"}\n'
+    case.socket_step=1
+    case.fault=fault
+    if fault == "deadline":
+        case.deadline=.05
+    with pytest.raises(RuntimeError, match=pattern):
+        case.start()
+    assert case.clients == []
+
+
+def test_readiness_gate_socket_or_other_run_marker_cannot_supply_readiness(readiness_gate_case, tmp_path):
+    case=readiness_gate_case
+    other=tmp_path / "other-run"
+    other.mkdir()
+    (other / "host-runtime.log").write_bytes(b'"operational_ready"')
+    case.initial_log=b'"phase":"live"\n' * 5000
+    case.socket_at_start=True
+    with pytest.raises(RuntimeError, match="startup deadline expired"):
+        case.start()
+    assert not case.clients
+    assert all(0 < size <= 64000 for _, size in case.reads)
+
+def test_readiness_gate_matches_marker_split_across_writer_polls(readiness_gate_case):
+    case = readiness_gate_case
+    case.initial_log = b'[LIFT OPERATIONAL] {"phase":"operational_'
+    case.append = b'ready"}\n'
+    case.start()
+    assert case.clients[0].connected
+    assert case.reads == [(0, 64000), (len(case.initial_log), 64000)]
+
+
+@pytest.mark.parametrize("fault", ["stop", "deadline"])
+def test_readiness_gate_rechecks_cancellation_after_socket_before_client(readiness_gate_case, monkeypatch, fault):
+    from pathlib import Path
+    case = readiness_gate_case
+    case.initial_log = b'[LIFT OPERATIONAL] {"phase":"operational_ready"}\n'
+    case.socket_at_start = True
+    exists = Path.exists
+    def cancellation_at_socket(path):
+        present = exists(path)
+        if path == case.socketpath and present:
+            if fault == "stop":
+                case.fault, case.fault_step = "stop", 0
+            else:
+                case.deadline = 0
+        return present
+    monkeypatch.setattr(Path, "exists", cancellation_at_socket)
+    with pytest.raises(RuntimeError, match="cancelled by Stop" if fault == "stop" else "startup deadline expired"):
+        case.start()
+    assert not case.clients

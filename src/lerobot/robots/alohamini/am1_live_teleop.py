@@ -990,9 +990,49 @@ def response_receipt(robot):
     return left_response_receipt(robot) or right_response_receipt(robot)
 
 
+def _current_rest_shoulder_reference(robot, control, workspace, receipt, *, goals=None):
+    """Freeze the original admitted literal Goal; later Pause/cursor values cannot renew it."""
+    trial = getattr(robot, "_am1_left_response_p_trial", None)
+    request = {} if trial is None else trial.binding["request"]
+    degrees = request.get("left_shoulder_startup_degrees")
+    enabled = (receipt is not None and receipt["kind"] == "left-response-p"
+               and receipt["configured_p"] == 32 and receipt["workload_segment"] == "left-reach"
+               and request.get("workspace_profile") == workspace.get("workspace_profile") == "left-current-rest-1051-1164"
+               and type(degrees) in (int, float) and degrees == 1)
+    anchor = getattr(control, "_teleop_original_shoulder_goal", None)
+    if not enabled and anchor is None:
+        return None
+    name = "arm_left_shoulder_lift"
+    calibration = robot._am1_activation_calibration(robot.left_bus, name)
+    if (not enabled or getattr(robot, "_am1_shutdown_in_progress", False) is True
+            or calibration != (2, 0, 515, 848, 3223)
+            or tuple(workspace["calibration"][name]) != calibration
+            or robot.left_bus.motors[name].id != 2 or robot.left_bus.motors[name].model != "sts3215"
+            or robot._am1_teleop_binding != {**control.binding, "recipe": RECIPE}):
+        raise RuntimeError("AM1 current-rest original shoulder hold binding/calibration changed or Stop prevailed")
+    binding = tuple(sorted(control.binding.items()))
+    authority = json.dumps(trial.binding, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    if anchor is None:
+        if goals is None:
+            raise RuntimeError("AM1 current-rest original shoulder hold acquisition is unavailable")
+        raw = goals["left"]["registers"]["Goal_Position"][name]
+        if type(raw) is not int or not calibration[3] <= raw <= calibration[4]:
+            raise RuntimeError("AM1 current-rest original shoulder hold Goal is outside unchanged calibration")
+        anchor = control._teleop_original_shoulder_goal = (
+            trial, robot.left_bus, binding, calibration, raw, authority)
+    if (anchor[0] is not trial or anchor[1] is not robot.left_bus or anchor[2] != binding
+            or anchor[3] != calibration or anchor[5] != authority):
+        raise RuntimeError("AM1 current-rest original shoulder hold owner/request changed")
+    from examples.alohamini.am1_live_teleop import normalized_raw
+
+    return normalized_raw(anchor[4], calibration)
+
+
 def _left_response_target_valid(robot, control, sample):
     receipt = response_receipt(robot)
     if receipt is None:
+        if getattr(control, "_teleop_original_shoulder_goal", None) is not None:
+            raise RuntimeError("AM1 current-rest original shoulder hold response authority disappeared")
         return True
     from examples.alohamini.am1_live_teleop import ZERO_BODY
 
@@ -1001,6 +1041,7 @@ def _left_response_target_valid(robot, control, sample):
     if set(sample["body"]) != set(ZERO_BODY) or any(sample["body"][key] != 0 for key in ZERO_BODY):
         return False
     workspace = control._live_summary["workspace"]
+    shoulder_reference = _current_rest_shoulder_reference(robot, control, workspace, receipt)
     side = "left" if receipt["kind"] == "left-response-p" else "right"
     allowed = {"arm_" + side + "_elbow_flex.pos"}
     if receipt["workload_segment"] == "left-reach":
@@ -1009,6 +1050,8 @@ def _left_response_target_valid(robot, control, sample):
         if key in allowed:
             continue
         cal = workspace["calibration"][key.removesuffix(".pos")]
+        if key == "arm_left_shoulder_lift.pos" and shoulder_reference is not None:
+            reference = shoulder_reference
         tick = (100 if key.endswith("_gripper.pos") else 200) / (cal[4] - cal[3])
         if abs(sample["target"][key] - reference) > tick + 1e-9:
             return False
@@ -1043,9 +1086,9 @@ def verify_settings(robot):
 def qualify_rest(robot, bus, name, calibration, *, phase, present_raw):
     """Acquire the supported shoulder rest without widening its command range.
 
-    The half-degree limit bounds the initial inward command displacement. It is
-    an operating bound, not an encoder-accuracy or mechanical-clearance claim.
-    Other joints and the historical diagnostic endpoint path keep their rules.
+    The ordinary half-degree initial inward bound may be explicitly selected as
+    one degree by the retained current-rest action request. This operating bound
+    does not change legal goals, calibration, health checks or other joint roles.
     """
     def refuse(reason):
         raise RuntimeError("AM1 arm activation refused: normal-rest " + reason)
@@ -1061,6 +1104,23 @@ def qualify_rest(robot, bus, name, calibration, *, phase, present_raw):
     ):
         refuse("protected role/mapping/calibration differs")
     binding = copy.deepcopy(robot._am1_teleop_binding)
+    trial = robot._am1_current_rest_activation_trial()
+    bound_degrees = 0.5 if trial is None else trial.normal_rest_startup_degrees(robot)
+    allowance_request = None if trial is None else {
+        "request_id": trial.binding["request"]["request_id"],
+        "request_sha256": trial.binding["request_sha256"],
+    }
+
+    def check_allowance():
+        current = robot._am1_current_rest_activation_trial()
+        if (current is not trial
+                or (0.5 if current is None else current.normal_rest_startup_degrees(robot)) != bound_degrees
+                or current is not None and {
+                    "request_id": current.binding["request"]["request_id"],
+                    "request_sha256": current.binding["request_sha256"],
+                } != allowance_request):
+            refuse("startup allowance authority changed")
+
     baseline = robot._am1_teleop_settings["left"]["registers"]
     expected = {register: baseline[register][name] for register in STATIC}
     started = time.monotonic()
@@ -1069,7 +1129,8 @@ def qualify_rest(robot, bus, name, calibration, *, phase, present_raw):
         "phase": phase,
         "binding": binding,
         "calibration": list(calibration),
-        "operating_displacement_bound_degrees": 0.5,
+        "operating_displacement_bound_degrees": bound_degrees,
+        "startup_allowance_request": copy.deepcopy(allowance_request),
         "initial_measured_raw": present_raw,
         "qualified": False,
         "samples": [],
@@ -1079,17 +1140,20 @@ def qualify_rest(robot, bus, name, calibration, *, phase, present_raw):
     robot._am1_teleop_rest_evidence.append(proof)
 
     def read(register):
+        check_allowance()
         refresh_startup_temperatures(robot)
         began = time.monotonic()
         if not started <= began < deadline:
             refuse("acquisition deadline expired")
         value = robot._read_am1_activation_raw(bus, register, name, phase="normal_rest_" + phase, num_retry=0)
         ended = time.monotonic()
+        check_allowance()
         if not began <= ended <= began + 0.04 or ended >= deadline:
             refuse("register read exceeded its original40ms budget")
         return value
 
     def seed_for(raw):
+        check_allowance()
         if raw < calibration[3]:
             refuse("lower endpoint is outside the supported rest role")
         seed = max(calibration[3], min(calibration[4], raw))
@@ -1100,9 +1164,9 @@ def qualify_rest(robot, bus, name, calibration, *, phase, present_raw):
             or not math.isfinite(cap)
             or cap <= 0
             or displacement > math.floor(cap * (calibration[4] - calibration[3]) / 200)
-            or displacement > math.floor(0.5 * bus.model_resolution_table["sts3215"] / 360)
+            or displacement > math.floor(bound_degrees * bus.model_resolution_table["sts3215"] / 360)
         ):
-            refuse("rest-to-legal-seed displacement exceeds the half-degree or measured-error bound")
+            refuse("rest-to-legal-seed displacement exceeds the selected operating or measured-error bound")
         return seed
 
     try:
@@ -1111,6 +1175,8 @@ def qualify_rest(robot, bus, name, calibration, *, phase, present_raw):
             and entry["qualified"]
             and entry["binding"] == binding
             and tuple(entry["calibration"]) == calibration
+            and entry["operating_displacement_bound_degrees"] == bound_degrees
+            and entry.get("startup_allowance_request") == allowance_request
             for entry in robot._am1_teleop_rest_evidence
         ):
             refuse("post-home endpoint needs its original before-home qualification")
@@ -1365,6 +1431,17 @@ def workspace(robot, identity, measured, *, goals=None):
     if set(TELEOP_ARM_KEYS) - set(measured):
         raise RuntimeError("AM1 teleop complete actual feedback is unavailable")
     result = {"version": 1, "units": {}, "bounds": {}, "reference": {}, "calibration": {}, "raw_bounds": {}}
+    receipt = response_receipt(robot)
+    profile = None
+    if receipt is not None:
+        side = "left" if receipt["kind"] == "left-response-p" else "right"
+        trial = getattr(robot, "_am1_" + side + "_response_p_trial")
+        profile = trial.binding["request"].get("workspace_profile")
+        if profile is not None:
+            if (side != "left" or profile != "left-current-rest-1051-1164"
+                    or receipt["configured_p"] != 32 or receipt["workload_segment"] != "left-reach"):
+                raise RuntimeError("AM1 current-rest workspace requires its exact active left trial")
+            result["workspace_profile"] = profile
     if goals is None:
         goals = read_groups(robot, ("Goal_Position",))
     for side, bus, names in _groups(robot):
@@ -1380,7 +1457,7 @@ def workspace(robot, identity, measured, *, goals=None):
             if type(q0) not in (int, float) or not math.isfinite(q0):
                 raise RuntimeError("AM1 teleop actual resting pose is invalid")
             if name.endswith("_elbow_flex"):
-                low, high = (2011, 2124) if side == "left" else (1847, 1960)
+                low, high = ((1051, 1164) if profile is not None else (2011, 2124)) if side == "left" else (1847, 1960)
                 if not low <= seed <= high:
                     raise RuntimeError("AM1 teleop actual elbow rest is outside supported bench workspace")
             else:
@@ -1530,6 +1607,8 @@ def apply_frame(control, robot, command, marker_key):
         if "workspace" not in control._live_summary:
             control._live_summary["workspace"] = workspace(robot, control.binding, measured, goals=goals)
             control._live_summary["reference"] = dict(control._live_summary["workspace"]["reference"])
+            _current_rest_shoulder_reference(robot, control, control._live_summary["workspace"],
+                                            response_receipt(robot), goals=goals)
         if marker["live_admitted"] and "live_admitted_at_monotonic_s" not in control._live_summary:
             now = control.clock()
             control._live_summary.update(

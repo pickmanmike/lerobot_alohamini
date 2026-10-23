@@ -128,3 +128,43 @@ def test_workspace_cannot_expand_physical_travel_or_rate_when_roundtrip_is_valid
         w["bounds"][key]["max"] += 0.1 if mutation == "elbow" else 10
     with pytest.raises(ValueError):
         m.validate_workspace(w)
+
+
+@pytest.mark.parametrize("bad", [None, "absent_profile", "unknown_profile", "wrong_left", "wrong_right", "extra", "span", "rate", "calibration", "reference"])
+def test_current_rest_workspace_only_admits_approved_exact_opt_in_geometry(bad):
+    m, value = contract(), workspace()
+    key = "arm_left_elbow_flex.pos"
+    value["workspace_profile"] = "left-current-rest-1051-1164"
+    value["calibration"][key.removesuffix(".pos")] = [3, 0, 1845, 864, 3073]
+    value["raw_bounds"][key] = [1051, 1164]
+    endpoints = [m.normalized_raw(raw, value["calibration"][key.removesuffix(".pos")]) for raw in (1051, 1164)]
+    value["bounds"][key].update(min=endpoints[0], max=endpoints[1])
+    value["reference"][key] = m.normalized_raw(1090, value["calibration"][key.removesuffix(".pos")])
+    if bad == "absent_profile":
+        value.pop("workspace_profile")
+    elif bad == "unknown_profile":
+        value["workspace_profile"] = "left-current-rest-1000-1200"
+    elif bad == "wrong_left":
+        value["raw_bounds"][key][0] -= 1
+    elif bad == "wrong_right":
+        value["raw_bounds"]["arm_right_elbow_flex.pos"] = [1051, 1164]
+    elif bad == "extra":
+        value["raw_goal"] = 1090
+    elif bad == "span":
+        value["raw_bounds"][key][1] += 1
+    elif bad == "rate":
+        value["bounds"][key]["rate_per_s"] = 99
+    elif bad == "calibration":
+        value["calibration"][key.removesuffix(".pos")][2] += 1
+    elif bad == "reference":
+        value["reference"][key] = endpoints[1] + .1
+    if bad:
+        with pytest.raises(ValueError):
+            m.validate_workspace(value)
+    else:
+        assert m.validate_workspace(value) == value
+        target = dict(value["reference"])
+        target[key] = endpoints[1]
+        assert m.validate_target(target, workspace=value) == target
+        with pytest.raises(ValueError):
+            m.validate_target(dict(target, **{key: endpoints[1] + .1}), workspace=value)

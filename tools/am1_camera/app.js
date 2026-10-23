@@ -282,10 +282,13 @@ function render() {
   diagnostics.textContent = `Status request ${Math.round(timing.status_ms)} ms (max ${Math.round(timing.status_max_ms)} ms); failures ${timing.status_failures}\n` +
     `Decode failures ${timing.decode_failures}; stream cancellations ${timing.cancellations}; last ${timing.last_cancel}\n` +
     roles.map(role => { const p = progress.get(role); return `${labels[role]} primary: received ${p.received}, displayed ${p.displayed}, seq ${p.sequence}; max receive/display gap ${Math.round(p.receive_max_gap_ms)}/${Math.round(p.display_max_gap_ms)} ms`; }).join("\n");
+  const attempt=webView?.diagnostics?.();
+  if(attempt)diagnostics.textContent+="\nWebRTC attempt diagnostics (observational): "+JSON.stringify(attempt);
 }
 async function statusLoop() {
   const start = performance.now();
   const request = ++statusRequest;
+  const requestedBinding = webView?.binding;
   try {
     const response = await fetch(cameraURL("status.json"), {cache:"no-store", signal:AbortSignal.timeout(1500)});
     if (!response.ok) throw new Error("Status unavailable");
@@ -301,7 +304,7 @@ async function statusLoop() {
         if (Number.isSafeInteger(source?.sequence)) sourceSequences.set(role, source.sequence);
         sourceStates.set(role, state);
       }
-      if (webView?.binding && next.video?.role && !webView.connecting &&
+      if (webView?.binding && webView.binding === requestedBinding && next.video?.role && !webView.connecting &&
           next.video.encode_generation !== webView.binding.encode_generation) {
         stopPrimary("shared-primary-generation-changed");
         if(roles.includes(next.video.role))selected=next.video.role;

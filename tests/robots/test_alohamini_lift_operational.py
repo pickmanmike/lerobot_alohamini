@@ -1688,6 +1688,122 @@ def test_cleanup_cannot_relabel_new_sustained_heat_as_clean_success(operating_ro
     assert robot.left_bus.registers[("Torque_Enable", "lift_axis")] == 0
 
 
+def test_cleanup123_exact_forward_gap_needs_five_new_occupied_slots():
+    from lerobot.robots.alohamini.lift_operational import TemperatureWindow
+
+    window = TemperatureWindow()
+    old = [596036.255327495, 596036.378354038, 596036.493367454, 596036.580383924, 596036.667142913]
+    for stamp in old:
+        window.update(33, stamp)
+    origin = window._origin_ns
+    assert window.ready
+    first = 596037.782446889
+    assert first-old[-1] == pytest.approx(1.115303976, abs=1e-9)
+    for index in range(5):
+        window.update(33, first+index*.101, expire_old_slots=True)
+        assert len(window.samples) == index+1
+        assert window.ready is (index == 4)
+    assert window._origin_ns == origin and window.outliers == 0
+    assert all(stamp >= first for stamp, _ in window.samples)
+
+
+@pytest.mark.parametrize("cleanup,gap,refused", [(False, .5, False), (False, .500000001, True),
+                                               (True, .499999999, False), (True, .5, False),
+                                               (True, .500000001, False), (True, 1.115303976, False)])
+def test_cleanup123_forward_gap_boundary_preserves_powered_raw_age(cleanup, gap, refused):
+    from lerobot.robots.alohamini.lift_motor_feedback import ComparisonRefusal
+    from lerobot.robots.alohamini.lift_operational import TemperatureWindow
+
+    window = TemperatureWindow()
+    window.update(33, 1000.)
+    if refused:
+        with pytest.raises(ComparisonRefusal, match="timestamp"):
+            window.update(33, 1000.+gap, expire_old_slots=cleanup)
+    else:
+        window.update(33, 1000.+gap, expire_old_slots=cleanup)
+        assert not window.ready  # A new receipt cannot create five genuine slots.
+
+
+@pytest.mark.parametrize("fault", ["repeated", "backward", "nan", "infinite", "invalid_temperature", "latched"])
+def test_cleanup123_slot_expiry_never_accepts_invalid_or_latched_feedback(fault):
+    from lerobot.robots.alohamini.lift_motor_feedback import ComparisonRefusal
+    from lerobot.robots.alohamini.lift_operational import TemperatureWindow
+
+    window = TemperatureWindow()
+    for index in range(5):
+        window.update(33, index*.1)
+    before = list(window.samples)
+    if fault == "latched":
+        with pytest.raises(ComparisonRefusal) as first:
+            window.refuse("retained genuine failure")
+    stamp = {"repeated": .4, "backward": .39, "nan": float("nan"), "infinite": float("inf")}.get(fault, 1.5)
+    with pytest.raises(ComparisonRefusal) as caught:
+        window.update(256 if fault == "invalid_temperature" else 33, stamp, expire_old_slots=True)
+    assert list(window.samples) == before
+    if fault == "latched":
+        assert caught.value is first.value
+
+
+def test_cleanup123_unexpired_peak_counter_and_original_slot_anchor_are_retained():
+    from lerobot.robots.alohamini.lift_operational import TemperatureWindow
+
+    window = TemperatureWindow()
+    for index in range(5):
+        window.update(60 if index == 4 else 33, index*.1)
+    origin = window._origin_ns
+    window.update(33, .45, expire_old_slots=True)
+    assert window.samples[-1] == (.4, 60) and window.outliers == 1
+    window.update(33, .50001, expire_old_slots=True)
+    assert (.4, 60) in window.samples and window.outliers == 1 and window._origin_ns == origin
+
+
+def test_cleanup123_real_off_collection_refills_after_exact_gap_without_resetting_live_history(operating_robot, capsys):
+    robot, clock = operating_robot
+    robot.connect(calibrate=False)
+    operation = robot._lift_operation
+    original = (list(operation.temperature.samples), operation.temperature._origin_ns,
+                operation.temperature._last_sample_at, operation.temperature.outliers)
+    capsys.readouterr()
+    clock.now = original[2]+1.115303976-.002  # Existing grouped fixture acquisition consumes2ms.
+    robot.disconnect()
+    records = [r for r in operational_records(capsys) if r["phase"] == "cleanup_readback"]
+    assert records[0]["sample_monotonic_s"]-original[2] == pytest.approx(1.115303976, abs=1e-9)
+    assert records[0]["temperature_window"]["count"] == 1 and not records[0]["temperature_window"]["ready"]
+    assert records[-1]["temperature_window"]["count"] == 5 and records[-1]["temperature_window"]["ready"]
+    slots = {round((r["sample_monotonic_s"]*1e9)-original[1])//100_000_000 for r in records}
+    assert len(slots) >= 5 and records[-1]["sample_monotonic_s"]-records[0]["sample_monotonic_s"] <= 1.
+    assert all(r["torque_enable"] == r["goal_velocity_raw"] == r["status"] == 0 for r in records)
+    assert original == (list(operation.temperature.samples), operation.temperature._origin_ns,
+                        operation.temperature._last_sample_at, operation.temperature.outliers)
+    assert not robot.left_bus.is_connected
+
+
+@pytest.mark.parametrize("register,value", [("Torque_Enable", 1), ("Goal_Velocity", 1), ("Status", 4),
+                                          ("Present_Temperature", OSError("actual grouped failure"))])
+def test_cleanup123_forward_gap_cannot_bypass_off_zero_status_or_transport(operating_robot, register, value):
+    robot, clock = operating_robot
+    robot.connect(calibrate=False)
+    clock.sleep(1.115303976)
+    robot.left_bus.read_sequences[(register, "lift_axis")] = [value]
+    with pytest.raises(RuntimeError, match="cleanup issues"):
+        robot.disconnect()
+    assert not robot.left_bus.is_connected
+
+
+def test_cleanup123_refilled_hot_slots_still_latch_the_original_role_ceiling(operating_robot, capsys):
+    robot, clock = operating_robot
+    robot.connect(calibrate=False)
+    capsys.readouterr()
+    clock.sleep(1.115303976)
+    robot.left_bus.read_sequences[("Present_Temperature", "lift_axis")] = [60]*20
+    with pytest.raises(RuntimeError, match=r"majority \(3/5 time slots\).*55 C"):
+        robot.disconnect()
+    rejected = [r for r in operational_records(capsys) if r.get("rejected")]
+    assert len(rejected) == 1 and len(rejected[0]["temperature_history"]) == 5
+    assert all(value == 60 for _, value in rejected[0]["temperature_history"])
+    assert not robot.left_bus.is_connected
+
+
 @pytest.mark.parametrize("register,value,reason", [
     ("Status", 4, "status"),
     ("Present_Voltage", 10, "voltage"),

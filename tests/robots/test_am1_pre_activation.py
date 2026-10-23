@@ -586,3 +586,140 @@ def test_protected_endpoint_rejects_negative_unsigned_current(activation, monkey
     robot.left_bus.registers["Present_Current", "arm_left_shoulder_lift"] = -1
     with pytest.raises(RuntimeError):robot.activate_motors(home_lift=False)
     assert not energizing(activation.events) and not goals(activation.events)
+
+
+def current_rest_normal_activation_case(case, tmp_path, monkeypatch):
+    """Real protected transaction/activation; replace only external register I/O."""
+    import copy
+
+    from test_am1_elbow_integral import CURRENT_REST_PROFILE, ELBOW, left_response_p_robot
+
+    from lerobot.robots.alohamini import am1_live_teleop
+
+    _, bound, trial, _, _, _ = left_response_p_robot(
+        tmp_path, monkeypatch, workspace_profile=CURRENT_REST_PROFILE
+    )
+    robot = case.robot
+    robot.config.no_follower = False
+    robot._am1_protected_cleanup = True
+    robot._am1_selected_joint_evidence_enabled = False
+    robot._am1_teleop_binding = copy.deepcopy(bound._am1_teleop_binding)
+    robot._am1_left_response_p_binding = copy.deepcopy(bound._am1_left_response_p_binding)
+    robot._am1_left_response_p_trial = trial
+    robot._am1_teleop_settings = copy.deepcopy(bound._am1_teleop_settings)
+    robot.left_bus.calibration[ELBOW] = copy.deepcopy(bound.left_bus.calibration[ELBOW])
+    robot.left_bus.registers.update({key: value for key, value in bound.left_bus.values.items() if key[1] == ELBOW})
+    robot.left_bus._read = bound.left_bus._read
+    bound._am1_left_response_p_trial = None
+    # Dedicated real thermal/settings fixtures retain those acquisition tests;
+    # this fixture runs the actual ordinary arm-calibration/seed/activation code.
+    monkeypatch.setattr(am1_live_teleop, "refresh_startup_temperatures", lambda source: None)
+    monkeypatch.setattr(am1_live_teleop, "verify_settings", lambda source: None)
+    trial.prepare(robot)
+    trial.disable_torque(robot)
+    trial.apply(robot)
+    robot.left_bus.registers["Goal_Position", ELBOW] = 2050
+    case.events.clear()
+
+    def observed_goal_transition(register, name, value):
+        if register == "Goal_Position":
+            robot.left_bus.registers["Torque_Enable", name] = 1
+    robot.left_bus.on_write = observed_goal_transition
+    robot.right_bus.on_write = lambda register, name, value: (
+        robot.right_bus.registers.__setitem__(("Torque_Enable", name), 1)
+        if register == "Goal_Position" else None
+    )
+    return robot, trial, ELBOW
+
+
+def test_current_rest_normal_activation_uses_fresh_afterhome_q0_and_never_replays_original_goal(
+    activation, tmp_path, monkeypatch
+):
+    case = activation
+    robot, trial, elbow = current_rest_normal_activation_case(case, tmp_path, monkeypatch)
+    def after_home(source):
+        source.left_bus.registers["Present_Position", elbow] = 1091
+        case.clock.now += 0.25
+    case.home_change = after_home
+    robot.activate_motors()
+    selected = [row for row in goals(case.events) if row[3] == elbow]
+    assert len(selected) == 1 and selected[0][4] == 1091
+    assert len(goals(case.events)) == 12 and all(row[4] != 2050 for row in goals(case.events))
+    assert all(row[4] == getattr(robot, row[1] + "_bus").registers["Present_Position", row[3]]
+               for row in goals(case.events) if row[3] != elbow)
+    evidence = trial.evidence["normal_activation"]
+    assert evidence["policy"] == "ordinary-fresh-measured-after-home"
+    assert evidence["position"] in robot._am1_activation_readbacks
+    assert evidence["position"]["phase"] == "after_home" and evidence["position"]["raw"] == 1091
+    assert evidence["torque_off"]["raw"] == 0 and evidence["torque_off"]["phase"] == "after_home"
+    assert evidence["goal_readback"] in robot._am1_activation_readbacks
+    assert evidence["goal_readback"]["phase"] == "seed_readback" and evidence["goal_readback"]["raw"] == 1091
+    assert evidence["goal_write"]["value"] == 1091
+    assert evidence["position"]["read_completed_at"] <= evidence["goal_write"]["started_at_monotonic_s"]
+    assert evidence["goal_write"]["completed_at_monotonic_s"] <= evidence["goal_readback"]["read_started_at"]
+    assert trial.active_receipt(robot)["configured_p"] == 32
+    boundary = len(case.events)
+    robot._safe_shutdown(close_buses=True)
+    assert not goals(case.events[boundary:])
+    assert robot.left_bus.registers["Goal_Position", elbow] == 1091
+    assert robot.left_bus.registers["P_Coefficient", elbow] == 16
+    assert robot.left_bus.registers["Torque_Enable", elbow] == 0
+    assert robot.left_bus.registers["Lock", elbow] == 0 and not trial.restore_required
+
+
+@pytest.mark.parametrize("fault", ["outside", "stale", "binding", "stop"])
+def test_current_rest_normal_activation_refuses_current_corridor_or_authority_before_first_seed(
+    activation, tmp_path, monkeypatch, fault
+):
+    case = activation
+    robot, trial, elbow = current_rest_normal_activation_case(case, tmp_path, monkeypatch)
+    if fault == "outside":
+        case.home_change = lambda source: source.left_bus.registers.__setitem__(("Present_Position", elbow), 1165)
+    else:
+        def changed(register, name):
+            if case.home_calls and register == "Present_Position" and name == "arm_right_gripper":
+                if fault == "stale":
+                    case.clock.now += 1.0
+                elif fault == "binding":
+                    robot._am1_left_response_p_binding["host_incarnation"] = "99999999-9999-4999-8999-999999999999"
+                else:
+                    robot._am1_shutdown_in_progress = True
+        robot.right_bus.on_read = changed
+    with pytest.raises(RuntimeError, match="motor activation failed"):
+        robot.activate_motors()
+    assert not goals(case.events)
+    assert not [row for row in energizing(case.events) if row[3].startswith("arm_")]
+    assert robot.left_bus.registers["Torque_Enable", elbow] == 0
+    assert trial.evidence["original_registers"]["Goal_Position"] == 2050
+
+
+def test_current_rest_normal_activation_cannot_continue_seed_after_original_vector_expires(
+    activation, tmp_path, monkeypatch
+):
+    case = activation
+    robot, _, elbow = current_rest_normal_activation_case(case, tmp_path, monkeypatch)
+    ordinary = robot.left_bus.on_write
+    def delayed(register, name, value):
+        ordinary(register, name, value)
+        if register == "Goal_Position" and name == "arm_left_shoulder_lift":
+            case.clock.now += 1.0
+    robot.left_bus.on_write = delayed
+    with pytest.raises(RuntimeError, match="motor activation failed"):
+        robot.activate_motors()
+    assert [row[3] for row in goals(case.events)] == ["arm_left_shoulder_pan", "arm_left_shoulder_lift"]
+    assert not [row for row in goals(case.events) if row[3] == elbow]
+    assert robot.left_bus.registers["Torque_Enable", elbow] == 0
+
+
+def test_current_rest_normal_activation_seed_readback_failure_restores_p_without_stale_goal(
+    activation, tmp_path, monkeypatch
+):
+    case = activation
+    robot, trial, elbow = current_rest_normal_activation_case(case, tmp_path, monkeypatch)
+    robot.left_bus.readback_mismatch = ("Goal_Position", elbow)
+    with pytest.raises(RuntimeError, match="motor activation failed"):
+        robot.activate_motors()
+    assert not [row for row in goals(case.events) if row[4] == 2050]
+    assert robot.left_bus.registers["P_Coefficient", elbow] == 16
+    assert robot.left_bus.registers["Torque_Enable", elbow] == 0
+    assert robot.left_bus.registers["Lock", elbow] == 0 and not trial.restore_required

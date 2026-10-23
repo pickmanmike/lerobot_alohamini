@@ -93,7 +93,8 @@ class SelectedLeftWorkload:
     shoulder = "arm_left_shoulder_lift.pos"
     gripper = "arm_left_gripper.pos"
 
-    def __init__(self, workspace, *, segment="left-maintained", peer_side=None, peer_direction=None, peer_raw_step=None, peer_active_p=None):
+    def __init__(self, workspace, *, segment="left-maintained", peer_side=None, peer_direction=None, peer_raw_step=None, peer_active_p=None,
+                 command_reference=None):
         if segment not in self.DURATIONS:
             raise ValueError("Unknown selected left finite profile")
         self.segment, self.duration_s = segment, self.DURATIONS[segment]
@@ -105,9 +106,20 @@ class SelectedLeftWorkload:
             self.elbow = f"arm_{peer_side}_elbow_flex.pos"
             self.gripper = f"arm_{peer_side}_gripper.pos"
         self.workspace = validate_workspace(workspace)
-        # Refuse an unsupported nonselected pose instead of moving it into a
-        # different command corridor during an allegedly selected-only check.
-        self.origin = validate_target(self.workspace["reference"], workspace=self.workspace)
+        self.measured_reference = dict(self.workspace["reference"])
+        self.command_reference = command_reference is not None
+        # A measured resting pose can differ from its already qualified legal
+        # hold Goal. Keep that measurement immutable, and never substitute the
+        # actual selected q0 with a different command or a clamped measurement.
+        self.origin = validate_target(self.measured_reference if command_reference is None else command_reference,
+                                      workspace=self.workspace)
+        selected = {self.elbow}
+        if segment in {"left-reach", "left-supported-reach"}:
+            selected.add(self.gripper)
+        if segment == "left-supported-reach":
+            selected.add(self.shoulder)
+        self.origin.update({key: self.measured_reference[key] for key in selected})
+        validate_target(self.origin, workspace=self.workspace)
         bound = self.workspace["bounds"][self.elbow]
         self.endpoint = (bound["max"] if segment == "left-opposite-first" else
                          max((bound["min"], bound["max"]), key=lambda value: abs(value-self.origin[self.elbow])))
@@ -363,7 +375,7 @@ class SelectedLeftWorkload:
         bound, cal = self.workspace["bounds"][self.elbow], self.workspace["calibration"][self.elbow.removesuffix(".pos")]
         raw = min(self.workspace["raw_bounds"][self.elbow], key=lambda value: abs(normalized_raw(value, cal)-self.endpoint))
         result = {"segment": self.segment, "program_active_seconds": self.duration_s,
-                "reference": dict(self.origin), "endpoint_normalized": self.endpoint, "endpoint_raw_bound": raw,
+                "reference": dict(self.measured_reference), "endpoint_normalized": self.endpoint, "endpoint_raw_bound": raw,
                 "direction_normalized": 1 if self.endpoint > self.origin[self.elbow] else -1,
                 "travel_normalized": self.endpoint-self.origin[self.elbow], "rate_limit_per_s": bound["rate_per_s"],
                 "gripper_opening_delta": self.opening-self.origin[self.gripper],
@@ -371,6 +383,9 @@ class SelectedLeftWorkload:
                 "active_progress_s": self.elapsed_s, "interrupted_phases": sorted(self.interrupted_phases),
                 "dwell_basis": "producer active intent; native delivered dwell assessed separately",
                 "target_policy": "fixed original admitted references and supported endpoint across qualified recovery"}
+        if self.command_reference:
+            result["command_reference"] = dict(self.origin)
+            result["command_reference_basis"] = "current native qualified HOLD cursor; selected measured q0 unchanged"
         if self.peer:
             result.pop("endpoint_raw_bound")
             result.update(peer_side=self.peer["side"], direction_raw=self.peer["direction_raw"], raw_step=self.peer["raw_step"],
@@ -714,6 +729,21 @@ def recovery_grant_refusal(error):
             }.items()
         )
     )
+
+
+def selected_view_refusal(error):
+    identity = getattr(error, "identity", None)
+    keys = {"run_id", "service_incarnation", "controller_generation", "connection_generation",
+            "host_incarnation", "intent_revision"}
+    return (isinstance(error, CommandRefusedError) and getattr(error, "operation", None) in {"grant", "input"}
+            and isinstance(error.response, dict)
+            and isinstance(identity, dict) and set(identity) == keys
+            and type(identity["intent_revision"]) is int and identity["intent_revision"] >= 0
+            and all(type(identity[key]) is str and identity[key] for key in keys - {"intent_revision"})
+            and error.response.get("uncertain", False) is False
+            and all(type(error.response.get(key)) is type(value) and error.response[key] == value
+                    for key, value in {"accepted": False, "status": "refused", "effect_admitted": False,
+                                       "reason": "required selected view expired"}.items()))
 
 
 def _resume_send_failure(error, identity, operation_id, ws):
@@ -1711,6 +1741,48 @@ def _view_admitted(snapshot):
             (snapshot.get("run") or {}).get("bench_continuity") is True and view.get("required") is False)
 
 
+def _qualified_command_reference(client, workspace):
+    """Read a current HOLD origin as data; required view still gates Resume/input."""
+    state = client.snapshot or {}
+    run, evidence, live = state.get("run") or {}, state.get("evidence") or {}, _live(state)
+    ack, owner = evidence.get("accepted_host_action") or {}, state.get("controller") or {}
+    revision, stamp = run.get("intent_revision"), ack.get("acquired_at_monotonic_s")
+    start, deadline, remaining = (run.get(key) for key in ("native_live_at", "deadline", "remaining_s"))
+    event = _latest_run_event(state, {"run_id": run.get("run_id"),
+                                    "service_incarnation": state.get("service_incarnation")})
+    if (run.get("recipe") != TELEOP_RECIPE or run.get("status") != "paused"
+        or any(type(value) is not str or not value for value in
+               (run.get("run_id"), run.get("backend_incarnation"), state.get("service_incarnation")))
+        or run.get("uncertain") is not False or run.get("recovery") is not None
+        or any(run.get(key) for key in ("first_cause", "native_first_cause")) or evidence.get("fault")
+        or getattr(client, "transport_error", None)
+        or not client.device or not client.generation
+        or owner.get("device_id") != client.device or owner.get("controller_generation") != client.generation
+        or not all(evidence.get(key) is True for key in
+                   ("feedback", "required_observation", "hold_acknowledged", "pose_aligned", "native_ack"))
+        or evidence.get("active_acknowledged") is not False
+        or type(revision) is not int or revision < 0
+        or type(ack.get("intent_revision")) is not int or ack["intent_revision"] != revision
+        or type(evidence.get("acknowledged_intent_revision")) is not int
+        or evidence["acknowledged_intent_revision"] != revision
+        or type(live.get("cursor_intent_revision")) is not int or live["cursor_intent_revision"] != revision
+        or ack.get("run_id") != run.get("run_id") or ack.get("host_incarnation") != run.get("backend_incarnation")
+        or ack.get("state") != "paused" or type(ack.get("epoch")) is not int or ack["epoch"] < 0
+        or ack.get("accepted_action") != {"mode": "raw_goal_hold", "body_velocity": 0.}
+        or live.get("body") != ZERO_BODY
+        or any(type(value) not in (int, float) for value in (live.get("body") or {}).values())
+        or live.get("workspace") != workspace
+        or live.get("reference") != workspace["reference"]
+        or live.get("cursor") != live.get("accepted_target")
+        or event.get("kind") in {"pause", "stop", "handoff", "released", "revoked"}
+        or any(type(value) not in (int, float) or not math.isfinite(value)
+               for value in (start, deadline, remaining, stamp))
+        or not 0 < remaining <= deadline-start <= 300.
+        or not start <= stamp <= deadline-remaining or deadline-remaining-stamp >= 1.):
+        raise RuntimeError("current same-owner qualified native held command unavailable")
+    return validate_target(live.get("cursor"), workspace=workspace)
+
+
 async def _acquisition_delay(requested_at):
     # Receipt cost consumes this cadence; an overdue tick acquires one NEW
     # sample, rather than sleeping again or replaying missed samples.
@@ -2261,7 +2333,9 @@ class SameRunRecovery:
         # This is the existing authenticated owner read, not a WSS freshness
         # guess. Anchor BEFORE the read so HTTP time cannot extend the ceiling.
         mailbox_refusal = expected_pause == "native_input_expired" and refusal_identity is not None
-        if mailbox_refusal:
+        view_refusal = expected_pause == "required_view_expired" and refusal_identity is not None
+        bound_refusal = mailbox_refusal or view_refusal
+        if bound_refusal:
             binding = {"run_id": self.original["run"]["run_id"], "service_incarnation": self.original["service"],
                        "controller_generation": self.original["controller"]["controller_generation"],
                        "connection_generation": self.client.connection,
@@ -2276,6 +2350,9 @@ class SameRunRecovery:
             ):
                 raise RuntimeError("original mailbox input refusal identity changed")
         requested = time.monotonic()
+        if view_refusal:
+            clock["held_view_ceiling"] = min(clock.get("held_view_ceiling", float("inf")), requested + 8,
+                                              wall_deadline if wall_deadline is not None else float("inf"))
         request_ceiling = min(wall_deadline if wall_deadline is not None else float("inf"),
                               clock.get("held_view_ceiling", float("inf")))
         state = (
@@ -2308,6 +2385,37 @@ class SameRunRecovery:
             }
         )
         self.check(state, history=False)
+        if view_refusal:
+            while state["run"]["status"] == "running":
+                self.check(state)
+                current, evidence = state["run"], state.get("evidence", {})
+                if (self.client.connection != refusal_identity["connection_generation"]
+                    or current.get("intent_revision") != refusal_identity["intent_revision"]
+                    or not all(evidence.get(key) is True for key in ("feedback", "required_observation", "native_ack"))
+                    or _latest_run_event(state, refusal_identity).get("kind") in {"pause", "stop", "handoff", "released", "revoked"}):
+                    raise RuntimeError("original selected-view refusal binding changed before ordinary HOLD")
+                budget = min(clock["held_view_ceiling"], clock["ceiling"], clock["native_ceiling"]) - time.monotonic()
+                if budget <= 0:
+                    raise TimeoutError("original selected-view ordinary HOLD ceiling exhausted")
+                if renewal_check:
+                    renewal_check()
+                await asyncio.sleep(min(.05, budget))
+                read_at = time.monotonic()
+                budget = min(clock["held_view_ceiling"], clock["ceiling"], clock["native_ceiling"]) - read_at
+                if budget <= 0:
+                    raise TimeoutError("original selected-view ordinary HOLD ceiling exhausted")
+                state = (await asyncio.wait_for(self.client.get("state"), budget))["snapshot"]
+                self.client.snapshot = state
+                self.check(state)
+                native_remaining = state["run"].get("remaining_s")
+                if (type(native_remaining) not in (int, float) or not math.isfinite(native_remaining)
+                    or not 0 < native_remaining <= clock["remaining"]):
+                    raise RuntimeError("original selected-view native remaining clock changed")
+                clock["remaining"] = native_remaining
+                clock["native_ceiling"] = min(clock["native_ceiling"], read_at + native_remaining)
+                self.record({"event": "owner_rejoin_state", "snapshot": state,
+                             "request_started_at_monotonic_s": read_at,
+                             "response_observed_at_monotonic_s": time.monotonic()})
         binding_context = grant_context or resume_context
         if binding_context is not None and native_remaining > binding_context["snapshot"]["run"]["remaining_s"]:
             raise RuntimeError("original grant native remaining clock increased")
@@ -2323,7 +2431,7 @@ class SameRunRecovery:
                 or state["run"]["intent_revision"] != identity["intent_revision"] + 2
                 or _latest_run_event(state, identity) != interrupted.event):
                 raise RuntimeError("fresh authority for superseding ordinary pause changed")
-        if mailbox_refusal and (
+        if bound_refusal and (
             self.client.connection != refusal_identity["connection_generation"]
             or state["run"]["status"] != "paused"
             or type(state["run"].get("intent_revision")) is not int
@@ -2511,7 +2619,7 @@ class SameRunRecovery:
                 )
         self.check(state)  # A cleared descriptor alone never proves a closed episode.
         timeout = None if local_ceiling is None else max(0, local_ceiling - time.monotonic())
-        if mailbox_refusal and self.client.connection != refusal_identity["connection_generation"]:
+        if bound_refusal and self.client.connection != refusal_identity["connection_generation"]:
             raise RuntimeError("original mailbox input refusal connection changed before Resume")
         if renewal_check:
             renewal_check()
@@ -2522,6 +2630,14 @@ class SameRunRecovery:
                 raise TimeoutError("original rejoin ceiling exhausted")
             if renewal_check:
                 renewal_check()
+            if view_refusal:
+                event = _latest_run_event(snapshot, refusal_identity)
+                if (event.get("kind") in {"pause", "stop", "handoff", "released", "revoked", "presence_expired"}
+                    or snapshot["run"].get("status") == "paused"
+                    and event == _latest_run_event(state, refusal_identity)
+                    and snapshot["run"].get("intent_revision") != refusal_identity["intent_revision"] +
+                        (1 if self.client.connection == refusal_identity["connection_generation"] else 2)):
+                    raise RuntimeError("original selected-view ordinary HOLD intent superseded")
             try:
                 self.check(snapshot)
             except RuntimeError as original:
@@ -3527,6 +3643,10 @@ async def run(args):
             if segment in SelectedLeftWorkload.DURATIONS:
                 selected_kwargs = {"peer_side": peer["side"], "peer_direction": peer["direction_raw"], "peer_raw_step": peer["raw_step"],
                                    **({"peer_active_p": peer["active_p"]} if "active_p" in peer else {})} if peer else {}
+                try:
+                    validate_target(workspace["reference"], workspace=workspace)
+                except ValueError:
+                    selected_kwargs["command_reference"] = _qualified_command_reference(client, workspace)
                 workload = source = SelectedLeftWorkload(workspace, segment=segment, **selected_kwargs)
                 summary["selected_profile"] = workload.plan()
                 record({"event": "workload_plan", "run_id": run_id, **workload.plan()})
@@ -3841,10 +3961,12 @@ async def run(args):
                     await rejoin(until=peer_baseline_until)
                     continue
                 mailbox = mailbox_input_refusal(error)
-                if not (recovery_grant_refusal(error) or mailbox):
+                view = selected_view_refusal(error)
+                if not (recovery_grant_refusal(error) or mailbox or view):
                     raise
                 await rejoin(require_episode=True, refusal_identity=error.identity,
-                             expected_pause="native_input_expired" if mailbox else None, until=peer_baseline_until)
+                             expected_pause="native_input_expired" if mailbox else "required_view_expired" if view else None,
+                             until=peer_baseline_until)
                 continue
             if sent is None:
                 if workload:

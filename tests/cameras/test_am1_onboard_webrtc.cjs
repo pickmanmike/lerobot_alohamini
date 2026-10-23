@@ -1,19 +1,23 @@
 "use strict";
 const test=require("node:test"),assert=require("node:assert/strict"),fs=require("node:fs"),vm=require("node:vm"),path=require("node:path");
-function fixture() {
+function fixture({manualTimers=false}={}) {
   const file=path.resolve(__dirname,"../../tools/am1_camera/webrtc.js");
   assert.ok(fs.existsSync(file),"bounded native onboard WebRTC player missing");
-  let now=0,progressResponse=null;const callbacks=[],requests=[];
+  let now=0,progressResponse=null,offerResponse=null,remoteError=null,setupError=null,statsResponse=new Map(),statsCalls=0,timerId=0;
+  const callbacks=[],requests=[],logs=[],timers=new Map();
   const video={srcObject:null,requestVideoFrameCallback(fn){callbacks.push(fn);return callbacks.length;},cancelVideoFrameCallback(){},play:async()=>{}};
   class Peer {
-    constructor(){this.iceGatheringState="complete";this.connectionState="connected";}
-    addTransceiver(){} async createOffer(){return {type:"offer",sdp:"v=0\r\n"};}
-    async setLocalDescription(value){this.localDescription=value;} async setRemoteDescription(){} close(){this.closed=true;}
+    constructor(){this.iceGatheringState=setupError==="ice-gather"?"gathering":"complete";this.connectionState="connected";this.iceConnectionState="connected";}
+    addTransceiver(){} async createOffer(){if(setupError==="create")throw Error("private create SDP");return {type:"offer",sdp:"v=0\r\n"};}
+    async setLocalDescription(value){if(setupError==="local-description")throw Error("private local SDP");this.localDescription=value;} async setRemoteDescription(){if(remoteError)throw remoteError;} close(){this.closed=true;}
+    getStats(){statsCalls++;return typeof statsResponse==="function"?statsResponse():Promise.resolve(statsResponse);}
   }
   const ids={owner_generation:"owner-a",capture_generation:"capture-a",encode_generation:"encode-a",view_generation:"11111111-1111-4111-8111-111111111111"};
   const context=vm.createContext({RTCPeerConnection:Peer,MediaStream:class {},performance:{now:()=>now},
-    setInterval:()=>1,clearInterval(){},setTimeout,clearTimeout,AbortSignal,AbortController,
-    fetch:async(url,options)=>{requests.push({url,...options});if(url.endsWith("/progress")&&progressResponse)return typeof progressResponse==="function"?progressResponse(options):progressResponse;return {ok:true,headers:{get:name=>({
+    setInterval:()=>1,clearInterval(){},setTimeout:manualTimers?(fn,delay)=>{const id=++timerId;timers.set(id,{fn,delay});return id;}:setTimeout,
+    clearTimeout:manualTimers?id=>timers.delete(id):clearTimeout,AbortSignal,AbortController,
+    console:{info:(tag,value)=>logs.push({tag,...JSON.parse(value)})},
+    fetch:async(url,options)=>{requests.push({url,...options});if(url.endsWith("/progress")&&progressResponse)return typeof progressResponse==="function"?progressResponse(options):progressResponse;if(!url.endsWith("/progress")&&offerResponse)return offerResponse;return {ok:true,status:201,headers:{get:name=>({
       "X-Camera-Owner-Generation":ids.owner_generation,"X-Camera-Capture-Generation":ids.capture_generation,
       "X-Camera-Encode-Generation":ids.encode_generation,"X-Camera-View-Generation":ids.view_generation}[name]||null)},text:async()=>"v=0\r\n",json:async()=>({accepted:true})};}});
   vm.runInContext(fs.readFileSync(file,"utf8"),context);
@@ -22,7 +26,9 @@ function fixture() {
   function source(role="chest") {view.updateSource({owner_generation:ids.owner_generation,
     cameras:{[role]:{configured:true,state:"fresh",age_ms:0,sequence:12,capture_generation:ids.capture_generation}},
     video:{role,state:"running",encode_generation:ids.encode_generation,capture_generation:ids.capture_generation}},now);}
-  return {view,video,callbacks,requests,ids,source,advance:value=>{now=value;},setProgressResponse:value=>{progressResponse=value;}};
+  return {view,video,callbacks,requests,ids,source,logs,context,advance:value=>{now=value;},setProgressResponse:value=>{progressResponse=value;},
+    setOfferResponse:value=>{offerResponse=value;},setRemoteError:value=>{remoteError=value;},setSetupError:value=>{setupError=value;},setStatsResponse:value=>{statsResponse=value;},
+    statsCalls:()=>statsCalls,runTimers:delay=>{for(const [id,item]of [...timers])if(item.delay===delay){timers.delete(id);item.fn();}},timers};
 }
 test("a connected video and ontrack never qualify an undecoded primary view",async()=>{
   const p=fixture();await p.view.start("chest");p.source();p.view.pc.ontrack({track:{}});
@@ -57,18 +63,23 @@ test("loaded camera page selects WebRTC and switches roles without any control r
   const directory=path.resolve(__dirname,"../../tools/am1_camera"),requests=[],errors=[];
   const roles=["forward","backward","chest","wrist_left","wrist_right"],owner=randomUUID();
   const captures=Object.fromEntries(roles.map(role=>[role,randomUUID()]));
-  let selected=null,generation=null,sequence=1;
+  let selected=null,generation=null,sequence=1,statusGate=null,chestGate=null,sourceFresh=true;
   const server=http.createServer(async(request,response)=>{
     requests.push({method:request.method,path:request.url});
     const reply=(status,type,body,headers={})=>{response.writeHead(status,{"Content-Type":type,...headers});response.end(body);};
-    if(request.url==="/api/onboard/status")return reply(200,"application/json",JSON.stringify({owner_generation:owner,
-      cameras:Object.fromEntries(roles.map(role=>[role,{configured:true,state:"fresh",age_ms:0,sequence:sequence++,
-        capture_generation:captures[role],rotation_degrees:role==="wrist_right"?270:180}])),
-      video:{enabled:true,transport:"webrtc",role:selected,encode_generation:generation,
-        capture_generation:captures[selected],state:selected?"running":"unavailable"}}));
+    if(request.url==="/api/onboard/status"){
+      const body=JSON.stringify({owner_generation:owner,
+        cameras:Object.fromEntries(roles.map(role=>[role,{configured:true,state:sourceFresh?"fresh":"stale",age_ms:0,sequence:sequence++,
+          capture_generation:captures[role],rotation_degrees:role==="wrist_right"?270:180}])),
+        video:{enabled:true,transport:"webrtc",role:selected,encode_generation:generation,
+          capture_generation:captures[selected],state:selected?"running":"unavailable"}});
+      const gate=statusGate;statusGate=null;if(gate){gate.capturedAt=Date.now();gate.arrive();await gate.wait;}
+      return reply(200,"application/json",body);
+    }
     if(request.url.startsWith("/api/onboard/webrtc/")) {
       const role=request.url.split("/").at(-1);if(role!==selected){selected=role;generation=randomUUID();}
       for await(const _ of request){};
+      const gate=role==="chest"?chestGate:null;if(gate){chestGate=null;gate.arrive();await gate.wait;}
       return reply(201,"application/sdp","v=0\r\n",{"X-Camera-Owner-Generation":owner,
         "X-Camera-Capture-Generation":captures[role],"X-Camera-Encode-Generation":generation,"X-Camera-View-Generation":randomUUID()});
     }
@@ -105,6 +116,46 @@ test("loaded camera page selects WebRTC and switches roles without any control r
   assert.ok(!requests.some(request=>/\/api\/(claim|start|connect|renew|input|stop|pause)(?:\/|$)/.test(request.path)));
   assert.ok(!requests.some(request=>request.path.includes("stream.mjpeg")||request.path.includes("/mjpeg/")));
   assert.deepEqual(errors,[]);
+  const holdResponse=()=>{let arrive,release;const ready=new Promise(resolve=>{arrive=resolve;}),wait=new Promise(resolve=>{release=resolve;});
+    return {arrive,release,ready,wait,capturedAt:null};};
+  for(const ordering of ["before Chest binding","after Chest binding"])await t.test("old Front status "+ordering,{timeout:8000},async()=>{
+    await page.locator('button.view[data-role="forward"]').click();
+    await page.waitForFunction(()=>AM1CameraHealth().selected_role==="forward"&&AM1CameraHealth().video?.fresh);
+    const gate=statusGate=holdResponse(),offer=ordering.startsWith("before")?chestGate=holdResponse():null;
+    try {
+      await gate.ready;const first=requests.length;
+      await page.locator('button.view[data-role="chest"]').click();
+      if(offer){await offer.ready;gate.release();await page.waitForTimeout(30);offer.release();}
+      else{
+        await page.waitForFunction(()=>AM1CameraHealth().video?.role==="chest"&&!AM1CameraHealth().video?.connecting);
+        gate.release();
+      }
+      assert.ok(Date.now()-gate.capturedAt<500,"test keeps the captured Front response within current source freshness");
+      await page.waitForTimeout(120);
+      assert.equal(await page.locator("#primary").getAttribute("data-role"),"chest","older status must not replace the newly selected attachment");
+      assert.ok(!requests.slice(first).some(request=>request.path==="/api/onboard/webrtc/forward"),"older status must not launch a replacement Front offer");
+      await page.waitForFunction(()=>AM1CameraHealth().selected_role==="chest"&&AM1CameraHealth().video?.fresh);
+    }finally{gate.release();offer?.release();}
+  });
+  await t.test("current status still reconciles a shared producer role change",{timeout:8000},async()=>{
+    // Front has used its unchanged three-attempt allowance in the prior cases.
+    const first=requests.length;selected="backward";generation=randomUUID();
+    await page.waitForFunction(()=>AM1CameraHealth().selected_role==="backward"&&AM1CameraHealth().video?.fresh);
+    assert.ok(requests.slice(first).some(request=>request.path==="/api/onboard/webrtc/backward"));
+  });
+  assert.deepEqual(errors,[]);
+  const diagnosticPrefix="WebRTC attempt diagnostics (observational): ";
+  const readDiagnostic=async()=>JSON.parse((await page.locator("#diagnostics").textContent()).split(diagnosticPrefix)[1]);
+  await page.waitForFunction(()=>document.querySelector("#diagnostics").textContent.includes('"state":"current"'));
+  assert.ok((await page.locator("#diagnostics").textContent()).includes(diagnosticPrefix),"existing diagnostics panel must surface the curated attempt");
+  const liveDiagnostic=await readDiagnostic();assert.equal(liveDiagnostic.state,"current");
+  assert.ok(liveDiagnostic.records.some(row=>row.phase==="offer"&&row.http_status===201&&row.headers_valid===true));
+  assert.ok(liveDiagnostic.records.length<=8);
+  sourceFresh=false;
+  await page.waitForFunction(()=>document.querySelector("#diagnostics").textContent.includes('"state":"stopped"'));
+  const stoppedDiagnostic=await readDiagnostic();assert.equal(stoppedDiagnostic.attempt,liveDiagnostic.attempt);
+  assert.equal(stoppedDiagnostic.state,"stopped");assert.deepEqual(stoppedDiagnostic.records.slice(0,liveDiagnostic.records.length),liveDiagnostic.records);
+  assert.equal(await page.evaluate(()=>AM1CameraHealth().video?.fresh),false);
   await page.close();
 });
 
@@ -510,4 +561,165 @@ test("standalone WebRTC without progress remains usable without an attachment he
   assert.equal(p.view.health().fresh,true);assert.equal(p.view.health().decoded_frames,1);
   assert.equal(p.requests.filter(r=>r.url.endsWith("/progress")).length,0);
  }finally{await p.view.stop();}
+});
+
+test("curated diagnostics bound current negotiation, states and inbound-video scalars without secrets",async()=>{
+ const p=fixture({manualTimers:true}),secret="PRIVATE-SDP-cookie-candidate-192.0.2.99-device";
+ p.setStatsResponse(new Map([
+  ["candidate",{type:"local-candidate",address:secret}],
+  ["video",{type:"inbound-rtp",kind:"video",codecId:secret,packetsReceived:17,bytesReceived:2300,
+   framesReceived:5,framesDecoded:0,jitterBufferEmittedCount:1,trackIdentifier:secret}],
+  [secret,{type:"codec",mimeType:"video/H264",sdpFmtpLine:secret}]]));
+ await p.view.start("chest");p.source();
+ const pc=p.view.pc;
+ for(let i=0;i<20;i++){
+  pc.iceConnectionState=i%2?"connected":"checking";pc.oniceconnectionstatechange?.();
+  pc.connectionState=i%2?"connected":"connecting";pc.onconnectionstatechange?.();
+  pc.ontrack({track:{kind:"video",id:secret,label:secret}});
+ }
+ p.runTimers(3000);await new Promise(setImmediate);
+ const row=phase=>p.logs.find(log=>log.phase===phase);
+ assert.ok(row("offer"),"current offer diagnostic missing");
+ assert.equal(row("offer").http_status,201);assert.equal(row("offer").headers_valid,true);
+ assert.equal(row("remote-description").ok,true);assert.equal(row("track").kind,"video");
+ assert.equal(p.logs.filter(log=>log.phase==="ice").length,2);
+ assert.equal(p.logs.filter(log=>log.phase==="connection").length,2);
+ const stats=row("stats");assert.equal(stats.outcome,"available");
+ for(const [key,value]of Object.entries({packetsReceived:17,bytesReceived:2300,framesReceived:5,
+  framesDecoded:0,jitterBufferEmittedCount:1,codec:"H264"}))assert.equal(stats[key],value);
+ assert.equal(p.statsCalls(),1);assert.equal(p.logs.length,8);
+ assert.ok(p.logs.every(log=>log.attempt===p.view.epoch&&log.tag==="AM1 WebRTC diagnostics"));
+ const text=JSON.stringify(p.logs);
+ for(const forbidden of [secret,"owner-a","capture-a","encode-a",p.ids.view_generation,"v=0","csrf"])
+  assert.ok(!text.includes(forbidden),"diagnostics must exclude identity/SDP/credentials");
+ assert.equal(p.view.health().fresh,false,"stats/transport cannot create decoder freshness");
+ await p.view.stop();assert.equal(p.timers.size,0);
+});
+
+for(const failure of ["http","headers","description"])test("curated diagnostics retain bounded negotiation failure: "+failure,async()=>{
+ const p=fixture({manualTimers:true}),secret="PRIVATE-SDP-description-and-URL";
+ if(failure==="http")p.setOfferResponse({ok:false,status:503,headers:{get:()=>secret}});
+ if(failure==="headers")p.ids.view_generation=null;
+ if(failure==="description")p.setRemoteError(Object.assign(Error(secret),{name:"OperationError",detail:secret}));
+ await assert.rejects(p.view.start("chest"));
+ const offer=p.logs.find(log=>log.phase==="offer");assert.ok(offer,"failed offer diagnostic missing");
+ assert.equal(offer.http_status,failure==="http"?503:201);
+ assert.equal(offer.headers_valid,failure==="description");
+ if(failure==="description"){
+  const description=p.logs.find(log=>log.phase==="remote-description");
+  assert.equal(description.ok,false);assert.equal(description.error_category,"operation");
+ }
+ assert.ok(!JSON.stringify(p.logs).includes(secret));assert.equal(p.statsCalls(),0);
+ assert.equal(p.timers.size,0);assert.equal(p.view.pc,null);
+});
+
+test("curated diagnostics quarantine one unresolved stats call across stop and new attempt",async()=>{
+ const p=fixture({manualTimers:true});let finish;
+ p.setStatsResponse(()=>new Promise(resolve=>{finish=resolve;}));
+ await p.view.start("chest");p.source();const old=p.view.pc;
+ p.runTimers(3000);await new Promise(setImmediate);assert.equal(p.statsCalls(),1,"one diagnostic sample must dispatch");
+ // Diagnostics must not await/block current input-view reporting or renew freshness.
+ p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});await p.view.report();
+ assert.equal(p.view.health().fresh,true);p.advance(501);p.source();assert.equal(p.view.health().fresh,false);
+ p.runTimers(750);await new Promise(setImmediate);
+ assert.equal(p.logs.find(log=>log.phase==="stats").outcome,"timeout");
+ await p.view.stop();await p.view.start("forward");p.source("forward");
+ const current=p.view.epoch,count=p.logs.length;
+ old.ontrack({track:{kind:"video"}});old.onconnectionstatechange?.();old.oniceconnectionstatechange?.();
+ assert.equal(p.logs.length,count,"retired callbacks cannot append diagnostics");
+ p.runTimers(3000);await new Promise(setImmediate);
+ assert.equal(p.statsCalls(),1,"an abort-ignoring stats promise cannot accumulate across epochs");
+ assert.equal(p.logs.find(log=>log.phase==="stats"&&log.attempt===current).outcome,"busy");
+ const logged=JSON.stringify(p.logs);finish(new Map([["late",{type:"inbound-rtp",kind:"video",framesDecoded:999}]]));
+ await new Promise(setImmediate);assert.equal(JSON.stringify(p.logs),logged,"late stats cannot report against new peer");
+ await p.view.stop();assert.equal(p.timers.size,0);
+});
+
+test("curated diagnostics cannot throw into playback when console or stats fails",async()=>{
+ const p=fixture({manualTimers:true});
+ p.context.console.info=()=>{throw Error("private console failure");};
+ p.setStatsResponse(()=>{throw Object.assign(Error("private stats failure"),{name:"OperationError"});});
+ await p.view.start("chest");p.source();p.runTimers(3000);await new Promise(setImmediate);
+ p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});await p.view.report();
+ assert.equal(p.view.health().fresh,true);assert.equal(p.view.frames,1);
+ assert.equal(p.statsCalls(),1,"diagnostic sampling was not exercised");
+ await p.view.stop();assert.equal(p.timers.size,0);
+});
+
+test("curated diagnostics discard nonfinite counters and nonallowlisted codec labels",async()=>{
+ const p=fixture({manualTimers:true});
+ p.setStatsResponse(new Map([["video",{type:"inbound-rtp",kind:"video",codecId:"private",packetsReceived:NaN,
+  bytesReceived:Infinity,framesReceived:-1,framesDecoded:1.5,jitterBufferEmittedCount:0}],
+  ["private",{type:"codec",mimeType:"video/private-address-secret"}]]));
+ await p.view.start("chest");p.runTimers(3000);await new Promise(setImmediate);
+ const stats=p.logs.find(log=>log.phase==="stats");assert.ok(stats,"bounded stats diagnostic missing");
+ for(const key of ["packetsReceived","bytesReceived","framesReceived","framesDecoded"])assert.equal(stats[key],null);
+ assert.equal(stats.jitterBufferEmittedCount,0);assert.equal(stats.codec,null);
+ assert.ok(!JSON.stringify(p.logs).includes("private"));await p.view.stop();
+});
+
+test("curated diagnostics reject late negotiation after a new attachment",async()=>{
+ const p=fixture({manualTimers:true});let finish;
+ p.setOfferResponse(new Promise(resolve=>{finish=resolve;}));
+ const old=p.view.start("chest");await new Promise(setImmediate);
+ await p.view.stop();p.setOfferResponse(null);await p.view.start("forward");
+ const logged=JSON.stringify(p.logs);
+ finish({ok:true,status:201,headers:{get:name=>({"X-Camera-Owner-Generation":"retired-owner",
+  "X-Camera-Capture-Generation":"retired-capture","X-Camera-Encode-Generation":"retired-encode",
+  "X-Camera-View-Generation":p.ids.view_generation}[name])},text:async()=>"private retired SDP"});
+ await old;assert.equal(JSON.stringify(p.logs),logged);assert.equal(p.view.binding.role,"forward");
+ await p.view.stop();assert.equal(p.timers.size,0);
+});
+
+for(const mode of ["unsupported","rejected"])test("curated diagnostics isolate stats availability: "+mode,async()=>{
+ const p=fixture({manualTimers:true});await p.view.start("chest");
+ if(mode==="unsupported")p.view.pc.getStats=null;
+ else p.setStatsResponse(()=>Promise.reject(Error("private candidate address")));
+ p.runTimers(3000);await new Promise(setImmediate);
+ assert.equal(p.logs.find(log=>log.phase==="stats").outcome,mode==="unsupported"?"unsupported":"failed");
+ assert.ok(!JSON.stringify(p.logs).includes("private"));assert.equal(p.view.error,null);
+ await p.view.stop();assert.equal(p.timers.size,0);
+});
+
+for(const phase of ["create","local-description","ice-gather"])test("curated diagnostics identify pre-offer boundary: "+phase,async()=>{
+ const p=fixture({manualTimers:true});p.setSetupError(phase);
+ const rejected=assert.rejects(p.view.start("chest"));await new Promise(setImmediate);
+ if(phase==="ice-gather")p.runTimers(2000);
+ await rejected;
+ const failure=p.logs.find(log=>log.failure_phase===phase);
+ assert.ok(failure,"pre-offer failure needs a closed phase label");assert.equal(failure.error_category,"other");
+ assert.ok(!JSON.stringify(p.logs).includes("private"));assert.equal(p.requests.length,0);
+ assert.equal(p.timers.size,0);assert.ok(p.logs.length<=8);
+});
+
+test("existing-panel diagnostics retain only the bounded current-or-stopped scalar snapshot",async()=>{
+ const p=fixture({manualTimers:true});
+ assert.equal(typeof p.view.diagnostics,"function","curated snapshot is missing");
+ assert.equal(p.view.diagnostics(),null);
+ await p.view.start("chest");const old=p.view.pc;
+ for(let i=0;i<50;i++){
+  old.oniceconnectionstatechange?.();old.onconnectionstatechange?.();old.ontrack({track:{kind:"video",id:"private"}});
+ }
+ p.setStatsResponse(new Map([["video",{type:"inbound-rtp",kind:"video",framesDecoded:0,packetsReceived:99}]]));
+ p.runTimers(3000);await new Promise(setImmediate);
+ const current=p.view.diagnostics();assert.equal(current.state,"current");assert.equal(current.attempt,p.view.epoch);
+ assert.equal(current.records.length,8);assert.ok(!JSON.stringify(current).includes("private"));
+ const unchanged=JSON.stringify(current);current.records[0].http_status="corrupted";current.records.length=0;
+ assert.equal(JSON.stringify(p.view.diagnostics()),unchanged,"public snapshot must not alias player state");
+ await p.view.stop();const stopped=p.view.diagnostics();assert.equal(stopped.state,"stopped");
+ assert.equal(stopped.attempt,JSON.parse(unchanged).attempt);
+ assert.deepEqual(JSON.parse(JSON.stringify(stopped.records)),JSON.parse(unchanged).records);
+ old.ontrack({track:{kind:"video"}});assert.deepEqual(p.view.diagnostics(),stopped);
+ await p.view.start("forward");const next=p.view.diagnostics();assert.equal(next.state,"current");
+ assert.ok(next.attempt>stopped.attempt);assert.equal(next.records.length,2);
+ assert.ok(!next.records.some(row=>row.phase==="stats"));await p.view.stop();
+});
+
+test("existing-panel diagnostics survive an unavailable console without changing freshness",async()=>{
+ const p=fixture({manualTimers:true});p.context.console.info=()=>{throw Error("private console unavailable");};
+ await p.view.start("chest");p.source();
+ assert.equal(typeof p.view.diagnostics,"function","panel snapshot must not depend on console receipt");
+ assert.equal(p.view.diagnostics().records.length,2);
+ assert.equal(p.view.health().fresh,false);p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});await p.view.report();
+ assert.equal(p.view.health().fresh,true);await p.view.stop();assert.equal(p.view.diagnostics().state,"stopped");
 });
