@@ -1,6 +1,7 @@
 "use strict";
 // Remote fake mode never instantiates the legacy body input, owner restore or camera adapters.
 class AM1SessionTransport {
+  static reconnectNotice="Disconnected; controls cleared. Reconnecting to current state.";
   static liveElbows=Object.freeze({
     "physical-live-left-elbow":Object.freeze({joint:"arm_left_elbow_flex.pos",side:"left",label:"Left elbow",profile:"LiveLeftElbow"}),
     "physical-live-right-elbow":Object.freeze({joint:"arm_right_elbow_flex.pos",side:"right",label:"Right elbow",profile:"LiveRightElbow"}),
@@ -172,7 +173,7 @@ class AM1SessionTransport {
       };
       ws.onclose=()=> {
         if(this.socket!==ws)return;
-        this.connected=false;this.clear();this.render(this,"Disconnected; controls cleared. Reconnecting to current state.");
+        this.connected=false;this.clear();this.render(this,AM1SessionTransport.reconnectNotice);
         this.reconnect(300);
       };
       ws.onerror=()=>ws.close();
@@ -596,10 +597,12 @@ globalThis.AM1RemoteInitialize=function() {
     const simulated=run?.source==="simulated-provider" || recipes?.some(name=>name.startsWith("sim-"));
     const priorTest=physical && run && !physicalRun, priorKind=simulated ? "simulated" : "synthetic";
     const teleop=run?.recipe==="physical-live-teleop" || select.value==="physical-live-teleop";
-    document.querySelector("#view-heading").textContent=physical ? teleop ? "AM1 leader teleoperation" : liveElbow ? "Physical live elbow AM1 session" : "Physical finite AM1 session" : simulated ? "Simulated finite provider session" : "Fake persistent session";
-    state.textContent=run ? `${priorTest ? `Prior ${priorKind}` : physical ? "Physical" : "Fake"} session · ${run.status} · ${run.progress_s.toFixed(2)} s` : `${physical ? "Physical" : "Fake"} session · no run`;
-    document.querySelector("#session-details").textContent=JSON.stringify(transport.snapshot,null,2);
     const terminal=run && ["stopped","completed","faulted","interrupted"].includes(run.status);
+    const viewerRole=teleop ? run?.recipe==="physical-live-teleop" && !terminal ?
+      `Viewer · PC adapter session · controller ${transport.snapshot.controller ? "present" : "unavailable"}` : "Viewer · start PC adapter" : null;
+    document.querySelector("#view-heading").textContent=physical ? teleop ? "AM1 leader teleoperation" : liveElbow ? "Physical live elbow AM1 session" : "Physical finite AM1 session" : simulated ? "Simulated finite provider session" : "Fake persistent session";
+    state.textContent=(viewerRole ? viewerRole+" · " : "")+(run ? `${priorTest ? `Prior ${priorKind}` : physical ? "Physical" : "Fake"} session · ${run.status} · ${run.progress_s.toFixed(2)} s` : `${physical ? "Physical" : "Fake"} session · no run`);
+    document.querySelector("#session-details").textContent=JSON.stringify(transport.snapshot,null,2);
     document.querySelector("#live-countdown").textContent=priorTest ? `Prior ${priorKind} result · cleanup: ${run.cleanup || "unknown"}; physical Start required` :
       physical && run?.status==="finishing" ? "Physical finishing · measured cleanup pending; native Live countdown pending" :
       physical && terminal ? `${AM1SessionTransport.outcomeText(run) || "Physical session ended"} · cleanup: ${run.cleanup || "unknown"}` :
@@ -624,7 +627,7 @@ globalThis.AM1RemoteInitialize=function() {
       open.onclick=()=>view.start();close.onclick=()=>{view.stop();status.textContent="View closed · task observation continues independently";};
       window.addEventListener("pagehide",()=>view.stop());root.append(label,video,status,open,close);
     }
-    document.querySelector("#gate-state").textContent=transport.controllerGeneration ? physical ? "Explicit controller; physical Start activates the protected host. Request acceptance is separate from protected-host ACK and measured motion." : "Explicit controller; accepted requests require actual fake acknowledgement." : "Spectator; viewing does not claim input.";
+    document.querySelector("#gate-state").textContent=viewerRole || (transport.controllerGeneration ? physical ? "Explicit controller; physical Start activates the protected host. Request acceptance is separate from protected-host ACK and measured motion." : "Explicit controller; accepted requests require actual fake acknowledgement." : "Spectator; viewing does not claim input.");
     document.querySelector("#control-help").textContent=liveElbow ? `Claim input, explicitly Start, then qualify Resume. Hold an elbow jog button or [ / ] to stream current mapped targets. Ordinary release holds position; a new press requests qualified rearm. Blur, expiry or reconnection requires explicit Resume and new input. The original ${liveBudget}-second Live budget continues through holds and reconnects. Other joints remain held; body and lift stay zero. Input acceptance, protected-host ACK and measured movement are separate.` : physical ? "Explicitly claim input before physical Start. Start activates the selected bounded recipe through the protected motor host. Viewing, enrollment and reconnection do not start motion. Finite authorization survives browser closure. Pause and Stop remain available to enrolled control-capable spectators. Actual feedback and protected-host ACK are reported separately; an accepted command does not prove joint motion. Body inputs belong to the selected finite recipe. Required camera evidence is validated on Pi; optional P1 viewing is advisory." : defaultControlHelp;
     if(!transport.videoView&&document.querySelector("#am1-camera-root").dataset.onboard!=="true")document.querySelector("#am1-camera-root").textContent=physical ? "Task camera evidence is validated on Pi; optional P1 viewing is advisory." : "Cameras unavailable · synthetic fake evidence only";
     for(const button of document.querySelectorAll("[data-operation], [data-body-key]")) {
@@ -659,10 +662,15 @@ globalThis.AM1RemoteInitialize=function() {
       const rate=Number.isFinite(actualRate) ? actualRate.toFixed(3)+" normalized/s" : "pending";
       elbow.querySelector("output").textContent=!selectionFrozen&&selectedElbow ? workspace ? `Workspace ${workspace.id} · raw ${workspace.command_min_raw} to ${workspace.command_max_raw} · span ${workspace.span_norm.toFixed(3)} normalized · rate ${rate} · current admission pending` : `${selectedElbow.label} · rate ${rate} · current admission pending` : `Measured ${Number.isFinite(measured) ? measured.toFixed(3) : "pending"} · target ${Number.isFinite(transport.elbowCursor) ? transport.elbowCursor.toFixed(3) : Number.isFinite(cursor) ? cursor.toFixed(3) : "pending"} normalized · admitted ${Number.isFinite(run?.live_input?.corridor_min_norm) ? run.live_input.corridor_min_norm.toFixed(3) : "pending"} to ${Number.isFinite(run?.live_input?.corridor_max_norm) ? run.live_input.corridor_max_norm.toFixed(3) : "pending"} · rate ${rate} · run q0 ${Number.isFinite(run?.live_input?.reference_norm) ? run.live_input.reference_norm.toFixed(3) : "pending"}`;
     }
-    if(teleop)document.querySelector("#control-help").textContent="The authenticated PC adapter owns USB or virtual leader input and the original finite deadline. This page supplies the selected required onboard view. Lost decoded view progress holds steering; fresh video permits the existing qualified Resume. Camera selection, opening and closing this page do not Claim or Start input. Pause and Stop remain available.";
-    if(message){notice.textContent=message;notice.hidden=false;}
+    if(teleop)document.querySelector("#control-help").textContent="Use the authenticated PC adapter for USB or virtual leader input and the original finite deadline. This page supplies the selected required onboard view. Lost decoded view progress holds steering; fresh video permits the existing qualified Resume. Camera selection, opening and closing this page do not Claim or Start input. Pause and Stop remain available.";
+    if(message && (message!==AM1SessionTransport.reconnectNotice || notice.hidden || !notice.textContent)) {
+      notice.textContent=message;notice.hidden=false;
+    } else if(!message && transport.connected && notice.textContent===AM1SessionTransport.reconnectNotice) {
+      notice.textContent="";notice.hidden=true;
+    }
     document.querySelector("#pairing-panel").hidden=Boolean(transport.device);
-    for(const button of document.querySelectorAll("[data-operation]"))button.disabled=!transport.control || !transport.connected || button.dataset.operation==="Start" && selectionFrozen;
+    for(const button of document.querySelectorAll("[data-operation]"))button.disabled=!transport.control || !transport.connected ||
+      teleop && ["Start","ClaimInput","Resume","Handoff"].includes(button.dataset.operation) || button.dataset.operation==="Start" && selectionFrozen;
   };
   document.querySelector("#view-heading").textContent="Fake persistent session";
   const panel=document.createElement("section");panel.id="pairing-panel";

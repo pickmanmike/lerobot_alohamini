@@ -79,6 +79,82 @@ test("two enrolled loaded UIs retain one finite run through lost response, reloa
     console.log(JSON.stringify({contexts:2,distinctCookies:true,lostStartRetried:true,run_id:before.run.run_id,deadlinePreserved:true,reconnectedOrigin:restart.url,renderedStop:await pa.locator("#session-state").innerText(),forbiddenRequests:forbidden.length}));
   } finally {await a.close();await b.close();await browser.close();await f.close();}
 });
+for(const retained of [null,"Command outcome unknown; inspect status","Native fault remains recorded"])test("loaded UI reconnect notice preserves "+(retained || "only current connection status"),async t=>{
+  const f=await fixture();t.after(()=>f.close());
+  const browser=await chromium.launch({headless:true,channel:process.env.AM1_TEST_BROWSER_CHANNEL || "msedge"});t.after(()=>browser.close());
+  const context=await browser.newContext({ignoreHTTPSErrors:true});t.after(()=>context.close());const page=await context.newPage();
+  await enroll(page,f.info.url,f.info.a);
+  const epoch=await page.evaluate(message=>{
+    const notice=document.querySelector("#control-notice");notice.textContent="";notice.hidden=true;
+    if(message)am1Remote.render(am1Remote,message);
+    const epoch=am1Remote.epoch;am1Remote.socket.close();return epoch;
+  },retained);
+  await page.waitForFunction(()=>!am1Remote.connected);
+  if(!retained)assert.match(await page.locator("#control-notice").innerText(),/Disconnected; controls cleared/);
+  await page.waitForFunction(previous=>am1Remote.connected&&am1Remote.epoch>previous,epoch);
+  if(retained) {
+    assert.equal(await page.locator("#control-notice").innerText(),retained);
+    assert.equal(await page.locator("#control-notice").isVisible(),true);
+  } else {
+    assert.equal(await page.locator("#control-notice").isVisible(),false);
+    assert.equal(await page.locator("#control-notice").textContent(),"");
+  }
+  assert.equal(await page.evaluate(()=>am1Remote.controllerGeneration),null,"reconnection stays a viewer");
+});
+
+test("loaded PC teleop viewer keeps protective controls without browser input ownership",async t=>{
+  const f=await fixture();t.after(()=>f.close());
+  const browser=await chromium.launch({headless:true,channel:process.env.AM1_TEST_BROWSER_CHANNEL || "msedge"});t.after(()=>browser.close());
+  const context=await browser.newContext({ignoreHTTPSErrors:true});t.after(()=>context.close());const page=await context.newPage();
+  await enroll(page,f.info.url,f.info.a);
+  // Exercise the served renderer and button handlers with protocol-only metadata.
+  await page.evaluate(()=>{
+    am1Remote.detach();am1Remote.connected=true;am1Remote.control=true;
+    am1Remote.snapshot.recipes=["physical-live-teleop","fake-finite"];
+    am1Remote.snapshot.run=null;am1Remote.snapshot.controller=null;
+    globalThis.viewerActions=[];
+    for(const op of ["claim","start","resume"])am1Remote[op]=async()=>viewerActions.push({op});
+    am1Remote.post=async(op,body)=>{viewerActions.push({op,body});return {accepted:true};};
+    am1Remote.render(am1Remote);
+    document.querySelector("#fake-recipe").value="physical-live-teleop";am1Remote.render(am1Remote);
+  });
+  assert.match(await page.locator("#gate-state").textContent(),/Viewer.*start PC adapter/);
+  assert.equal(await page.locator("#session-state").isVisible(),true);
+  assert.match(await page.locator("#session-state").innerText(),/Viewer.*start PC adapter.*session.*no run/);
+  assert.doesNotMatch(await page.locator("#control-help").textContent(),/owns/);
+  for(const op of ["Start","ClaimInput","Resume","Handoff"])
+    assert.equal(await page.locator(`[data-operation="${op}"]`).isDisabled(),true,op+" belongs to PC adapter");
+  await page.evaluate(()=>{
+    am1Remote.snapshot.run={run_id:"pc-owned-run",recipe:"physical-live-teleop",source:"protected-physical-provider",
+      status:"running",progress_s:3,native_live_at:100,deadline:400,remaining_s:297,uncertain:false};
+    am1Remote.snapshot.controller={device_id:"pc-device",controller_generation:"pc-generation"};am1Remote.render(am1Remote);
+    for(const op of ["Start","ClaimInput","Resume","Handoff"])document.querySelector(`[data-operation="${op}"]`).click();
+  });
+  assert.match(await page.locator("#gate-state").textContent(),/Viewer.*PC adapter session.*controller present/);
+  assert.match(await page.locator("#session-state").innerText(),/Viewer.*PC adapter session.*controller present.*Physical session.*running.*3\.00/);
+  assert.deepEqual(await page.evaluate(()=>viewerActions),[],"viewer must not acquire input authority");
+  for(const op of ["Pause","Stop"]) {
+    assert.equal(await page.locator(`[data-operation="${op}"]`).isDisabled(),false);
+    await page.locator(`[data-operation="${op}"]`).click();
+  }
+  const actions=await page.evaluate(()=>viewerActions);
+  assert.deepEqual(actions.map(value=>value.op),["pause","stop"]);
+  for(const action of actions){assert.equal(action.body.run_id,"pc-owned-run");assert.match(action.body.operation_id,/^[0-9a-f-]{36}$/);}
+  assert.notEqual(actions[0].body.operation_id,actions[1].body.operation_id,"newer protective command keeps its own operation fence");
+  await page.evaluate(()=>{am1Remote.snapshot.controller=null;am1Remote.render(am1Remote);});
+  assert.match(await page.locator("#gate-state").textContent(),/controller unavailable/);
+  await page.evaluate(()=>{
+    Object.assign(am1Remote.snapshot.run,{recipe:"fake-finite",source:"fake-provider",status:"stopped"});
+    document.querySelector("#fake-recipe").value="fake-finite";am1Remote.render(am1Remote);
+  });
+  for(const op of ["Start","ClaimInput","Resume","Handoff"])
+    assert.equal(await page.locator(`[data-operation="${op}"]`).isDisabled(),false,op+" remains available for other recipes");
+  for(const key of ["control","connected"]) {
+    await page.evaluate(key=>{am1Remote.control=true;am1Remote.connected=true;am1Remote[key]=false;am1Remote.render(am1Remote);},key);
+    for(const op of ["Pause","Stop"])assert.equal(await page.locator(`[data-operation="${op}"]`).isDisabled(),true);
+  }
+});
+
 test("late REST claim cannot restore authority after reconnect and interactive UI handoff clears input", async t => {
   const f=await fixture();
   t.after(()=>f.close());
