@@ -1119,7 +1119,11 @@ class AlohaMini(Robot):
                 if self.config.robot_model == "alohamini1":
                     from .lift_operational import OperationalLift
 
-                    self._lift_operation = OperationalLift(self)
+                    record_writer = getattr(self, "_am1_lift_record_writer", None)
+                    self._lift_operation = (
+                        OperationalLift(self) if record_writer is None
+                        else OperationalLift(self, record_writer=record_writer)
+                    )
                     # The same single lift encoder owner is used from home through
                     # ordinary control; other motors retain their existing bus.
                     self.lift = self._lift_operation.lift

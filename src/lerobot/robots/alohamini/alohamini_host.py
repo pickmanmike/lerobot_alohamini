@@ -1830,9 +1830,21 @@ def _run_host(args):
     primary_error: BaseException | None = None
     interrupted_motor_io = False
     keyboard_interrupted = False
+    routine_writer = None
+    routine_report = print
     try:
+        if practical_config is not None or teleop:
+            # Startup home/relief uses the same bounded sink as ordinary Live.
+            # Construct it before connect creates the sole lift owner.
+            routine_writer = AM1RoutineRecordWriter()
+            selected_evidence.emit = routine_writer.emit_selected
+            routine_report = routine_writer.submit_line
+            robot._am1_routine_report = routine_report
+            robot._am1_lift_record_writer = routine_writer
         logging.info("Connecting AlohaMini")
         connect_robot(robot, skip_lift_home=args.skip_lift_home)
+        if routine_writer is not None:
+            routine_writer.raise_if_failed()
 
         logging.info("Starting HostAgent")
         host_config = make_host_config(args)
@@ -1862,6 +1874,15 @@ def _run_host(args):
                 f"pending selected joint fault: {type(reporting_error).__name__}: {reporting_error}"
             )
             error.add_note(f"pending selected joint fault also failed: {type(reporting_error).__name__}: {reporting_error}")
+        # Actual zero/off and bus cleanup above precede the finite stdout drain.
+        if routine_writer is not None:
+            try:
+                routine_writer.close(timeout=2.0)
+            except BaseException as reporting_error:
+                args._am1_cleanup_errors.append(
+                    f"routine log writer drain: {type(reporting_error).__name__}: {reporting_error}"
+                )
+                error.add_note(f"routine log writer drain also failed: {type(reporting_error).__name__}: {reporting_error}")
         raise
 
     command_state = HostCommandState(
@@ -1890,8 +1911,6 @@ def _run_host(args):
     fault_loop_context = None
     fault_loop_context_error = None
     command_received = False
-    routine_writer = None
-    routine_report = print
     no_lift_drain = object()
     previous_lift_drain = getattr(robot, "_am1_routine_lift_drain", no_lift_drain)
     installed_lift_drain = False
@@ -1899,11 +1918,7 @@ def _run_host(args):
     logging.info("Waiting for commands...")
 
     try:
-        if practical_config is not None or teleop:
-            routine_writer = AM1RoutineRecordWriter()
-            selected_evidence.emit = routine_writer.emit_selected
-            routine_report = routine_writer.submit_line
-            robot._am1_routine_report = routine_report
+        if routine_writer is not None:
             if teleop:
                 def drain_lift_samples():
                     routine_writer.raise_if_failed()

@@ -136,8 +136,11 @@ class OperationalLift(InstalledLiftCheck):
     # Strict startup, relief and cleanup retain the shared diagnostic criterion.
     IDLE_POSITION_SPAN_MM = 0.10
 
-    def __init__(self, robot) -> None:
+    def __init__(self, robot, *, record_writer=None) -> None:
         super().__init__(robot)
+        # Only the selected ordinary host supplies its existing bounded writer.
+        # The host retains its lifetime; no hardware object reaches its worker.
+        self._record_writer = record_writer
         # At raw +200, 600 mm needs about 146 s, not the diagnostic's 20 s.
         # Keep the travel/fault guards and stop on bottom detection, not the deadline.
         # Copy the config so the legacy/opt-in diagnostic limit is unchanged.
@@ -171,6 +174,16 @@ class OperationalLift(InstalledLiftCheck):
 
     def emit(self, record: dict[str, Any]) -> None:
         record = {key: value for key, value in record.items() if key != "comparison_profile"}
+        if self._record_writer is not None:
+            # A rejected sample or an already latched startup fault keeps its
+            # first cause even if its final report also encounters a sink fault.
+            check_failure = not record.get("rejected") and self.failure is None
+            if check_failure:
+                self._record_writer.raise_if_failed()
+            self._record_writer.emit_lift(record)
+            if check_failure:
+                self._record_writer.raise_if_failed()
+            return
         print("[LIFT OPERATIONAL] " + json.dumps(
             {**record, "policy": "am1-confirmed-temperature-slots-relief-v2", "wall_time_ns": time.time_ns()},
             allow_nan=False, separators=(",", ":"),
