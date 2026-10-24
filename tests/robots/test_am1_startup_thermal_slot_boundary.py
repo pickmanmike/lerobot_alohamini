@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import math
+import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,6 +14,150 @@ from tests.robots.test_alohamini_lift_operational import operating_robot as _ope
 from tests.robots.test_am1_startup_thermal_handoff import at
 
 operating_robot = _operating_robot
+
+
+@pytest.fixture
+def startup_reporting_host(operating_robot, monkeypatch):
+    from lerobot.robots.alohamini import alohamini_host as host
+
+    robot, clock = operating_robot
+    entered, release = threading.Event(), threading.Event()
+    written, writers = [], []
+    original_writer = host.AM1RoutineRecordWriter
+    state = SimpleNamespace(robot=robot, clock=clock, entered=entered, release=release,
+                            written=written, writers=writers, close_error=None, closed=False)
+
+    def write(data):
+        if b'"phase":"relief"' in data and not entered.is_set():
+            entered.set()
+            assert release.wait(2), "test must release the existing writer after motor cleanup"
+        written.append(bytes(data))
+        return len(data)
+
+    def writer():
+        result = original_writer(write=write)
+        close = result.close
+
+        def close_after_shutdown(**kwargs):
+            assert not robot.is_connected and not robot.left_bus.is_connected
+            assert robot.left_bus.registers[("Torque_Enable", "lift_axis")] == 0
+            assert robot.left_bus.registers[("Goal_Velocity", "lift_axis")] == 0
+            state.closed = True
+            release.set()
+            close(**kwargs)
+            if state.close_error is not None:
+                raise state.close_error
+
+        result.close = close_after_shutdown
+        writers.append(result)
+        return result
+
+    # Select the existing practical writer branch while the shared fixture owns
+    # only fake base/lift mechanics; no arm admission is claimed by this test.
+    monkeypatch.setattr(host, "live_elbow_config", lambda recipe: SimpleNamespace())
+    monkeypatch.setattr(host, "AM1RoutineRecordWriter", writer)
+    monkeypatch.setattr(host, "AlohaMini", lambda config: robot)
+    monkeypatch.setattr(host, "AlohaMiniHost", lambda config: SimpleNamespace(
+        connection_time_s=0, max_loop_freq_hz=30, watchdog_timeout_ms=1000, disconnect=lambda: None,
+    ))
+    state.host = host
+    state.args = host.make_parser().parse_args(["--no_cameras", "--no_follower"])
+    try:
+        yield state
+    finally:
+        release.set()
+        for result in writers:
+            if not result._closed:
+                result.close()
+
+
+def test_selected_startup_keeps_sampling_while_existing_log_sink_is_blocked(
+    startup_reporting_host, monkeypatch,
+):
+    from lerobot.robots.alohamini import lift_operational
+
+    state = startup_reporting_host
+    original_print = print
+    delayed = []
+
+    def synchronous_sink(line, **kwargs):
+        record = json.loads(line.split("] ", 1)[1])
+        operation = getattr(state.robot, "_lift_operation", None)
+        if record["phase"] == "relief" and not delayed:
+            offset = (record["sample_monotonic_s"] - operation.temperature._origin_ns / 1e9) % .1
+            if .04 <= offset <= .055:
+                delayed.append(record["sample_monotonic_s"])
+                state.clock.sleep(.133314121)
+        original_print(line, **kwargs)
+
+    monkeypatch.setattr(lift_operational, "print", synchronous_sink, raising=False)
+    owner = threading.get_ident()
+    original_hook = state.robot.left_bus.hook
+    samples_during_block = []
+
+    def hook(register):
+        assert threading.get_ident() == owner
+        if register == "Present_Position":
+            # The shared fake clock patches time.sleep; this real event wait
+            # lets the existing stdout worker enter its controlled blocked sink.
+            threading.Event().wait(.001)
+            if state.entered.is_set() and not state.release.is_set():
+                samples_during_block.append(state.clock.now)
+                if len(samples_during_block) == 8:
+                    state.release.set()
+        return original_hook(register)
+
+    monkeypatch.setattr(state.robot.left_bus, "hook", hook)
+    state.host._run_host(state.args)
+    assert state.entered.is_set() and len(samples_during_block) >= 5
+    assert not delayed and len(state.writers) == 1 and state.closed
+    rows = [json.loads(line.split(b"] ", 1)[1]) for data in state.written for line in data.splitlines()
+            if line.startswith(b"[LIFT OPERATIONAL] ")]
+    relief = [row for row in rows if row["phase"] == "relief"]
+    assert relief and all(row["temperature_window"]["span_s"] <= .5 for row in relief)
+    assert any(row["phase"] == "operational_ready" for row in rows)
+    assert any(row["phase"] == "shutdown_verified" for row in rows)
+    assert all(a["wall_time_ns"] <= b["wall_time_ns"] for a, b in zip(rows, rows[1:]))
+
+
+def test_selected_startup_fault_shuts_down_before_writer_drain_and_keeps_first_cause(
+    startup_reporting_host, monkeypatch,
+):
+    state = startup_reporting_host
+    drain_error = state.close_error = OSError("synthetic final log drain failure")
+    injected = []
+
+    def hook(register):
+        operation = getattr(state.robot, "_lift_operation", None)
+        if register == "Present_Velocity" and operation is not None and operation.reader.phase == "relief":
+            if injected:
+                state.robot.left_bus.registers[("Status", "lift_axis")] = 1
+            else:
+                injected.append(True)
+
+    state.robot.left_bus.hook = hook
+    with pytest.raises(RuntimeError, match="AlohaMini motor activation failed") as caught:
+        state.host._run_host(state.args)
+    assert "servo status is nonzero" in str(caught.value.__cause__)
+    assert state.closed and len(state.writers) == 1
+    assert any(str(drain_error) in note for note in caught.value.__notes__)
+
+
+def test_actual125_same_slot_suffix_remains_a_powered_history_refusal():
+    from lerobot.robots.alohamini.lift_operational import TemperatureWindow
+
+    window = TemperatureWindow()
+    # Synthetic phase anchor matches actual125's original 100ms slot alignment.
+    # Every retained peak at refusal is one of the literal original receipts.
+    window.update(33, 619674.443864224)
+    for stamp in (619674.510264050, 619674.566282828, 619674.622188568,
+                  619674.678189142, 619674.734206975, 619674.792204020, 619674.981218826):
+        window.update(33, stamp)
+    with pytest.raises(feedback.ComparisonRefusal, match="five-slot.*stale"):
+        window.update(33, 619675.039512261)
+    assert list(window.samples) == [(stamp, 33) for stamp in
+        (619674.510264050, 619674.622188568, 619674.734206975, 619674.792204020, 619675.039512261)]
+    assert 619675.039512261 - window.samples[0][0] == pytest.approx(.529248211)
 
 
 @pytest.fixture
