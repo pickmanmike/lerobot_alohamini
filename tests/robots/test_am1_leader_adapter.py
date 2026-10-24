@@ -2478,7 +2478,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal", "peer_start_normal", "peer_start_bench", "peer_bench_unqualified_view", "peer_bench_local_loss", "peer_normal_unqualified_view", "held_command120_view_later", "held_command120_view_never", "held_command120_local_loss", "view_refusal122_input_before", "view_refusal122_input_after", "view_refusal122_grant_before", "view_refusal122_grant_after", "view_refusal122_never", "view_refusal122_pause", "view_refusal122_stop", "view_refusal122_takeover"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal", "peer_start_normal", "peer_start_bench", "peer_bench_unqualified_view", "peer_bench_local_loss", "peer_normal_unqualified_view", "held_command120_view_later", "held_command120_view_never", "held_command120_local_loss", "view_refusal122_input_before", "view_refusal122_input_after", "view_refusal122_grant_before", "view_refusal122_grant_after", "view_refusal122_never", "view_refusal122_pause", "view_refusal122_stop", "view_refusal122_takeover", "view_refusal130_grant_input_race_before", "view_refusal130_grant_input_race_never", "view_refusal130_grant_input_race_pause", "view_refusal130_grant_input_race_stop", "view_refusal130_grant_input_race_takeover", "view_refusal130_grant_input_race_revision", "view_refusal130_grant_input_race_history", "view_refusal130_grant_input_race_time"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause):
     import asyncio
     import copy
@@ -2499,16 +2499,18 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
     a._teleop_view = {"run_id": e.run_id, "qualified_until": 10.5, "role": "chest"}
     healthy, epoch, commands = [True], [0], []
     held120 = cause.startswith("held_command120_")
-    view122 = cause.startswith("view_refusal122_")
+    view_input_race = cause.startswith("view_refusal130_")
+    view122 = cause.startswith("view_refusal122_") or view_input_race
+    race_waiting = [False]
     if held120 or view122:
         e.desired = "hold"
         a.run.update(accepted_at=8., startup_deadline=188., bench_continuity=False)
         e.sample["ack"]["live_input"]["workspace"] = held_command119_workspace()
         a._teleop_view = {"run_id": e.run_id, "qualified_until": 9.5 if held120 else 10.5, "role": "chest"}
-        if cause in {"held_command120_view_never", "view_refusal122_never"}:
+        if cause in {"held_command120_view_never", "view_refusal122_never"} or view_input_race and cause.endswith("never"):
             # Clip the existing qualification to actual remaining native time,
             # retaining the original9â†’309 ceiling rather than adding a timer.
-            a.clock = e.clock = lambda: 308.85
+            a.clock = e.clock = lambda: 308.6 if view_input_race else 308.85
             a.controller["expires"] = 310.
             if view122:
                 a._teleop_view["qualified_until"] = a.clock()+.5
@@ -2556,6 +2558,8 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
             live["accepted_target"] = dict(live["cursor"])
             value["measured_positions"] = copy.deepcopy(native["reference"])
             value["accepted_host_action"]["accepted_action"] = {"mode": "raw_goal_hold", "body_velocity": 0.}
+            if race_waiting[0]:
+                value["pose_aligned"] = False
             if cause == "held_command120_local_loss":
                 value["required_observation"] = False
         if not cursor_ready[0]:
@@ -2765,6 +2769,10 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         await asyncio.sleep(.04)
                         a.tick()
                         assert a.run["status"] == "paused" and e._live_target is None
+                        if view_input_race:
+                            assert a.events[-1]["kind"] == "input_expired"
+                            assert sum(op == "resume" for op, _ in commands) == 1
+                            assert len(observed) == 1 and not m._view_admitted(a.snapshot())
                         if cause.endswith("pause"):
                             assert a.handle({"op": "pause", "run_id": e.run_id, "operation_id": str(uuid4())}, enrolled["device_id"])["accepted"]
                         elif cause.endswith("stop"):
@@ -2773,7 +2781,14 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                             a.controller["expires"] = a.clock()-1
                             a._expire_controls(a.clock())
                             assert a.handle({"op": "claim"}, "competitor")["accepted"]
-                        elif cause != "view_refusal122_never":
+                        elif view_input_race and cause.endswith("revision"):
+                            a.run["intent_revision"] += 1
+                        elif view_input_race and cause.endswith("history"):
+                            a.run["first_cause"] = "required_proof_loss"
+                        elif view_input_race and cause.endswith("time"):
+                            a.events[-1]["at"] = a.run["deadline"]
+                        elif cause != "view_refusal122_never" and not (view_input_race and cause.endswith("never")):
+                            race_waiting[0] = False
                             a._teleop_view["qualified_until"] = a.clock()+.5
                     async def selected_view_race(command, device):
                         nonlocal qualification
@@ -2787,6 +2802,15 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                             assert result == {"accepted": False, "status": "refused", "effect_admitted": False,
                                               "reason": "required selected view expired"}
                             refused.append(copy.deepcopy(command))
+                            if view_input_race:
+                                race_waiting[0] = True
+                                expired_at = a.clock() + .3
+                                a.clock = e.clock = lambda: expired_at
+                                a.tick()  # The real Core chooses input expiry before its simultaneous view expiry.
+                                assert a.run["status"] == "paused" and a.events[-1]["kind"] == "input_expired"
+                                assert a.run["intent_revision"] == command["intent_revision"] + 1
+                                if cause.endswith("time"):
+                                    a.events[-1]["at"] = a.run["deadline"]
                             pending_read[0] = not cause.endswith("after")
                             if not pending_read[0]:
                                 a.tick()
@@ -2815,6 +2839,8 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         assert observed[0][0]["grant_id"] != observed[1][0]["grant_id"]
                         assert observed[1][1]["source"]["sample_seq"] > observed[0][1]["source"]["sample_seq"]
                         assert observed[1][0]["expires"]-observed[1][0]["issued"] == .25
+                        if view_input_race:
+                            assert not race_waiting[0]
                         if refused[0]["op"] == "input":
                             assert observed[1][1]["source"]["sample_seq"] > refused[0]["source"]["sample_seq"]
                             assert observed[1][0]["grant_id"] != refused[0]["grant_id"]

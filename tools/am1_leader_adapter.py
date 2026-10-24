@@ -2539,6 +2539,18 @@ class SameRunRecovery:
                 {},
             )
             allowed = {"required_view_expired", "input_expired", "native_input_expired"}
+            ack = (state.get("evidence") or {}).get("accepted_host_action") or {}
+            if (view_refusal and require_episode and event.get("kind") == "input_expired"
+                and set(event) == {"kind", "at", "run_id", "service_incarnation"}
+                and all(type(value) in (int, float) and math.isfinite(value)
+                        for value in (event.get("at"), ack.get("acquired_at_monotonic_s")))
+                and run["native_live_at"] <= event["at"] <= ack["acquired_at_monotonic_s"] <= run["deadline"] - native_remaining
+                and ack.get("run_id") == run["run_id"] and ack.get("host_incarnation") == run["backend_incarnation"]
+                and ack.get("state") == "paused" and type(ack.get("intent_revision")) is int
+                and ack["intent_revision"] == run.get("intent_revision")):
+                # Core may choose input expiry while required viewing is also
+                # expired. Adopt that exact winner; fresh HOLD/view still gate Resume.
+                expected_pause = "input_expired"
             if (
                 run["status"] != "paused"
                 or run.get("recovery") is not None
