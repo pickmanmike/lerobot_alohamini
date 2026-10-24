@@ -730,7 +730,7 @@ def test_real_wss_clean_close_ends_qualified_wait_before_timeout(tmp_path):
         "bench_program_finish", "bench_program_finish_failed",
         "peer_fixed_baseline_ready", "peer_fixed_baseline_missing", "peer_fixed_baseline_native", "peer_fixed_baseline_blocked",
         "normal_program_finish", "normal_program_finish_failed", "normal_program_finish_combined_body",
-        "normal_program_finish_left_maintained", "normal_program_finish_left_reach", "normal_program_finish_left_reach_held", "normal_program_finish_left_supported", "normal_program_finish_left_opposite", "usb_finite_finish", "usb_finite_finish_failed", "usb_quit_finish", "usb_quit_empty_finish",
+        "normal_program_finish_left_maintained", "normal_program_finish_left_reach", "normal_program_finish_left_reach_held", "normal_program_finish_left_reach_cycles", "normal_program_finish_left_supported", "normal_program_finish_left_opposite", "usb_finite_finish", "usb_finite_finish_failed", "usb_quit_finish", "usb_quit_empty_finish",
     ],
 )
 def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
@@ -747,6 +747,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
     initial_pause_case = failure == "initial_resume_pause"
     terminal_hold = isinstance(failure, str) and failure.startswith("bench_terminal_hold_")
     normal_finish = isinstance(failure, str) and failure.startswith(("normal_program_finish", "usb_finite_finish", "usb_quit_"))
+    cycle_run = failure == "normal_program_finish_left_reach_cycles"
     usb_finish = isinstance(failure, str) and failure.startswith(("usb_finite_finish", "usb_quit_"))
     program_finish = failure in {"bench_program_finish", "bench_program_finish_failed"} or normal_finish
     bench_case = failure in {"bench_input_gap", "bench_controller_gap", "bench_renewal_during_resume", "bench_renewal_attach_ceiling", "bench_renewal_snapshot_race",
@@ -779,7 +780,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
     timed_expiry = failure in {"expired_first", "expired_zero", "expired_zero_timeout"}
     pc_clock = [10.0]
     if (
-        recovery_case
+        cycle_run
+        or recovery_case
         or ordinary_case
         or mailbox_case
         or timed_expiry
@@ -798,6 +800,10 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         monkeypatch.setattr(
             m, "time", SimpleNamespace(monotonic=lambda: pc_clock[0], perf_counter=time.perf_counter)
         )
+        if cycle_run:
+            async def acquisition_delay(_requested):
+                await asyncio.sleep(0)
+            monkeypatch.setattr(m, "_acquisition_delay", acquisition_delay)
     owned_id, foreign_id = str(uuid4()), str(uuid4())
     instances = []
 
@@ -1237,6 +1243,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 return {"accepted": True, "grant_id": str(uuid4()), "expires": 99.0}
             assert payload["op"] == "input"
             self.inputs.append(copy.deepcopy(payload))
+            if cycle_run:
+                pc_clock[0] += .1  # Full real60-active-second schedule; only PC time is accelerated.
             if peer_wait_case:
                 if failure == "peer_fixed_baseline_blocked":
                     await asyncio.sleep(10.)  # The one original baseline ceiling must cancel an in-flight receipt wait.
@@ -1493,6 +1501,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         if program_finish:
             if normal_finish:
                 args.bench_continuity = False
+            if cycle_run:
+                args.workload_segment, args.left_reach_cycles, args.duration_seconds = "left-reach", 3, 60.
             if failure == "normal_program_finish_combined_body":
                 args.workload_segment = "combined-body"
             if failure in {"normal_program_finish_left_maintained", "normal_program_finish_left_reach", "normal_program_finish_left_reach_held"}:
@@ -1553,6 +1563,33 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 assert start["terminal_qualification_budget_seconds"] == 2.
                 assert summary["producer_program_complete"] is (not usb_finish)
                 assert summary["native_execution_complete"] is False
+                if cycle_run:
+                    assert start["program_active_seconds"] == 60. and start["left_reach_cycles"] == 3
+                    assert summary["left_reach_cycles"] == 3 and summary["active_progress_s"] == 60.
+                    assert summary["selected_profile"]["cycles_completed"] == 3
+                    assert summary["original_native_deadline"] == 301.
+                    frames = [row for row in records if row["event"] == "leader_frame"]
+                    assert len(frames) == 600 and {r["cycle_index"] for r in frames} == {1,2,3}
+                    assert [r["progress_s"] for r in frames] == pytest.approx([i/10 for i in range(600)])
+                    assert all(r["left_reach_cycles"] == 3 and r["cycle_index"] == int(r["progress_s"]//20)+1 for r in frames)
+                    attempts = [row for row in records if row["event"] == "leader_frame_attempt"]
+                    assert [(r["left_reach_cycles"], r["cycle_index"]) for r in attempts] == [(3, int(i//200)+1) for i in range(600)]
+                    assert all(r["native"]["run"]["live_input"]["required_view"] == {"required": True,"qualified": True,"role":"chest"} for r in frames)
+                    assert all(r["frame"]["body"] == m.ZERO_BODY for r in frames)
+                    assert len({r["frame"]["source"]["source_id"] for r in frames}) == 1
+                    assert [r["frame"]["source"]["sample_seq"] for r in frames] == list(range(1,601))
+                    assert len({r["grant"]["grant_id"] for r in frames}) == 600
+                    assert sum(r["event"] == "leader_clutch_acquired" for r in records) == 1
+                    assert all(r["native"]["run"]["run_id"] == owned_id and r["native"]["run"]["deadline"] == 301. for r in frames)
+                    plans = [r for r in records if r["event"] == "workload_plan"]
+                    assert len(plans) == 1 and plans[0]["reference"] == summary["workspace"]["reference"]
+                    assert plans[0]["endpoint_normalized"] == summary["selected_profile"]["endpoint_normalized"]
+                    for index in range(200):
+                        assert frames[index]["frame"]["target"] == frames[index+200]["frame"]["target"] == frames[index+400]["frame"]["target"]
+                    selected = {"arm_left_elbow_flex.pos", "arm_left_gripper.pos"}
+                    assert all(all(value == summary["workspace"]["reference"][key] for key, value in r["frame"]["target"].items()
+                                   if key not in selected) for r in frames)
+                    assert len(session.start_requests) == len(session.pauses) == 1 and session.claim_posts == 0
                 if failure == "normal_program_finish_combined_body":
                     assert start["workload_segment"] == summary["workload_segment"] == "combined-body"
                     assert start["program_active_seconds"] == 64.5
@@ -1596,7 +1633,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             if failure == "usb_quit_empty_finish":
                 assert len(session.inputs) == 0 and len(session.pauses) == 1
                 assert summary["frame_count"] == 0 and summary["endpoint_error_normalized"] == {}
-            else:
+            elif not cycle_run:
                 assert len(session.inputs) == len(session.pauses) == 1
             if not failure.endswith("failed"):
                 assert summary["pause_operation_id"] == session.pauses[0]["operation_id"]
@@ -8828,6 +8865,80 @@ def test_selected_left_profile_refuses_endpoint_that_cannot_fit_existing_ramp_ra
     native["bounds"]["arm_left_elbow_flex.pos"]["rate_per_s"] = .1
     with pytest.raises(ValueError, match="unchanged.*ramp rate"):
         m.SelectedLeftWorkload(native)
+
+
+@pytest.mark.parametrize("count", [2, 3])
+def test_left_reach_cycles_preserve_original_targets_across_all_boundaries_and_holds(count):
+    m = adapter(); native = workspace()
+    task = m.SelectedLeftWorkload(native, segment="left-reach", left_reach_cycles=count)
+    single = m.SelectedLeftWorkload(native, segment="left-reach")
+    assert task.duration_s == 20. * count and task.plan()["left_reach_cycles"] == count
+    assert len(task.plan()["phases"]) == 7 * count
+    original = task.plan()
+    for cycle in range(count):
+        for local in (0., 2., 4., 6., 8., 9., 10., 11., 12., 14., 16., 19.9):
+            task.elapsed_s, single.elapsed_s = cycle * 20 + local, local
+            assert task.get_action() == single.get_action()
+            assert task.phase == single.phase and task.cycle_index == cycle + 1
+            assert not task.complete
+    task.elapsed_s = 27.; task.admit(10.); task.freeze(); task.advance(80.)
+    assert task.elapsed_s == 27. and task.interrupted_phases == {"cycle-2/left_endpoint_hold"}
+    assert task.plan()["reference"] == original["reference"]
+    assert task.plan()["endpoint_normalized"] == original["endpoint_normalized"]
+    task.admit(80.)
+    for i in range(1, int((20. * count - 27.) * 10) + 1):
+        task.advance(80. + i/10)
+    assert task.complete and task.elapsed_s == 20. * count and task.cycle_index == count
+    assert task.plan()["cycles_completed"] == count
+    assert len(task.phases_completed) == 7 * count
+    assert task.get_action() == {k.removeprefix("arm_"):v for k,v in native["reference"].items()}
+
+
+def test_left_reach_cycles_default_one_keeps_existing_shape_and_behavior():
+    m = adapter(); native = workspace()
+    default = m.SelectedLeftWorkload(native, segment="left-reach")
+    explicit = m.SelectedLeftWorkload(native, segment="left-reach", left_reach_cycles=1)
+    assert default.plan() == explicit.plan() and default.duration_s == 20.
+    assert len(default.plan()["phases"]) == 7 and "left_reach_cycles" not in default.plan()
+    for at in (0., 8., 11., 20.):
+        default.elapsed_s = explicit.elapsed_s = at
+        assert default.get_action() == explicit.get_action() and default.complete == explicit.complete
+
+
+@pytest.mark.parametrize("changes", [
+    {"left_reach_cycles":0}, {"left_reach_cycles":4}, {"left_reach_cycles":True}, {"left_reach_cycles":1.5},
+    {"workload_segment":"left-maintained"}, {"source":"usb-leaders"}, {"bench_continuity":True},
+    {"next_start_seconds":1.}, {"interrupt_at_seconds":0.}, {"interrupt_controller":True},
+    {"duration_seconds":59.9},
+])
+def test_left_reach_cycles_invalid_run_selection_refuses_before_output_or_ownership(tmp_path, monkeypatch, changes):
+    import asyncio
+    from types import SimpleNamespace
+    m = adapter(); output = tmp_path/"must-not-exist"
+    values=dict(source="virtual-leaders",workload_segment="left-reach",left_reach_cycles=3,
+                bench_continuity=False,next_start_seconds=None,interrupt_at_seconds=None,interrupt_controller=False,output=str(output))
+    values.update(changes)
+    def forbidden(*args):raise AssertionError("invalid selection reached session ownership")
+    monkeypatch.setattr(m,"SessionClient",forbidden)
+    with pytest.raises(ValueError,match="cycles"):
+        asyncio.run(m.run(SimpleNamespace(**values)))
+    assert not output.exists()
+
+
+def test_left_reach_cycles_cli_declares_three_normal_required_cycles_before_run(monkeypatch):
+    m = adapter(); seen=[]
+    async def run(args):seen.append(args);return {}
+    monkeypatch.setattr(m,"run",run)
+    m.main(["--source","virtual-leaders","--url","unused","--ca","unused","--storage-state","unused",
+            "--output","unused","--workload-segment","left-reach","--left-reach-cycles","3"])
+    assert len(seen)==1 and seen[0].left_reach_cycles == 3
+    assert not seen[0].bench_continuity and seen[0].next_start_seconds is seen[0].interrupt_at_seconds is None
+    for extra in (["--left-reach-cycles","4"],["--left-reach-cycles","3","--next-start-seconds","1"],
+                  ["--left-reach-cycles","3","--workload-segment","left-maintained"]):
+        with pytest.raises(SystemExit):
+            m.main(["--source","virtual-leaders","--url","unused","--ca","unused","--storage-state","unused",
+                    "--output","unused",*extra])
+    assert len(seen)==1
 
 
 @pytest.mark.parametrize("at,shoulder_fraction,elbow_fraction,opening_fraction", [
