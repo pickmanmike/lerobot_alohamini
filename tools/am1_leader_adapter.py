@@ -738,6 +738,33 @@ class HTTPOutcomeError(RuntimeError):
         super().__init__(reason if isinstance(reason, str) else detail)
 
 
+def _normal_renewal_receipt(receipt, generation):
+    if (not isinstance(receipt, dict)
+        or set(receipt) != {"accepted", "status", "controller_generation", "presence_expires", "lease_seconds", "timing"}
+        or receipt.get("accepted") is not True or receipt.get("status") != "claimed"
+        or type(receipt.get("controller_generation")) is not str or receipt["controller_generation"] != generation
+        or type(receipt.get("lease_seconds")) not in (int, float) or receipt["lease_seconds"] != 3.):
+        return False
+    timing = receipt["timing"]
+    if (not isinstance(timing, dict) or set(timing) != {"service_received_at", "service_completed_at"}
+        or any(type(v) not in (int, float) or not math.isfinite(v)
+               for v in (*timing.values(), receipt["presence_expires"]))):
+        return False
+    return (0 <= timing["service_received_at"] <= timing["service_completed_at"] < receipt["presence_expires"]
+            and receipt["presence_expires"] == timing["service_received_at"] + 3.)
+
+
+def _owner_unknown_renewal(error):
+    expected = {
+        "accepted": None, "status": "unknown", "uncertain": True,
+        "reason": "owner outcome unknown; inspect state or lookup the same operation", "effect_admitted": None,
+    }
+    return (type(error) is HTTPOutcomeError and type(error.http_status) is int and error.http_status == 503
+            and isinstance(error.response, dict) and set(error.response) == set(expected)
+            and all(type(error.response[k]) is type(v) and error.response[k] == v for k, v in expected.items())
+            and isinstance(getattr(error, "renewal_context", None), dict))
+
+
 def expired_input_refusal(error):
     return isinstance(error, CommandRefusedError) and all(
         error.response.get(key) == value and type(error.response.get(key)) is type(value)
@@ -1355,6 +1382,16 @@ class SessionClient:
             # current presence, not a burst of missed ticks or a new Claim.
             due = time.monotonic() + 0.45
             started = time.monotonic()
+            anchor = None
+            try:
+                previous = self._renewal_ack
+                if _normal_renewal_receipt(previous, self.generation):
+                    anchor = {"identity": self.identities(), "device": self.device,
+                              "run": {k: self.snapshot["run"][k] for k in
+                                      ("run_id", "operation_id", "recipe", "backend_incarnation", "native_live_at", "deadline")},
+                              "previous_expiry": previous["presence_expires"], "dispatched": started}
+            except (AttributeError, KeyError, TypeError):
+                pass  # No qualified prior receipt means no automatic unknown-renewal reconciliation.
             detail = {"event": "controller_renewal", "controller_generation": self.generation,
                       "dispatch_at_monotonic_s": started}
             try:
@@ -1363,9 +1400,12 @@ class SessionClient:
                 detail["outcome"] = "cancelled"
                 raise
             except Exception as error:
+                if type(error) is HTTPOutcomeError and anchor is not None:
+                    error.renewal_context = anchor
                 detail.update(outcome="failed", error_type=type(error).__name__, message=str(error))
                 raise
             else:
+                self._renewal_ack = result
                 detail.update(outcome="accepted", presence_expires=result.get("presence_expires"),
                               lease_seconds=result.get("lease_seconds"), service_timing=result.get("timing"))
             finally:
@@ -2147,9 +2187,9 @@ class SameRunRecovery:
 
     async def resume(
         self, *, wall_deadline=None, require_episode=False, refusal_identity=None, expected_pause=None,
-        renewal_check=None, grant_error=None,
+        renewal_check=None, grant_error=None, renewal_reconcile=None,
     ):
-        clock = {"ceiling": wall_deadline, "anchored": False}
+        clock = {"ceiling": wall_deadline, "anchored": False, "before_resume": True}
         interrupted, deferred, first_transport_error = None, [], grant_error
         grant_context, pending_recovery, resume_context = None, None, None
         consumed_resumes = set()
@@ -2223,6 +2263,14 @@ class SameRunRecovery:
                     require_episode, refusal_identity, expected_pause = False, None, outcome.event["kind"]
                     self.record({"event": "accepted_resume_superseded", "identity": outcome.identity,
                                  "pause_event": outcome.event, "remaining_s": clock["ceiling"] - time.monotonic()})
+                    continue
+                except HTTPOutcomeError as original:
+                    if (renewal_reconcile is None or not _owner_unknown_renewal(original)
+                        or not clock["before_resume"] or clock.get("renewal_reconciled")):
+                        raise
+                    first_transport_error = first_transport_error or original
+                    clock["renewal_reconciled"] = True
+                    await self._renew_current_after_unknown(original, clock, renewal_reconcile, renewal_check)
                     continue
                 except (ConnectionError, TimeoutError) as original:
                     context = getattr(original, "resume_result_context", None)
@@ -2299,6 +2347,88 @@ class SameRunRecovery:
                 if first_transport_error is not None and error is not first_transport_error:
                     raise first_transport_error from error
                 raise
+
+    async def _renew_current_after_unknown(self, original, clock, restart, renewal_check):
+        """A fresh fenced presence receipt never qualifies motion or resolves the old RPC."""
+        context = original.renewal_context
+        identity = context.get("identity") or {}
+        actual = self.client.identities()
+        if (set(context) != {"identity", "device", "run", "previous_expiry", "dispatched"}
+            or context["run"] != self.original["run"] or context["device"] != self.client.device
+            or not isinstance(identity, dict) or set(identity) != set(actual)
+            or any(type(identity[k]) is not type(v) or identity[k] != v for k, v in actual.items() if k != "intent_revision")
+            or type(identity.get("intent_revision")) is not int or identity["intent_revision"] < 0
+            or any(type(context.get(k)) not in (int, float) or not math.isfinite(context[k])
+                   for k in ("previous_expiry", "dispatched"))
+            or context["dispatched"] > time.monotonic()):
+            raise RuntimeError("original unknown renewal authority unavailable")
+        current_ceiling = clock.get("ceiling")
+        ceiling = min(context["dispatched"] + 8, float("inf") if current_ceiling is None else current_ceiling,
+                      clock.get("held_view_ceiling", float("inf")), clock.get("native_ceiling", float("inf")))
+        clock["ceiling"] = ceiling
+
+        def budget():
+            remaining = clock["ceiling"] - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("original unknown renewal qualification ceiling exhausted")
+            return remaining
+
+        async def fresh():
+            requested = time.monotonic()
+            read_budget = budget()
+            state = (await asyncio.wait_for(self.client.get("state"), read_budget))["snapshot"]
+            self.check(state)
+            run, controller = state["run"], state.get("controller") or {}
+            remaining = run.get("remaining_s")
+            if (type(remaining) not in (int, float) or not math.isfinite(remaining)
+                or not 0 < remaining <= clock["remaining"]):
+                raise RuntimeError("original unknown renewal native remaining clock changed")
+            # Map Pi's unchanged remaining budget at GET REQUEST, never at receipt.
+            clock["ceiling"] = min(clock["ceiling"], requested + remaining)
+            clock["remaining"] = remaining
+            budget()
+            pi_now = run["deadline"] - remaining
+            expiry = controller.get("presence_expires")
+            event = _latest_run_event(state, identity)
+            if (run.get("status") != "paused" or run.get("recovery") is not None
+                or type(run.get("intent_revision")) is not int
+                or run["intent_revision"] not in (identity.get("intent_revision"), identity.get("intent_revision", -2) + 1)
+                or event.get("kind") not in {"input_expired", "native_input_expired", "required_view_expired", "live_sensing_requalified"}
+                or type(event.get("at")) not in (int, float) or not math.isfinite(event["at"])
+                or not run["native_live_at"] <= event["at"] <= pi_now < run["deadline"]
+                or type(expiry) not in (int, float) or not math.isfinite(expiry)
+                or not expiry > max(pi_now, context["previous_expiry"])):
+                raise RuntimeError("current advanced unknown renewal authority/ordinary HOLD unavailable")
+            lease_ceiling = requested + expiry - pi_now
+            if time.monotonic() >= lease_ceiling:
+                raise TimeoutError("current unknown renewal lease expired during authenticated read")
+            self.client.snapshot = state
+            return state, pi_now, lease_ceiling
+
+        state, pi_now, lease_ceiling = await fresh()
+        post_budget = min(budget(), max(0, lease_ceiling - time.monotonic()))
+        result = await asyncio.wait_for(self.client.post("claim", {
+            "controller_generation": self.original["controller"]["controller_generation"]}),
+            post_budget)
+        if (not _normal_renewal_receipt(result, self.client.generation)
+            or result["timing"]["service_received_at"] < pi_now
+            or result["presence_expires"] < state["controller"]["presence_expires"]):
+            raise RuntimeError("current fenced renewal receipt unavailable")
+        state, _, _ = await fresh()
+        if state["controller"]["presence_expires"] != result["presence_expires"]:
+            raise RuntimeError("current fenced renewal receipt/state changed")
+        self.client._renewal_ack = result
+        self.record({"event": "controller_renewal_requalified", "original_outcome": "unknown",
+                     "original_dispatch_at_monotonic_s": context["dispatched"], "receipt": result,
+                     "original_ceiling_monotonic_s": clock["ceiling"]})
+        await restart(original)
+        if getattr(self.client, "transport_error", None):
+            close = getattr(self.client, "transport_close", None) or {}
+            if (self.client.transport_error != "owner reporting unavailable" or close.get("expected") is not False
+                or close.get("reason") != "reader-error"
+                or close.get("reader_error") != {"error_type": "RuntimeError", "message": "owner reporting unavailable"}):
+                raise RuntimeError("unknown renewal transport closure is not qualified")
+            await self._attach_transport(state, self.client.identities(), budget, renewal_check)
 
     async def _attach_transport(self, state, identity, remaining, renewal_check):
         attachment_attempt = 0
@@ -2869,6 +2999,7 @@ class SameRunRecovery:
             else:
                 options = ({"qualification_ceiling": clock["held_view_ceiling"]}
                            if "held_view_ceiling" in clock else {})
+                clock["before_resume"] = False
                 await asyncio.wait_for(self.client.resume(check=checked, refusal_record=self.record, **options), timeout)
         except _NativeRecoveryPendingError as outcome:
             outcome.episode = episode if recovered and outcome.pending_episode is None else None
@@ -3733,6 +3864,12 @@ async def run(args):
                 renewal.result()
                 raise RuntimeError("original controller renewal ended")
 
+        async def restart_qualified_renewal(original):
+            nonlocal renewal
+            if not renewal.done() or renewal.exception() is not original:
+                raise RuntimeError("original failed renewal task changed")
+            renewal = asyncio.create_task(client.renew())
+
         if not bench:
             await recovery.resume(renewal_check=renewal_healthy)
             producer.native_cursor = _live(client.snapshot)["cursor"]
@@ -3776,7 +3913,11 @@ async def run(args):
                         "meaning": "discard ambiguous input; fresh attachment, held qualification and new capture"})
             if bench and await ensure_authority(force=input_error is not None, until=ceiling):
                 require_episode, refusal_identity, expected_pause, grant_error = False, None, None, None
-            renewal_healthy()
+            try:
+                renewal_healthy()
+            except HTTPOutcomeError as original:
+                if bench or not _owner_unknown_renewal(original):
+                    raise
             if workload:
                 workload.freeze()
             while True:
@@ -3787,6 +3928,7 @@ async def run(args):
                         refusal_identity=refusal_identity,
                         expected_pause=expected_pause,
                         renewal_check=renewal_healthy, grant_error=grant_error,
+                        renewal_reconcile=None if bench else restart_qualified_renewal,
                     )
                     break
                 except Exception as error:
@@ -3898,8 +4040,13 @@ async def run(args):
                 raise TimeoutError("peer baseline original qualification ceiling exhausted")
             if bench and await ensure_authority(until=peer_baseline_until):
                 await rejoin(until=peer_baseline_until)
-            if renewal.done():
-                renewal.result()
+            try:
+                renewal_healthy()
+            except HTTPOutcomeError as original:
+                if bench or not _owner_unknown_renewal(original):
+                    raise
+                await rejoin(until=peer_baseline_until)
+                continue
             state = acquisition_state()
             wall_elapsed = time.monotonic() - active_at
             if (
