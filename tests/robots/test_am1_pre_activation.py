@@ -588,7 +588,7 @@ def test_protected_endpoint_rejects_negative_unsigned_current(activation, monkey
     assert not energizing(activation.events) and not goals(activation.events)
 
 
-def current_rest_normal_activation_case(case, tmp_path, monkeypatch):
+def current_rest_normal_activation_case(case, tmp_path, monkeypatch, *, workload_segment="left-reach"):
     """Real protected transaction/activation; replace only external register I/O."""
     import copy
 
@@ -597,7 +597,9 @@ def current_rest_normal_activation_case(case, tmp_path, monkeypatch):
     from lerobot.robots.alohamini import am1_live_teleop
 
     _, bound, trial, _, _, _ = left_response_p_robot(
-        tmp_path, monkeypatch, workspace_profile=CURRENT_REST_PROFILE
+        tmp_path, monkeypatch, workload_segment=workload_segment,
+        workspace_profile=("ordinary-arms-left-current-rest-1051-1164" if workload_segment == "ordinary-arms" else CURRENT_REST_PROFILE),
+        left_shoulder_startup_degrees=1 if workload_segment == "ordinary-arms" else None,
     )
     robot = case.robot
     robot.config.no_follower = False
@@ -632,11 +634,14 @@ def current_rest_normal_activation_case(case, tmp_path, monkeypatch):
     return robot, trial, ELBOW
 
 
+@pytest.mark.parametrize("workload_segment", ["left-reach", "ordinary-arms"])
 def test_current_rest_normal_activation_uses_fresh_afterhome_q0_and_never_replays_original_goal(
-    activation, tmp_path, monkeypatch
+    activation, tmp_path, monkeypatch, workload_segment,
 ):
     case = activation
-    robot, trial, elbow = current_rest_normal_activation_case(case, tmp_path, monkeypatch)
+    robot, trial, elbow = current_rest_normal_activation_case(case, tmp_path, monkeypatch, workload_segment=workload_segment)
+    assert trial.binding["request"]["workload_segment"] == workload_segment
+    assert trial.normal_rest_startup_degrees(robot) == (1. if workload_segment == "ordinary-arms" else .5)
     def after_home(source):
         source.left_bus.registers["Present_Position", elbow] = 1091
         case.clock.now += 0.25

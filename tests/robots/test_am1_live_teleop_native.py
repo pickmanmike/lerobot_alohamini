@@ -1161,12 +1161,13 @@ def test_current_rest_native_workspace_requires_exact_active_trial_and_keeps_ori
         assert control._live_summary["workspace"] == workspace and control._live_summary["reference"] == original
 
 
-def current_rest119_lane(monkeypatch, *, explicit=True):
+def current_rest119_lane(monkeypatch, *, explicit=True, workload_segment="left-reach"):
     """Actual119 measured rest and original legal hold through the real native lane."""
     from lerobot.robots.alohamini.am1_live_teleop import before_write
     now, identity, owner, robot, control = lane()
-    trial = install_left_response_trial(monkeypatch, robot, workload="left-reach")
-    trial.binding["request"]["workspace_profile"] = "left-current-rest-1051-1164"
+    trial = install_left_response_trial(monkeypatch, robot, workload=workload_segment)
+    trial.binding["request"]["workspace_profile"] = (
+        "ordinary-arms-left-current-rest-1051-1164" if workload_segment == "ordinary-arms" else "left-current-rest-1051-1164")
     if explicit:
         trial.binding["request"]["left_shoulder_startup_degrees"] = 1
     robot._am1_left_response_p_binding = copy.deepcopy(trial.binding)
@@ -1179,6 +1180,39 @@ def current_rest119_lane(monkeypatch, *, explicit=True):
     robot._am1_live_before_write = lambda: before_write(control, robot)
     assert control.apply(robot, frame(identity, owner, 0))
     return now, identity, owner, robot, control, trial
+
+
+@pytest.mark.parametrize("workload_segment", ["left-reach", "ordinary-arms"])
+def test_ordinary_arms_explicit_native_profile_allows_coordinated_targets_without_broadening_legacy(monkeypatch, workload_segment):
+    now, identity, owner, robot, control, trial = current_rest119_lane(monkeypatch, workload_segment=workload_segment)
+    from lerobot.robots.alohamini.am1_live_teleop import _left_response_target_valid
+
+    original = copy.deepcopy(control.live_snapshot()["workspace"])
+    value = sample(control)
+    expected = workload_segment == "ordinary-arms"
+    assert _left_response_target_valid(robot, control, value) is expected
+    now[0] += .05
+    assert control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2, sample=value)) is expected
+    assert control.live_snapshot()["workspace"] == original
+    assert control.live_snapshot()["reference"] == original["reference"]
+    assert trial.receipt["configured_p"] == 32
+    assert not any(register == "P_Coefficient" for register, _values in robot.right_bus.writes)
+
+
+@pytest.mark.parametrize("changed", ["body", "source", "expired", "stop"])
+def test_ordinary_arms_profile_keeps_zero_body_source_and_original_expiry_stop_guards(monkeypatch, changed):
+    now, identity, owner, robot, control, _ = current_rest119_lane(monkeypatch, workload_segment="ordinary-arms")
+    value = sample(control)
+    if changed == "body":
+        value["body"]["x.vel"] = 1.
+    elif changed == "source":
+        value["source"]["kind"] = "usb-leaders"
+    elif changed == "expired":
+        value["valid_until_monotonic_s"] = now[0]
+    else:
+        assert control.apply(robot, dict(ZERO))
+    now[0] += .05
+    assert control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2, sample=value)) is False
 
 
 def current_rest119_sample(control, **kwargs):

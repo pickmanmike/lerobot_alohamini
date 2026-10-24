@@ -135,10 +135,16 @@ def normalized_raw(raw, calibration, *, gripper=False):
     return (100 - value if gripper else -value) if direction else value
 
 
+CURRENT_REST_WORKSPACE_PROFILES = {
+    "left-reach": "left-current-rest-1051-1164",
+    "ordinary-arms": "ordinary-arms-left-current-rest-1051-1164",
+}
+
+
 def validate_workspace(workspace):
     fields = {"version", "units", "bounds", "reference", "calibration", "raw_bounds"}
     if isinstance(workspace, dict) and "workspace_profile" in workspace:
-        if workspace["workspace_profile"] != "left-current-rest-1051-1164":
+        if workspace["workspace_profile"] not in CURRENT_REST_WORKSPACE_PROFILES.values():
             raise ValueError("unknown native workspace profile")
         fields.add("workspace_profile")
     if (

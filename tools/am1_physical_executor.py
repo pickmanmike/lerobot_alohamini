@@ -2287,8 +2287,8 @@ def wait_required_camera(camera, observation, cancel, *, sleep=time.sleep):
 
 
 def prepare_left_response_p_request(config_path, *, ttl_seconds=120, workspace_profile=None,
-                                    left_shoulder_startup_degrees=None):
-    """Prepare only one boot-local left-reach P32 request; never consume or Start it.
+                                    left_shoulder_startup_degrees=None, workload_segment="left-reach"):
+    """Prepare one explicit boot-local LEFT-P32 workload request; never consume or Start it.
 
     This self-contained function is relayed by the PC CLI and imports the installed
     validators. It does not require deploying this CLI into the physical runtime.
@@ -2312,16 +2312,21 @@ def prepare_left_response_p_request(config_path, *, ttl_seconds=120, workspace_p
         _publish_no_replace,
         acquire_stopped_guard,
     )
+    from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES
 
     if type(ttl_seconds) is not int or not 1 <= ttl_seconds <= 120:
         raise ValueError("Preparation expiry must be within 1–120 seconds")
+    if type(workload_segment) is not str or workload_segment not in CURRENT_REST_WORKSPACE_PROFILES:
+        raise ValueError("Only left-reach and explicit ordinary-arms preparation are supported")
+    if workload_segment == "ordinary-arms" and workspace_profile is None:
+        raise ValueError("Ordinary arms requires explicit current-rest preparation")
     if workspace_profile is not None and (type(workspace_profile) is not str
-            or workspace_profile != "left-current-rest-1051-1164"):
+            or workspace_profile != CURRENT_REST_WORKSPACE_PROFILES[workload_segment]):
         raise ValueError("Only the explicit current-rest workspace profile is supported")
     if left_shoulder_startup_degrees is not None and (
         type(left_shoulder_startup_degrees) not in (int, float)
         or left_shoulder_startup_degrees != 1
-        or workspace_profile != "left-current-rest-1051-1164"
+        or workspace_profile != CURRENT_REST_WORKSPACE_PROFILES[workload_segment]
     ):
         raise ValueError("Left shoulder startup allowance requires exactly 1 degree and the current-rest workspace")
     path = Path(config_path)
@@ -2343,7 +2348,7 @@ def prepare_left_response_p_request(config_path, *, ttl_seconds=120, workspace_p
             raise ValueError("Stopped known-clean state and no pending response request required")
         request = {
             "version": 1, "kind": "left-response-p", "request_id": str(uuid.uuid4()),
-            "source_head": config["host_head"], "proportional": 32, "workload_segment": "left-reach",
+            "source_head": config["host_head"], "proportional": 32, "workload_segment": workload_segment,
             "boot_id": _left_response_p_boot_id(), "expires_at_monotonic_s": time.monotonic() + ttl_seconds,
         }
         if workspace_profile is not None:
@@ -2394,26 +2399,34 @@ def main(argv=None):
 
     parser = argparse.ArgumentParser(description=main.__doc__)
     parser.add_argument("--prepare-left-response-p", action="store_true", required=True,
-                        help="Prepare a fresh temporary P32 left-reach request without starting hardware")
+                        help="Prepare one explicit temporary LEFT-P32 workload without starting hardware")
     parser.add_argument("--ssh", choices=("am1-pi",), required=True)
     parser.add_argument("--config", required=True, help="Existing installed Pi physical.json")
     parser.add_argument("--ttl-seconds", type=int, default=120)
     parser.add_argument("--left-response-workspace", choices=("current-rest",), default=None,
                         help="Explicitly select the approved LEFT1051..1164 corridor and ordinary measured-q startup")
+    parser.add_argument("--left-response-workload", choices=("left-reach", "ordinary-arms"), default="left-reach",
+                        help="Explicit target scope; ordinary-arms preserves only LEFT elbow P32 and zero body intent")
     parser.add_argument("--left-shoulder-startup-degrees", type=int, choices=(1,), default=None,
                         help="Explicit temporary 1-degree inward LEFT shoulder startup allowance for current-rest only")
     args = parser.parse_args(argv)
     if args.left_shoulder_startup_degrees is not None and args.left_response_workspace is None:
         parser.error("Left shoulder startup allowance requires --left-response-workspace current-rest")
+    if args.left_response_workload == "ordinary-arms" and args.left_response_workspace is None:
+        parser.error("Ordinary arms requires --left-response-workspace current-rest")
     if (not 1 <= args.ttl_seconds <= 120
             or re.fullmatch(r"/home/pickmanmike/\.local/share/am1-physical-adapter-01/"
                             r"deployments/[0-9a-f]{16}/physical\.json", args.config) is None
             or str(PurePosixPath(args.config)) != args.config):
         parser.error("Existing installed physical.json and preparation expiry within 1–120 seconds required")
-    profile_args = ["left-current-rest-1051-1164"] if args.left_response_workspace is not None else []
+    from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES
+    profile_args = [CURRENT_REST_WORKSPACE_PROFILES[args.left_response_workload]] if args.left_response_workspace is not None else []
     profile_keyword = ", workspace_profile=sys.argv[3]" if profile_args else ""
     startup_args = ["1"] if args.left_shoulder_startup_degrees is not None else []
     startup_keyword = ", left_shoulder_startup_degrees=int(sys.argv[4])" if startup_args else ""
+    workload_args = ["ordinary-arms"] if args.left_response_workload == "ordinary-arms" else []
+    workload_keyword = (", workload_segment=sys.argv[" + str(3 + len(profile_args) + len(startup_args)) + "]"
+                        if workload_args else "")
     # Fixed reviewed code, no command/interpreter/source/nonce override. SSH's remote
     # shell receives only quoted fixed arguments, never interpolated source text.
     payload = (
@@ -2422,10 +2435,10 @@ def main(argv=None):
         "'/home/pickmanmike/lerobot_alohamini/src']\n"
         + inspect.getsource(prepare_left_response_p_request)
         + "\nprint(json.dumps(prepare_left_response_p_request(sys.argv[1], "
-        "ttl_seconds=int(sys.argv[2])" + profile_keyword + startup_keyword + "), sort_keys=True))\n"
+        "ttl_seconds=int(sys.argv[2])" + profile_keyword + startup_keyword + workload_keyword + "), sort_keys=True))\n"
     )
     remote = shlex.join(["/home/pickmanmike/lerobot_alohamini/.venv/bin/python", "-B", "-",
-                         args.config, str(args.ttl_seconds), *profile_args, *startup_args])
+                         args.config, str(args.ttl_seconds), *profile_args, *startup_args, *workload_args])
     # An ambiguous SSH receipt is never retried automatically: the pending request
     # may already exist and must remain available for explicit inspection.
     reply = subprocess.run(
