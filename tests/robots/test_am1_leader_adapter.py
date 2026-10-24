@@ -730,7 +730,7 @@ def test_real_wss_clean_close_ends_qualified_wait_before_timeout(tmp_path):
         "bench_program_finish", "bench_program_finish_failed",
         "peer_fixed_baseline_ready", "peer_fixed_baseline_missing", "peer_fixed_baseline_native", "peer_fixed_baseline_blocked",
         "normal_program_finish", "normal_program_finish_failed", "normal_program_finish_combined_body",
-        "normal_program_finish_left_maintained", "normal_program_finish_left_reach", "normal_program_finish_left_reach_held", "normal_program_finish_left_reach_cycles", "normal_program_finish_left_supported", "normal_program_finish_left_opposite", "usb_finite_finish", "usb_finite_finish_failed", "usb_quit_finish", "usb_quit_empty_finish",
+        "normal_program_finish_left_maintained", "normal_program_finish_left_reach", "normal_program_finish_left_reach_held", "normal_program_finish_left_reach_cycles", "normal_program_finish_left_reach_closing_cycles", "normal_program_finish_left_reach_zero_gripper", "normal_program_finish_left_supported", "normal_program_finish_left_opposite", "usb_finite_finish", "usb_finite_finish_failed", "usb_quit_finish", "usb_quit_empty_finish",
     ],
 )
 def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
@@ -747,7 +747,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
     initial_pause_case = failure == "initial_resume_pause"
     terminal_hold = isinstance(failure, str) and failure.startswith("bench_terminal_hold_")
     normal_finish = isinstance(failure, str) and failure.startswith(("normal_program_finish", "usb_finite_finish", "usb_quit_"))
-    cycle_run = failure == "normal_program_finish_left_reach_cycles"
+    cycle_run = failure in {"normal_program_finish_left_reach_cycles", "normal_program_finish_left_reach_closing_cycles"}
     usb_finish = isinstance(failure, str) and failure.startswith(("usb_finite_finish", "usb_quit_"))
     program_finish = failure in {"bench_program_finish", "bench_program_finish_failed"} or normal_finish
     bench_case = failure in {"bench_input_gap", "bench_controller_gap", "bench_renewal_during_resume", "bench_renewal_attach_ceiling", "bench_renewal_snapshot_race",
@@ -930,6 +930,14 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
 
         def state(self, run_id):
             w = peer_workspace() if peer_wait_case else workspace()
+            if failure in {"normal_program_finish_left_reach_closing_cycles", "normal_program_finish_left_reach_zero_gripper"}:
+                gripper = "arm_left_gripper.pos"
+                w["calibration"][gripper[:-4]] = [6, 0, 933, 1886, 3401]
+                w["reference"][gripper] = 80.52805280528052
+                low = 2803 if cycle_run else 3106
+                w["raw_bounds"][gripper] = [low, 3106]
+                w["bounds"][gripper] = {"min": m.normalized_raw(low, w["calibration"][gripper[:-4]], gripper=True),
+                                         "max": 80.52805280528052, "rate_per_s": 20.}
             if peer_wait_case:
                 w["reference"]["arm_left_elbow_flex.pos"] = m.normalized_raw(2043, w["calibration"]["arm_left_elbow_flex"])
             if failure == "normal_program_finish_left_supported":
@@ -1503,6 +1511,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 args.bench_continuity = False
             if cycle_run:
                 args.workload_segment, args.left_reach_cycles, args.duration_seconds = "left-reach", 3, 60.
+            if failure == "normal_program_finish_left_reach_zero_gripper":
+                args.workload_segment = "left-reach"
             if failure == "normal_program_finish_combined_body":
                 args.workload_segment = "combined-body"
             if failure in {"normal_program_finish_left_maintained", "normal_program_finish_left_reach", "normal_program_finish_left_reach_held"}:
@@ -1539,13 +1549,20 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                     super().__init__(*args, **kwargs)
                     self.duration_s = .001  # Reporting seam only; real Native held proof is exercised below.
             monkeypatch.setattr(am1_teleop_workload, "TeleopWorkload", ShortProgramme)
-            if failure in {"normal_program_finish_left_maintained", "normal_program_finish_left_reach", "normal_program_finish_left_reach_held", "normal_program_finish_left_supported", "normal_program_finish_left_opposite"}:
+            if failure in {"normal_program_finish_left_maintained", "normal_program_finish_left_reach", "normal_program_finish_left_reach_held", "normal_program_finish_left_reach_zero_gripper", "normal_program_finish_left_supported", "normal_program_finish_left_opposite"}:
                 original_selected = m.SelectedLeftWorkload
                 class ShortSelected(original_selected):
                     def __init__(self, *args, **kwargs):
                         super().__init__(*args, **kwargs)
                         self.duration_s = .001  # Runner/reporting seam; full16/20s clocks tested independently.
                 monkeypatch.setattr(m, "SelectedLeftWorkload", ShortSelected)
+            if failure == "normal_program_finish_left_reach_zero_gripper":
+                with pytest.raises(ValueError, match="gripper.*excursion"):
+                    asyncio.run(asyncio.wait_for(m.run(args), 10))
+                session = instances[0]
+                assert session.starts == 1 and session.resumes == 0 and not session.inputs
+                assert session.stops == [owned_id]
+                return
             if failure.endswith("failed"):
                 with pytest.raises(RuntimeError, match="Native held qualification unavailable"):
                     asyncio.run(asyncio.wait_for(m.run(args), 10))
@@ -1590,6 +1607,15 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                     assert all(all(value == summary["workspace"]["reference"][key] for key, value in r["frame"]["target"].items()
                                    if key not in selected) for r in frames)
                     assert len(session.start_requests) == len(session.pauses) == 1 and session.claim_posts == 0
+                    if failure == "normal_program_finish_left_reach_closing_cycles":
+                        plan = summary["selected_profile"]
+                        assert plan["gripper_opening_delta"] == pytest.approx(-20.)
+                        assert plan["gripper_endpoint_normalized"] == pytest.approx(60.52805280528053)
+                        assert plan["gripper_direction_normalized"] == -1
+                        for cycle in range(3):
+                            assert frames[cycle*200]["frame"]["target"]["arm_left_gripper.pos"] == 80.52805280528052
+                            assert frames[cycle*200+100]["frame"]["target"]["arm_left_gripper.pos"] == pytest.approx(60.52805280528053)
+                            assert frames[cycle*200+120]["frame"]["target"]["arm_left_gripper.pos"] == 80.52805280528052
                 if failure == "normal_program_finish_combined_body":
                     assert start["workload_segment"] == summary["workload_segment"] == "combined-body"
                     assert start["program_active_seconds"] == 64.5
@@ -8892,6 +8918,64 @@ def test_left_reach_cycles_preserve_original_targets_across_all_boundaries_and_h
     assert task.plan()["cycles_completed"] == count
     assert len(task.phases_completed) == 7 * count
     assert task.get_action() == {k.removeprefix("arm_"):v for k,v in native["reference"].items()}
+
+
+@pytest.mark.parametrize("rate", [2., 20.])
+@pytest.mark.parametrize("count", [1, 3])
+def test_left_reach_gripper_uses_exact_admitted_closing_range_and_original_reference(rate, count):
+    import copy
+    m = adapter()
+    native = workspace()
+    key = "arm_left_gripper.pos"
+    calibration = [6, 0, 933, 1886, 3401]
+    native["calibration"][key[:-4]] = calibration
+    native["reference"][key] = 80.52805280528052
+    native["raw_bounds"][key] = [2803, 3106]
+    native["bounds"][key] = {"min": 60.52805280528053, "max": 80.52805280528052, "rate_per_s": rate}
+    original = copy.deepcopy(native)
+    task = m.SelectedLeftWorkload(native, segment="left-reach", left_reach_cycles=count)
+    plan = task.plan()
+    delta = -min(20., 2 * rate)
+    assert plan["gripper_opening_delta"] == pytest.approx(delta)
+    assert plan["gripper_endpoint_normalized"] == pytest.approx(native["reference"][key] + delta)
+    assert plan["gripper_direction_normalized"] == -1
+    assert "legacy left_gripper_open" in plan["gripper_endpoint_policy"]
+    clock = [10.]
+    producer = m.FrameProducer(task, clock=lambda: clock[0])
+    producer.workspace, producer.native_cursor = native, dict(native["reference"])
+    frames = []
+    for cycle in range(count):
+        for local, fraction in ((0., 0.), (8., 0.), (9., .5), (10., 1.), (11., .5), (12., 0.), (19.9, 0.)):
+            task.elapsed_s = cycle * 20. + local
+            clock[0] += .1
+            frame = producer.serialize(producer.capture({"grant_id": str(uuid4())}))
+            frames.append(frame)
+            target = frame["target"][key]
+            assert target == pytest.approx(native["reference"][key] + fraction * delta)
+            raw_goal = round(calibration[3] + target * (calibration[4] - calibration[3]) / 100.)
+            assert 2803 <= raw_goal <= 3106
+            if local == 10.:
+                assert raw_goal == (2803 if rate == 20. else 3045)
+            if local in (0., 12., 19.9):
+                assert raw_goal == 3106
+            assert frame["body"] == m.ZERO_BODY and not producer.clutch.last_clamps
+            selected = {task.elbow, key}
+            assert all(value == native["reference"][joint] for joint, value in frame["target"].items() if joint not in selected)
+    assert [frame["source"]["sample_seq"] for frame in frames] == list(range(1, len(frames) + 1))
+    assert len({frame["source"]["grant_id"] for frame in frames}) == len(frames)
+    assert native == original and task.plan() == {**plan, "active_progress_s": task.elapsed_s,
+                                                 **({"cycle_index": count, "cycles_completed": count - 1} if count > 1 else {})}
+
+
+def test_left_reach_gripper_equal_legal_excursions_prefer_existing_opening():
+    m = adapter()
+    native = workspace()
+    key = "arm_left_gripper.pos"
+    native["reference"][key] = 5.
+    task = m.SelectedLeftWorkload(native, segment="left-reach")
+    assert task.plan()["gripper_opening_delta"] == 4.
+    assert task.plan()["gripper_endpoint_normalized"] == 9.
+    assert task.plan()["gripper_direction_normalized"] == 1
 
 
 def test_left_reach_cycles_default_one_keeps_existing_shape_and_behavior():

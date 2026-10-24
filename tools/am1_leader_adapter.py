@@ -173,6 +173,13 @@ class SelectedLeftWorkload:
         self.opening = (min(self.origin[self.gripper] + 20., opening["max"],
                             self.origin[self.gripper] + 2 * opening["rate_per_s"])
                         if segment in {"left-reach", "left-supported-reach"} else self.origin[self.gripper])
+        if segment == "left-reach":
+            excursion = min(20., 2 * opening["rate_per_s"])
+            candidates = (min(self.origin[self.gripper] + excursion, opening["max"]),
+                          max(self.origin[self.gripper] - excursion, opening["min"]))
+            self.opening = max(candidates, key=lambda value: (abs(value-self.origin[self.gripper]), value))
+            if self.opening == self.origin[self.gripper]:
+                raise ValueError("left-reach gripper requires a nonzero admitted excursion")
         if segment == "left-supported-reach":
             shoulder = self.workspace["bounds"][self.shoulder]
             self.shoulder_endpoint = shoulder["max"]
@@ -420,6 +427,11 @@ class SelectedLeftWorkload:
                 "active_progress_s": self.elapsed_s, "interrupted_phases": sorted(self.interrupted_phases),
                 "dwell_basis": "producer active intent; native delivered dwell assessed separately",
                 "target_policy": "fixed original admitted references and supported endpoint across qualified recovery"}
+        if self.segment == "left-reach":
+            result.update(gripper_endpoint_normalized=self.opening,
+                          gripper_direction_normalized=1 if self.opening > self.origin[self.gripper] else -1,
+                          gripper_endpoint_policy="farthest admitted endpoint capped at20 opening points/two-second rate; "
+                                                  "opening wins equal travel; legacy left_gripper_open follows signed delta (negative closes)")
         if self.left_reach_cycles > 1:
             result.update(**self.cycle_metadata(), cycles_completed=int(self.elapsed_s // self.cycle_duration_s),
                           phases=[{"phase": name, "start_s": cycle * self.cycle_duration_s + start,
