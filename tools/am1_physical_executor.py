@@ -518,6 +518,110 @@ class PhysicalExecutor:
         self._live_admission_requested = False
         self._live_expired = None
         self._teleop_source = None
+        self._reset_input_transport_trace()
+
+    def _reset_input_transport_trace(self):
+        self._input_transport_trace = {
+            "version": 1, "clock": "pi-monotonic",
+            "provenance": "protected-executor/mailbox-and-send",
+            "recent_limit": 32, "dropped_rows": 0, "invalid_rows": 0,
+            "recent": [], "first_native_expiry": None, "first_native_expiry_seen": False,
+        }
+
+    def _input_transport_row(self, event, marker):
+        """Copy only bounded diagnostic primitives, never targets or PC clocks."""
+        if self.live_spec is not TELEOP_SPEC:
+            return None
+        try:
+            binding = marker.get("live_binding") or {}
+            row = {key: marker[key] for key in ("run_id", "host_incarnation")}
+            row.update({key: binding[key] for key in
+                        ("service_incarnation", "controller_generation", "connection_generation")})
+            if any(type(value) is not str or not 0 < len(value) <= 64 for value in row.values()):
+                raise ValueError("unbounded diagnostic identity")
+            for key, minimum in (("intent_revision", 0), ("epoch", -1)):
+                value = marker[key]
+                if type(value) is not int or not minimum <= value < 2**63:
+                    raise ValueError("invalid diagnostic revision/epoch")
+                row[key] = value
+            if type(marker["mode"]) is not str or marker["mode"] not in ("active", "pause"):
+                raise ValueError("invalid diagnostic mode")
+            row["mode"] = marker["mode"]
+            action_sequence = marker.get("action_sequence")
+            if event == "worker_send" and (type(action_sequence) is not int or not 0 <= action_sequence < 2**63):
+                raise ValueError("invalid diagnostic action sequence")
+            row["action_sequence"] = action_sequence if event == "worker_send" else None
+            original = marker.get("live_input")
+            if original is not None:
+                source = original["source"]
+                item = {"source_id": source["source_id"], "source_kind": source["kind"],
+                        "sample_seq": source["sample_seq"], "seq": original["seq"],
+                        "grant_id": original["grant_id"],
+                        "valid_until_monotonic_s": original["valid_until_monotonic_s"]}
+                if (type(item["source_id"]) is not str or not 0 < len(item["source_id"]) <= 64
+                        or type(item["grant_id"]) is not str or not 0 < len(item["grant_id"]) <= 64
+                        or type(item["source_kind"]) is not str
+                        or item["source_kind"] not in ("usb-leaders", "virtual-leaders")
+                        or any(type(item[key]) is not int or not 0 <= item[key] < 2**63
+                               for key in ("sample_seq", "seq"))
+                        or type(item["valid_until_monotonic_s"]) not in (int, float)
+                        or not math.isfinite(item["valid_until_monotonic_s"])
+                        or item["valid_until_monotonic_s"] < 0):
+                    raise ValueError("invalid diagnostic original input")
+                row["input"] = item
+            at = self.clock()
+            if type(at) not in (int, float) or not math.isfinite(at) or at < 0:
+                raise ValueError("invalid diagnostic Pi clock")
+            row["event"] = event
+            row["send_started_at_monotonic_s" if event == "worker_send" else "admitted_at_monotonic_s"] = at
+            return row
+        except Exception:
+            self._input_transport_trace["invalid_rows"] = min(2**63 - 1, self._input_transport_trace["invalid_rows"] + 1)
+            return None  # Diagnostic failure never changes admission, expiry or the original send exception.
+
+    def _append_input_transport(self, row, *, outcome=None, error_type=None):
+        if row is None:
+            return
+        try:
+            if row["event"] == "worker_send":
+                at = self.clock()
+                if (type(at) not in (int, float) or not math.isfinite(at)
+                        or at < row["send_started_at_monotonic_s"]
+                        or outcome not in ("returned", "raised")
+                        or error_type is not None and (type(error_type) is not str or len(error_type) > 64)):
+                    raise ValueError("invalid diagnostic send completion")
+                row.update(send_completed_at_monotonic_s=at, outcome=outcome, error_type=error_type)
+            trace = self._input_transport_trace
+            trace["recent"].append(row)
+            if len(trace["recent"]) > trace["recent_limit"]:
+                del trace["recent"][0]
+                trace["dropped_rows"] = min(2**63 - 1, trace["dropped_rows"] + 1)
+        except Exception:
+            self._input_transport_trace["invalid_rows"] = min(2**63 - 1, self._input_transport_trace["invalid_rows"] + 1)
+
+    def _freeze_input_transport_expiry(self, sample):
+        trace = self._input_transport_trace
+        if self.live_spec is not TELEOP_SPEC or trace["first_native_expiry_seen"]:
+            return
+        trace["first_native_expiry_seen"] = True
+        try:
+            ack, expired = sample["ack"], sample["ack"]["live_input"]
+            first = {key: ack[key] for key in ("run_id", "host_incarnation", "intent_revision", "epoch")}
+            first.update(feedback_sequence=sample["sequence"], last_input_seq=expired["last_input_seq"],
+                         valid_until_monotonic_s=expired["valid_until_monotonic_s"],
+                         expiry_detected_at_monotonic_s=expired["expiry_detected_at_monotonic_s"],
+                         observed_at_monotonic_s=self.clock())
+            if (any(type(first[key]) is not str or not 0 < len(first[key]) <= 64
+                    for key in ("run_id", "host_incarnation"))
+                    or any(type(first[key]) is not int or not 0 <= first[key] < 2**63
+                           for key in ("intent_revision", "epoch", "feedback_sequence", "last_input_seq"))
+                    or any(type(first[key]) not in (int, float) or not math.isfinite(first[key]) or first[key] < 0
+                           for key in ("valid_until_monotonic_s", "expiry_detected_at_monotonic_s", "observed_at_monotonic_s"))):
+                raise ValueError("invalid diagnostic expiry")
+            first["rows"] = copy.deepcopy(trace["recent"])
+            trace["first_native_expiry"] = first
+        except Exception:
+            trace["invalid_rows"] = min(2**63 - 1, trace["invalid_rows"] + 1)
 
     def supports(self, recipe):
         if recipe.name == TELEOP_RECIPE:
@@ -720,6 +824,7 @@ class PhysicalExecutor:
             self._hold_reference = None
             self._dispatch_ack = False
             self._execution = {"progress_s": 0.0, "complete": False, "fault": None}
+            self._reset_input_transport_trace()
             self._finite_completion = None
             self._completion_returns = []
             self._lifecycle = {
@@ -860,6 +965,11 @@ class PhysicalExecutor:
                              "valid_until_monotonic_s": valid_until_monotonic_s}
         self._teleop_source = copy.deepcopy(source)
         self._live_last_seq = seq
+        self._append_input_transport(self._input_transport_row("mailbox_admitted", {
+            "run_id": self.run_id, "host_incarnation": self.host_incarnation,
+            "intent_revision": self.revision, "epoch": self._epoch, "mode": "active",
+            "live_binding": self._live_binding, "live_input": self._live_target,
+        }))
         self._wake.set()
         return True
 
@@ -946,6 +1056,7 @@ class PhysicalExecutor:
             and ack.get("live_input", {}).get("state") == "expired"
         ):
             self._live_expired = copy.deepcopy(ack["live_input"])
+            self._freeze_input_transport_expiry(sample)
 
     def evidence(self):
         with self.mutex:
@@ -1109,7 +1220,12 @@ class PhysicalExecutor:
 
     def advance(self, now, dt):
         with self.mutex:
-            return copy.deepcopy(self._execution)
+            execution = copy.deepcopy(self._execution)
+            if self.live_spec is TELEOP_SPEC:
+                # Core already persists the full execution and exposes its typed
+                # run reference; essential status receives only scalar summaries.
+                execution["input_transport_trace"] = copy.deepcopy(self._input_transport_trace)
+            return execution
 
     def finish(self, status):
         with self.mutex:
@@ -1459,8 +1575,17 @@ class PhysicalExecutor:
                             live_admitted=self._live_admission_requested,
                             live_input=copy.deepcopy(self._live_target) if desired == "active" else None)
                     # Bound send is outside authority; the worker mutex fences concurrent Pause/Stop.
+                    send_trace = self._input_transport_row("worker_send", action["_am1_local_control"])
                     try:
-                        io.send(action)
+                        try:
+                            io.send(action)
+                        except BaseException as exc:
+                            self._append_input_transport(send_trace, outcome="raised", error_type=type(exc).__name__)
+                            raise
+                        else:
+                            # This is only the transport call returning, never a
+                            # unique native admission or an SDK-write receipt.
+                            self._append_input_transport(send_trace, outcome="returned")
                     except (FeedbackUnavailable, OSError) as exc:
                         self._transient = str(exc)
                         self.desired = "hold"

@@ -542,6 +542,186 @@ def test_practical_twenty_degrees_survives_ordinary_twenty_normalized_relative_c
     assert obj.config.max_relative_target == 20
 
 
+def test_teleop_command_join_records_real_admission_return_refusal_and_original_error():
+    import json
+    from tests.robots.test_am1_live_teleop_native import lane as teleop_lane, frame as teleop_frame, sample as teleop_sample
+
+    now, identity, owner, robot, control = teleop_lane()
+    assert control.apply(robot, teleop_frame(identity, owner, 1))
+    output = bytearray()
+    writer = host.AM1RoutineRecordWriter(write=lambda data: output.extend(data) or len(data))
+    original = teleop_sample(control, seq=548)
+    try:
+        now[0] = 10.1
+        command = teleop_frame(identity, owner, 2, mode="active", epoch=2, sample=original)
+        assert host._apply_traced_teleop_command(control, robot, command, writer, received_at=10.09)
+        assert host._apply_traced_teleop_command(control, robot,
+            teleop_frame(identity, owner, 3, mode="active", epoch=2, sample=original), writer, received_at=10.1)
+        now[0] = 10.26
+        assert not host._apply_traced_teleop_command(control, robot,
+            teleop_frame(identity, owner, 4, mode="active", epoch=2,
+                         sample=teleop_sample(control, seq=549, expiry=10.5, acquired=2.01)), writer, received_at=10.25)
+        assert host._apply_traced_teleop_command(control, robot,
+            teleop_frame(identity, owner, 5, epoch=3), writer, received_at=10.26)
+        error_now, error_identity, error_owner, error_robot, error_control = teleop_lane()
+        assert error_control.apply(error_robot, teleop_frame(error_identity, error_owner, 1))
+        primary = OSError("original hardware failure must survive trace")
+        def fail(_action):
+            raise primary
+        error_robot.send_action = fail
+        error_now[0] = 10.1
+        with pytest.raises(OSError) as caught:
+            host._apply_traced_teleop_command(error_control, error_robot,
+                teleop_frame(error_identity, error_owner, 2, mode="active", epoch=2,
+                             sample=teleop_sample(error_control, seq=549)), writer, received_at=10.09)
+        assert caught.value is primary
+    finally:
+        writer.close(timeout=1)
+    rows = [json.loads(line.split("] ", 1)[1]) for line in output.decode().splitlines()]
+    assert len(rows) == 5 and [row["outcome"] for row in rows] == ["accepted", "accepted", "refused", "accepted", "raised"]
+    assert [row["new_input_admitted"] for row in rows] == [True, False, False, False, True]
+    assert rows[0]["input"] == {"source_id": original["source"]["source_id"], "source_kind": "virtual-leaders",
+        "sample_seq": 548, "seq": 548, "grant_id": original["grant_id"], "valid_until_monotonic_s": 10.25}
+    assert rows[3]["input"] is None and rows[-1]["error_type"] == "OSError"
+    assert rows[2]["input"]["seq"] == 549 and rows[2]["native_input_after"]["seq"] == 548
+    assert rows[2]["native_input_after"]["valid_until_monotonic_s"] == 10.25
+    for index, row in enumerate(rows):
+        expected_identity, expected_owner = (identity, owner) if index < 4 else (error_identity, error_owner)
+        assert row["version"] == 1 and row["clock"] == "monotonic"
+        assert row["run_id"] == expected_identity["run_id"] and row["host_incarnation"] == expected_identity["host_incarnation"]
+        assert row["service_incarnation"] == expected_owner["service_incarnation"]
+        assert row["received_at_monotonic_s"] <= row["completed_at_monotonic_s"]
+        assert len(json.dumps(row, separators=(",", ":")).encode()) <= 2048
+        assert set(row) == {"version", "clock", "provenance", "run_id", "host_incarnation", "intent_revision", "epoch",
+                           "action_sequence", "mode", "service_incarnation", "controller_generation", "connection_generation",
+                           "input", "received_at_monotonic_s", "state_before", "outcome", "error_type", "completed_at_monotonic_s",
+                           "state_after", "native_input_after", "native_admitted_at_monotonic_s", "new_input_admitted"}
+        assert not {"target", "workspace", "body", "write_acknowledged"} & set(row)
+
+
+@pytest.mark.parametrize("change", ["foreign_run", "foreign_owner", "version", "extra", "source", "seq", "not_teleop", "no_writer",
+                                    "expiry_nan", "huge_seq", "pause_input", "received_nan"])
+def test_teleop_command_join_filters_bound_fields_without_changing_apply(monkeypatch, change):
+    from tests.robots.test_am1_live_teleop_native import lane as teleop_lane, frame as teleop_frame, sample as teleop_sample
+    now, identity, owner, robot, control = teleop_lane()
+    assert control.apply(robot, teleop_frame(identity, owner, 1))
+    command = teleop_frame(identity, owner, 2, mode="active", epoch=2, sample=teleop_sample(control))
+    marker = command[host.AM1_LOCAL_CONTROL_KEY]
+    if change == "foreign_run":marker["run_id"] = str(uuid4())
+    elif change == "foreign_owner":marker["live_binding"]["connection_generation"] = str(uuid4())
+    elif change == "version":marker["version"] = True
+    elif change == "extra":marker["secret"] = "must not be copied"
+    elif change == "source":marker["live_input"]["source"]["source_id"] = "x" * 10000
+    elif change == "seq":marker["action_sequence"] = True
+    elif change == "expiry_nan":marker["live_input"]["valid_until_monotonic_s"] = float("nan")
+    elif change == "huge_seq":marker["action_sequence"] = 2**10000
+    elif change == "pause_input":marker["mode"] = "pause"
+    elif change == "not_teleop":control.teleop = False
+    called, output = [], bytearray()
+    monkeypatch.setattr(control, "apply", lambda obj, data: called.append((obj, data)) or False)
+    writer = host.AM1RoutineRecordWriter(write=lambda data: output.extend(data) or len(data))
+    try:
+        assert not host._apply_traced_teleop_command(control, robot, command, None if change == "no_writer" else writer,
+                                                    received_at=float("nan") if change == "received_nan" else 10.)
+    finally:
+        writer.close(timeout=1)
+    assert called == [(robot, command)] and not output
+
+
+@pytest.mark.parametrize("bad_clock", [False, True])
+def test_teleop_command_join_bounds_untrusted_payload_and_refuses_nonfinite_completion(monkeypatch, bad_clock):
+    import json
+    from types import SimpleNamespace
+    from tests.robots.test_am1_live_teleop_native import lane as teleop_lane, frame as teleop_frame, sample as teleop_sample
+    now, identity, owner, robot, control = teleop_lane()
+    assert control.apply(robot, teleop_frame(identity, owner, 1))
+    command = teleop_frame(identity, owner, 2, mode="active", epoch=2, sample=teleop_sample(control))
+    original = command[host.AM1_LOCAL_CONTROL_KEY]["live_input"]
+    original["target"] = {"never-copy-this": "x" * 100000}
+    original["seq"] = original["source"]["sample_seq"] = 2**63 - 1
+    original["valid_until_monotonic_s"] = float.fromhex("0x1.fffffffffffffp+1023")
+    monkeypatch.setattr(control, "apply", lambda *args: False)
+    if bad_clock:monkeypatch.setattr(host, "time", SimpleNamespace(monotonic=lambda: float("nan")))
+    output = bytearray()
+    writer = host.AM1RoutineRecordWriter(write=lambda data: output.extend(data) or len(data))
+    assert not host._apply_traced_teleop_command(control, robot, command, writer, received_at=10.)
+    if bad_clock:
+        with pytest.raises(ValueError, match="bounded finite"):writer.close(timeout=1)
+        assert not output
+    else:
+        writer.close(timeout=1)
+        record = json.loads(output.decode().split("] ", 1)[1])
+        assert record["outcome"] == "refused" and len(output) <= 2048
+        assert "never-copy-this" not in output.decode() and "target" not in record
+
+
+@pytest.mark.parametrize("sink", ["blocked", "failed", "submit_raised"])
+def test_teleop_command_join_writer_never_replaces_hardware_error_or_blocks(monkeypatch, sink):
+    import threading
+    from tests.robots.test_am1_live_teleop_native import lane as teleop_lane, frame as teleop_frame, sample as teleop_sample
+    now, identity, owner, robot, control = teleop_lane()
+    assert control.apply(robot, teleop_frame(identity, owner, 1))
+    command = teleop_frame(identity, owner, 2, mode="active", epoch=2, sample=teleop_sample(control))
+    entered, release = threading.Event(), threading.Event()
+    primary, secondary = OSError("original hardware fault"), OSError("trace sink failure")
+    def write(data):
+        entered.set()
+        if sink == "failed":raise secondary
+        assert release.wait(2)
+        return len(data)
+    writer = host.AM1RoutineRecordWriter(write=write)
+    if sink == "submit_raised":
+        def submit(*args):raise secondary
+        monkeypatch.setattr(writer, "submit", submit)
+    def fail(*args):raise primary
+    monkeypatch.setattr(control, "apply", fail)
+    try:
+        with pytest.raises(OSError) as caught:
+            host._apply_traced_teleop_command(control, robot, command, writer, received_at=10.)
+        assert caught.value is primary
+        if sink != "submit_raised":assert entered.wait(1)
+        assert not release.is_set()
+    finally:
+        release.set()
+        if sink == "blocked":writer.close(timeout=1)
+        else:
+            with pytest.raises(OSError) as caught:writer.close(timeout=1)
+            assert caught.value is secondary
+
+
+@pytest.mark.parametrize("diagnostic", ["clock", "cache", "cache_normal"])
+def test_teleop_command_join_diagnostic_failure_preserves_first_fault_and_one_apply(monkeypatch, diagnostic):
+    from types import SimpleNamespace
+    from tests.robots.test_am1_live_teleop_native import lane as teleop_lane, frame as teleop_frame, sample as teleop_sample
+    now, identity, owner, robot, control = teleop_lane()
+    assert control.apply(robot, teleop_frame(identity, owner, 1))
+    command = teleop_frame(identity, owner, 2, mode="active", epoch=2, sample=teleop_sample(control))
+    calls, output = [], bytearray()
+    primary, secondary = OSError("original apply fault"), OSError("diagnostic clock fault")
+    def apply(obj, data):
+        calls.append((obj, data))
+        if diagnostic != "cache_normal":raise primary
+        return False
+    monkeypatch.setattr(control, "apply", apply)
+    if diagnostic == "clock":
+        def clock():raise secondary
+        monkeypatch.setattr(host, "time", SimpleNamespace(monotonic=clock))
+    else:
+        control._live_summary["source"] = object()  # Unexpected cache is a diagnostic failure only.
+    writer = host.AM1RoutineRecordWriter(write=lambda data: output.extend(data) or len(data))
+    if diagnostic == "cache_normal":
+        assert not host._apply_traced_teleop_command(control, robot, command, writer, received_at=10.)
+    else:
+        with pytest.raises(OSError) as caught:
+            host._apply_traced_teleop_command(control, robot, command, writer, received_at=10.)
+        assert caught.value is primary
+    assert calls == [(robot, command)]
+    with pytest.raises(OSError if diagnostic == "clock" else AttributeError) as caught:
+        writer.close(timeout=1)
+    if diagnostic == "clock":assert caught.value is secondary
+    assert not output
+
+
 def test_practical_routine_writer_blocked_sink_keeps_owner_free_and_records_immutable():
     import json
     import threading
