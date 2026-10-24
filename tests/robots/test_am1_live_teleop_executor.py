@@ -80,6 +80,84 @@ def test_exact_whole_frame_preserves_source_body_expiry_and_rejects_regrant_repl
     assert not e.supports(Recipe("physical-live-teleop", "finite", 180, 300, seed=None))
 
 
+@pytest.mark.parametrize("bad", ["nan_clock", "infinite_clock", "boolean_clock", "raised_clock",
+                                 "long_run", "long_generation", "huge_sequence"])
+def test_input_trace_invalid_diagnostics_never_change_valid_mailbox_admission(bad):
+    e, identity = admitted_executor()
+    if bad == "long_run":
+        e.run_id = identity["run_id"] = "x" * 65
+    elif bad == "long_generation":
+        identity["controller_generation"] = e._live_binding["controller_generation"] = "x" * 65
+    elif bad.endswith("clock"):
+        calls = [0]
+
+        def diagnostic_clock():
+            calls[0] += 1
+            if calls[0] != 4:
+                return 10.
+            if bad == "raised_clock":
+                raise ValueError("diagnostic clock unavailable")
+            return {"nan_clock": float("nan"), "infinite_clock": float("inf"), "boolean_clock": True}[bad]
+
+        e.clock = diagnostic_clock
+    src = source()
+    seq = 2**63 if bad == "huge_sequence" else 1
+    assert e.apply(dict.fromkeys(KEYS, 5.), body=dict.fromkeys(
+        ("x.vel", "y.vel", "theta.vel", "lift_axis.vel"), 0), source=src,
+        valid_until_monotonic_s=10.2, grant_id=src["grant_id"], seq=seq, **identity)
+    assert e._live_target["seq"] == seq and e._fault is None and e.desired == "active"
+    trace = e.advance(10., 0.)["input_transport_trace"]
+    assert trace["invalid_rows"] == 1 and trace["recent"] == []
+
+
+def test_input_trace_mailbox_rows_are_bounded_copied_and_reset_only_with_new_run():
+    import json
+
+    e, identity = admitted_executor()
+    for seq in range(1, 70):
+        src = source(seq)
+        assert e.apply(dict.fromkeys(KEYS, 5.), body=dict.fromkeys(
+            ("x.vel", "y.vel", "theta.vel", "lift_axis.vel"), 0), source=src,
+            valid_until_monotonic_s=10.2, grant_id=src["grant_id"], seq=seq, **identity)
+    trace = e.advance(10., 0.)["input_transport_trace"]
+    assert trace["recent_limit"] == len(trace["recent"]) == 32
+    assert trace["dropped_rows"] == 37
+    assert [row["input"]["seq"] for row in trace["recent"]] == list(range(38, 70))
+    assert all(set(row["input"]) == {"source_id", "source_kind", "sample_seq", "seq", "grant_id",
+                                     "valid_until_monotonic_s"} for row in trace["recent"])
+    assert len(json.dumps(trace, allow_nan=False)) < 40000
+    trace["recent"][-1]["input"]["seq"] = -999
+    e.set_intent_revision(1)
+    assert e.advance(10., 0.)["input_transport_trace"]["recent"][-1]["input"]["seq"] == 69
+    e.bind_run(str(uuid4()), RECIPES["physical-live-teleop"])
+    reset = e.advance(10., 0.)["input_transport_trace"]
+    assert reset["recent"] == [] and reset["first_native_expiry"] is None
+    assert reset["dropped_rows"] == reset["invalid_rows"] == 0
+
+
+def test_input_trace_send_exception_preserves_original_fault_and_terminal_cleanup(monkeypatch):
+    from tests.robots.test_am1_physical_executor import until
+
+    e, _ = admitted_executor()
+    io = e.io_factory()
+    primary = RuntimeError("original native send failure")
+
+    def failed(action):
+        io.actions.append(copy.deepcopy(action))
+        raise primary
+
+    monkeypatch.setattr(io, "send", failed)
+    assert e.begin(e.recipe)
+    e.worker.join(2)
+    assert not e.worker.is_alive()
+    until(lambda: e.evidence()["lifecycle"]["phase"] == "terminal")
+    assert e._fault == "RuntimeError: original native send failure" and io.finished == 1
+    trace = e.advance(10., 0.)["input_transport_trace"]
+    sent = [row for row in trace["recent"] if row["event"] == "worker_send"]
+    assert len(sent) == 1 and sent[0]["outcome"] == "raised" and sent[0]["error_type"] == "RuntimeError"
+    assert sent[0]["action_sequence"] == io.actions[0]["_am1_local_control"]["action_sequence"]
+
+
 def test_connection_rebind_keeps_source_history_but_clears_movement():
     e, identity = admitted_executor()
     src = source()
@@ -166,6 +244,27 @@ def test_current_expiry_survives_same_revision_held_ack_until_core_transition(he
     assert e._live_expired is None
 
 
+def test_malformed_first_expiry_diagnostic_cannot_be_replaced_by_later_expiry():
+    e, _ = admitted_executor()
+    e._epoch = 2
+    e.sample["sequence"] = 6
+    first = {"state": "expired", "last_input_seq": 1, "valid_until_monotonic_s": 9.9,
+             "expiry_detected_at_monotonic_s": float("nan")}
+    e.sample["ack"].update(epoch=2, live_input=first)
+    control = (e.revision, e._epoch, tuple(sorted(e._live_binding.items())))
+    e._retain_live_expiry(poll_control=control, previous_sequence=5, usable=True)
+    assert e._live_expired["last_input_seq"] == 1  # Existing control latch still runs unchanged.
+    trace = e.advance(10., 0.)["input_transport_trace"]
+    assert trace["first_native_expiry"] is None and trace["invalid_rows"] == 1
+    e.sample["sequence"] = 7
+    e.sample["ack"]["live_input"] = dict(first, last_input_seq=2, expiry_detected_at_monotonic_s=10.)
+    e._retain_live_expiry(poll_control=control, previous_sequence=6, usable=True)
+    trace = e.advance(10., 0.)["input_transport_trace"]
+    assert trace["first_native_expiry"] is None  # Never relabel the later record as the first.
+    assert trace["invalid_rows"] == 1 and trace["first_native_expiry_seen"] is True
+    assert e._live_expired["last_input_seq"] == 2 and e._fault is None
+
+
 def authority_lane(tmp_path):
     from tools.am1_session_core import SessionAuthority
 
@@ -250,7 +349,8 @@ def test_view_progress_is_internal_and_static_decode_never_renews_required_view(
         a.close()
 
 
-@pytest.mark.parametrize("queued_expiry", [pytest.param(False, id="ordinary"), pytest.param(True, id="queued-expiry")])
+@pytest.mark.parametrize("queued_expiry", [pytest.param(False, id="ordinary"), pytest.param(True, id="queued-expiry"),
+                                        pytest.param("fresh-mailbox", id="fresh-mailbox-inflight")])
 @pytest.mark.parametrize("endpoint_rest", [False, True])
 def test_real_core_executor_native_frame_expiry_and_fresh_rejoin_preserve_run(tmp_path, endpoint_rest, queued_expiry):
     import threading
@@ -261,6 +361,11 @@ def test_real_core_executor_native_frame_expiry_and_fresh_rejoin_preserve_run(tm
     from tests.robots.test_am1_persistent_session import command, start
     from tests.robots.test_am1_physical_executor import until
     from tools.am1_session_core import SessionAuthority
+
+    fresh_mailbox = queued_expiry == "fresh-mailbox"
+    clock_offset = [0.]
+    clock = lambda: time.monotonic() + clock_offset[0]
+    first_seq = 548 if fresh_mailbox else 1
 
     class NativeIO:
         provenance = "protected-host"
@@ -288,18 +393,25 @@ def test_real_core_executor_native_frame_expiry_and_fresh_rejoin_preserve_run(tm
                 "recipe": recipe.name,
             }
             self.control = host.AM1LocalControl(
-                run_id=run_id, host_incarnation=incarnation, live=True, live_recipe=recipe.name
+                run_id=run_id, host_incarnation=incarnation, live=True, live_recipe=recipe.name,
+                **({"clock": clock} if fresh_mailbox else {}),
             )
             self.actions = []
             self.queue_expiry = False
             self.expiry_queued = threading.Event()
             self.release_expiry = threading.Event()
             self.original_expiry = None
+            self.block_poll = False
+            self.poll_blocked, self.release_poll = threading.Event(), threading.Event()
 
         def poll(self, previous):
+            if self.block_poll:
+                self.block_poll = False
+                self.poll_blocked.set()
+                assert self.release_poll.wait(2), "test did not release the in-flight native poll"
             self.control.check_live(self.robot)
             observation = self.robot.get_observation()
-            at = time.monotonic()
+            at = clock() if fresh_mailbox else time.monotonic()
             self.control.annotate(observation, acquired_at=at)
             marker = observation[host.AM1_LOCAL_FEEDBACK_KEY]
             sample = {
@@ -326,7 +438,9 @@ def test_real_core_executor_native_frame_expiry_and_fresh_rejoin_preserve_run(tm
 
     io = NativeIO()
     e = executor(io)
-    a = SessionAuthority(tmp_path, executor=e)
+    if fresh_mailbox:
+        e.clock = clock
+    a = SessionAuthority(tmp_path, executor=e, **({"clock": clock} if fresh_mailbox else {}))
     decode = [0]
 
     def step():
@@ -405,7 +519,7 @@ def test_real_core_executor_native_frame_expiry_and_fresh_rejoin_preserve_run(tm
             assert io.robot.left_bus.goals[key.removesuffix(".pos")] == 3223
         resume()
         grant = a.handle(dict(op="grant", **ids()), "owner")
-        src = source(grant=grant["grant_id"])
+        src = source(first_seq, grant=grant["grant_id"])
         target = {
             k: b["max"] if abs(b["max"] - frozen_workspace["reference"][k]) > 1e-6 else b["min"]
             for k, b in frozen_workspace["bounds"].items()
@@ -417,12 +531,12 @@ def test_real_core_executor_native_frame_expiry_and_fresh_rejoin_preserve_run(tm
             body={"x.vel": 0.05, "y.vel": 0.0, "theta.vel": 0.0, "lift_axis.vel": 0},
             source=src,
             grant_id=grant["grant_id"],
-            seq=1,
+            seq=first_seq,
         )
-        io.queue_expiry = queued_expiry
+        io.queue_expiry = queued_expiry is True
         admitted = a.handle(packet, "owner")
         assert admitted["accepted"], admitted
-        until(lambda: bool(step()) and e.evidence()["live_input"].get("last_input_seq") == 1)
+        until(lambda: bool(step()) and e.evidence()["live_input"].get("last_input_seq") == first_seq)
         assert io.control.live_snapshot()["source"] == src
         assert io.control.live_snapshot()["body"]["x.vel"] == 0.05
         received_samples = [
@@ -433,13 +547,66 @@ def test_real_core_executor_native_frame_expiry_and_fresh_rejoin_preserve_run(tm
         assert received_samples and all(
             s["valid_until_monotonic_s"] == grant["expires"] for s in received_samples
         )
-        if queued_expiry:
+        if fresh_mailbox:
+            io.block_poll = True
+            assert io.poll_blocked.wait(1)
+            clock_offset[0] += .1  # New grants remain valid after the original548 grant expires.
+            for seq in (549, 550):
+                latest_grant = a.handle(dict(op="grant", **ids()), "owner")
+                assert latest_grant["accepted"], latest_grant
+                latest = dict(packet, seq=seq, grant_id=latest_grant["grant_id"],
+                              source=source(seq, grant=latest_grant["grant_id"]))
+                assert a.handle(latest, "owner")["accepted"]
+            with e.mutex:
+                assert e._live_target["seq"] == 550
+            trace = e.advance(clock(), 0.)["input_transport_trace"]
+            mailed = [row for row in trace["recent"] if row["event"] == "mailbox_admitted"]
+            assert [row["input"]["seq"] for row in mailed[-3:]] == [548, 549, 550]
+            assert all(row["run_id"] == a.run["run_id"] and row["host_incarnation"] == e.host_incarnation
+                       for row in mailed[-3:])
+            assert mailed[-1]["input"]["source_id"] == src["source_id"]
+            assert mailed[-1]["input"]["sample_seq"] == 550
+            assert mailed[-1]["input"]["grant_id"] == latest_grant["grant_id"]
+            assert mailed[-1]["input"]["valid_until_monotonic_s"] == latest_grant["expires"]
+            assert io.control.live_snapshot()["last_input_seq"] == 548
+            clock_offset[0] += max(0., grant["expires"] - clock()) + .001
+            assert clock() < latest_grant["expires"]
+            io.release_poll.set()
+            until(lambda: e.evidence()["live_input"].get("state") == "expired")
+            assert e.evidence()["live_input"]["last_input_seq"] == 548
+            assert not any((row["_am1_local_control"].get("live_input") or {}).get("seq") in (549, 550)
+                           for row in io.actions)
+            trace = e.advance(clock(), 0.)["input_transport_trace"]
+            assert trace["clock"] == "pi-monotonic"
+            frozen_expiry = copy.deepcopy(trace["first_native_expiry"])
+            assert frozen_expiry["last_input_seq"] == 548
+            assert frozen_expiry["valid_until_monotonic_s"] == grant["expires"]
+            assert [row["input"]["seq"] for row in frozen_expiry["rows"]
+                    if row["event"] == "mailbox_admitted"][-3:] == [548, 549, 550]
+            assert not any(row["event"] == "worker_send" and row.get("input", {}).get("seq") in (549, 550)
+                           for row in trace["recent"])
+            # A send receipt describes the actual marker passed to IO, including
+            # repeated sends; it makes no native admission or SDK-write claim.
+            by_action = {row["_am1_local_control"]["action_sequence"]: row["_am1_local_control"]
+                         for row in io.actions}
+            for row in trace["recent"]:
+                if row["event"] != "worker_send":
+                    continue
+                marker = by_action[row["action_sequence"]]
+                assert row["epoch"] == marker["epoch"] and row["intent_revision"] == marker["intent_revision"]
+                assert row["outcome"] == "returned" and row["error_type"] is None
+                assert row["send_started_at_monotonic_s"] <= row["send_completed_at_monotonic_s"]
+                if marker.get("live_input"):
+                    assert row["input"]["seq"] == marker["live_input"]["seq"]
+        if queued_expiry is True:
             # Retain the original native expiry in flight while Core advances
             # the hold revision; do not synthesize or retimestamp feedback.
             assert io.expiry_queued.wait(1), "native expiry was not captured"
         until(lambda: bool(step()) and a.run["status"] == "paused")
         assert a.run["deadline"] == frozen_deadline
-        if queued_expiry:
+        if fresh_mailbox:
+            assert a.events[-1]["kind"] == "native_input_expired"
+        if queued_expiry is True:
             expected_revision = a.run["intent_revision"]
             expired = io.original_expiry["ack"]["live_input"]
             assert io.original_expiry["ack"]["intent_revision"] < expected_revision
@@ -482,24 +649,58 @@ def test_real_core_executor_native_frame_expiry_and_fresh_rejoin_preserve_run(tm
             assert a.snapshot()["run"]["live_input"]["cursor_intent_revision"] == expected_revision
         resume()
         new_grant = a.handle(dict(op="grant", **ids()), "owner")
+        next_seq = 551 if fresh_mailbox else 2
         stale = dict(
             packet,
             **ids(),
-            seq=2,
+            seq=next_seq,
             grant_id=new_grant["grant_id"],
             source=dict(src, grant_id=new_grant["grant_id"]),
         )
         assert not a.handle(stale, "owner")["accepted"]
-        fresh = source(2, grant=new_grant["grant_id"])
+        fresh = source(next_seq, grant=new_grant["grant_id"])
         valid = dict(
             stale, source=fresh, body={"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0, "lift_axis.vel": 0}
         )
         admitted = a.handle(valid, "owner")
         assert admitted["accepted"], admitted
-        until(lambda: bool(step()) and e.evidence()["live_input"].get("last_input_seq") == 2)
+        until(lambda: bool(step()) and e.evidence()["live_input"].get("last_input_seq") == next_seq)
         assert io.control.live_snapshot()["workspace"] == frozen_workspace
         assert a.run["deadline"] == frozen_deadline
+        if fresh_mailbox:
+            import json
+
+            from tests.robots.test_am1_status_details import resolve
+
+            # Exercise ordinary production sends until the rolling window moves
+            # beyond the original expiry. The first window remains immutable.
+            until(lambda: bool(step()) and e.advance(clock(), 0.)["input_transport_trace"]["dropped_rows"] >= 40)
+            a.handle(command("stop", run_id=a.run["run_id"]), "owner")
+            until(lambda: bool(step()) and a.run["status"] == "stopped")
+            retained = a.run["execution"]["input_transport_trace"]
+            assert len(retained["recent"]) == 32 and len(frozen_expiry["rows"]) <= 32
+            assert retained["first_native_expiry"] == frozen_expiry
+            a._save()
+            durable = json.loads(a.db.execute("SELECT data FROM state WHERE id=1").fetchone()[0])
+            assert durable["execution"]["input_transport_trace"] == retained
+            view = a.snapshot()
+            essential = view["run"]["execution"]["input_transport_trace"]
+            assert "recent" not in essential and "first_native_expiry" not in essential
+            assert essential["dropped_rows"] == retained["dropped_rows"]
+            assert resolve(a, view["run"]["details_reference"])["execution"]["input_transport_trace"] == retained
+            assert "input_transport_trace" not in (view["evidence"].get("accepted_host_action") or {})
+            assert len(json.dumps(view["evidence"]["accepted_host_action"]).encode()) <= 4096
+            trace_bytes = len(json.dumps(retained, separators=(",", ":"), allow_nan=False).encode())
+            assert trace_bytes < 60000
+            copied_at = time.perf_counter()
+            copied = e.advance(clock(), 0.)["input_transport_trace"]
+            copy_duration_s = time.perf_counter() - copied_at
+            assert copied == retained
+            print(f"input_transport_trace endpoint_rest={endpoint_rest} compact_bytes={trace_bytes} "
+                  f"recent_rows={len(retained['recent'])} first_rows={len(frozen_expiry['rows'])} "
+                  f"advance_copy_s={copy_duration_s:.6f}")
     finally:
+        io.release_poll.set()
         io.release_expiry.set()
         if a.run:
             a.handle(command("stop", run_id=a.run["run_id"]), "owner")

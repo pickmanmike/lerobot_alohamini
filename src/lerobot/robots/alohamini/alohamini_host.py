@@ -722,6 +722,145 @@ class AM1LocalControl:
         return True
 
 
+def _apply_traced_teleop_command(control, robot, command, writer, *, received_at):
+    """Observe the existing apply boundary; this is not a servo write ACK."""
+    def uuid_text(value):
+        return type(value) is str and len(value) == 36 and str(UUID(value)) == value
+
+    def integer(value):
+        return type(value) is int and 0 <= value < 2**63
+
+    def finite(value):
+        return integer(value) or type(value) is float and math.isfinite(value) and value >= 0
+
+    record = None
+    try:
+        marker = command.get(AM1_LOCAL_CONTROL_KEY)
+        if (writer is not None and control.teleop and isinstance(marker, dict)
+            and set(marker) == {"version", "mode", "epoch", "run_id", "host_incarnation", "intent_revision",
+                               "action_sequence", "live_binding", "live_input", "live_admitted"}
+            and type(marker["version"]) is int and marker["version"] == 2
+            and marker["mode"] in {"active", "pause"} and type(marker["live_admitted"]) is bool
+            and all(integer(marker[key]) for key in ("epoch", "intent_revision", "action_sequence"))
+            and all(uuid_text(marker[key]) and marker[key] == (control.binding or {}).get(key)
+                    for key in ("run_id", "host_incarnation")) and finite(received_at)):
+            owner, original = marker["live_binding"], marker["live_input"]
+            valid = (isinstance(owner, dict)
+                     and set(owner) == {"service_incarnation", "controller_generation", "connection_generation"}
+                     and all(uuid_text(value) for value in owner.values())
+                     and (control.live_binding is None or owner == control.live_binding
+                          or marker["mode"] == "pause" and marker["intent_revision"] > control.intent_revision)
+                     and (marker["mode"] != "pause" or original is None))
+            identity = None
+            if original is not None:
+                source = original.get("source", {}) if isinstance(original, dict) else {}
+                valid = (valid and isinstance(original, dict)
+                         and set(original) == {"target", "body", "source", "grant_id", "seq", "valid_until_monotonic_s"}
+                         and isinstance(source, dict)
+                         and set(source) == {"kind", "source_id", "sample_seq", "grant_id", "acquired_at_monotonic_s",
+                                            "grant_received_at_monotonic_s", "sent_at_monotonic_s"}
+                         and source["kind"] in {"usb-leaders", "virtual-leaders"}
+                         and uuid_text(source["source_id"]) and integer(source["sample_seq"])
+                         and uuid_text(original["grant_id"]) and source["grant_id"] == original["grant_id"]
+                         and integer(original["seq"]) and finite(original["valid_until_monotonic_s"])
+                         and all(finite(source[key]) for key in ("acquired_at_monotonic_s", "grant_received_at_monotonic_s", "sent_at_monotonic_s"))
+                         and source["grant_received_at_monotonic_s"] <= source["acquired_at_monotonic_s"] <= source["sent_at_monotonic_s"])
+                if valid:
+                    identity = {"source_id": source["source_id"], "source_kind": source["kind"],
+                                "sample_seq": source["sample_seq"], "seq": original["seq"],
+                                "grant_id": original["grant_id"], "valid_until_monotonic_s": original["valid_until_monotonic_s"]}
+            if valid:
+                record = {"version": 1, "clock": "monotonic", "provenance": "protected-host/receive-apply",
+                          **{key: marker[key] for key in ("run_id", "host_incarnation", "intent_revision", "epoch", "action_sequence", "mode")},
+                          **owner, "input": identity, "received_at_monotonic_s": received_at}
+    except (AttributeError, KeyError, TypeError, ValueError):
+        pass  # Invalid/foreign payloads never enter the observation schema.
+    if record is None:
+        return control.apply(robot, command)
+
+    def admission():
+        cached = control._live_summary
+        source = cached.get("source") or {}
+        return (cached.get("accepted_at_monotonic_s"), cached.get("last_input_seq"), cached.get("grant_id"),
+                source.get("source_id"), source.get("sample_seq"), cached.get("valid_until_monotonic_s"))
+
+    def state():
+        return {"control": control.state if control.state in {"ready", "active", "paused", "stopped"} else "unknown",
+                "input": control._live_summary.get("state") if control._live_summary.get("state") in
+                         {"held", "active", "expired", "awaiting_input", "budget_expired"} else "unknown"}
+
+    try:
+        before = admission()
+        record.update(state_before=state(), outcome="refused", error_type=None)
+    except BaseException as reporting_error:
+        writer._latch(reporting_error)
+        return control.apply(robot, command)
+    try:
+        result = control.apply(robot, command)
+        record["outcome"] = "accepted" if result is True else "refused"
+        return result
+    except BaseException as error:
+        record.update(outcome="raised", error_type=type(error).__name__[:64])
+        raise
+    finally:
+        try:
+            completed_at = time.monotonic()
+            after, identity = admission(), record["input"]
+            native_input = ({"seq": after[1], "grant_id": after[2], "source_id": after[3], "sample_seq": after[4],
+                             "valid_until_monotonic_s": after[5]}
+                            if integer(after[1]) and uuid_text(after[2]) and uuid_text(after[3]) and integer(after[4]) and finite(after[5]) else None)
+            record.update(completed_at_monotonic_s=completed_at, state_after=state(),
+                          native_input_after=native_input,
+                          native_admitted_at_monotonic_s=after[0] if finite(after[0]) else None,
+                          new_input_admitted=bool(identity is not None and after != before and finite(after[0])
+                              and after[1:] == (identity["seq"], identity["grant_id"], identity["source_id"], identity["sample_seq"], identity["valid_until_monotonic_s"])))
+            if not finite(completed_at) or completed_at < received_at or len(json.dumps(record, allow_nan=False, separators=(",", ":")).encode()) > 2048:
+                raise ValueError("bounded finite host command observation required")
+            writer.submit("[AM1 TELEOP COMMAND] ", record)
+        except BaseException as reporting_error:
+            writer._latch(reporting_error)  # Preserve an in-flight hardware error and existing cleanup ordering.
+
+
+def _receive_host_command(host, robot, local_control, command_state, routine_writer, lift_operation):
+    """Service one latest command through the existing owner and protection boundary."""
+    data = None
+    try:
+        msg = host.zmq_cmd_socket.recv_string(zmq.NOBLOCK)
+        command_received_t = time.monotonic()
+        command_received_wall_time_ns = command_state.capture_wall_time_ns()
+        data = dict(json.loads(msg))
+        if local_control is not None:
+            if routine_writer is not None and getattr(local_control, "teleop", False):
+                received = _apply_traced_teleop_command(
+                    local_control, robot, data, routine_writer, received_at=command_received_t)
+            else:
+                received = local_control.apply(robot, data)
+        else:
+            robot.send_action(data)
+            received = True
+        if received:
+            command_state.record_command(
+                robot.logs.get("action_diagnostics", {}),
+                received_at=command_received_t,
+                received_wall_time_ns=command_received_wall_time_ns,
+            )
+        return received
+    except zmq.Again:
+        return False
+    except Exception as error:
+        if lift_operation is not None:
+            # Preserve the existing latched lift fault before the legacy
+            # malformed-command handler can classify an input exception.
+            lift_operation.raise_if_faulted()
+        if local_control is not None and (
+            local_control.state != "ready"
+            or (isinstance(data, dict) and AM1_LOCAL_CONTROL_KEY in data)
+        ):
+            raise
+        logging.exception("Message fetching failed: %s", error)
+        return False
+
+
 def _private_directory(path: Path) -> None:
     info = path.stat(follow_symlinks=False)
     if path.is_symlink() or not stat.S_ISDIR(info.st_mode):
@@ -1969,7 +2108,6 @@ def _run_host(args):
             if loop_timing is not None:
                 loop_timing.begin(loop_start_t)
             command_received = False
-            data = None
             # One grouped lift transaction on the existing owning thread before
             # any ordinary action. No confirmation wait, worker, or second socket.
             lift_operation = getattr(robot, "_lift_operation", None)
@@ -1977,36 +2115,8 @@ def _run_host(args):
                 lift_operation.poll(defer_sample_log=True)
             if loop_timing is not None:
                 loop_timing.mark("command", time.perf_counter())
-            try:
-                msg = host.zmq_cmd_socket.recv_string(zmq.NOBLOCK)
-                command_received_t = time.monotonic()
-                command_received_wall_time_ns = command_state.capture_wall_time_ns()
-                data = dict(json.loads(msg))
-                #print(f"Received action: {data}")   # debug
-                if local_control is not None:
-                    command_received = local_control.apply(robot, data)
-                else:
-                    robot.send_action(data)
-                    command_received = True
-                if command_received:
-                    command_state.record_command(
-                        robot.logs.get("action_diagnostics", {}),
-                        received_at=command_received_t,
-                        received_wall_time_ns=command_received_wall_time_ns,
-                    )
-            except zmq.Again:
-                pass
-            except Exception as e:
-                if lift_operation is not None:
-                    # Do not let the legacy malformed-command handler swallow a
-                    # latched lift fault (including an unsuccessful motor write).
-                    lift_operation.raise_if_faulted()
-                if local_control is not None and (
-                    local_control.state != "ready"
-                    or (isinstance(data, dict) and AM1_LOCAL_CONTROL_KEY in data)
-                ):
-                    raise
-                logging.exception("Message fetching failed: %s", e)
+            command_received = _receive_host_command(
+                host, robot, local_control, command_state, routine_writer, lift_operation)
             command_done_t = time.perf_counter()
             if loop_timing is not None:
                 loop_timing.mark("watchdog", command_done_t)
@@ -2019,6 +2129,14 @@ def _run_host(args):
                     local_control.watchdog_stop(robot)
                 else:
                     robot.stop_motion()
+
+            if teleop:
+                # One extra nonblocking service opportunity before full feedback
+                # work; the same native guards still reject an expired epoch.
+                # A fixed single attempt cannot drain indefinitely or starve IO.
+                command_received = _receive_host_command(
+                    host, robot, local_control, command_state, routine_writer, lift_operation) or command_received
+                command_done_t = time.perf_counter()
 
             if local_control is not None and not local_control.check_live(robot):
                 break
