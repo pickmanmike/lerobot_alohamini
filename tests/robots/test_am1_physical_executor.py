@@ -2952,6 +2952,59 @@ def request_preparation_config(tmp_path, monkeypatch):
     return path, config, gains, calibration
 
 
+def test_ordinary_arms_preparation_is_explicit_closed_canonical_and_keeps_left_p32(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    m = module()
+    path, config, gains, _calibration = request_preparation_config(tmp_path, monkeypatch)
+    result = m.prepare_left_response_p_request(str(path), workload_segment="ordinary-arms",
+        workspace_profile="ordinary-arms-left-current-rest-1051-1164", left_shoulder_startup_degrees=1)
+    request, raw, info = gains._right_p20_file(Path(result["path"]))
+    assert request == result["request"] and request["workload_segment"] == "ordinary-arms"
+    assert request["workspace_profile"] == "ordinary-arms-left-current-rest-1051-1164"
+    assert request["kind"] == "left-response-p" and request["proportional"] == 32
+    assert request["source_head"] == config["host_head"] and request["left_shoulder_startup_degrees"] == 1
+    assert raw == gains._right_p20_json(request) and info.st_nlink == 1
+    assert result["hardware_started"] is False
+
+
+@pytest.mark.parametrize("shoulder", [False, True])
+def test_ordinary_arms_preparer_relay_uses_exact_installed_profile_without_new_runtime_helper(tmp_path, monkeypatch, capsys, shoulder):
+    import io
+    import json
+    import shlex
+    import subprocess
+    import sys
+    from contextlib import redirect_stdout
+
+    m = module()
+    path, config, _gains, _calibration = request_preparation_config(tmp_path, monkeypatch)
+    native_config = "/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/7438c74662d59a02/physical.json"
+    profile = "ordinary-arms-left-current-rest-1051-1164"
+    calls = []
+    def remote(args, **options):
+        values = shlex.split(args[7])
+        calls.append(values)
+        assert values == ["/home/pickmanmike/lerobot_alohamini/.venv/bin/python", "-B", "-", native_config,
+                          "120", profile, *(["1"] if shoulder else []), "ordinary-arms"]
+        output = io.StringIO()
+        with monkeypatch.context() as context, redirect_stdout(output):
+            context.setattr(sys, "argv", ["-", str(path), *values[4:]])
+            context.delattr(m, "prepare_left_response_p_request")
+            exec(compile(options["input"], "<existing-ordinary-preparation-relay>", "exec"), {})
+        return SimpleNamespace(stdout=output.getvalue(), stderr="", returncode=0)
+    monkeypatch.setattr(subprocess, "run", remote)
+    args = ["--prepare-left-response-p", "--ssh", "am1-pi", "--config", native_config,
+            "--left-response-workspace", "current-rest", "--left-response-workload", "ordinary-arms"]
+    assert m.main(args + (["--left-shoulder-startup-degrees", "1"] if shoulder else [])) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["request"]["workspace_profile"] == profile
+    assert result["request"]["workload_segment"] == "ordinary-arms" and result["request"]["proportional"] == 32
+    assert result["request"].get("left_shoulder_startup_degrees") == (1 if shoulder else None)
+    assert result["request"]["source_head"] == config["host_head"] and result["hardware_started"] is False
+    assert len(calls) == 1
+
+
 def test_left_response_preparation_canonical_once_only_and_no_hardware(tmp_path, monkeypatch):
     import hashlib
     from pathlib import Path

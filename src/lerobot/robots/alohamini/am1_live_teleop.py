@@ -968,10 +968,11 @@ def _response_receipt(robot, side):
             or getattr(robot, "_am1_" + other + "_response_p_trial", None) is not None):
         raise RuntimeError(f"AM1 {side} response transaction binding changed")
     receipt = trial.active_receipt(robot)
-    allowed = ("left-maintained", "left-reach", "left-peer-fixed") if side == "left" else ("right-peer-fixed",)
+    allowed = ("left-maintained", "left-reach", "left-peer-fixed", "ordinary-arms") if side == "left" else ("right-peer-fixed",)
     if (receipt.get("kind") != side + "-response-p" or receipt.get("original_p") != 16
             or receipt.get("configured_p") not in (16, 32) or receipt.get("restore_required") is not True
             or receipt.get("workload_segment") not in allowed
+            or receipt.get("workload_segment") == "ordinary-arms" and receipt.get("configured_p") != 32
             or any(receipt.get(key) != robot._am1_teleop_binding[key] for key in ("run_id", "host_incarnation"))):
         raise RuntimeError(f"AM1 {side} response active settings proof differs")
     return receipt
@@ -995,9 +996,11 @@ def _current_rest_shoulder_reference(robot, control, workspace, receipt, *, goal
     trial = getattr(robot, "_am1_left_response_p_trial", None)
     request = {} if trial is None else trial.binding["request"]
     degrees = request.get("left_shoulder_startup_degrees")
+    from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES
     enabled = (receipt is not None and receipt["kind"] == "left-response-p"
-               and receipt["configured_p"] == 32 and receipt["workload_segment"] == "left-reach"
-               and request.get("workspace_profile") == workspace.get("workspace_profile") == "left-current-rest-1051-1164"
+               and receipt["configured_p"] == 32 and receipt["workload_segment"] in CURRENT_REST_WORKSPACE_PROFILES
+               and request.get("workspace_profile") == workspace.get("workspace_profile")
+               == CURRENT_REST_WORKSPACE_PROFILES[receipt["workload_segment"]]
                and type(degrees) in (int, float) and degrees == 1)
     anchor = getattr(control, "_teleop_original_shoulder_goal", None)
     if not enabled and anchor is None:
@@ -1042,6 +1045,18 @@ def _left_response_target_valid(robot, control, sample):
         return False
     workspace = control._live_summary["workspace"]
     shoulder_reference = _current_rest_shoulder_reference(robot, control, workspace, receipt)
+    if receipt["workload_segment"] == "ordinary-arms":
+        from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES, validate_target
+        trial = getattr(robot, "_am1_left_response_p_trial", None)
+        if (receipt["kind"] != "left-response-p" or receipt["configured_p"] != 32 or trial is None
+            or trial.binding["request"].get("workspace_profile") != workspace.get("workspace_profile")
+            or workspace.get("workspace_profile") != CURRENT_REST_WORKSPACE_PROFILES["ordinary-arms"]):
+            return False
+        try:
+            validate_target(sample["target"], workspace=workspace)
+        except (KeyError, TypeError, ValueError):
+            return False
+        return True
     side = "left" if receipt["kind"] == "left-response-p" else "right"
     allowed = {"arm_" + side + "_elbow_flex.pos"}
     if receipt["workload_segment"] == "left-reach":
@@ -1424,7 +1439,9 @@ def before_write(control, robot):
 
 
 def workspace(robot, identity, measured, *, goals=None):
-    from examples.alohamini.am1_live_teleop import TELEOP_ARM_KEYS, normalized_raw, validate_workspace
+    from examples.alohamini.am1_live_teleop import (
+        CURRENT_REST_WORKSPACE_PROFILES, TELEOP_ARM_KEYS, normalized_raw, validate_workspace,
+    )
 
     if not binding_valid(robot) or robot._am1_teleop_binding != {**identity, "recipe": RECIPE}:
         raise RuntimeError("AM1 teleop workspace binding differs")
@@ -1438,8 +1455,9 @@ def workspace(robot, identity, measured, *, goals=None):
         trial = getattr(robot, "_am1_" + side + "_response_p_trial")
         profile = trial.binding["request"].get("workspace_profile")
         if profile is not None:
-            if (side != "left" or profile != "left-current-rest-1051-1164"
-                    or receipt["configured_p"] != 32 or receipt["workload_segment"] != "left-reach"):
+            if (side != "left" or receipt["workload_segment"] not in CURRENT_REST_WORKSPACE_PROFILES
+                    or profile != CURRENT_REST_WORKSPACE_PROFILES.get(receipt["workload_segment"])
+                    or receipt["configured_p"] != 32):
                 raise RuntimeError("AM1 current-rest workspace requires its exact active left trial")
             result["workspace_profile"] = profile
     if goals is None:

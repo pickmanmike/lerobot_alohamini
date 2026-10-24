@@ -93,6 +93,87 @@ def test_combined_body_cli_preserves_normal_required_view_selection(monkeypatch)
     assert seen[0].bench_continuity is False and seen[0].interrupt_at_seconds is None
 
 
+def test_ordinary_arms_cli_selects_only_normal_uninterrupted_virtual_input(monkeypatch):
+    m, seen = adapter(), []
+
+    async def run(args):
+        seen.append(args)
+        return {}
+
+    monkeypatch.setattr(m, "run", run)
+    argv = ["--source", "virtual-leaders", "--url", "unused", "--ca", "unused",
+            "--storage-state", "unused", "--output", "unused", "--workload-segment", "ordinary-arms"]
+    m.main(argv)
+    assert len(seen) == 1 and seen[0].workload_segment == "ordinary-arms" and not seen[0].bench_continuity
+    for extra in (["--bench-continuity"], ["--next-start-seconds", "1"], ["--interrupt-at-seconds", "1"],
+                  ["--interrupt-controller"], ["--source", "usb-leaders"]):
+        with pytest.raises(SystemExit):
+            m.main(argv + extra)
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize("changed", [{"source": "usb-leaders"}, {"bench_continuity": True},
+                                    {"next_start_seconds": 1.}, {"interrupt_at_seconds": 1.},
+                                    {"interrupt_controller": True}])
+def test_ordinary_arms_invalid_selection_refuses_before_output_or_client(tmp_path, monkeypatch, changed):
+    import asyncio
+    from types import SimpleNamespace
+
+    m = adapter()
+    values = dict(source="virtual-leaders", workload_segment="ordinary-arms", bench_continuity=False,
+                  next_start_seconds=None, interrupt_at_seconds=None, interrupt_controller=False,
+                  output=str(tmp_path / "forbidden"))
+    values.update(changed)
+    monkeypatch.setattr(m, "SessionClient", lambda *args: pytest.fail("invalid selection reached ownership"))
+    with pytest.raises(ValueError, match="ordinary-arms"):
+        asyncio.run(m.run(SimpleNamespace(**values)))
+    assert not (tmp_path / "forbidden").exists()
+
+
+def test_ordinary_arms_absolute_targets_keep_original_reference_across_reacquisition():
+    import copy
+    from examples.alohamini.am1_teleop_workload import TeleopWorkload
+
+    m = adapter()
+    client, native = held_command119_client()
+    reference = copy.deepcopy(native["reference"])
+    commands = m._qualified_command_reference(client, native)
+    task = TeleopWorkload(native, segment="ordinary-arms", command_reference=commands)
+    task.elapsed_s = 6.
+    now = [10.]
+    producer = m.FrameProducer(task, clock=lambda: now[0])
+    producer.workspace, producer.native_cursor = native, dict(commands)
+    first = producer.capture({"grant_id": str(uuid4())})
+    assert first["target"] == task.targets and first["body"] == m.ZERO_BODY
+    producer.native_cursor = {k: native["bounds"][k]["min"] for k in KEYS}
+    producer.reacquire = True
+    now[0] += .06
+    second = producer.capture({"grant_id": str(uuid4())})
+    assert second["target"] == first["target"] and second["source"]["sample_seq"] == 2
+    assert task.measured_reference == native["reference"] == reference
+    assert task.plan()["command_reference"] == commands
+
+
+@pytest.mark.parametrize("changed", ["bench", "advisory", "temporarily_unqualified"])
+def test_ordinary_arms_recovery_keeps_required_policy_separate_from_view_qualification(changed):
+    m = adapter()
+    client, native = held_command119_client()
+    native["workspace_profile"] = "ordinary-arms-left-current-rest-1051-1164"
+    client.snapshot["run"].update(bench_continuity=False, recovery_episodes=0)
+    guard = m.SameRunRecovery(client, lambda row: None)
+    if changed == "bench":
+        client.snapshot["run"]["bench_continuity"] = True
+    elif changed == "advisory":
+        client.snapshot["run"]["live_input"]["required_view"]["required"] = False
+    else:
+        client.snapshot["run"]["live_input"]["required_view"]["qualified"] = False
+    if changed == "temporarily_unqualified":
+        guard.check(client.snapshot)  # Existing bounded view qualification still governs Resume.
+    else:
+        with pytest.raises(RuntimeError, match="ordinary-arms"):
+            guard.check(client.snapshot)
+
+
 @pytest.mark.parametrize("boundary", ["cli", "run"])
 def test_predetermined_segment_refuses_usb_before_creating_run(monkeypatch, boundary):
     import asyncio
@@ -731,6 +812,7 @@ def test_real_wss_clean_close_ends_qualified_wait_before_timeout(tmp_path):
         "peer_fixed_baseline_ready", "peer_fixed_baseline_missing", "peer_fixed_baseline_native", "peer_fixed_baseline_blocked",
         "normal_program_finish", "normal_program_finish_failed", "normal_program_finish_combined_body",
         "normal_program_finish_left_maintained", "normal_program_finish_left_reach", "normal_program_finish_left_reach_held", "normal_program_finish_left_reach_cycles", "normal_program_finish_left_reach_closing_cycles", "normal_program_finish_left_reach_zero_gripper", "normal_program_finish_left_supported", "normal_program_finish_left_opposite", "usb_finite_finish", "usb_finite_finish_failed", "usb_quit_finish", "usb_quit_empty_finish",
+        "normal_program_finish_ordinary_arms", "normal_program_finish_ordinary_arms_old_profile", "normal_program_finish_ordinary_arms_advisory",
     ],
 )
 def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
@@ -748,6 +830,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
     terminal_hold = isinstance(failure, str) and failure.startswith("bench_terminal_hold_")
     normal_finish = isinstance(failure, str) and failure.startswith(("normal_program_finish", "usb_finite_finish", "usb_quit_"))
     cycle_run = failure in {"normal_program_finish_left_reach_cycles", "normal_program_finish_left_reach_closing_cycles"}
+    ordinary_arms = isinstance(failure, str) and failure.startswith("normal_program_finish_ordinary_arms")
     usb_finish = isinstance(failure, str) and failure.startswith(("usb_finite_finish", "usb_quit_"))
     program_finish = failure in {"bench_program_finish", "bench_program_finish_failed"} or normal_finish
     bench_case = failure in {"bench_input_gap", "bench_controller_gap", "bench_renewal_during_resume", "bench_renewal_attach_ceiling", "bench_renewal_snapshot_race",
@@ -780,7 +863,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
     timed_expiry = failure in {"expired_first", "expired_zero", "expired_zero_timeout"}
     pc_clock = [10.0]
     if (
-        cycle_run
+        cycle_run or ordinary_arms
         or recovery_case
         or ordinary_case
         or mailbox_case
@@ -800,7 +883,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         monkeypatch.setattr(
             m, "time", SimpleNamespace(monotonic=lambda: pc_clock[0], perf_counter=time.perf_counter)
         )
-        if cycle_run:
+        if cycle_run or ordinary_arms:
             async def acquisition_delay(_requested):
                 await asyncio.sleep(0)
             monkeypatch.setattr(m, "_acquisition_delay", acquisition_delay)
@@ -944,8 +1027,10 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 w["bounds"]["arm_left_shoulder_lift.pos"]["rate_per_s"] = 3.
             if failure == "normal_program_finish_left_opposite":
                 w["bounds"]["arm_left_elbow_flex.pos"]["rate_per_s"] = 3.
-            if failure == "normal_program_finish_left_reach_held":
+            if failure == "normal_program_finish_left_reach_held" or ordinary_arms:
                 w = held_command119_workspace()
+                if ordinary_arms and not failure.endswith("old_profile"):
+                    w["workspace_profile"] = "ordinary-arms-left-current-rest-1051-1164"
             value = {
                 "service_incarnation": "service",
                 "controller": {"device_id": "device", "controller_generation": "control"},
@@ -989,7 +1074,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 },
             }
 
-            if failure == "normal_program_finish_left_reach_held":
+            if failure == "normal_program_finish_left_reach_held" or ordinary_arms:
                 value["run"].update(status="paused", intent_revision=0)
                 live = value["run"]["live_input"]
                 live.update(cursor={**w["reference"], "arm_left_shoulder_lift.pos": 100.},
@@ -1104,6 +1189,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                     if normal_finish:
                         self.snapshot["run"].update(bench_continuity=False, control_intent=None)
                         self.snapshot["run"]["live_input"]["required_view"].update(required=True, role="chest")
+                        if ordinary_arms and failure.endswith("advisory"):
+                            self.snapshot["run"]["live_input"]["required_view"]["required"] = False
                     if failure == "bench_renewal_attach_ceiling":
                         self.snapshot["run"]["remaining_s"] = .02
                     if program_finish:
@@ -1251,7 +1338,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 return {"accepted": True, "grant_id": str(uuid4()), "expires": 99.0}
             assert payload["op"] == "input"
             self.inputs.append(copy.deepcopy(payload))
-            if cycle_run:
+            if cycle_run or ordinary_arms:
                 pc_clock[0] += .1  # Full real60-active-second schedule; only PC time is accelerated.
             if peer_wait_case:
                 if failure == "peer_fixed_baseline_blocked":
@@ -1511,6 +1598,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 args.bench_continuity = False
             if cycle_run:
                 args.workload_segment, args.left_reach_cycles, args.duration_seconds = "left-reach", 3, 60.
+            if ordinary_arms:
+                args.workload_segment, args.duration_seconds = "ordinary-arms", 12.
             if failure == "normal_program_finish_left_reach_zero_gripper":
                 args.workload_segment = "left-reach"
             if failure == "normal_program_finish_combined_body":
@@ -1547,8 +1636,16 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             class ShortProgramme(original_workload):
                 def __init__(self, *args, **kwargs):
                     super().__init__(*args, **kwargs)
-                    self.duration_s = .001  # Reporting seam only; real Native held proof is exercised below.
+                    if not ordinary_arms:
+                        self.duration_s = .001  # Reporting seam only; real Native held proof is exercised below.
             monkeypatch.setattr(am1_teleop_workload, "TeleopWorkload", ShortProgramme)
+            if ordinary_arms and failure.endswith(("old_profile", "advisory")):
+                with pytest.raises((RuntimeError, ValueError), match="ordinary-arms"):
+                    asyncio.run(asyncio.wait_for(m.run(args), 10))
+                session = instances[0]
+                assert session.starts == 1 and session.resumes == 0 and not session.inputs
+                assert session.stops == [owned_id]
+                return
             if failure in {"normal_program_finish_left_maintained", "normal_program_finish_left_reach", "normal_program_finish_left_reach_held", "normal_program_finish_left_reach_zero_gripper", "normal_program_finish_left_supported", "normal_program_finish_left_opposite"}:
                 original_selected = m.SelectedLeftWorkload
                 class ShortSelected(original_selected):
@@ -1580,6 +1677,24 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 assert start["terminal_qualification_budget_seconds"] == 2.
                 assert summary["producer_program_complete"] is (not usb_finish)
                 assert summary["native_execution_complete"] is False
+                if ordinary_arms:
+                    plan = summary["selected_profile"]
+                    frames = [r for r in records if r["event"] == "leader_frame"]
+                    assert start["program_active_seconds"] == summary["active_progress_s"] == 12.
+                    assert summary["workload_segment"] == plan["segment"] == "ordinary-arms"
+                    assert summary["view_policy"] == "required_presentation" and not summary["bench_continuity"]
+                    assert len(frames) == 120 and plan["measured_reference"] == summary["workspace"]["reference"]
+                    assert [row["progress_s"] for row in frames] == pytest.approx([i / 10 for i in range(120)])
+                    assert plan["command_reference"]["arm_left_shoulder_lift.pos"] == 100.
+                    assert frames[0]["frame"]["target"] == plan["command_reference"]
+                    assert frames[60]["frame"]["target"] == plan["targets"]
+                    assert all(row["frame"]["body"] == m.ZERO_BODY for row in frames)
+                    assert all(row["native"]["run"]["live_input"]["required_view"] ==
+                               {"required": True, "qualified": True, "role": "chest"} for row in frames)
+                    assert len({row["frame"]["source"]["source_id"] for row in frames}) == 1
+                    assert [row["frame"]["source"]["sample_seq"] for row in frames] == list(range(1, 121))
+                    assert len({row["grant"]["grant_id"] for row in frames}) == 120
+                    assert len(session.start_requests) == len(session.pauses) == 1 and session.claim_posts == 0
                 if cycle_run:
                     assert start["program_active_seconds"] == 60. and start["left_reach_cycles"] == 3
                     assert summary["left_reach_cycles"] == 3 and summary["active_progress_s"] == 60.
@@ -1659,7 +1774,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             if failure == "usb_quit_empty_finish":
                 assert len(session.inputs) == 0 and len(session.pauses) == 1
                 assert summary["frame_count"] == 0 and summary["endpoint_error_normalized"] == {}
-            elif not cycle_run:
+            elif not cycle_run and not ordinary_arms:
                 assert len(session.inputs) == len(session.pauses) == 1
             if not failure.endswith("failed"):
                 assert summary["pause_operation_id"] == session.pauses[0]["operation_id"]
