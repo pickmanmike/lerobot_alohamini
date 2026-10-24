@@ -4,28 +4,37 @@ This is generated bench input, never a recorded human demonstration. Only an
 acknowledged active sender advances its clock; interruption time is discarded.
 """
 
-from .am1_live_teleop import TELEOP_ARM_KEYS, validate_workspace
+from .am1_live_teleop import TELEOP_ARM_KEYS, validate_target, validate_workspace
 
 
 class TeleopWorkload:
     kind = "virtual-leaders"
     duration_s = 172.5
 
-    def __init__(self, workspace, *, segment="full"):
+    def __init__(self, workspace, *, segment="full", command_reference=None):
         segments = {"full": (0.0, 172.5), "combined": (96.0, 12.0),
                     "continuity": (96.0, 24.0), "body": (168.0, 4.5),
-                    "combined-body": (108.0, 64.5)}
+                    "combined-body": (108.0, 64.5), "ordinary-arms": (96.0, 12.0)}
         if segment not in segments:
             raise ValueError("Unknown declared bench segment")
         self.segment = segment
         self._program_offset_s, self.duration_s = segments[segment]
         self.workspace = validate_workspace(workspace)
-        self.origin = {
-            k: max(
-                workspace["bounds"][k]["min"], min(workspace["bounds"][k]["max"], workspace["reference"][k])
-            )
-            for k in TELEOP_ARM_KEYS
-        }
+        self.measured_reference = dict(self.workspace["reference"])
+        self.absolute_targets = segment == "ordinary-arms"
+        if self.absolute_targets:
+            if command_reference is None:
+                raise ValueError("ordinary-arms requires an explicit qualified legal command reference")
+            self.origin = validate_target(command_reference, workspace=self.workspace)
+        elif command_reference is not None:
+            raise ValueError("command reference is only selected by the ordinary-arms profile")
+        else:
+            self.origin = {
+                k: max(
+                    workspace["bounds"][k]["min"], min(workspace["bounds"][k]["max"], workspace["reference"][k])
+                )
+                for k in TELEOP_ARM_KEYS
+            }
         self.targets = {
             k: max(
                 (workspace["bounds"][k]["min"], workspace["bounds"][k]["max"]),
@@ -105,3 +114,14 @@ class TeleopWorkload:
             for key in TELEOP_ARM_KEYS:
                 target[key] += fraction * (self.targets[key] - self.origin[key])
         return {k.removeprefix("arm_"): v for k, v in target.items()}
+
+    def plan(self):
+        if not self.absolute_targets:
+            return None
+        return {"segment": self.segment, "program_active_seconds": self.duration_s,
+                "measured_reference": dict(self.measured_reference), "command_reference": dict(self.origin),
+                "command_reference_basis": "original current native qualified HOLD cursor; measured reference unchanged",
+                "targets": dict(self.targets), "active_progress_s": self.elapsed_s,
+                "phases_completed": sorted(self.phases_completed),
+                "schedule": [{"phase": "coordinated_reach", "start_s": 0., "end_s": 6.},
+                             {"phase": "coordinated_return", "start_s": 6., "end_s": 12.}]}

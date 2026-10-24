@@ -891,7 +891,8 @@ def test_right_p20_fresh_nonce_requires_absent_global_marker_after_explicit_reti
 LEFT_P_BOOT = "77777777-7777-4777-8777-777777777777"
 
 
-def left_response_p_files(tmp_path, monkeypatch, *, proportional=32, workspace_profile=None, left_shoulder_startup_degrees=None):
+def left_response_p_files(tmp_path, monkeypatch, *, proportional=32, workspace_profile=None, left_shoulder_startup_degrees=None,
+                          workload_segment=None):
     module = right_p20_module()
     assert callable(getattr(module, "consume_left_response_p_request", None)), (
         "left proportional consumer missing"
@@ -912,6 +913,8 @@ def left_response_p_files(tmp_path, monkeypatch, *, proportional=32, workspace_p
     }
     if workspace_profile is not None:
         value.update(workspace_profile=workspace_profile, workload_segment="left-reach")
+    if workload_segment is not None:
+        value["workload_segment"] = workload_segment
     if left_shoulder_startup_degrees is not None:
         value["left_shoulder_startup_degrees"] = left_shoulder_startup_degrees
     request = state / "left-response-p-request.json"
@@ -920,10 +923,12 @@ def left_response_p_files(tmp_path, monkeypatch, *, proportional=32, workspace_p
     return module, state, directory, request, value
 
 
-def left_response_p_robot(tmp_path, monkeypatch, *, proportional=32, workspace_profile=None, left_shoulder_startup_degrees=None):
+def left_response_p_robot(tmp_path, monkeypatch, *, proportional=32, workspace_profile=None, left_shoulder_startup_degrees=None,
+                          workload_segment=None):
     module, state, directory, request, value = left_response_p_files(
         tmp_path, monkeypatch, proportional=proportional, workspace_profile=workspace_profile,
         left_shoulder_startup_degrees=left_shoulder_startup_degrees,
+        workload_segment=workload_segment,
     )
     path = module.consume_left_response_p_request(
         state, directory, "physical-live-teleop", RIGHT_P20_RUN, RIGHT_P20_HOST, "a" * 40
@@ -1815,8 +1820,11 @@ def test_current_rest_request_cannot_broaden_other_role_or_experiment(tmp_path, 
     assert request.read_bytes() == raw and list(directory.iterdir()) == []
 
 
-def test_current_rest_original_goal_is_evidence_while_gain_restores_lock_last(tmp_path, monkeypatch):
-    module, r, trial, directory, request, original = left_response_p_robot(tmp_path, monkeypatch, workspace_profile=CURRENT_REST_PROFILE)
+@pytest.mark.parametrize("workload_segment", ["left-reach", "ordinary-arms"])
+def test_current_rest_original_goal_is_evidence_while_gain_restores_lock_last(tmp_path, monkeypatch, workload_segment):
+    module, r, trial, directory, request, original = left_response_p_robot(tmp_path, monkeypatch,
+        workload_segment=workload_segment,
+        workspace_profile=("ordinary-arms-left-current-rest-1051-1164" if workload_segment == "ordinary-arms" else CURRENT_REST_PROFILE))
     trial.prepare(r)
     durable = json.loads(trial.snapshot_path.read_bytes())
     assert durable["restore_required"] is True and durable["original_registers"]["Goal_Position"] == 2050
@@ -1932,12 +1940,13 @@ def test_current_rest_instance_cannot_escape_immutable_request_corridor(tmp_path
     assert not trial.restore_required and r.left_bus.values["Goal_Position", ELBOW] == 2050
 
 
-def stopped_115_original(tmp_path, monkeypatch):
+def stopped_115_original(tmp_path, monkeypatch, *, workload_segment="left-reach"):
     """Retain the failed pre-P32 original; this is not a fresh apply opportunity."""
     import hashlib
 
     module, r, trial, directory, _, _ = left_response_p_robot(
-        tmp_path, monkeypatch, workspace_profile=CURRENT_REST_PROFILE
+        tmp_path, monkeypatch, workload_segment=workload_segment,
+        workspace_profile=("ordinary-arms-left-current-rest-1051-1164" if workload_segment == "ordinary-arms" else CURRENT_REST_PROFILE),
     )
     trial.prepare(r)
     trial._snapshot.update(
@@ -1967,6 +1976,46 @@ def stopped_115_original(tmp_path, monkeypatch):
               "completion_id": "55555555-5555-4555-8555-555555555555",
               "check_stopped": lambda: guard_calls.append(True)}
     return module, r, trial, directory, original, kwargs, guard_calls
+
+
+def test_ordinary_arms_stopped_completion_preserves_exact_failed_original_and_gain_identity(tmp_path, monkeypatch):
+    module, r, trial, directory, original, kwargs, guard_calls = stopped_115_original(
+        tmp_path, monkeypatch, workload_segment="ordinary-arms")
+    result = module.complete_stopped_left_response_p_original(r.left_bus, directory, **kwargs)
+    assert trial.snapshot_path.read_bytes() == original and trial.restore_required
+    assert result["selected_restoration_verified"] is True and result["native_acknowledged"] is False
+    assert result["original_sha256"] == kwargs["original_sha256"]
+    assert r.left_bus.values["P_Coefficient", ELBOW] == 16 and r.left_bus.values["Torque_Enable", ELBOW] == 0
+    assert all(row[1] != "Goal_Position" for row in writes(r.left_bus)) and guard_calls
+
+
+@pytest.mark.parametrize("segment", ["left-maintained", "left-peer-fixed"])
+def test_current_rest_explicit_null_profile_cannot_enable_unprofiled_workloads(tmp_path, monkeypatch, segment):
+    module, _state, _directory, _request, value = left_response_p_files(tmp_path, monkeypatch)
+    value.update(workload_segment=segment, workspace_profile=None)
+    with pytest.raises(ValueError):
+        module._left_response_p_request(value, "a" * 40)
+
+
+@pytest.mark.parametrize("changed", ["legacy_profile", "missing_profile", "gain", "side", "unknown_workload"])
+def test_ordinary_arms_request_cannot_borrow_other_profile_gain_or_role(tmp_path, monkeypatch, changed):
+    module, state, directory, request, value = left_response_p_files(tmp_path, monkeypatch,
+        workload_segment="ordinary-arms", workspace_profile="ordinary-arms-left-current-rest-1051-1164")
+    if changed == "legacy_profile":
+        value["workspace_profile"] = CURRENT_REST_PROFILE
+    elif changed == "missing_profile":
+        value.pop("workspace_profile")
+    elif changed == "gain":
+        value["proportional"] = 16
+    elif changed == "side":
+        value["kind"] = "right-response-p"
+    else:
+        value["workload_segment"] = "ordinary-body"
+    request.write_bytes(module._right_p20_json(value))
+    before = request.read_bytes()
+    with pytest.raises(ValueError):
+        module.consume_left_response_p_request(state, directory, "physical-live-teleop", RIGHT_P20_RUN, RIGHT_P20_HOST, "a" * 40)
+    assert request.read_bytes() == before and not list(directory.iterdir())
 
 
 @pytest.mark.parametrize("lock", [0, 1])

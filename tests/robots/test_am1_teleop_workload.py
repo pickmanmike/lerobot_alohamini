@@ -72,3 +72,30 @@ def test_combined_body_selection_matches_last_five_original_cycles_and_body():
     assert selected.phases_completed == {"combined", "body"}
     assert selected.body_phase_elapsed is None
     assert original.duration_s == 172.5 and "individual" not in selected.phases_completed
+
+
+def test_ordinary_arms_uses_explicit_legal_command_origin_and_original_measured_reference():
+    value = workspace()
+    shoulder = "arm_left_shoulder_lift.pos"
+    value["reference"][shoulder] = 10.01
+    origin = {**value["reference"], shoulder: 10.}
+    selected = TeleopWorkload(value, segment="ordinary-arms", command_reference=origin)
+    assert selected.duration_s == 12. and selected.absolute_targets is True
+    assert selected.measured_reference == value["reference"] and selected.origin == origin
+    assert selected.measured_reference[shoulder] == 10.01
+    for at, expected in ((0., origin), (6., selected.targets), (12., origin)):
+        selected.elapsed_s = at
+        assert selected.get_action() == {key.removeprefix("arm_"): target for key, target in expected.items()}
+        assert selected.body_phase_elapsed is None
+    selected.elapsed_s = 3.
+    expected = selected.get_action()
+    selected.freeze()
+    selected.advance(100.)
+    assert selected.get_action() == expected and selected.origin == origin
+    with pytest.raises(ValueError):
+        TeleopWorkload(value, segment="ordinary-arms")
+
+
+@pytest.mark.parametrize("segment", ["full", "combined", "continuity", "body", "combined-body"])
+def test_ordinary_plan_never_labels_legacy_workloads_as_twelve_second_actions(segment):
+    assert TeleopWorkload(workspace(), segment=segment).plan() is None

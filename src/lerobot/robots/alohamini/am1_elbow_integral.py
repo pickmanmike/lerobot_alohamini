@@ -897,10 +897,11 @@ def _left_response_p_boot_id():
 
 def _response_p_request(value, source_head=None, *, kind):
     import re
+    from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES
 
     if kind not in (LEFT_RESPONSE_P_KIND, RIGHT_RESPONSE_P_KIND):
         raise ValueError("Only the two selected response elbow roles are supported")
-    segments = (("left-maintained", "left-reach", "left-peer-fixed")
+    segments = (("left-maintained", "left-reach", "left-peer-fixed", "ordinary-arms")
                 if kind == LEFT_RESPONSE_P_KIND else ("right-peer-fixed",))
     if (
         not isinstance(value, dict)
@@ -935,14 +936,20 @@ def _response_p_request(value, source_head=None, *, kind):
         or value["expires_at_monotonic_s"] <= 0
     ):
         raise ValueError("Selected elbow response P requires its closed current-source finite comparison request")
+    if value["workload_segment"] == "ordinary-arms" and "workspace_profile" not in value:
+        raise ValueError("Ordinary arms requires its explicit current-rest workspace profile")
     if "workspace_profile" in value and (
-        kind != LEFT_RESPONSE_P_KIND or value["workspace_profile"] != LEFT_CURRENT_REST_WORKSPACE_PROFILE
-        or value["proportional"] != 32 or value["workload_segment"] != "left-reach"
+        kind != LEFT_RESPONSE_P_KIND
+        or value["workload_segment"] not in CURRENT_REST_WORKSPACE_PROFILES
+        or type(value["workspace_profile"]) is not str
+        or value["workspace_profile"] != CURRENT_REST_WORKSPACE_PROFILES.get(value["workload_segment"])
+        or value["proportional"] != 32
     ):
-        raise ValueError("Current-rest profile requires only the explicit LEFT/P32/left-reach request")
+        raise ValueError("Current-rest profile requires its exact explicit LEFT/P32 workload request")
     if "left_shoulder_startup_degrees" in value and (
-        kind != LEFT_RESPONSE_P_KIND or value.get("workspace_profile") != LEFT_CURRENT_REST_WORKSPACE_PROFILE
-        or value["proportional"] != 32 or value["workload_segment"] != "left-reach"
+        kind != LEFT_RESPONSE_P_KIND
+        or value.get("workspace_profile") != CURRENT_REST_WORKSPACE_PROFILES.get(value["workload_segment"])
+        or value["workload_segment"] not in CURRENT_REST_WORKSPACE_PROFILES or value["proportional"] != 32
         or type(value["left_shoulder_startup_degrees"]) not in (int, float)
         or not math.isfinite(value["left_shoulder_startup_degrees"])
         or value["left_shoulder_startup_degrees"] != 1
@@ -1416,7 +1423,8 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
     def require_normal_activation_owner(self, robot):
         """Read-free fence while the ordinary owner seeds its fresh measured goals."""
         self._retained_owner(robot)
-        if (self.workspace_profile != LEFT_CURRENT_REST_WORKSPACE_PROFILE or self.side != "left"
+        from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES
+        if (self.workspace_profile not in CURRENT_REST_WORKSPACE_PROFILES.values() or self.side != "left"
                 or self.proportional != 32 or not self.restore_required
                 or self._snapshot.get("state") != "configured"
                 or self._snapshot.get("configured_p_readback") != 32
@@ -1430,9 +1438,11 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
         if "left_shoulder_startup_degrees" not in request:
             return 0.5
         degrees = request["left_shoulder_startup_degrees"]
+        from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES
         if (type(degrees) not in (int, float) or not math.isfinite(degrees) or degrees != 1
-                or request.get("workspace_profile") != LEFT_CURRENT_REST_WORKSPACE_PROFILE
-                or request.get("proportional") != 32 or request.get("workload_segment") != "left-reach"):
+                or request.get("workload_segment") not in CURRENT_REST_WORKSPACE_PROFILES
+                or request.get("workspace_profile") != CURRENT_REST_WORKSPACE_PROFILES.get(request.get("workload_segment"))
+                or request.get("proportional") != 32):
             raise RuntimeError("Left shoulder startup request authority changed")
         return 1.0
 
@@ -1659,7 +1669,9 @@ def complete_stopped_left_response_p_original(
         raise ValueError("Stopped completion output must be fresh")
     binding = load_left_response_p_binding(directory / "left-response-p.json", directory, run_id, host_incarnation)
     request = _response_p_request(binding["request"], source_head, kind=LEFT_RESPONSE_P_KIND)
-    if request.get("workspace_profile") != "left-current-rest-1051-1164":
+    from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES
+    if (request.get("workload_segment") not in CURRENT_REST_WORKSPACE_PROFILES
+        or request.get("workspace_profile") != CURRENT_REST_WORKSPACE_PROFILES[request["workload_segment"]]):
         raise ValueError("Stopped completion requires the exact current-rest request")
     path = directory / "left-response-p-original.json"
 

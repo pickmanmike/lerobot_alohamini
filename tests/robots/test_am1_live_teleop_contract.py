@@ -168,3 +168,19 @@ def test_current_rest_workspace_only_admits_approved_exact_opt_in_geometry(bad):
         assert m.validate_target(target, workspace=value) == target
         with pytest.raises(ValueError):
             m.validate_target(dict(target, **{key: endpoints[1] + .1}), workspace=value)
+
+
+def test_ordinary_arms_workspace_is_a_distinct_closed_current_rest_profile():
+    m, value = contract(), workspace()
+    key = "arm_left_elbow_flex.pos"
+    value["workspace_profile"] = "ordinary-arms-left-current-rest-1051-1164"
+    value["calibration"][key.removesuffix(".pos")] = [3, 0, 1845, 864, 3073]
+    value["raw_bounds"][key] = [1051, 1164]
+    low, high = (m.normalized_raw(raw, value["calibration"][key.removesuffix(".pos")]) for raw in (1051, 1164))
+    value["bounds"][key].update(min=low, max=high)
+    value["reference"][key] = m.normalized_raw(1090, value["calibration"][key.removesuffix(".pos")])
+    assert m.validate_workspace(value) == value
+    changed = copy.deepcopy(value)
+    changed["raw_bounds"][key][0] -= 1
+    with pytest.raises(ValueError):
+        m.validate_workspace(changed)

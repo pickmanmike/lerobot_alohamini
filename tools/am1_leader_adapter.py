@@ -32,6 +32,20 @@ from examples.alohamini.am1_live_teleop import (
     validate_workspace,
 )
 
+ORDINARY_ARMS_PROFILE = "ordinary-arms-left-current-rest-1051-1164"
+
+
+def _ordinary_arms_options(args):
+    selected = getattr(args, "workload_segment", "full") == "ordinary-arms"
+    if selected and (
+        args.source != "virtual-leaders" or getattr(args, "bench_continuity", False)
+        or getattr(args, "next_start_seconds", None) is not None
+        or getattr(args, "interrupt_at_seconds", None) is not None
+        or getattr(args, "interrupt_controller", False)
+    ):
+        raise ValueError("ordinary-arms requires normal required-view virtual input without diagnostic interruptions")
+    return selected
+
 
 class LeaderClutch:
     """Explicit acquisition reference, separate from unchanged motor calibration."""
@@ -495,7 +509,7 @@ class FrameProducer:
                     "meaning": "explicit relative acquisition; calibration unchanged",
                 }
                 self.reacquire = False
-            fixed = isinstance(self.input, SelectedLeftWorkload)
+            fixed = isinstance(self.input, SelectedLeftWorkload) or getattr(self.input, "absolute_targets", False) is True
             if fixed and self.last_clutch:
                 self.last_clutch["meaning"] = "fresh binding; declared original absolute programme targets remain fixed"
             target = self.clutch.map(leader, self.workspace, absolute=True) if fixed else self.clutch.map(leader, self.workspace)
@@ -2087,6 +2101,11 @@ class SameRunRecovery:
 
     def check(self, state, *, history=True):
         run, evidence, live = state.get("run") or {}, state.get("evidence", {}), _live(state)
+        if self.original["workspace"].get("workspace_profile") == ORDINARY_ARMS_PROFILE and (
+            run.get("bench_continuity") is not False
+            or (live.get("required_view") or {}).get("required") is not True
+        ):
+            raise RuntimeError("ordinary-arms native normal required-view policy changed")
         if (
             any(run.get(k) != v for k, v in self.original["run"].items())
             or state.get("service_incarnation") != self.original["service"]
@@ -3496,6 +3515,7 @@ async def send_leader_sample(client, producer, body, record, *, phase, progress_
 async def run(args):
     from examples.alohamini.am1_teleop_workload import TeleopWorkload
 
+    ordinary_arms = _ordinary_arms_options(args)
     left_reach_cycles = _left_reach_cycles(args)
     bench = getattr(args, "bench_continuity", False)
     segment = getattr(args, "workload_segment", "full")
@@ -3609,7 +3629,7 @@ async def run(args):
              **({"peer_baseline_qualification_budget_seconds": 2.} if peer and "fixed_start_raw" in peer else {}),
              "terminal_qualification_budget_seconds": terminal_budget,
              "terminal_completion_policy": summary["terminal_completion_policy"],
-             "program_active_seconds": {"full": 172.5, "combined": 12., "body": 4.5, "continuity": 24., "combined-body": 64.5, **SelectedLeftWorkload.DURATIONS}[segment] * left_reach_cycles if args.source == "virtual-leaders" else None,
+             "program_active_seconds": {"full": 172.5, "combined": 12., "ordinary-arms": 12., "body": 4.5, "continuity": 24., "combined-body": 64.5, **SelectedLeftWorkload.DURATIONS}[segment] * left_reach_cycles if args.source == "virtual-leaders" else None,
              "input_duration_seconds": args.duration_seconds,
              "controller_interruption": controller_gap, "interruption_at_seconds": getattr(args, "interrupt_at_seconds", None),
              "interruption_seconds": getattr(args, "interruption_seconds", .65)}
@@ -3842,7 +3862,16 @@ async def run(args):
         summary.update(run_id=run_id, original_native_deadline=deadline, workspace=workspace)
         record({"event": "native_admitted", "snapshot": client.snapshot})
         if args.source == "virtual-leaders":
-            if segment in SelectedLeftWorkload.DURATIONS:
+            if ordinary_arms:
+                if (workspace.get("workspace_profile") != ORDINARY_ARMS_PROFILE
+                    or client.snapshot["run"].get("bench_continuity") is not False
+                    or (_live(client.snapshot).get("required_view") or {}).get("required") is not True):
+                    raise RuntimeError("ordinary-arms requires its exact qualified native normal required-view profile")
+                commands = _qualified_command_reference(client, workspace)
+                workload = source = TeleopWorkload(workspace, segment=segment, command_reference=commands)
+                summary["selected_profile"] = workload.plan()
+                record({"event": "workload_plan", "run_id": run_id, **workload.plan()})
+            elif segment in SelectedLeftWorkload.DURATIONS:
                 selected_kwargs = {"peer_side": peer["side"], "peer_direction": peer["direction_raw"], "peer_raw_step": peer["raw_step"],
                                    **({"peer_active_p": peer["active_p"]} if "active_p" in peer else {})} if peer else {}
                 if left_reach_cycles > 1:
@@ -4153,6 +4182,8 @@ async def run(args):
                 original_body = dict(body)
                 body.pop("lift_axis.height_mm")
                 record({"event": "body_velocity_precedence", "original": original_body, "sent": body})
+            if ordinary_arms and body != ZERO_BODY:
+                raise RuntimeError("ordinary-arms body commands must remain literal zero")
             acquisition_started = time.monotonic()
             try:
                 async with asyncio.timeout_at(peer_baseline_until) as baseline_budget:
@@ -4370,7 +4401,7 @@ async def run(args):
                 ordinary_pauses_observed=recovery.pause_recoveries,
             )
     finally:
-        if isinstance(workload, SelectedLeftWorkload):
+        if isinstance(workload, SelectedLeftWorkload) or ordinary_arms and workload is not None:
             summary["selected_profile"] = workload.plan()
 
         async def cleanup_step(name, operation, timeout):
@@ -4499,7 +4530,7 @@ def main(argv=None):
     parser.add_argument("--interrupt-at-seconds", type=float)
     parser.add_argument("--interruption-seconds", type=float, default=0.65)
     parser.add_argument("--bench-continuity", action="store_true", help="predetermined virtual bench; viewing is advisory")
-    parser.add_argument("--workload-segment", choices=("full", "combined", "body", "continuity", "combined-body", *SelectedLeftWorkload.DURATIONS), default="full")
+    parser.add_argument("--workload-segment", choices=("full", "combined", "ordinary-arms", "body", "continuity", "combined-body", *SelectedLeftWorkload.DURATIONS), default="full")
     parser.add_argument("--left-reach-cycles", type=int, choices=(1, 2, 3), default=1,
                         help="one to three normal virtual left-reach cycles using the original reference")
     parser.add_argument("--peer-side", choices=("left", "right"))
@@ -4512,6 +4543,7 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
     try:
+        _ordinary_arms_options(args)
         _left_reach_cycles(args)
         _peer_options(args.workload_segment, args.peer_side, args.peer_direction, args.peer_raw_step,
                       bench=args.bench_continuity, next_start=args.next_start_seconds, active_p=args.peer_active_p)
