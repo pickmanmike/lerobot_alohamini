@@ -14,6 +14,7 @@ from tests.robots.test_am1_selected_joint_evidence import robot as selected_robo
 from tests.robots.test_am1_selected_joint_evidence import visible_register_packet, visible_robot
 from tests.robots.test_alohamini_lift_motor_feedback import status
 from tests.robots.test_alohamini_lift_operational import operating_robot
+from tests.robots.test_am1_teleop_temperature import command_cadence_boundary
 
 KEY = "arm_left_elbow_flex.pos"
 
@@ -540,6 +541,225 @@ def test_practical_twenty_degrees_survives_ordinary_twenty_normalized_relative_c
     obj.send_action({RIGHT_KEY: config.target_norm(20), "x.vel": 0, "y.vel": 0, "theta.vel": 0, "lift_axis.vel": 0})
     assert obj._am1_selected_joint_action["expected_goal_raw"] == 2074
     assert obj.config.max_relative_target == 20
+
+
+@pytest.mark.parametrize("case", ["fresh", "empty", "late", "expired", "already_expired", "foreign", "stale",
+                                 "hard_status", "pause", "stop", "nonteleop"])
+def test_teleop_extra_ingress_services_queued_input_before_observation_with_original_guards(monkeypatch, case):
+    import json
+    import time
+    from types import SimpleNamespace
+
+    from lerobot.robots.alohamini import am1_live_teleop as native
+    from tests.robots.test_am1_live_teleop_native import lane as teleop_lane, frame as teleop_frame, sample as teleop_sample
+
+    now, identity, owner, robot, control = teleop_lane()
+    now[0] = 751896.
+    robot._am1_live_before_write = lambda: None  # Production send uses a no-op until the first input installs it.
+    for epoch in range(1, 12):
+        assert control.apply(robot, teleop_frame(identity, owner, epoch,
+            mode="pause" if epoch % 2 else "active", epoch=epoch, revision=5))
+    original = teleop_sample(control, seq=4, expiry=751896.845854434)
+    original["source"]["sample_seq"] = 8
+    now[0] = 751896.665869680
+    assert control.apply(robot, teleop_frame(identity, owner, 97, mode="active", epoch=12, revision=5, sample=original))
+    deadline, reference = control.live_snapshot()["live_deadline_monotonic_s"], control.live_snapshot()["reference"]
+    fresh = teleop_sample(control, seq=5, expiry=751897.018885891,
+                          source_id=original["source"]["source_id"], acquired=2.01)
+    fresh["source"]["sample_seq"] = 9
+    repeated = teleop_frame(identity, owner, 99, mode="active", epoch=12, revision=5, sample=original)
+    queued = teleop_frame(identity, owner, 100, mode="active", epoch=12, revision=5, sample=fresh)
+    if case == "expired":
+        fresh["valid_until_monotonic_s"] = 751896.834
+    elif case == "foreign":
+        queued[host.AM1_LOCAL_CONTROL_KEY]["live_binding"] = dict(owner, connection_generation=str(uuid4()))
+    elif case == "stale":
+        fresh["seq"] = 3
+    elif case == "pause":
+        queued = teleop_frame(identity, owner, 100, epoch=13, revision=6)
+    elif case == "stop":
+        queued = {"x.vel": 0, "y.vel": 0, "theta.vel": 0, "lift_axis.vel": 0}
+    packets = [repeated, *([] if case == "empty" else [queued])]
+    if case == "fresh":
+        packets.append(teleop_frame(identity, owner, 101, mode="active", epoch=12, revision=5, sample=fresh))
+    attempted, applied, observations, events, output = [], [], [], [], bytearray()
+    applying = [None]
+    actual_apply, actual_send, actual_observation = control.apply, robot.send_action, robot.get_observation
+
+    def apply(obj, command):
+        marker = command.get(host.AM1_LOCAL_CONTROL_KEY, {})
+        applying[0] = marker.get("action_sequence", "stop")
+        try:
+            result = actual_apply(obj, command)
+            applied.append((applying[0], result, now[0]))
+            return result
+        finally:
+            applying[0] = None
+
+    def send(action):
+        result = actual_send(action)
+        now[0] = (751896.846854434 if case == "already_expired" else 751896.834646695) if applying[0] == 99 else now[0] + .025
+        return result
+
+    def observation():
+        if applying[0] is None:
+            observations.append((list(attempted), list(applied), control.live_snapshot()))
+            now[0] += .022144041
+        return actual_observation()
+
+    class Socket:
+        def recv_string(self, flags):
+            assert flags == host.zmq.NOBLOCK
+            attempted.append(now[0])
+            if not packets or case == "late" and len(packets) == 1 and now[0] < 751896.856790736:
+                raise host.zmq.Again()
+            return json.dumps(packets.pop(0))
+
+        def recv_multipart(self, **kwargs):
+            raise host.zmq.Again()
+
+    def disconnect(**kwargs):
+        events.append("motor-zero-off")
+        robot.left_bus.is_connected = robot.right_bus.is_connected = False
+
+    robot.logs, robot.cameras = {}, {}
+    robot._am1_teleop_settings = robot._am1_teleop_active_settings = {"left": {}, "right": {}}
+    robot._am1_teleop_rest_evidence = []
+    robot.send_action, robot.get_observation, robot.disconnect = send, observation, disconnect
+    monkeypatch.setattr(control, "apply", apply)
+    primary = OSError("original grouped status fault")
+    actual_history = native.thermal_history_status
+
+    def history(obj, *args, **kwargs):
+        if applying[0] == 100 and case == "hard_status":
+            raise primary
+        return actual_history(obj, *args, **kwargs)
+
+    monkeypatch.setattr(native, "thermal_history_status", history)
+    writer_type = host.AM1RoutineRecordWriter
+
+    class Writer(writer_type):
+        def __init__(self):
+            super().__init__(write=lambda data: output.extend(data) or len(data))
+
+        def close(self, **kwargs):
+            events.append("writer-drain")
+            super().close(**kwargs)
+
+    evidence = SimpleNamespace(enabled=False, guard_recovery=lambda *args: None, publish=lambda *args: None,
+        report=lambda *args: None, enrich_fault=lambda *args: None, emit_pending_fault=lambda *args: None)
+    monkeypatch.setattr(host, "AM1RoutineRecordWriter", Writer)
+    monkeypatch.setattr(host, "AM1SelectedJointEvidence", lambda **kwargs: evidence)
+    monkeypatch.setattr(host, "AlohaMini", lambda config: robot)
+    monkeypatch.setattr(host, "connect_robot", lambda *args, **kwargs: None)
+    monkeypatch.setattr(host, "visible_control_binding", lambda args: {**identity,
+        "recipe": "physical-live-left-elbow" if case == "nonteleop" else "physical-live-teleop"})
+    monkeypatch.setattr(host, "AM1LocalControl", lambda **kwargs: control)
+    monkeypatch.setattr(host, "AlohaMiniHost", lambda config: SimpleNamespace(watchdog_timeout_ms=1000,
+        connection_time_s=.09, max_loop_freq_hz=30, zmq_cmd_socket=Socket(), zmq_observation_socket=Socket(),
+        disconnect=lambda: events.append("socket-close")))
+    monkeypatch.setattr(host, "time", SimpleNamespace(monotonic=lambda: now[0], perf_counter=lambda: now[0],
+        time_ns=time.time_ns, sleep=lambda seconds: now.__setitem__(0, now[0] + seconds)))
+    args = host.make_parser().parse_args(["--no_cameras", "--skip_lift_home"])
+    args.am1_run_id, args.am1_host_incarnation = identity["run_id"], identity["host_incarnation"]
+    now[0] = 751896.799420929
+    if case == "hard_status":
+        with pytest.raises(OSError) as caught:
+            host._run_host(args)
+        assert caught.value is primary
+        assert not observations
+    else:
+        host._run_host(args)
+        state = control.live_snapshot()
+        if case == "fresh":
+            assert observations[0][2]["last_input_seq"] == 5
+            assert observations[0][2]["accepted_at_monotonic_s"] < original["valid_until_monotonic_s"]
+            assert state["valid_until_monotonic_s"] == fresh["valid_until_monotonic_s"]
+            assert observations[0][1] == [(99, True, 751896.834646695), (100, True, 751896.859646695)]
+            receipts = [json.loads(line.split("] ", 1)[1]) for line in output.decode().splitlines()
+                        if line.startswith("[AM1 TELEOP COMMAND] ")]
+            received = next(row for row in receipts if row["action_sequence"] == 100)
+            assert received["received_at_monotonic_s"] == received["native_admitted_at_monotonic_s"] == 751896.834646695
+            assert received["completed_at_monotonic_s"] == 751896.859646695
+            assert received["new_input_admitted"] is True and received["input"]["sample_seq"] == 9
+            assert received["input"]["grant_id"] == fresh["grant_id"]
+            assert received["input"]["valid_until_monotonic_s"] == 751897.018885891
+        elif case == "pause":
+            assert observations[0][2]["state"] == state["state"] == "held" and control.epoch == 13
+            assert applied[1][0:2] == (100, True)
+        elif case == "stop":
+            assert control.state == "stopped" and not observations
+        else:
+            assert state["last_input_seq"] == 4 and state["state"] == "expired"
+            assert not any(seq == 100 and accepted for seq, accepted, _ in applied)
+        if observations:
+            assert len(observations[0][0]) == (1 if case == "nonteleop" else 2)
+            assert len(observations) >= 2
+            assert all(len(current[0]) - len(previous[0]) <= (1 if case == "nonteleop" else 2)
+                       for previous, current in zip(observations, observations[1:]))
+    assert control.live_snapshot()["reference"] == reference
+    assert control.live_snapshot()["live_deadline_monotonic_s"] == deadline
+    assert events[:2] == ["motor-zero-off", "socket-close"]
+    if case != "nonteleop":
+        assert events[-1] == "writer-drain"
+
+
+@pytest.mark.parametrize("fault", ["history", "current", "status", "confirmed_heat", "raw_loss"])
+def test_teleop_extra_ingress_uses_real_role_and_thermal_protections(command_cadence_boundary, fault):
+    import json
+    from types import SimpleNamespace
+
+    from lerobot.robots.alohamini import am1_live_teleop as native
+    from tests.robots.test_am1_live_teleop_native import frame as teleop_frame, sample as teleop_sample
+
+    state, robot = command_cadence_boundary, command_cadence_boundary.robot
+    for side, raw in (("left", 2124), ("right", 1847)):
+        for register in ("Present_Position", "Goal_Position"):
+            getattr(robot, side + "_bus").registers[register, "arm_" + side + "_elbow_flex"] = raw
+    for motor in (*robot.base_motors, "lift_axis"):
+        robot.left_bus.registers["Goal_Velocity", motor] = 0
+    identity = {key: robot._am1_teleop_binding[key] for key in ("run_id", "host_incarnation")}
+    owner = {key: str(uuid4()) for key in ("service_incarnation", "controller_generation", "connection_generation")}
+    control = host.AM1LocalControl(**identity, live=True, live_recipe="physical-live-teleop", clock=lambda: state.clock.now)
+    assert control.apply(robot, teleop_frame(identity, owner, 1))
+    assert control.apply(robot, teleop_frame(identity, owner, 2, mode="active", epoch=2))
+    original = teleop_sample(control, expiry=state.clock.now + .25)
+    assert control.apply(robot, teleop_frame(identity, owner, 3, mode="active", epoch=2, sample=original))
+    deadline = control.live_snapshot()["live_deadline_monotonic_s"]
+    packets = [teleop_frame(identity, owner, 4, mode="active", epoch=2, sample=original)]
+
+    class Socket:
+        def recv_string(self, flags):
+            assert flags == host.zmq.NOBLOCK
+            return json.dumps(packets.pop(0))
+
+    owner_host = SimpleNamespace(zmq_cmd_socket=Socket())
+    command_state = host.HostCommandState(watchdog_timeout_ms=1000, clock=lambda: state.clock.now)
+    assert host._receive_host_command(owner_host, robot, control, command_state, None, state.operation)
+    state.clock.sleep(.501 if fault == "raw_loss" else .21)
+    if fault == "current":
+        robot.right_bus.registers["Present_Current", "arm_right_gripper"] = 310
+    elif fault == "status":
+        robot.right_bus.registers["Status", "arm_right_gripper"] = 8
+    elif fault == "confirmed_heat":
+        window = robot._am1_teleop_temperatures["right", 6]["window"]
+        window.samples[-1] = (window.samples[-1][0], 70)
+        window.samples[-2] = (window.samples[-2][0], 70)
+        robot.right_bus.registers["Present_Temperature", "arm_right_gripper"] = 70
+    fresh = teleop_sample(control, seq=2, expiry=state.clock.now + .25,
+        source_id=original["source"]["source_id"], acquired=2.01)
+    packets.append(teleop_frame(identity, owner, 5, mode="active", epoch=2, sample=fresh))
+    if fault == "history":
+        assert not host._receive_host_command(owner_host, robot, control, command_state, None, state.operation)
+        assert control.state == "paused" and control.live_sample is None
+        assert native.thermal_history_status(robot)["deficit_started_at_monotonic_s"] is not None
+    else:
+        with pytest.raises(RuntimeError, match={"current": "current protection", "status": "status fault",
+                                              "confirmed_heat": "majority", "raw_loss": "stale"}[fault]):
+            host._receive_host_command(owner_host, robot, control, command_state, None, state.operation)
+    assert control.live_snapshot()["last_input_seq"] == original["seq"]
+    assert control.live_snapshot()["valid_until_monotonic_s"] == original["valid_until_monotonic_s"]
+    assert control.live_snapshot()["live_deadline_monotonic_s"] == deadline
 
 
 def test_teleop_command_join_records_real_admission_return_refusal_and_original_error():

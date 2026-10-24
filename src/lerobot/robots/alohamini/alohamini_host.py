@@ -821,6 +821,46 @@ def _apply_traced_teleop_command(control, robot, command, writer, *, received_at
             writer._latch(reporting_error)  # Preserve an in-flight hardware error and existing cleanup ordering.
 
 
+def _receive_host_command(host, robot, local_control, command_state, routine_writer, lift_operation):
+    """Service one latest command through the existing owner and protection boundary."""
+    data = None
+    try:
+        msg = host.zmq_cmd_socket.recv_string(zmq.NOBLOCK)
+        command_received_t = time.monotonic()
+        command_received_wall_time_ns = command_state.capture_wall_time_ns()
+        data = dict(json.loads(msg))
+        if local_control is not None:
+            if routine_writer is not None and getattr(local_control, "teleop", False):
+                received = _apply_traced_teleop_command(
+                    local_control, robot, data, routine_writer, received_at=command_received_t)
+            else:
+                received = local_control.apply(robot, data)
+        else:
+            robot.send_action(data)
+            received = True
+        if received:
+            command_state.record_command(
+                robot.logs.get("action_diagnostics", {}),
+                received_at=command_received_t,
+                received_wall_time_ns=command_received_wall_time_ns,
+            )
+        return received
+    except zmq.Again:
+        return False
+    except Exception as error:
+        if lift_operation is not None:
+            # Preserve the existing latched lift fault before the legacy
+            # malformed-command handler can classify an input exception.
+            lift_operation.raise_if_faulted()
+        if local_control is not None and (
+            local_control.state != "ready"
+            or (isinstance(data, dict) and AM1_LOCAL_CONTROL_KEY in data)
+        ):
+            raise
+        logging.exception("Message fetching failed: %s", error)
+        return False
+
+
 def _private_directory(path: Path) -> None:
     info = path.stat(follow_symlinks=False)
     if path.is_symlink() or not stat.S_ISDIR(info.st_mode):
@@ -2068,7 +2108,6 @@ def _run_host(args):
             if loop_timing is not None:
                 loop_timing.begin(loop_start_t)
             command_received = False
-            data = None
             # One grouped lift transaction on the existing owning thread before
             # any ordinary action. No confirmation wait, worker, or second socket.
             lift_operation = getattr(robot, "_lift_operation", None)
@@ -2076,40 +2115,8 @@ def _run_host(args):
                 lift_operation.poll(defer_sample_log=True)
             if loop_timing is not None:
                 loop_timing.mark("command", time.perf_counter())
-            try:
-                msg = host.zmq_cmd_socket.recv_string(zmq.NOBLOCK)
-                command_received_t = time.monotonic()
-                command_received_wall_time_ns = command_state.capture_wall_time_ns()
-                data = dict(json.loads(msg))
-                #print(f"Received action: {data}")   # debug
-                if local_control is not None:
-                    if routine_writer is not None and getattr(local_control, "teleop", False):
-                        command_received = _apply_traced_teleop_command(
-                            local_control, robot, data, routine_writer, received_at=command_received_t)
-                    else:
-                        command_received = local_control.apply(robot, data)
-                else:
-                    robot.send_action(data)
-                    command_received = True
-                if command_received:
-                    command_state.record_command(
-                        robot.logs.get("action_diagnostics", {}),
-                        received_at=command_received_t,
-                        received_wall_time_ns=command_received_wall_time_ns,
-                    )
-            except zmq.Again:
-                pass
-            except Exception as e:
-                if lift_operation is not None:
-                    # Do not let the legacy malformed-command handler swallow a
-                    # latched lift fault (including an unsuccessful motor write).
-                    lift_operation.raise_if_faulted()
-                if local_control is not None and (
-                    local_control.state != "ready"
-                    or (isinstance(data, dict) and AM1_LOCAL_CONTROL_KEY in data)
-                ):
-                    raise
-                logging.exception("Message fetching failed: %s", e)
+            command_received = _receive_host_command(
+                host, robot, local_control, command_state, routine_writer, lift_operation)
             command_done_t = time.perf_counter()
             if loop_timing is not None:
                 loop_timing.mark("watchdog", command_done_t)
@@ -2122,6 +2129,14 @@ def _run_host(args):
                     local_control.watchdog_stop(robot)
                 else:
                     robot.stop_motion()
+
+            if teleop:
+                # One extra nonblocking service opportunity before full feedback
+                # work; the same native guards still reject an expired epoch.
+                # A fixed single attempt cannot drain indefinitely or starve IO.
+                command_received = _receive_host_command(
+                    host, robot, local_control, command_state, routine_writer, lift_operation) or command_received
+                command_done_t = time.perf_counter()
 
             if local_control is not None and not local_control.check_live(robot):
                 break
