@@ -8853,7 +8853,11 @@ def test_resume_send_failure_requires_original_current_request_socket_and_proven
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("change", ["closed-history", "manual", "deadline", "workspace", "episode", "controller"])
+@pytest.mark.parametrize("change", [
+    "closed-history", "native-cause-absent", "native-cause-before", "native-cause-after",
+    "operation-missing", "first-cause-missing", "deadline-missing",
+    "manual", "deadline", "workspace", "episode", "controller",
+])
 def test_acquisition_pause_discard_keeps_immutable_authority_and_closed_history(change):
     import asyncio
     import copy
@@ -8868,7 +8872,21 @@ def test_acquisition_pause_discard_keeps_immutable_authority_and_closed_history(
     after = copy.deepcopy(before)
     after["run"].update(status="paused", intent_revision=3, remaining_s=299.9)
     after["events"].append({"kind": "input_expired", "at": 100.08, "run_id": "owned", "service_incarnation": "service"})
-    if change == "manual":
+    if change == "native-cause-absent":
+        # Core adds this key only when consuming terminal native cleanup.
+        before["run"].pop("native_first_cause")
+        after["run"].pop("native_first_cause")
+    elif change == "native-cause-before":
+        before["run"]["native_first_cause"] = "feedback_loss"
+    elif change == "native-cause-after":
+        after["run"]["native_first_cause"] = "feedback_loss"
+    elif change == "operation-missing":
+        after["run"].pop("operation_id")
+    elif change == "first-cause-missing":
+        after["run"].pop("first_cause")
+    elif change == "deadline-missing":
+        after["run"].pop("deadline")
+    elif change == "manual":
         after["events"][-1]["kind"] = "pause"
     elif change == "deadline":
         after["run"]["deadline"] += 1
@@ -8903,7 +8921,7 @@ def test_acquisition_pause_discard_keeps_immutable_authority_and_closed_history(
     async def scenario():
         return await m.send_leader_sample(client, producer, m.ZERO_BODY, records.append,
                                           phase="individual", progress_s=0.)
-    if change == "closed-history":
+    if change in {"closed-history", "native-cause-absent"}:
         assert asyncio.run(scenario()) is None
         assert records[-1]["discarded"] is True and records[-1]["fresh_acquisition_allowed"] is False
         assert client.snapshot["run"]["first_cause"] == "feedback_loss"

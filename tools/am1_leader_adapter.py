@@ -3431,7 +3431,7 @@ async def send_leader_sample(client, producer, body, record, *, phase, progress_
         remaining = (before.get("remaining_s"), after.get("remaining_s"))
         clocks = (*remaining, before.get("native_live_at"), before.get("deadline"), pause.get("at"), previous_event.get("at"))
         run_pins = ("run_id", "operation_id", "backend_incarnation", "native_live_at", "deadline",
-                    "first_cause", "native_first_cause")
+                    "first_cause")
         live_pins = ("reference", "workspace", "live_admitted_at_monotonic_s", "live_deadline_monotonic_s")
         ordinary_pause = (
             set(identity) == {"run_id", "service_incarnation", "controller_generation", "connection_generation",
