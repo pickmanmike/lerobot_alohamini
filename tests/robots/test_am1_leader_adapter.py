@@ -730,7 +730,7 @@ def test_real_wss_clean_close_ends_qualified_wait_before_timeout(tmp_path):
         "bench_program_finish", "bench_program_finish_failed",
         "peer_fixed_baseline_ready", "peer_fixed_baseline_missing", "peer_fixed_baseline_native", "peer_fixed_baseline_blocked",
         "normal_program_finish", "normal_program_finish_failed", "normal_program_finish_combined_body",
-        "normal_program_finish_left_maintained", "normal_program_finish_left_reach", "normal_program_finish_left_reach_held", "normal_program_finish_left_supported", "normal_program_finish_left_opposite", "usb_finite_finish", "usb_finite_finish_failed", "usb_quit_finish", "usb_quit_empty_finish",
+        "normal_program_finish_left_maintained", "normal_program_finish_left_reach", "normal_program_finish_left_reach_held", "normal_program_finish_left_reach_cycles", "normal_program_finish_left_reach_closing_cycles", "normal_program_finish_left_reach_zero_gripper", "normal_program_finish_left_supported", "normal_program_finish_left_opposite", "usb_finite_finish", "usb_finite_finish_failed", "usb_quit_finish", "usb_quit_empty_finish",
     ],
 )
 def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
@@ -747,6 +747,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
     initial_pause_case = failure == "initial_resume_pause"
     terminal_hold = isinstance(failure, str) and failure.startswith("bench_terminal_hold_")
     normal_finish = isinstance(failure, str) and failure.startswith(("normal_program_finish", "usb_finite_finish", "usb_quit_"))
+    cycle_run = failure in {"normal_program_finish_left_reach_cycles", "normal_program_finish_left_reach_closing_cycles"}
     usb_finish = isinstance(failure, str) and failure.startswith(("usb_finite_finish", "usb_quit_"))
     program_finish = failure in {"bench_program_finish", "bench_program_finish_failed"} or normal_finish
     bench_case = failure in {"bench_input_gap", "bench_controller_gap", "bench_renewal_during_resume", "bench_renewal_attach_ceiling", "bench_renewal_snapshot_race",
@@ -779,7 +780,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
     timed_expiry = failure in {"expired_first", "expired_zero", "expired_zero_timeout"}
     pc_clock = [10.0]
     if (
-        recovery_case
+        cycle_run
+        or recovery_case
         or ordinary_case
         or mailbox_case
         or timed_expiry
@@ -798,6 +800,10 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         monkeypatch.setattr(
             m, "time", SimpleNamespace(monotonic=lambda: pc_clock[0], perf_counter=time.perf_counter)
         )
+        if cycle_run:
+            async def acquisition_delay(_requested):
+                await asyncio.sleep(0)
+            monkeypatch.setattr(m, "_acquisition_delay", acquisition_delay)
     owned_id, foreign_id = str(uuid4()), str(uuid4())
     instances = []
 
@@ -924,6 +930,14 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
 
         def state(self, run_id):
             w = peer_workspace() if peer_wait_case else workspace()
+            if failure in {"normal_program_finish_left_reach_closing_cycles", "normal_program_finish_left_reach_zero_gripper"}:
+                gripper = "arm_left_gripper.pos"
+                w["calibration"][gripper[:-4]] = [6, 0, 933, 1886, 3401]
+                w["reference"][gripper] = 80.52805280528052
+                low = 2803 if cycle_run else 3106
+                w["raw_bounds"][gripper] = [low, 3106]
+                w["bounds"][gripper] = {"min": m.normalized_raw(low, w["calibration"][gripper[:-4]], gripper=True),
+                                         "max": 80.52805280528052, "rate_per_s": 20.}
             if peer_wait_case:
                 w["reference"]["arm_left_elbow_flex.pos"] = m.normalized_raw(2043, w["calibration"]["arm_left_elbow_flex"])
             if failure == "normal_program_finish_left_supported":
@@ -1237,6 +1251,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 return {"accepted": True, "grant_id": str(uuid4()), "expires": 99.0}
             assert payload["op"] == "input"
             self.inputs.append(copy.deepcopy(payload))
+            if cycle_run:
+                pc_clock[0] += .1  # Full real60-active-second schedule; only PC time is accelerated.
             if peer_wait_case:
                 if failure == "peer_fixed_baseline_blocked":
                     await asyncio.sleep(10.)  # The one original baseline ceiling must cancel an in-flight receipt wait.
@@ -1493,6 +1509,10 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         if program_finish:
             if normal_finish:
                 args.bench_continuity = False
+            if cycle_run:
+                args.workload_segment, args.left_reach_cycles, args.duration_seconds = "left-reach", 3, 60.
+            if failure == "normal_program_finish_left_reach_zero_gripper":
+                args.workload_segment = "left-reach"
             if failure == "normal_program_finish_combined_body":
                 args.workload_segment = "combined-body"
             if failure in {"normal_program_finish_left_maintained", "normal_program_finish_left_reach", "normal_program_finish_left_reach_held"}:
@@ -1529,13 +1549,20 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                     super().__init__(*args, **kwargs)
                     self.duration_s = .001  # Reporting seam only; real Native held proof is exercised below.
             monkeypatch.setattr(am1_teleop_workload, "TeleopWorkload", ShortProgramme)
-            if failure in {"normal_program_finish_left_maintained", "normal_program_finish_left_reach", "normal_program_finish_left_reach_held", "normal_program_finish_left_supported", "normal_program_finish_left_opposite"}:
+            if failure in {"normal_program_finish_left_maintained", "normal_program_finish_left_reach", "normal_program_finish_left_reach_held", "normal_program_finish_left_reach_zero_gripper", "normal_program_finish_left_supported", "normal_program_finish_left_opposite"}:
                 original_selected = m.SelectedLeftWorkload
                 class ShortSelected(original_selected):
                     def __init__(self, *args, **kwargs):
                         super().__init__(*args, **kwargs)
                         self.duration_s = .001  # Runner/reporting seam; full16/20s clocks tested independently.
                 monkeypatch.setattr(m, "SelectedLeftWorkload", ShortSelected)
+            if failure == "normal_program_finish_left_reach_zero_gripper":
+                with pytest.raises(ValueError, match="gripper.*excursion"):
+                    asyncio.run(asyncio.wait_for(m.run(args), 10))
+                session = instances[0]
+                assert session.starts == 1 and session.resumes == 0 and not session.inputs
+                assert session.stops == [owned_id]
+                return
             if failure.endswith("failed"):
                 with pytest.raises(RuntimeError, match="Native held qualification unavailable"):
                     asyncio.run(asyncio.wait_for(m.run(args), 10))
@@ -1553,6 +1580,42 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 assert start["terminal_qualification_budget_seconds"] == 2.
                 assert summary["producer_program_complete"] is (not usb_finish)
                 assert summary["native_execution_complete"] is False
+                if cycle_run:
+                    assert start["program_active_seconds"] == 60. and start["left_reach_cycles"] == 3
+                    assert summary["left_reach_cycles"] == 3 and summary["active_progress_s"] == 60.
+                    assert summary["selected_profile"]["cycles_completed"] == 3
+                    assert summary["original_native_deadline"] == 301.
+                    frames = [row for row in records if row["event"] == "leader_frame"]
+                    assert len(frames) == 600 and {r["cycle_index"] for r in frames} == {1,2,3}
+                    assert [r["progress_s"] for r in frames] == pytest.approx([i/10 for i in range(600)])
+                    assert all(r["left_reach_cycles"] == 3 and r["cycle_index"] == int(r["progress_s"]//20)+1 for r in frames)
+                    attempts = [row for row in records if row["event"] == "leader_frame_attempt"]
+                    assert [(r["left_reach_cycles"], r["cycle_index"]) for r in attempts] == [(3, int(i//200)+1) for i in range(600)]
+                    assert all(r["native"]["run"]["live_input"]["required_view"] == {"required": True,"qualified": True,"role":"chest"} for r in frames)
+                    assert all(r["frame"]["body"] == m.ZERO_BODY for r in frames)
+                    assert len({r["frame"]["source"]["source_id"] for r in frames}) == 1
+                    assert [r["frame"]["source"]["sample_seq"] for r in frames] == list(range(1,601))
+                    assert len({r["grant"]["grant_id"] for r in frames}) == 600
+                    assert sum(r["event"] == "leader_clutch_acquired" for r in records) == 1
+                    assert all(r["native"]["run"]["run_id"] == owned_id and r["native"]["run"]["deadline"] == 301. for r in frames)
+                    plans = [r for r in records if r["event"] == "workload_plan"]
+                    assert len(plans) == 1 and plans[0]["reference"] == summary["workspace"]["reference"]
+                    assert plans[0]["endpoint_normalized"] == summary["selected_profile"]["endpoint_normalized"]
+                    for index in range(200):
+                        assert frames[index]["frame"]["target"] == frames[index+200]["frame"]["target"] == frames[index+400]["frame"]["target"]
+                    selected = {"arm_left_elbow_flex.pos", "arm_left_gripper.pos"}
+                    assert all(all(value == summary["workspace"]["reference"][key] for key, value in r["frame"]["target"].items()
+                                   if key not in selected) for r in frames)
+                    assert len(session.start_requests) == len(session.pauses) == 1 and session.claim_posts == 0
+                    if failure == "normal_program_finish_left_reach_closing_cycles":
+                        plan = summary["selected_profile"]
+                        assert plan["gripper_opening_delta"] == pytest.approx(-20.)
+                        assert plan["gripper_endpoint_normalized"] == pytest.approx(60.52805280528053)
+                        assert plan["gripper_direction_normalized"] == -1
+                        for cycle in range(3):
+                            assert frames[cycle*200]["frame"]["target"]["arm_left_gripper.pos"] == 80.52805280528052
+                            assert frames[cycle*200+100]["frame"]["target"]["arm_left_gripper.pos"] == pytest.approx(60.52805280528053)
+                            assert frames[cycle*200+120]["frame"]["target"]["arm_left_gripper.pos"] == 80.52805280528052
                 if failure == "normal_program_finish_combined_body":
                     assert start["workload_segment"] == summary["workload_segment"] == "combined-body"
                     assert start["program_active_seconds"] == 64.5
@@ -1596,7 +1659,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             if failure == "usb_quit_empty_finish":
                 assert len(session.inputs) == 0 and len(session.pauses) == 1
                 assert summary["frame_count"] == 0 and summary["endpoint_error_normalized"] == {}
-            else:
+            elif not cycle_run:
                 assert len(session.inputs) == len(session.pauses) == 1
             if not failure.endswith("failed"):
                 assert summary["pause_operation_id"] == session.pauses[0]["operation_id"]
@@ -2415,7 +2478,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal", "peer_start_normal", "peer_start_bench", "peer_bench_unqualified_view", "peer_bench_local_loss", "peer_normal_unqualified_view", "held_command120_view_later", "held_command120_view_never", "held_command120_local_loss", "view_refusal122_input_before", "view_refusal122_input_after", "view_refusal122_grant_before", "view_refusal122_grant_after", "view_refusal122_never", "view_refusal122_pause", "view_refusal122_stop", "view_refusal122_takeover"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal", "peer_start_normal", "peer_start_bench", "peer_bench_unqualified_view", "peer_bench_local_loss", "peer_normal_unqualified_view", "held_command120_view_later", "held_command120_view_never", "held_command120_local_loss", "view_refusal122_input_before", "view_refusal122_input_after", "view_refusal122_grant_before", "view_refusal122_grant_after", "view_refusal122_never", "view_refusal122_pause", "view_refusal122_stop", "view_refusal122_takeover", "view_refusal130_grant_input_race_before", "view_refusal130_grant_input_race_never", "view_refusal130_grant_input_race_pause", "view_refusal130_grant_input_race_stop", "view_refusal130_grant_input_race_takeover", "view_refusal130_grant_input_race_revision", "view_refusal130_grant_input_race_history", "view_refusal130_grant_input_race_time"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause):
     import asyncio
     import copy
@@ -2436,16 +2499,18 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
     a._teleop_view = {"run_id": e.run_id, "qualified_until": 10.5, "role": "chest"}
     healthy, epoch, commands = [True], [0], []
     held120 = cause.startswith("held_command120_")
-    view122 = cause.startswith("view_refusal122_")
+    view_input_race = cause.startswith("view_refusal130_")
+    view122 = cause.startswith("view_refusal122_") or view_input_race
+    race_waiting = [False]
     if held120 or view122:
         e.desired = "hold"
         a.run.update(accepted_at=8., startup_deadline=188., bench_continuity=False)
         e.sample["ack"]["live_input"]["workspace"] = held_command119_workspace()
         a._teleop_view = {"run_id": e.run_id, "qualified_until": 9.5 if held120 else 10.5, "role": "chest"}
-        if cause in {"held_command120_view_never", "view_refusal122_never"}:
+        if cause in {"held_command120_view_never", "view_refusal122_never"} or view_input_race and cause.endswith("never"):
             # Clip the existing qualification to actual remaining native time,
             # retaining the original9â†’309 ceiling rather than adding a timer.
-            a.clock = e.clock = lambda: 308.85
+            a.clock = e.clock = lambda: 308.6 if view_input_race else 308.85
             a.controller["expires"] = 310.
             if view122:
                 a._teleop_view["qualified_until"] = a.clock()+.5
@@ -2493,6 +2558,8 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
             live["accepted_target"] = dict(live["cursor"])
             value["measured_positions"] = copy.deepcopy(native["reference"])
             value["accepted_host_action"]["accepted_action"] = {"mode": "raw_goal_hold", "body_velocity": 0.}
+            if race_waiting[0]:
+                value["pose_aligned"] = False
             if cause == "held_command120_local_loss":
                 value["required_observation"] = False
         if not cursor_ready[0]:
@@ -2702,6 +2769,10 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         await asyncio.sleep(.04)
                         a.tick()
                         assert a.run["status"] == "paused" and e._live_target is None
+                        if view_input_race:
+                            assert a.events[-1]["kind"] == "input_expired"
+                            assert sum(op == "resume" for op, _ in commands) == 1
+                            assert len(observed) == 1 and not m._view_admitted(a.snapshot())
                         if cause.endswith("pause"):
                             assert a.handle({"op": "pause", "run_id": e.run_id, "operation_id": str(uuid4())}, enrolled["device_id"])["accepted"]
                         elif cause.endswith("stop"):
@@ -2710,7 +2781,14 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                             a.controller["expires"] = a.clock()-1
                             a._expire_controls(a.clock())
                             assert a.handle({"op": "claim"}, "competitor")["accepted"]
-                        elif cause != "view_refusal122_never":
+                        elif view_input_race and cause.endswith("revision"):
+                            a.run["intent_revision"] += 1
+                        elif view_input_race and cause.endswith("history"):
+                            a.run["first_cause"] = "required_proof_loss"
+                        elif view_input_race and cause.endswith("time"):
+                            a.events[-1]["at"] = a.run["deadline"]
+                        elif cause != "view_refusal122_never" and not (view_input_race and cause.endswith("never")):
+                            race_waiting[0] = False
                             a._teleop_view["qualified_until"] = a.clock()+.5
                     async def selected_view_race(command, device):
                         nonlocal qualification
@@ -2724,6 +2802,15 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                             assert result == {"accepted": False, "status": "refused", "effect_admitted": False,
                                               "reason": "required selected view expired"}
                             refused.append(copy.deepcopy(command))
+                            if view_input_race:
+                                race_waiting[0] = True
+                                expired_at = a.clock() + .3
+                                a.clock = e.clock = lambda: expired_at
+                                a.tick()  # The real Core chooses input expiry before its simultaneous view expiry.
+                                assert a.run["status"] == "paused" and a.events[-1]["kind"] == "input_expired"
+                                assert a.run["intent_revision"] == command["intent_revision"] + 1
+                                if cause.endswith("time"):
+                                    a.events[-1]["at"] = a.run["deadline"]
                             pending_read[0] = not cause.endswith("after")
                             if not pending_read[0]:
                                 a.tick()
@@ -2752,6 +2839,8 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         assert observed[0][0]["grant_id"] != observed[1][0]["grant_id"]
                         assert observed[1][1]["source"]["sample_seq"] > observed[0][1]["source"]["sample_seq"]
                         assert observed[1][0]["expires"]-observed[1][0]["issued"] == .25
+                        if view_input_race:
+                            assert not race_waiting[0]
                         if refused[0]["op"] == "input":
                             assert observed[1][1]["source"]["sample_seq"] > refused[0]["source"]["sample_seq"]
                             assert observed[1][0]["grant_id"] != refused[0]["grant_id"]
@@ -8828,6 +8917,138 @@ def test_selected_left_profile_refuses_endpoint_that_cannot_fit_existing_ramp_ra
     native["bounds"]["arm_left_elbow_flex.pos"]["rate_per_s"] = .1
     with pytest.raises(ValueError, match="unchanged.*ramp rate"):
         m.SelectedLeftWorkload(native)
+
+
+@pytest.mark.parametrize("count", [2, 3])
+def test_left_reach_cycles_preserve_original_targets_across_all_boundaries_and_holds(count):
+    m = adapter(); native = workspace()
+    task = m.SelectedLeftWorkload(native, segment="left-reach", left_reach_cycles=count)
+    single = m.SelectedLeftWorkload(native, segment="left-reach")
+    assert task.duration_s == 20. * count and task.plan()["left_reach_cycles"] == count
+    assert len(task.plan()["phases"]) == 7 * count
+    original = task.plan()
+    for cycle in range(count):
+        for local in (0., 2., 4., 6., 8., 9., 10., 11., 12., 14., 16., 19.9):
+            task.elapsed_s, single.elapsed_s = cycle * 20 + local, local
+            assert task.get_action() == single.get_action()
+            assert task.phase == single.phase and task.cycle_index == cycle + 1
+            assert not task.complete
+    task.elapsed_s = 27.; task.admit(10.); task.freeze(); task.advance(80.)
+    assert task.elapsed_s == 27. and task.interrupted_phases == {"cycle-2/left_endpoint_hold"}
+    assert task.plan()["reference"] == original["reference"]
+    assert task.plan()["endpoint_normalized"] == original["endpoint_normalized"]
+    task.admit(80.)
+    for i in range(1, int((20. * count - 27.) * 10) + 1):
+        task.advance(80. + i/10)
+    assert task.complete and task.elapsed_s == 20. * count and task.cycle_index == count
+    assert task.plan()["cycles_completed"] == count
+    assert len(task.phases_completed) == 7 * count
+    assert task.get_action() == {k.removeprefix("arm_"):v for k,v in native["reference"].items()}
+
+
+@pytest.mark.parametrize("rate", [2., 20.])
+@pytest.mark.parametrize("count", [1, 3])
+def test_left_reach_gripper_uses_exact_admitted_closing_range_and_original_reference(rate, count):
+    import copy
+    m = adapter()
+    native = workspace()
+    key = "arm_left_gripper.pos"
+    calibration = [6, 0, 933, 1886, 3401]
+    native["calibration"][key[:-4]] = calibration
+    native["reference"][key] = 80.52805280528052
+    native["raw_bounds"][key] = [2803, 3106]
+    native["bounds"][key] = {"min": 60.52805280528053, "max": 80.52805280528052, "rate_per_s": rate}
+    original = copy.deepcopy(native)
+    task = m.SelectedLeftWorkload(native, segment="left-reach", left_reach_cycles=count)
+    plan = task.plan()
+    delta = -min(20., 2 * rate)
+    assert plan["gripper_opening_delta"] == pytest.approx(delta)
+    assert plan["gripper_endpoint_normalized"] == pytest.approx(native["reference"][key] + delta)
+    assert plan["gripper_direction_normalized"] == -1
+    assert "legacy left_gripper_open" in plan["gripper_endpoint_policy"]
+    clock = [10.]
+    producer = m.FrameProducer(task, clock=lambda: clock[0])
+    producer.workspace, producer.native_cursor = native, dict(native["reference"])
+    frames = []
+    for cycle in range(count):
+        for local, fraction in ((0., 0.), (8., 0.), (9., .5), (10., 1.), (11., .5), (12., 0.), (19.9, 0.)):
+            task.elapsed_s = cycle * 20. + local
+            clock[0] += .1
+            frame = producer.serialize(producer.capture({"grant_id": str(uuid4())}))
+            frames.append(frame)
+            target = frame["target"][key]
+            assert target == pytest.approx(native["reference"][key] + fraction * delta)
+            raw_goal = round(calibration[3] + target * (calibration[4] - calibration[3]) / 100.)
+            assert 2803 <= raw_goal <= 3106
+            if local == 10.:
+                assert raw_goal == (2803 if rate == 20. else 3045)
+            if local in (0., 12., 19.9):
+                assert raw_goal == 3106
+            assert frame["body"] == m.ZERO_BODY and not producer.clutch.last_clamps
+            selected = {task.elbow, key}
+            assert all(value == native["reference"][joint] for joint, value in frame["target"].items() if joint not in selected)
+    assert [frame["source"]["sample_seq"] for frame in frames] == list(range(1, len(frames) + 1))
+    assert len({frame["source"]["grant_id"] for frame in frames}) == len(frames)
+    assert native == original and task.plan() == {**plan, "active_progress_s": task.elapsed_s,
+                                                 **({"cycle_index": count, "cycles_completed": count - 1} if count > 1 else {})}
+
+
+def test_left_reach_gripper_equal_legal_excursions_prefer_existing_opening():
+    m = adapter()
+    native = workspace()
+    key = "arm_left_gripper.pos"
+    native["reference"][key] = 5.
+    task = m.SelectedLeftWorkload(native, segment="left-reach")
+    assert task.plan()["gripper_opening_delta"] == 4.
+    assert task.plan()["gripper_endpoint_normalized"] == 9.
+    assert task.plan()["gripper_direction_normalized"] == 1
+
+
+def test_left_reach_cycles_default_one_keeps_existing_shape_and_behavior():
+    m = adapter(); native = workspace()
+    default = m.SelectedLeftWorkload(native, segment="left-reach")
+    explicit = m.SelectedLeftWorkload(native, segment="left-reach", left_reach_cycles=1)
+    assert default.plan() == explicit.plan() and default.duration_s == 20.
+    assert len(default.plan()["phases"]) == 7 and "left_reach_cycles" not in default.plan()
+    for at in (0., 8., 11., 20.):
+        default.elapsed_s = explicit.elapsed_s = at
+        assert default.get_action() == explicit.get_action() and default.complete == explicit.complete
+
+
+@pytest.mark.parametrize("changes", [
+    {"left_reach_cycles":0}, {"left_reach_cycles":4}, {"left_reach_cycles":True}, {"left_reach_cycles":1.5},
+    {"workload_segment":"left-maintained"}, {"source":"usb-leaders"}, {"bench_continuity":True},
+    {"next_start_seconds":1.}, {"interrupt_at_seconds":0.}, {"interrupt_controller":True},
+    {"duration_seconds":59.9},
+])
+def test_left_reach_cycles_invalid_run_selection_refuses_before_output_or_ownership(tmp_path, monkeypatch, changes):
+    import asyncio
+    from types import SimpleNamespace
+    m = adapter(); output = tmp_path/"must-not-exist"
+    values=dict(source="virtual-leaders",workload_segment="left-reach",left_reach_cycles=3,
+                bench_continuity=False,next_start_seconds=None,interrupt_at_seconds=None,interrupt_controller=False,output=str(output))
+    values.update(changes)
+    def forbidden(*args):raise AssertionError("invalid selection reached session ownership")
+    monkeypatch.setattr(m,"SessionClient",forbidden)
+    with pytest.raises(ValueError,match="cycles"):
+        asyncio.run(m.run(SimpleNamespace(**values)))
+    assert not output.exists()
+
+
+def test_left_reach_cycles_cli_declares_three_normal_required_cycles_before_run(monkeypatch):
+    m = adapter(); seen=[]
+    async def run(args):seen.append(args);return {}
+    monkeypatch.setattr(m,"run",run)
+    m.main(["--source","virtual-leaders","--url","unused","--ca","unused","--storage-state","unused",
+            "--output","unused","--workload-segment","left-reach","--left-reach-cycles","3"])
+    assert len(seen)==1 and seen[0].left_reach_cycles == 3
+    assert not seen[0].bench_continuity and seen[0].next_start_seconds is seen[0].interrupt_at_seconds is None
+    for extra in (["--left-reach-cycles","4"],["--left-reach-cycles","3","--next-start-seconds","1"],
+                  ["--left-reach-cycles","3","--workload-segment","left-maintained"]):
+        with pytest.raises(SystemExit):
+            m.main(["--source","virtual-leaders","--url","unused","--ca","unused","--storage-state","unused",
+                    "--output","unused",*extra])
+    assert len(seen)==1
 
 
 @pytest.mark.parametrize("at,shoulder_fraction,elbow_fraction,opening_fraction", [

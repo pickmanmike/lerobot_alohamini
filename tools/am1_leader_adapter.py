@@ -83,6 +83,20 @@ def _peer_options(segment, side, direction, raw_step, *, bench=False, next_start
     return result
 
 
+def _left_reach_cycles(args):
+    count = getattr(args, "left_reach_cycles", 1)
+    if type(count) is not int or not 1 <= count <= 3:
+        raise ValueError("left-reach cycles must be an integer from1 through3")
+    if count > 1 and (
+        args.source != "virtual-leaders" or getattr(args, "workload_segment", "full") != "left-reach"
+        or getattr(args, "bench_continuity", False) or getattr(args, "next_start_seconds", None) is not None
+        or getattr(args, "interrupt_at_seconds", None) is not None or getattr(args, "interrupt_controller", False)
+        or getattr(args, "duration_seconds", 180.) < 20. * count
+    ):
+        raise ValueError("repeated left-reach cycles require normal virtual left-reach without diagnostic interruptions")
+    return count
+
+
 class SelectedLeftWorkload:
     """Finite current input with fixed original targets, not a native trajectory."""
 
@@ -94,9 +108,13 @@ class SelectedLeftWorkload:
     gripper = "arm_left_gripper.pos"
 
     def __init__(self, workspace, *, segment="left-maintained", peer_side=None, peer_direction=None, peer_raw_step=None, peer_active_p=None,
-                 command_reference=None):
+                 command_reference=None, left_reach_cycles=1):
         if segment not in self.DURATIONS:
             raise ValueError("Unknown selected left finite profile")
+        if (type(left_reach_cycles) is not int or not 1 <= left_reach_cycles <= 3
+                or left_reach_cycles > 1 and segment != "left-reach"):
+            raise ValueError("left-reach cycles require integer1..3 and the left-reach profile")
+        self.left_reach_cycles = left_reach_cycles
         self.segment, self.duration_s = segment, self.DURATIONS[segment]
         self.peer = _peer_options(segment, peer_side, peer_direction, peer_raw_step, active_p=peer_active_p)
         self.fixed = self.peer is not None and "fixed_start_raw" in self.peer
@@ -155,6 +173,13 @@ class SelectedLeftWorkload:
         self.opening = (min(self.origin[self.gripper] + 20., opening["max"],
                             self.origin[self.gripper] + 2 * opening["rate_per_s"])
                         if segment in {"left-reach", "left-supported-reach"} else self.origin[self.gripper])
+        if segment == "left-reach":
+            excursion = min(20., 2 * opening["rate_per_s"])
+            candidates = (min(self.origin[self.gripper] + excursion, opening["max"]),
+                          max(self.origin[self.gripper] - excursion, opening["min"]))
+            self.opening = max(candidates, key=lambda value: (abs(value-self.origin[self.gripper]), value))
+            if self.opening == self.origin[self.gripper]:
+                raise ValueError("left-reach gripper requires a nonzero admitted excursion")
         if segment == "left-supported-reach":
             shoulder = self.workspace["bounds"][self.shoulder]
             self.shoulder_endpoint = shoulder["max"]
@@ -184,6 +209,8 @@ class SelectedLeftWorkload:
             self.schedule = [(peer_side+"_prepare", 0., 4.), (peer_side+"_baseline", 4., 6.),
                              (peer_side+"_outward", 6., 10.), (peer_side+"_endpoint_hold", 10., 14.),
                              (peer_side+"_retract", 14., 18.), (peer_side+"_final_hold", 18., 20.)]
+        self.cycle_duration_s = self.duration_s
+        self.duration_s *= left_reach_cycles
         self.elapsed_s, self._last = 0., None
         self.phases_completed, self.interrupted_phases = set(), set()
 
@@ -301,8 +328,21 @@ class SelectedLeftWorkload:
         return self.elapsed_s >= self.duration_s
 
     @property
+    def cycle_index(self):
+        return min(self.left_reach_cycles, int(self.elapsed_s // self.cycle_duration_s) + 1)
+
+    @property
+    def cycle_elapsed_s(self):
+        if self.left_reach_cycles == 1:
+            return self.elapsed_s
+        return self.cycle_duration_s if self.complete else round(self.elapsed_s % self.cycle_duration_s, 9)
+
+    def cycle_metadata(self):
+        return {"left_reach_cycles": self.left_reach_cycles, "cycle_index": self.cycle_index} if self.left_reach_cycles > 1 else {}
+
+    @property
     def phase(self):
-        return next((name for name, start, end in self.schedule if start <= self.elapsed_s < end), "complete")
+        return next((name for name, start, end in self.schedule if start <= self.cycle_elapsed_s < end), "complete")
 
     @property
     def body_phase_elapsed(self):
@@ -313,7 +353,7 @@ class SelectedLeftWorkload:
 
     def freeze(self):
         if self._last is not None and 0 < self.elapsed_s < self.duration_s:
-            self.interrupted_phases.add(self.phase)
+            self.interrupted_phases.add((f"cycle-{self.cycle_index}/" if self.left_reach_cycles > 1 else "") + self.phase)
         self._last = None
 
     def advance(self, now):
@@ -323,7 +363,11 @@ class SelectedLeftWorkload:
             raise ValueError("workload acquisition clock regressed")
         self.elapsed_s = min(self.duration_s, round(self.elapsed_s + min(.1, now-self._last), 9))
         self._last = now
-        self.phases_completed.update(name for name, _start, end in self.schedule if self.elapsed_s >= end)
+        self.phases_completed.update(
+            (f"cycle-{cycle+1}/" if self.left_reach_cycles > 1 else "") + name
+            for cycle in range(self.left_reach_cycles) for name, _start, end in self.schedule
+            if self.elapsed_s >= cycle * self.cycle_duration_s + end
+        )
 
     def get_action(self):
         self.require_peer_baseline()
@@ -361,7 +405,7 @@ class SelectedLeftWorkload:
             target[self.gripper] += opening * (self.opening-self.origin[self.gripper])
             return {key.removeprefix("arm_"): value for key, value in target.items()}
         retract = 10. if self.segment == "left-maintained" or self.peer else 12.
-        elapsed = self.elapsed_s
+        elapsed = self.cycle_elapsed_s if self.left_reach_cycles > 1 else self.elapsed_s
         fraction = (max(0., min(1., (elapsed-2.) / 4.)) if elapsed <= retract
                     else max(0., 1. - (elapsed-retract) / 4.))
         target[self.elbow] += fraction * (self.endpoint-self.origin[self.elbow])
@@ -383,6 +427,16 @@ class SelectedLeftWorkload:
                 "active_progress_s": self.elapsed_s, "interrupted_phases": sorted(self.interrupted_phases),
                 "dwell_basis": "producer active intent; native delivered dwell assessed separately",
                 "target_policy": "fixed original admitted references and supported endpoint across qualified recovery"}
+        if self.segment == "left-reach":
+            result.update(gripper_endpoint_normalized=self.opening,
+                          gripper_direction_normalized=1 if self.opening > self.origin[self.gripper] else -1,
+                          gripper_endpoint_policy="farthest admitted endpoint capped at20 opening points/two-second rate; "
+                                                  "opening wins equal travel; legacy left_gripper_open follows signed delta (negative closes)")
+        if self.left_reach_cycles > 1:
+            result.update(**self.cycle_metadata(), cycles_completed=int(self.elapsed_s // self.cycle_duration_s),
+                          phases=[{"phase": name, "start_s": cycle * self.cycle_duration_s + start,
+                                   "end_s": cycle * self.cycle_duration_s + end, "cycle_index": cycle + 1}
+                                  for cycle in range(self.left_reach_cycles) for name, start, end in self.schedule])
         if self.command_reference:
             result["command_reference"] = dict(self.origin)
             result["command_reference_basis"] = "current native qualified HOLD cursor; selected measured q0 unchanged"
@@ -2485,6 +2539,18 @@ class SameRunRecovery:
                 {},
             )
             allowed = {"required_view_expired", "input_expired", "native_input_expired"}
+            ack = (state.get("evidence") or {}).get("accepted_host_action") or {}
+            if (view_refusal and require_episode and event.get("kind") == "input_expired"
+                and set(event) == {"kind", "at", "run_id", "service_incarnation"}
+                and all(type(value) in (int, float) and math.isfinite(value)
+                        for value in (event.get("at"), ack.get("acquired_at_monotonic_s")))
+                and run["native_live_at"] <= event["at"] <= ack["acquired_at_monotonic_s"] <= run["deadline"] - native_remaining
+                and ack.get("run_id") == run["run_id"] and ack.get("host_incarnation") == run["backend_incarnation"]
+                and ack.get("state") == "paused" and type(ack.get("intent_revision")) is int
+                and ack["intent_revision"] == run.get("intent_revision")):
+                # Core may choose input expiry while required viewing is also
+                # expired. Adopt that exact winner; fresh HOLD/view still gate Resume.
+                expected_pause = "input_expired"
             if (
                 run["status"] != "paused"
                 or run.get("recovery") is not None
@@ -3196,6 +3262,8 @@ async def send_leader_sample(client, producer, body, record, *, phase, progress_
             "serialized_at_monotonic_s": time.perf_counter(),
         },
     }
+    if isinstance(producer.input, SelectedLeftWorkload):
+        attempt.update(producer.input.cycle_metadata())
     record({"event": "leader_frame_attempt", **attempt})
     current_identity = client.identities()
     if current_identity != identity:
@@ -3297,6 +3365,7 @@ async def send_leader_sample(client, producer, body, record, *, phase, progress_
 async def run(args):
     from examples.alohamini.am1_teleop_workload import TeleopWorkload
 
+    left_reach_cycles = _left_reach_cycles(args)
     bench = getattr(args, "bench_continuity", False)
     segment = getattr(args, "workload_segment", "full")
     controller_gap = getattr(args, "interrupt_controller", False)
@@ -3331,6 +3400,7 @@ async def run(args):
         "physical_human_movement_validated": False,
         "bench_continuity": bench,
         "workload_segment": segment,
+        **({"left_reach_cycles": left_reach_cycles} if left_reach_cycles > 1 else {}),
         **({"peer_selection": peer} if peer else {}),
         "view_policy": "advisory_presentation" if bench else "required_presentation",
         "terminal_qualification_budget_seconds": terminal_budget,
@@ -3403,11 +3473,12 @@ async def run(args):
         record(
             {"event": "start_requested", "operation_id": start_body["operation_id"], "recipe": TELEOP_RECIPE,
              "bench_continuity": bench, "view_policy": summary["view_policy"], "workload_segment": segment,
+             **({"left_reach_cycles": left_reach_cycles} if left_reach_cycles > 1 else {}),
              **({"peer_selection": peer} if peer else {}),
              **({"peer_baseline_qualification_budget_seconds": 2.} if peer and "fixed_start_raw" in peer else {}),
              "terminal_qualification_budget_seconds": terminal_budget,
              "terminal_completion_policy": summary["terminal_completion_policy"],
-             "program_active_seconds": {"full": 172.5, "combined": 12., "body": 4.5, "continuity": 24., "combined-body": 64.5, **SelectedLeftWorkload.DURATIONS}[segment] if args.source == "virtual-leaders" else None,
+             "program_active_seconds": {"full": 172.5, "combined": 12., "body": 4.5, "continuity": 24., "combined-body": 64.5, **SelectedLeftWorkload.DURATIONS}[segment] * left_reach_cycles if args.source == "virtual-leaders" else None,
              "input_duration_seconds": args.duration_seconds,
              "controller_interruption": controller_gap, "interruption_at_seconds": getattr(args, "interrupt_at_seconds", None),
              "interruption_seconds": getattr(args, "interruption_seconds", .65)}
@@ -3643,6 +3714,8 @@ async def run(args):
             if segment in SelectedLeftWorkload.DURATIONS:
                 selected_kwargs = {"peer_side": peer["side"], "peer_direction": peer["direction_raw"], "peer_raw_step": peer["raw_step"],
                                    **({"peer_active_p": peer["active_p"]} if "active_p" in peer else {})} if peer else {}
+                if left_reach_cycles > 1:
+                    selected_kwargs["left_reach_cycles"] = left_reach_cycles
                 try:
                     validate_target(workspace["reference"], workspace=workspace)
                 except ValueError:
@@ -3988,6 +4061,7 @@ async def run(args):
                     "receipt": result,
                     "progress_s": workload.elapsed_s if workload else None,
                     "phase": phase,
+                    **(workload.cycle_metadata() if isinstance(workload, SelectedLeftWorkload) else {}),
                     "raw_leaders": getattr(source, "last_raw", None),
                     "command_clamps": producer.clutch.last_clamps,
                     "native": client.snapshot,
@@ -4279,6 +4353,8 @@ def main(argv=None):
     parser.add_argument("--interruption-seconds", type=float, default=0.65)
     parser.add_argument("--bench-continuity", action="store_true", help="predetermined virtual bench; viewing is advisory")
     parser.add_argument("--workload-segment", choices=("full", "combined", "body", "continuity", "combined-body", *SelectedLeftWorkload.DURATIONS), default="full")
+    parser.add_argument("--left-reach-cycles", type=int, choices=(1, 2, 3), default=1,
+                        help="one to three normal virtual left-reach cycles using the original reference")
     parser.add_argument("--peer-side", choices=("left", "right"))
     parser.add_argument("--peer-direction", type=int, choices=(-1, 1))
     parser.add_argument("--peer-raw-step", type=int)
@@ -4289,6 +4365,7 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
     try:
+        _left_reach_cycles(args)
         _peer_options(args.workload_segment, args.peer_side, args.peer_direction, args.peer_raw_step,
                       bench=args.bench_continuity, next_start=args.next_start_seconds, active_p=args.peer_active_p)
     except ValueError as error:
