@@ -1218,6 +1218,41 @@ async def _startup_run_detail(client, state, remaining):
     return run
 
 
+def _record_controller_command_timing(record, command, request_id, timing, *, phase, outcome,
+                                      ack_completed=None, result=None, error=None):
+    """Bounded PC-clock observation only; never an admission or Native acknowledgement."""
+    def text(value):
+        return value[:64].encode("utf-8", errors="replace")[:64].decode("utf-8", errors="ignore") if type(value) is str else None
+
+    identity = {key: text(command.get(key)) for key in
+                ("run_id", "service_incarnation", "controller_generation", "connection_generation", "host_incarnation")}
+    revision = command.get("intent_revision")
+    identity["intent_revision"] = revision if type(revision) is int and 0 <= revision < 2**63 else None
+    stamps = {key: value for key, value in timing.items()
+              if key in {"request_started_at_monotonic_s", "send_started_at_monotonic_s",
+                         "send_completed_at_monotonic_s", "response_observed_at_monotonic_s"}
+              and type(value) in (int, float) and math.isfinite(value) and value >= 0}
+    if type(ack_completed) in (int, float) and math.isfinite(ack_completed) and ack_completed >= 0:
+        stamps["ack_completed_at_monotonic_s"] = ack_completed
+    stamps["outcome_observed_at_monotonic_s"] = time.perf_counter()
+    reply = result if type(result) is dict else {}
+    status = reply.get("status")
+    op = command.get("op")
+    row = {"event": "controller_command_timing", "clock": "pc_perf_counter",
+           "op": op if op in ("connect", "release_input", "resume") else None,
+           "request_id": request_id, "operation_id": text(command.get("operation_id")),
+           "identity": identity, "phase": phase, "outcome": outcome, "timing": stamps,
+           "accepted": reply.get("accepted") if type(reply.get("accepted")) is bool else None,
+           "effect_admitted": reply.get("effect_admitted") if type(reply.get("effect_admitted")) is bool else None,
+           "uncertain": reply.get("uncertain") if type(reply.get("uncertain")) is bool else None,
+           "status": status if type(status) is str and status in
+                     {"connected", "released", "running", "resuming", "paused", "refused", "unknown", "reporting_error"} else None,
+           "error_type": text(type(error).__name__) if error is not None else None}
+    if len(json.dumps(row, allow_nan=False).encode("utf-8")) > 4096:
+        raise ValueError("bounded controller-command timing record required")
+    record(row)
+
+
 class SessionClient:
     def __init__(self, origin, ca, storage_state):
         import aiohttp
@@ -1467,6 +1502,11 @@ class SessionClient:
                 raise self._ack_error from error
 
     async def command(self, command, *, check=None):
+        record = getattr(self, "record", None) if command.get("op") in ("connect", "release_input", "resume") else None
+        record = record if callable(record) else None
+        recorded_command = {key: command.get(key) for key in
+                            ("op", "operation_id", "run_id", "service_incarnation", "controller_generation",
+                             "connection_generation", "host_incarnation", "intent_revision")} if record else None
         if (
             self.transport_error
             or self.ws is None
@@ -1475,20 +1515,34 @@ class SessionClient:
             and self.reader.done()
             or len(self.pending) >= 4
         ):
-            raise ConnectionError("bounded current WSS connection required")
+            original = ConnectionError("bounded current WSS connection required")
+            if record:
+                try:
+                    _record_controller_command_timing(record, recorded_command, None,
+                        {"request_started_at_monotonic_s": time.perf_counter()}, phase="preflight", outcome="unknown", error=original)
+                except BaseException as reporting_error:
+                    raise original from reporting_error
+            raise original
         identity = str(uuid4())
         future = asyncio.get_running_loop().create_future()
         self.pending[identity] = future
         timing = {"request_started_at_monotonic_s": time.perf_counter()}
         ack_ceiling, ws = time.monotonic() + 2, self.ws
+        phase, outcome, ack_completed, result, original_error = "ack_wait", "unknown", None, None, None
         try:
             if command.get("op") not in {"pause", "stop"}:
                 await SessionClient._wait_current_ack(self, ws, ack_ceiling)
+            if record:
+                ack_completed = time.perf_counter()
+            phase = "pre_send"
             if self.ws is not ws or self.transport_error or ws.closed:
                 raise ConnectionError("bounded current WSS connection required")
             if check is not None:
                 check()  # Recheck source permission after the actual ACK wait, before dispatch.
             timing["send_started_at_monotonic_s"] = time.perf_counter()
+            phase = "send"
+            if record:
+                recorded_command = {key: command.get(key) for key in recorded_command}
             try:
                 await ws.send_json({"id": identity, "command": command})
             except ConnectionError as error:
@@ -1508,6 +1562,7 @@ class SessionClient:
                         "timing": dict(timing, send_failed_at_monotonic_s=time.perf_counter())}
                 raise
             timing["send_completed_at_monotonic_s"] = time.perf_counter()
+            phase = "receipt"
             try:
                 # A connect fence can take effect before its receipt arrives.
                 # Allow its bounded gateway call (1.5 s) to return; callers keep
@@ -1523,10 +1578,15 @@ class SessionClient:
                 raise
             timing["response_observed_at_monotonic_s"] = time.perf_counter()
             if result.get("accepted") is not True:
+                if (result.get("accepted") is False and result.get("status") == "refused"
+                    and result.get("effect_admitted") is False and result.get("uncertain", False) is False):
+                    outcome = "refused"
                 raise CommandRefusedError(result, timing=timing)
+            phase, outcome = "complete", "accepted"
             return result
-        except (TimeoutError, ConnectionError) as error:
-            if command.get("op") == "input":
+        except BaseException as error:
+            original_error = error
+            if isinstance(error, (TimeoutError, ConnectionError)) and command.get("op") == "input":
                 error.input_command_timing = dict(timing, outcome_observed_at_monotonic_s=time.perf_counter())
             raise
         finally:
@@ -1535,6 +1595,14 @@ class SessionClient:
                 future.cancel()
             elif not future.cancelled():
                 future.exception()  # A failed ACK barrier may leave an unread stream-close result.
+            if record:
+                try:
+                    _record_controller_command_timing(record, recorded_command, identity, timing, phase=phase,
+                        outcome=outcome, ack_completed=ack_completed, result=result, error=original_error)
+                except BaseException as reporting_error:
+                    if original_error is not None:
+                        raise original_error from reporting_error
+                    raise
 
     async def wait(self, predicate, timeout):
         deadline = time.monotonic() + timeout

@@ -596,6 +596,157 @@ def test_virtual_intent_real_client_rechecks_after_ack_wait_before_socket_send(m
     assert client.pending == {}
 
 
+@pytest.mark.parametrize("op,mode", [
+    ("connect", "accepted"), ("release_input", "accepted"), ("resume", "accepted"),
+    ("release_input", "ack_error"), ("release_input", "send_error"),
+    ("release_input", "receipt_timeout"), ("release_input", "unknown"), ("resume", "refused"),
+    ("resume", "cancelled"),
+])
+def test_controller_command_timing_retains_actual_ack_send_receipt_and_unknown_phase(monkeypatch, op, mode):
+    import asyncio
+    import json
+    from types import SimpleNamespace
+
+    m, clock, records, sends, waits = adapter(), [100.], [], [], []
+    original = (ConnectionError("original transport failure") if mode in {"ack_error", "send_error"}
+                else asyncio.CancelledError("original cancellation") if mode == "cancelled"
+                else TimeoutError("original receipt timeout"))
+    identity = {"run_id": "run", "service_incarnation": "service", "controller_generation": "controller",
+                "connection_generation": "connection", "host_incarnation": "host", "intent_revision": 12}
+    command = {"op": op, "operation_id": "11111111-1111-4111-8111-111111111111", **identity,
+               "ignored_private_payload": {"credential": "never-retain-this", "proof": "x"*30000}}
+    reply = ({"accepted": None, "status": "unknown", "uncertain": True, "effect_admitted": None} if mode == "unknown"
+             else {"accepted": False, "status": "refused", "effect_admitted": False, "reason": "closed refusal"} if mode == "refused"
+             else {"accepted": True, "status": "connected" if op == "connect" else "released" if op == "release_input" else "running"})
+
+    async def ack(self, ws, ceiling):
+        clock[0] += .2
+        if mode == "ack_error":
+            raise original
+
+    async def send(value):
+        sends.append(value)
+        clock[0] += .3
+        if mode == "send_error":
+            raise original
+        if mode not in {"receipt_timeout", "cancelled"}:
+            client.pending[value["id"]].set_result(reply)
+
+    async def wait(future, timeout):
+        waits.append(timeout)
+        clock[0] += .4
+        if mode in {"receipt_timeout", "cancelled"}:
+            raise original
+        return await future
+
+    monkeypatch.setattr(m, "time", SimpleNamespace(monotonic=__import__("time").monotonic, perf_counter=lambda: clock[0]))
+    monkeypatch.setattr(m.SessionClient, "_wait_current_ack", ack)
+    monkeypatch.setattr(m, "asyncio", SimpleNamespace(get_running_loop=asyncio.get_running_loop, wait_for=wait))
+    client = SimpleNamespace(transport_error=None, ws=SimpleNamespace(closed=False, send_json=send),
+                             reader=None, pending={}, record=records.append)
+
+    async def scenario():
+        if mode in {"ack_error", "send_error", "receipt_timeout", "cancelled"}:
+            with pytest.raises(type(original)) as caught:
+                await m.SessionClient.command(client, command)
+            assert caught.value is original
+        elif mode in {"unknown", "refused"}:
+            with pytest.raises(m.CommandRefusedError) as caught:
+                await m.SessionClient.command(client, command)
+            assert caught.value.response == reply
+        else:
+            assert await m.SessionClient.command(client, command) is reply
+
+    asyncio.run(scenario())
+    assert client.pending == {} and len(records) == 1, "one retained control-command timing record required"
+    row = records[0]
+    assert row["event"] == "controller_command_timing" and row["op"] == op
+    assert row["identity"] == identity and row["operation_id"] == command["operation_id"]
+    if sends:
+        assert row["request_id"] == sends[0]["id"]
+    assert len(json.dumps(row, allow_nan=False).encode()) <= 4096
+    assert "never-retain-this" not in json.dumps(row) and "ignored_private_payload" not in row
+    assert row["timing"]["request_started_at_monotonic_s"] == 100.
+    if mode == "ack_error":
+        assert row["phase"] == "ack_wait" and "send_started_at_monotonic_s" not in row["timing"]
+    else:
+        assert row["timing"]["ack_completed_at_monotonic_s"] == pytest.approx(100.2)
+        assert row["timing"]["send_started_at_monotonic_s"] == pytest.approx(100.2)
+        if mode == "send_error":
+            assert row["phase"] == "send" and "send_completed_at_monotonic_s" not in row["timing"]
+        else:
+            assert row["timing"]["send_completed_at_monotonic_s"] == pytest.approx(100.5)
+            assert waits == [2. if op == "connect" else 1.]
+            assert row["phase"] == ("complete" if mode == "accepted" else "receipt")
+    assert row["outcome"] == ("accepted" if mode == "accepted" else "refused" if mode == "refused" else "unknown")
+
+
+@pytest.mark.parametrize("failure", ["record", "clock"])
+def test_controller_command_timing_reporting_failure_cannot_replace_original_transport_error(monkeypatch, failure):
+    import asyncio
+    from types import SimpleNamespace
+
+    m, rows, transport_failed = adapter(), [], [False]
+    original, reporting = ConnectionError("original closing transport"), OSError("record file unavailable")
+
+    async def send(value):
+        transport_failed[0] = True
+        raise original
+
+    def record(row):
+        rows.append(row)
+        raise reporting
+
+    if failure == "clock":
+        def clock():
+            if transport_failed[0]:
+                raise reporting
+            return 100.
+        monkeypatch.setattr(m, "time", SimpleNamespace(monotonic=__import__("time").monotonic, perf_counter=clock))
+
+    client = SimpleNamespace(transport_error=None, ws=SimpleNamespace(closed=False, send_json=send),
+                             reader=None, pending={}, record=record)
+    with pytest.raises(ConnectionError) as caught:
+        asyncio.run(m.SessionClient.command(client, {"op": "release_input"}))
+    assert caught.value is original and caught.value.__cause__ is reporting
+    assert len(rows) == (1 if failure == "record" else 0) and client.pending == {}
+
+
+def test_controller_command_timing_preflight_is_bounded_without_payload_or_wire_request():
+    import asyncio
+    import json
+    from types import SimpleNamespace
+
+    m, rows = adapter(), []
+    client = SimpleNamespace(transport_error=None, ws=None, reader=None, pending={}, record=rows.append)
+    command = {"op": "release_input", "run_id": "\n"*10000, "controller_generation": "generation"*1000,
+               "intent_revision": True, "private": {"credential": "must-not-retain"}}
+    with pytest.raises(ConnectionError):
+        asyncio.run(m.SessionClient.command(client, command))
+    assert len(rows) == 1 and client.pending == {}
+    row = rows[0]
+    assert row["phase"] == "preflight" and row["request_id"] is None and row["outcome"] == "unknown"
+    assert row["identity"]["intent_revision"] is None and len(row["identity"]["run_id"]) <= 64
+    assert "send_started_at_monotonic_s" not in row["timing"]
+    assert len(json.dumps(row, allow_nan=False).encode()) <= 4096 and "must-not-retain" not in json.dumps(row)
+
+
+@pytest.mark.parametrize("op", ["input", "grant"])
+def test_controller_command_timing_does_not_add_per_frame_or_grant_records(op):
+    import asyncio
+    from types import SimpleNamespace
+
+    m, rows = adapter(), []
+
+    async def send(value):
+        client.pending[value["id"]].set_result({"accepted": True})
+
+    client = SimpleNamespace(transport_error=None, ws=SimpleNamespace(closed=False, send_json=send),
+                             reader=None, pending={}, record=rows.append)
+    assert asyncio.run(m.SessionClient.command(client, {"op": op})) == {"accepted": True}
+    assert rows == [] and client.pending == {}
+
+
 @pytest.mark.parametrize("foreign", [False, True])
 def test_changing_activity_frontdoor_derives_fresh_invocation_and_prepares_before_ownership(tmp_path, monkeypatch, foreign):
     import hashlib

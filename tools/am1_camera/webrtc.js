@@ -12,7 +12,42 @@ globalThis.AM1OnboardView=class {
   }
   diagnostics() {
     const view=this.diagnosticView;
-    return view?{attempt:view.attempt,state:view.state,records:view.records.map(row=>({...row}))}:null;
+    if(!view)return null;
+    const snapshot={attempt:view.attempt,state:view.state,records:view.records.map(row=>({...row})),view_progress:null};
+    try {
+      const number=value=>typeof value==="number"&&Number.isFinite(value)&&value>=0&&value<=Number.MAX_SAFE_INTEGER?value:null;
+      const count=value=>Number.isSafeInteger(value)&&value>=0?value:null;
+      const boolean=value=>typeof value==="boolean"?value:null;
+      const times=(value,keys)=>Object.fromEntries(keys.map(key=>[key,number(value?.[key])]));
+      const result=value=>value&&typeof value==="object"&&!Array.isArray(value)?{
+        accepted:boolean(value.accepted),status:["view_progress","refused","unknown","reporting_error"].includes(value.status)?value.status:null,
+        required_view:{required:boolean(value.required_view?.required),qualified:boolean(value.required_view?.qualified)}}:null;
+      const now=number(this.clock()),source=this.source?.cameras?.[this.binding?.role],receipt=this.progressReceipt;
+      let visibility=null,focus=null;
+      if(typeof document==="object"&&document!==null) {
+        const value=document.visibilityState;
+        visibility=["visible","hidden","prerender"].includes(value)?value:null;
+        if(typeof document.hasFocus==="function")focus=boolean(document.hasFocus());
+      }
+      const delivery=receipt?.view_delivery;
+      snapshot.view_progress={sampled_browser_clock_ms:now,visibility_state:visibility,has_focus:focus,
+        decoded_frames:count(this.frames),media_time:number(this.mediaTime),
+        decoded_age_ms:now!==null&&number(this.decodedAt)!==null?number(Math.max(0,now-this.decodedAt)):null,
+        source_age_ms:now!==null&&number(source?.age_ms)!==null&&number(this.sourceAt)!==null?
+          number(source.age_ms+Math.max(0,now-this.sourceAt)):null,
+        receipt:result(receipt)?{...result(receipt),view_delivery:delivery&&typeof delivery==="object"&&!Array.isArray(delivery)?{
+          decoded_frames:count(delivery.decoded_frames),media_time:number(delivery.media_time),source_sequence:count(delivery.source_sequence),
+          ...times(delivery,["request_received_at_monotonic_s","request_body_completed_at_monotonic_s",
+            "status_started_at_monotonic_s","status_completed_at_monotonic_s","source_arrived_at_monotonic_s",
+            "original_floor_at_monotonic_s","owner_snapshot_started_at_monotonic_s","owner_snapshot_completed_at_monotonic_s",
+            "owner_progress_started_at_monotonic_s","owner_progress_completed_at_monotonic_s",
+            "owner_enqueued_at_monotonic_s","http_response_ready_at_monotonic_s"]),
+          core:delivery.core&&typeof delivery.core==="object"&&!Array.isArray(delivery.core)?times(delivery.core,
+            ["core_started_at_monotonic_s","core_completed_at_monotonic_s","core_accepted_at_monotonic_s",
+             "original_floor_at_monotonic_s","qualified_until_monotonic_s"]):null,
+          owner_result:result(delivery.owner_result)}:null}:null};
+    } catch {} // Observing cached diagnostics must not affect playback or control.
+    return snapshot;
   }
   diagnosticCurrent(attempt) {return this.diagnostic===attempt&&attempt.epoch===this.epoch&&attempt.pc===this.pc;}
   diagnose(attempt,phase,fields) {

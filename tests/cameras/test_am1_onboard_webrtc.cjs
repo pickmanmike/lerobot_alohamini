@@ -83,7 +83,8 @@ test("loaded camera page selects WebRTC and switches roles without any control r
       return reply(201,"application/sdp","v=0\r\n",{"X-Camera-Owner-Generation":owner,
         "X-Camera-Capture-Generation":captures[role],"X-Camera-Encode-Generation":generation,"X-Camera-View-Generation":randomUUID()});
     }
-    if(request.url==="/api/onboard/progress"){for await(const _ of request){};return reply(200,"application/json",'{"accepted":true}');}
+    if(request.url==="/api/onboard/progress"){for await(const _ of request){};
+      const body='{"accepted":true}';return reply(200,"application/json",body,{"Content-Length":String(Buffer.byteLength(body))});}
     if(request.url.startsWith("/api/"))return reply(503,"text/plain","fixture thumbnail unavailable");
     const name=request.url==="/"?"index.html":request.url.slice(1);
     if(!["index.html","app.js","webrtc.js","freshness.js","mjpeg.js","style.css"].includes(name))return reply(404,"text/plain","");
@@ -146,9 +147,18 @@ test("loaded camera page selects WebRTC and switches roles without any control r
   assert.deepEqual(errors,[]);
   const diagnosticPrefix="WebRTC attempt diagnostics (observational): ";
   const readDiagnostic=async()=>JSON.parse((await page.locator("#diagnostics").textContent()).split(diagnosticPrefix)[1]);
-  await page.waitForFunction(()=>document.querySelector("#diagnostics").textContent.includes('"state":"current"'));
+  await page.waitForFunction(()=>{
+    const text=document.querySelector("#diagnostics").textContent.split("WebRTC attempt diagnostics (observational): ")[1];
+    if(!text)return false;const value=JSON.parse(text);
+    return value.state==="current"&&value.view_progress?.receipt?.accepted===true;
+  });
   assert.ok((await page.locator("#diagnostics").textContent()).includes(diagnosticPrefix),"existing diagnostics panel must surface the curated attempt");
   const liveDiagnostic=await readDiagnostic();assert.equal(liveDiagnostic.state,"current");
+  assert.equal(liveDiagnostic.view_progress.visibility_state,"visible");
+  assert.equal(typeof liveDiagnostic.view_progress.has_focus,"boolean");
+  assert.ok(Number.isFinite(liveDiagnostic.view_progress.sampled_browser_clock_ms));
+  assert.ok(liveDiagnostic.view_progress.decoded_frames>0,"existing DOM panel must expose decoder progress");
+  assert.equal(liveDiagnostic.view_progress.receipt.accepted,true);
   assert.ok(liveDiagnostic.records.some(row=>row.phase==="offer"&&row.http_status===201&&row.headers_valid===true));
   assert.ok(liveDiagnostic.records.length<=8);
   sourceFresh=false;
@@ -722,4 +732,89 @@ test("existing-panel diagnostics survive an unavailable console without changing
  assert.equal(p.view.diagnostics().records.length,2);
  assert.equal(p.view.health().fresh,false);p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});await p.view.report();
  assert.equal(p.view.health().fresh,true);await p.view.stop();assert.equal(p.view.diagnostics().state,"stopped");
+});
+
+test("view-progress panel projects only existing receipt clocks and qualified scalar results",async()=>{
+ const p=fixture({manualTimers:true}),secret="PRIVATE-cookie-SDP-source-identity";
+ p.context.document={visibilityState:"visible",hasFocus:()=>false};
+ await p.view.start("chest");p.source();
+ const receipt={accepted:true,status:"view_progress",reason:secret,
+  required_view:{required:true,qualified:true,role:secret},view_delivery:{run_id:secret,decoded_frames:1,
+   media_time:.1,source_sequence:12,request_received_at_monotonic_s:100.,http_response_ready_at_monotonic_s:100.04,
+   core:{core_started_at_monotonic_s:100.02,core_completed_at_monotonic_s:100.03,
+    core_accepted_at_monotonic_s:100.02,original_floor_at_monotonic_s:99.9,qualified_until_monotonic_s:100.4,csrf:secret},
+   owner_result:{accepted:false,status:"refused",reason:secret,required_view:{required:true,qualified:false}}}};
+ const body=JSON.stringify(receipt);p.setProgressResponse({ok:true,
+  headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":String(body.length)},text:async()=>body});
+ p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});await p.view.report();p.advance(200);
+ const snapshot=p.view.diagnostics(),v=snapshot.view_progress;
+ assert.equal(v.sampled_browser_clock_ms,200);assert.equal(v.visibility_state,"visible");assert.equal(v.has_focus,false);
+ assert.equal(v.decoded_age_ms,200);assert.equal(v.source_age_ms,200);assert.equal(v.decoded_frames,1);assert.equal(v.media_time,.1);
+ assert.equal(v.receipt.accepted,true);assert.equal(v.receipt.status,"view_progress");
+ assert.equal(v.receipt.required_view.qualified,true);
+ assert.equal(v.receipt.view_delivery.request_received_at_monotonic_s,100.);
+ assert.equal(v.receipt.view_delivery.core.core_accepted_at_monotonic_s,100.02);
+ assert.equal(v.receipt.view_delivery.core.qualified_until_monotonic_s,100.4,"Pi clocks remain original, not browser ages");
+ assert.equal(v.receipt.view_delivery.owner_result.accepted,false);
+ assert.equal(v.receipt.view_delivery.owner_result.required_view.qualified,false);
+ for(const forbidden of [secret,"owner-a","capture-a","encode-a",p.ids.view_generation,"csrf"])
+  assert.ok(!JSON.stringify(snapshot).includes(forbidden),"no identity, reason or credential objects in DOM diagnostics");
+ v.receipt.view_delivery.core.core_accepted_at_monotonic_s=999;
+ assert.equal(p.view.progressReceipt.view_delivery.core.core_accepted_at_monotonic_s,100.02,"projection cannot alias current receipt");
+ await p.view.stop();assert.equal(p.view.diagnostics().view_progress.receipt,null,"no receipt history after stop");
+});
+
+test("view-progress panel bounds hostile values and unavailable document fields",async t=>{
+ const p=fixture({manualTimers:true}),secret="PRIVATE".repeat(10000),ceiling=Number.MAX_SAFE_INTEGER;
+ await p.view.start("chest");p.source();
+ for(let i=0;i<5;i++){
+  p.view.pc.oniceconnectionstatechange?.();p.view.pc.onconnectionstatechange?.();p.view.pc.ontrack?.({track:{kind:"video"}});
+ }
+ p.setStatsResponse(new Map([["video",{type:"inbound-rtp",kind:"video",codecId:"codec",packetsReceived:ceiling,
+  bytesReceived:ceiling,framesReceived:ceiling,framesDecoded:ceiling,jitterBufferEmittedCount:ceiling}],
+  ["codec",{mimeType:"video/H264"}]]));
+ p.runTimers(3000);await new Promise(setImmediate);
+ const times=["request_received_at_monotonic_s","request_body_completed_at_monotonic_s","status_started_at_monotonic_s",
+  "status_completed_at_monotonic_s","source_arrived_at_monotonic_s","original_floor_at_monotonic_s",
+  "owner_snapshot_started_at_monotonic_s","owner_snapshot_completed_at_monotonic_s","owner_progress_started_at_monotonic_s",
+  "owner_progress_completed_at_monotonic_s","owner_enqueued_at_monotonic_s","http_response_ready_at_monotonic_s"];
+ const coreTimes=["core_started_at_monotonic_s","core_completed_at_monotonic_s","core_accepted_at_monotonic_s",
+  "original_floor_at_monotonic_s","qualified_until_monotonic_s"];
+ const delivery=Object.fromEntries(times.map(key=>[key,ceiling]));delivery.core=Object.fromEntries(coreTimes.map(key=>[key,ceiling]));
+ delivery.owner_result={accepted:true,status:"view_progress",reason:secret,required_view:{required:true,qualified:true}};
+ delivery.decoded_frames=delivery.source_sequence=ceiling;delivery.media_time=ceiling;delivery.private=delivery;
+ p.view.progressReceipt={accepted:true,status:"view_progress",reason:secret,view_delivery:delivery};
+ p.view.frames=p.view.mediaTime=ceiling;p.view.decodedAt=0;p.advance(ceiling);
+ p.context.document={visibilityState:secret,hasFocus:()=>true};
+ const snapshot=p.view.diagnostics(),bytes=Buffer.byteLength(JSON.stringify(snapshot));
+ assert.equal(snapshot.records.length,8,"size check includes the full existing diagnostic record bound");
+ assert.ok(bytes<=4096,"fixed scalar projection must stay below4KiB even at largest admitted numbers");
+ assert.ok(!JSON.stringify(snapshot).includes("PRIVATE"));assert.equal(snapshot.view_progress.visibility_state,null);
+ t.diagnostic("maximum-number view-progress diagnostic bytes="+bytes);
+ delivery.request_received_at_monotonic_s=Infinity;delivery.core.core_started_at_monotonic_s=1e308;
+ delivery.owner_result.accepted="true";delivery.owner_result.status=secret;delivery.owner_result.required_view.qualified=1;
+ p.view.frames=-1;p.view.mediaTime=NaN;p.view.decodedAt=NaN;p.view.source.cameras.chest.age_ms=Infinity;
+ const bad=p.view.diagnostics().view_progress;
+ assert.equal(bad.decoded_frames,null);assert.equal(bad.media_time,null);assert.equal(bad.decoded_age_ms,null);assert.equal(bad.source_age_ms,null);
+ assert.equal(bad.receipt.view_delivery.request_received_at_monotonic_s,null);
+ assert.equal(bad.receipt.view_delivery.core.core_started_at_monotonic_s,null);
+ assert.equal(bad.receipt.view_delivery.owner_result.accepted,null);assert.equal(bad.receipt.view_delivery.owner_result.status,null);
+ assert.equal(bad.receipt.view_delivery.owner_result.required_view.qualified,null);
+ await p.view.stop();
+});
+
+test("view-progress panel reads do not renew source clocks or schedule delivery",async()=>{
+ const p=fixture({manualTimers:true});await p.view.start("chest");p.source();
+ p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});await p.view.report();p.advance(501);p.source();
+ const before={decodedAt:p.view.decodedAt,sourceAt:p.view.sourceAt,frames:p.view.frames,mediaTime:p.view.mediaTime,
+  lastReportAt:p.view.lastReportAt,lastReportedFrames:p.view.lastReportedFrames,lastReportedMedia:p.view.lastReportedMedia,
+  reports:p.view.reports.size,requests:p.requests.length,timers:p.timers.size};
+ for(let i=0;i<100;i++)assert.equal(p.view.diagnostics().view_progress.decoded_age_ms,501);
+ assert.deepEqual({decodedAt:p.view.decodedAt,sourceAt:p.view.sourceAt,frames:p.view.frames,mediaTime:p.view.mediaTime,
+  lastReportAt:p.view.lastReportAt,lastReportedFrames:p.view.lastReportedFrames,lastReportedMedia:p.view.lastReportedMedia,
+  reports:p.view.reports.size,requests:p.requests.length,timers:p.timers.size},before);
+ assert.equal(p.view.health().fresh,false,"diagnostic reads cannot qualify an expired decoder");
+ p.context.document={get visibilityState(){throw Error("private unavailable document");}};
+ assert.doesNotThrow(()=>p.view.diagnostics());assert.equal(p.view.health().fresh,false);
+ await p.view.stop();
 });
