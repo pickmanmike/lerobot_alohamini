@@ -1332,7 +1332,7 @@ def test_current_rest119_original_goal_fence_is_rechecked_before_native_write(mo
 
 
 
-def left_entry_lane(monkeypatch, seed=1299, *, real_send=False):
+def left_entry_lane(monkeypatch, seed=1299, *, real_send=False, pan_hold_raw=None, pan_drive=0):
     from lerobot.robots.alohamini.am1_live_teleop import before_write
     now, identity, owner, robot, control = lane()
     trial = install_left_response_trial(monkeypatch, robot, workload="ordinary-arms", proportional=16)
@@ -1340,6 +1340,10 @@ def left_entry_lane(monkeypatch, seed=1299, *, real_send=False):
     robot._am1_left_response_p_binding = copy.deepcopy(trial.binding)
     robot.left_bus.raw["arm_left_elbow_flex"] = seed
     robot.left_bus.goals["arm_left_elbow_flex"] = seed
+    if pan_hold_raw is not None:
+        name = "arm_left_shoulder_pan"
+        robot.left_bus.calibration[name] = MotorCalibration(1, pan_drive, -1761, 731, 3438)
+        robot.left_bus.raw[name] = robot.left_bus.goals[name] = pan_hold_raw
     robot._am1_live_before_write = lambda: before_write(control, robot)
     assert control.apply(robot, frame(identity, owner, 0))
     if real_send:
@@ -1628,3 +1632,55 @@ def test_successful_no_input_readiness_excludes_held_wait_from_first_current_inp
     assert control.live_snapshot()["valid_until_monotonic_s"] == 20.29
     for field in ("workspace", "reference", "live_admitted_at_monotonic_s", "live_deadline_monotonic_s"):
         assert control.live_snapshot()[field] == frozen[field]
+
+
+@pytest.mark.parametrize("drive", [0, 1])
+def test_left_entry_f291_literal_pan2628_survives_real_encoder_before_sdk_write(monkeypatch, drive):
+    from examples.alohamini.am1_live_teleop import normalized_raw
+    now, identity, owner, robot, control, _ = left_entry_lane(
+        monkeypatch, seed=1256, real_send=True, pan_hold_raw=2628, pan_drive=drive)
+    frozen = copy.deepcopy(control.live_snapshot())
+    pan = "arm_left_shoulder_pan"
+    assert frozen["workspace"]["raw_bounds"][pan+".pos"] == [2628,2628]
+    value = sample(control)
+    value["target"] = dict(frozen["cursor"])
+    value["target"]["arm_left_elbow_flex.pos"] = normalized_raw(1164, frozen["workspace"]["calibration"]["arm_left_elbow_flex"])
+    now[0] += .05
+    assert control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2, sample=value))
+    assert robot.left_bus.goals[pan] == 2628
+    assert control.live_snapshot()["accepted_target"][pan+".pos"] == frozen["cursor"][pan+".pos"]
+    for key,bounds in frozen["workspace"]["raw_bounds"].items():
+        if key != "arm_left_elbow_flex.pos":
+            bus = robot.left_bus if key.startswith("arm_left_") else robot.right_bus
+            assert bus.goals[key[:-4]] == bounds[0] == bounds[1]
+    assert control.live_snapshot()["workspace"] == frozen["workspace"]
+    assert control.live_snapshot()["live_deadline_monotonic_s"] == frozen["live_deadline_monotonic_s"]
+
+
+@pytest.mark.parametrize("limiter", ["relative", "current"])
+def test_left_entry_canonical_pan_still_refuses_genuine_limiter_change_before_sdk_write(monkeypatch, limiter):
+    from examples.alohamini.am1_live_teleop import normalized_raw
+    now, identity, owner, robot, control, _ = left_entry_lane(monkeypatch, real_send=True, pan_hold_raw=2628)
+    pan = "arm_left_shoulder_pan"
+    robot.left_bus.raw[pan] = 2627
+    if limiter == "relative":
+        robot.config.max_relative_target = .01
+    else:
+        original_read = robot.left_bus.sync_read
+        def high_current(register, motors, **kwargs):
+            values = original_read(register, motors, **kwargs)
+            if register == "Present_Current" and pan in values:
+                values[pan] = 300  #1950mA activates the existing1800mA joint limiter.
+            return values
+        robot.left_bus.sync_read = high_current
+    frozen = copy.deepcopy(control.live_snapshot())
+    value = sample(control)
+    value["target"] = dict(frozen["cursor"])
+    value["target"]["arm_left_elbow_flex.pos"] = normalized_raw(1164, frozen["workspace"]["calibration"]["arm_left_elbow_flex"])
+    now[0] += .05
+    with pytest.raises(RuntimeError, match="entry"):
+        control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2, sample=value))
+    assert not any(register == "Goal_Position" for bus in (robot.left_bus,robot.right_bus) for register,_ in bus.writes)
+    assert robot.left_bus.goals[pan] == 2628
+    if limiter == "current":
+        assert robot._joint_hold_goal[pan] == normalized_raw(2627, frozen["workspace"]["calibration"][pan])

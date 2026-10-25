@@ -1765,3 +1765,44 @@ def test_teleop_tracking_initial_hold_uses_original_literal_goal_instead_of_meas
     now[0]=10.5
     evidence.report(obj,control,acquire())
     assert not port.writes and not rows, "an existing rawGoal differing from PP is still the initial hold"
+
+
+@pytest.mark.parametrize("drive", [0, 1])
+@pytest.mark.parametrize("motor,mode,calibration,raws", [
+    ("arm_left_shoulder_pan", MotorNormMode.RANGE_M100_100, (1, -1761, 731, 3438), (731, 2628, 3438)),
+    ("arm_left_gripper", MotorNormMode.RANGE_0_100, (6, 933, 1886, 3401), (1886, 2628, 2980, 3401)),
+    ("arm_left_elbow_flex", MotorNormMode.DEGREES, (3, 1845, 864, 3073), (864, 1299, 2628, 3073)),
+])
+def test_am1_encoder_preserves_exact_canonical_integer_goals_without_io(monkeypatch, drive, motor, mode, calibration, raws):
+    obj,reads,writes = robot(monkeypatch)
+    motor_id,offset,low,high = calibration
+    bus = FeetechMotorsBus("unused-canonical-roundtrip", {motor:Motor(motor_id,"sts3215",mode)},
+                          {motor:MotorCalibration(motor_id,drive,offset,low,high)})
+    obj.config.max_relative_target = None
+    for raw in raws:
+        canonical = obj._normalize_arm_feedback(bus,{motor:raw})[motor]
+        accepted,encoded = obj._encode_am1_arm_goals(bus,{motor+".pos":canonical},{motor:raw})
+        assert encoded == {motor:raw}
+        assert accepted == {motor+".pos":canonical}
+    assert reads == writes == []
+
+
+@pytest.mark.parametrize("drive", [0, 1])
+@pytest.mark.parametrize("mode", [MotorNormMode.RANGE_M100_100, MotorNormMode.RANGE_0_100, MotorNormMode.DEGREES])
+def test_am1_encoder_keeps_noncanonical_fractional_goal_truncation(monkeypatch, drive, mode):
+    obj,_,_ = robot(monkeypatch)
+    name = "arm_left_gripper" if mode is MotorNormMode.RANGE_0_100 else ELBOW
+    bus = FeetechMotorsBus("unused-fractional-roundtrip",{name:Motor(3,"sts3215",mode)},
+                          {name:MotorCalibration(3,drive,-1761,731,3438)})
+    obj.config.max_relative_target = None
+    raw = 2627.75
+    if mode is MotorNormMode.DEGREES:
+        goal = (raw-(731+3438)/2)*360/4095
+    elif mode is MotorNormMode.RANGE_0_100:
+        goal = (raw-731)/2707*100
+        if drive:goal = 100-goal
+    else:
+        goal = (raw-731)/2707*200-100
+        if drive:goal = -goal
+    _,encoded = obj._encode_am1_arm_goals(bus,{name+".pos":goal},{name:2628})
+    assert encoded[name] == 2627, "a noncanonical fractional request keeps existing truncation"

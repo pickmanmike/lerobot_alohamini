@@ -1667,20 +1667,25 @@ class AlohaMini(Robot):
             protected_hold = motor in holds and goal == holds[motor]
             if protected_hold and bounds and not bounds[0] <= goal <= bounds[1]:
                 raise RuntimeError(f"AM1 current-limit hold for {motor} cannot be represented within its command range")
-            if protected_hold and not motor.endswith("_gripper"):
-                # A joint hold is an integer Present_Position sample. Recover that
-                # exact encoder tick; a float round trip must not move its hold.
-                value = -goal if bus.apply_drive_mode and calibration.drive_mode else goal
-                if mode is MotorNormMode.RANGE_M100_100:
-                    raw_hold = (value + 100) / 200 * (calibration.range_max - calibration.range_min) + calibration.range_min
-                elif mode is MotorNormMode.RANGE_0_100:
-                    value = 100 - goal if bus.apply_drive_mode and calibration.drive_mode else goal
-                    raw_hold = value / 100 * (calibration.range_max - calibration.range_min) + calibration.range_min
-                else:
-                    raw_hold = goal * (bus.model_resolution_table[model.model] - 1) / 360 + (
-                        calibration.range_min + calibration.range_max
-                    ) / 2
-                raw_goals[model.id] = round(raw_hold)
+            value = -goal if bus.apply_drive_mode and calibration.drive_mode else goal
+            if mode is MotorNormMode.RANGE_M100_100:
+                raw_goal = (value + 100) / 200 * (calibration.range_max - calibration.range_min) + calibration.range_min
+            elif mode is MotorNormMode.RANGE_0_100:
+                value = 100 - goal if bus.apply_drive_mode and calibration.drive_mode else goal
+                raw_goal = value / 100 * (calibration.range_max - calibration.range_min) + calibration.range_min
+            else:
+                raw_goal = goal * (bus.model_resolution_table[model.model] - 1) / 360 + (
+                    calibration.range_min + calibration.range_max
+                ) / 2
+            raw_tick = round(raw_goal)
+            canonical_tick = (
+                (bounds is None or calibration.range_min <= raw_tick <= calibration.range_max)
+                and self._normalize_arm_feedback(bus, {motor: raw_tick})[motor] == goal
+            )
+            if (protected_hold and not motor.endswith("_gripper")) or canonical_tick:
+                # Exact integer Goals survive their float round trip. Arbitrary
+                # fractional requests retain the driver's existing truncation.
+                raw_goals[model.id] = raw_tick
             if self.config.max_relative_target is None:
                 continue
             cap = self._am1_relative_target_cap(key)
