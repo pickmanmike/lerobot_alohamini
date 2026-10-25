@@ -138,7 +138,10 @@ class VirtualIntentReader:
                 if self.mode != "interactive":
                     raise
                 self.reject(error)
-            return not line or self.finished
+            # Raw finish is only a request. Main may discard its original expired
+            # TTL after recovery; keep reading until EOF or accepted-finish cleanup.
+            # self.finished remains latched for conservative before-Start cancellation.
+            return not line
 
         def read():
             try:

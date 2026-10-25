@@ -266,6 +266,51 @@ def test_virtual_intent_reader_daemon_close_does_not_wait_for_stdin():
     assert not reader.thread.is_alive() and reader.take() is None
 
 
+def test_virtual_intent_finish_expired_during_recovery_keeps_reader_available_for_fresh_input():
+    import queue
+    import threading
+    from examples.alohamini.am1_teleop_workload import VirtualIntentWorkload
+
+    m, now, lines = adapter(), [10.], queue.Queue()
+    reading_again, fresh_read = threading.Event(), threading.Event()
+
+    class Input:
+        count = 0
+        def readline(self, limit):
+            self.count += 1
+            if self.count == 2:
+                reading_again.set()
+            if self.count == 3:
+                fresh_read.set()
+            return lines.get()
+
+    reader = m.VirtualIntentReader("interactive", stream=Input(), clock=lambda: now[0])
+    native = workspace()
+    source = VirtualIntentWorkload(native, command_reference=native["reference"], clock=lambda: now[0],
+                                  intent_channel=reader.intent_channel)
+    try:
+        source.freeze()  # The production recovery wait does not consume pending input.
+        lines.put("finish\n")
+        reader.start()
+        assert reading_again.wait(1), "raw finish must not end the input reader before main accepts it"
+        now[0] = 12.  # Existing recovery took2s; the original finish TTL remains1s.
+        finish = reader.take()
+        assert finish["issued_at_perf_counter_s"] == 10. and finish["expires_at_perf_counter_s"] == 11.
+        assert not source.submit(finish) and not source.complete and not source.active
+        assert reader.finished and not reader.eof  # Conservative before-Start cancellation stays latched.
+        lines.put("hold 5\n")
+        assert fresh_read.wait(1)
+        assert source.submit(reader.take()) and source.active and not source.complete
+        lines.put("")
+        reader.thread.join(1)
+        assert reader.eof and not reader.thread.is_alive()
+        assert source.submit(reader.take()) and source.complete
+    finally:
+        reader.close()
+        lines.put("")
+        reader.thread.join(1)
+
+
 @pytest.mark.parametrize("invalid_last", [True, False])
 def test_virtual_intent_reader_burst_retains_only_latest_valid_or_rejected_input(invalid_last):
     import threading
@@ -398,14 +443,16 @@ def test_virtual_intent_windows_console_polls_without_holding_blocking_crt_stdin
     assert not reader.thread.is_alive()
 
 
-def test_virtual_intent_clean_eof_before_start_does_not_claim_or_create_motor_task(tmp_path, monkeypatch):
+@pytest.mark.parametrize("marker", ["eof", "finished"])
+def test_virtual_intent_clean_eof_before_start_does_not_claim_or_create_motor_task(tmp_path, monkeypatch, marker):
     import asyncio
     from types import SimpleNamespace
 
     m = adapter()
 
     class Reader:
-        eof = True
+        eof = marker == "eof"
+        finished = marker == "finished"
         def __init__(self, *args, **kwargs):
             pass
         def start(self):
@@ -1272,6 +1319,7 @@ def test_real_wss_clean_close_ends_qualified_wait_before_timeout(tmp_path):
         "normal_program_finish_ordinary_arms_intents_invalid",
         "normal_program_finish_ordinary_arms_intents_expired_replacement",
         "normal_program_finish_ordinary_arms_intents_duration",
+        "normal_program_finish_ordinary_arms_intents_expired_finish_recovery",
     ],
 )
 def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
@@ -1291,6 +1339,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
     cycle_run = failure in {"normal_program_finish_left_reach_cycles", "normal_program_finish_left_reach_closing_cycles"}
     ordinary_arms = isinstance(failure, str) and failure.startswith("normal_program_finish_ordinary_arms")
     changing_intents = ordinary_arms and "_intents" in failure
+    finish_recovery = changing_intents and failure.endswith("expired_finish_recovery")
+    pending_recovery_finish, recovery_reader = [], []
     usb_finish = isinstance(failure, str) and failure.startswith(("usb_finite_finish", "usb_quit_"))
     program_finish = failure in {"bench_program_finish", "bench_program_finish_failed"} or normal_finish
     bench_case = failure in {"bench_input_gap", "bench_controller_gap", "bench_renewal_during_resume", "bench_renewal_attach_ceiling", "bench_renewal_snapshot_race",
@@ -1746,6 +1796,14 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             if recovery_case or ordinary_case or mailbox_case or bench_case:
                 assert self.snapshot["run"]["status"] != "recovering"
                 self.resumes += 1
+                if finish_recovery and self.resumes == 2:
+                    # Receipt during the existing recovery wait; main consumes it only afterwards.
+                    pending_recovery_finish.append({"seq": 2, "op": "finish",
+                        "intent_channel": recovery_reader[0].intent_channel,
+                        "issued_at_perf_counter_s": source_clock[0],
+                        "expires_at_perf_counter_s": source_clock[0]+1.})
+                    await asyncio.sleep(0)
+                    source_clock[0] += 2.
                 if terminal_hold and self.resumes == 2:
                     assert self.snapshot["events"][-1]["kind"] == "native_input_expired"
                     assert self.snapshot["evidence"]["hold_acknowledged"] is True
@@ -2082,6 +2140,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                         self.delivered = set()
                         self.waits = 0
                         self.intent_channel = options["intent_channel"]
+                        if finish_recovery:
+                            recovery_reader.append(self)
                     def start(self):
                         assert not instances, "stdin acquisition must begin before ownership/cold startup"
                     def close(self):
@@ -2090,10 +2150,11 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                         session = instances[0]
                         count = len(session.inputs)
                         expired_replacement = failure.endswith("expired_replacement")
-                        if (failure.endswith(("expiry", "pause", "invalid")) or expired_replacement) and count == 3:
+                        if (failure.endswith(("expiry", "pause", "invalid")) or expired_replacement or finish_recovery) and count == 3:
                             self.waits += 1
                             if self.waits == 1:
-                                source_clock[0] = 10.2 if expired_replacement else 16.
+                                if not finish_recovery:
+                                    source_clock[0] = 10.2 if expired_replacement else 16.
                                 state = session.snapshot
                                 revision = state["run"]["intent_revision"] + 1
                                 state["run"].update(status="paused", intent_revision=revision, remaining_s=299.)
@@ -2109,6 +2170,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                                     return {"seq": 2, "op": "hold", "intent_channel": self.intent_channel,
                                             "issued_at_perf_counter_s": 10., "expires_at_perf_counter_s": 10.1}
                                 return None
+                            if finish_recovery and pending_recovery_finish:
+                                return pending_recovery_finish.pop()
                         stages = {0: (1, "move", {"arm_left_gripper.pos": 4.}), 3: (2, "hold", None),
                                   5: (3, "move", {"arm_right_gripper.pos": 6.}),
                                   8: (4, "return", None), 11: (5, "finish", None)}
@@ -2116,7 +2179,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                             return None
                         self.delivered.add(count)
                         seq, op, targets = stages[count]
-                        if expired_replacement and count >= 3:
+                        if (expired_replacement or finish_recovery) and count >= 3:
                             seq += 1
                         command = {"seq": seq, "op": op, "intent_channel": self.intent_channel,
                                    "issued_at_perf_counter_s": source_clock[0],
@@ -2230,8 +2293,14 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                     assert row["virtual_intent"]["intent_channel"] == row["frame"]["source"]["source_id"] == summary["selected_profile"]["intent_channel"]
                 if failure.endswith("expired_replacement"):
                     assert all(row["virtual_intent"]["seq"] != 2 for row in frames)
+                if finish_recovery:
+                    discarded = next(row for row in records if row["event"] == "virtual_intent_discarded")
+                    assert discarded["op"] == "finish" and discarded["seq"] == 2
+                    assert discarded["issued_at_perf_counter_s"] == 10. and discarded["expires_at_perf_counter_s"] == 11.
+                    assert all(row["virtual_intent"]["seq"] != 2 for row in frames)
+                    assert summary["original_native_deadline"] == 301.
                 assert session.starts == 1 and len(session.pauses) == 1 and session.stops == [owned_id]
-                assert session.resumes == (2 if failure.endswith(("expiry", "invalid", "expired_replacement")) else 1)
+                assert session.resumes == (2 if finish_recovery or failure.endswith(("expiry", "invalid", "expired_replacement")) else 1)
                 return
             if normal_finish:
                 assert start["terminal_completion_policy"] == "owned_pause_native_hold_after_finite_input"
