@@ -2345,3 +2345,58 @@ def test_left_shoulder_startup_authority_cannot_survive_mutation_or_stop(tmp_pat
     with pytest.raises(RuntimeError):
         trial.normal_rest_startup_degrees(r)
     assert r.left_bus.events == boundary
+
+
+LEFT_ENTRY_PROFILE = "ordinary-arms-left-entry-p16-1164-1324"
+
+
+@pytest.mark.parametrize("raw", [1165, 1299, 1324])
+def test_left_entry_p16_transaction_admits_fresh_stopped_origin_without_gain_or_goal_write(tmp_path, monkeypatch, raw):
+    _, r, trial, _, _, request = left_response_p_robot(
+        tmp_path, monkeypatch, proportional=16, workspace_profile=LEFT_ENTRY_PROFILE,
+        workload_segment="ordinary-arms", left_shoulder_startup_degrees=1,
+    )
+    r.left_bus.values["Present_Position", ELBOW] = raw
+    r.left_bus.values["Goal_Position", ELBOW] = 1140
+    trial.prepare(r)
+    trial.disable_torque(r)
+    trial.apply(r)
+    assert trial.raw_bounds == (1164, 1324)
+    assert trial.receipt["configured_p"] == 16 and trial.normal_rest_startup_degrees(r) == 1
+    assert not [event for event in writes(r.left_bus) if event[1] in {"P_Coefficient", "Goal_Position"}]
+    r._am1_shutdown_in_progress = True
+    trial.restore(r)
+    assert not trial.restore_required and r.left_bus.values["P_Coefficient", ELBOW] == 16
+    assert r.left_bus.values["Goal_Position", ELBOW] == 1140 and not writes(r.right_bus)
+
+
+@pytest.mark.parametrize("bad", ["inside", "outside", "gain", "status", "current", "torque", "stop"])
+def test_left_entry_p16_refuses_other_gains_unbounded_rest_and_unhealthy_owner(tmp_path, monkeypatch, bad):
+    module, r, trial, _, _, _ = left_response_p_robot(
+        tmp_path, monkeypatch, proportional=16, workspace_profile=LEFT_ENTRY_PROFILE,
+        workload_segment="ordinary-arms",
+    )
+    r.left_bus.values["Present_Position", ELBOW] = 1299
+    if bad == "inside": r.left_bus.values["Present_Position", ELBOW] = 1164
+    elif bad == "outside": r.left_bus.values["Present_Position", ELBOW] = 1325
+    elif bad == "gain": r.left_bus.values["P_Coefficient", ELBOW] = 32
+    elif bad == "status": r.left_bus.values["Status", ELBOW] = 1
+    elif bad == "current": r.left_bus.values["Present_Current", ELBOW] = 310
+    elif bad == "torque": r.left_bus.values["Torque_Enable", ELBOW] = 1
+    else: r._am1_shutdown_in_progress = True
+    with pytest.raises(RuntimeError): trial.prepare(r)
+    assert not trial.restore_required and not writes(r.left_bus)
+
+
+@pytest.mark.parametrize("changed", ["p32", "side", "workload", "unknown", "allowance"])
+def test_left_entry_request_cannot_borrow_p32_or_another_role(tmp_path, monkeypatch, changed):
+    module, _, _, _, value = left_response_p_files(
+        tmp_path, monkeypatch, proportional=16, workspace_profile=LEFT_ENTRY_PROFILE,
+        workload_segment="ordinary-arms",
+    )
+    if changed == "p32": value["proportional"] = 32
+    elif changed == "side": value["kind"] = "right-response-p"
+    elif changed == "workload": value["workload_segment"] = "left-reach"
+    elif changed == "unknown": value["workspace_profile"] += "-other"
+    else: value["left_shoulder_startup_degrees"] = 2
+    with pytest.raises(ValueError): module._left_response_p_request(value, "a" * 40)

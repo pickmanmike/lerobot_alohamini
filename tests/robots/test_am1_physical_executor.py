@@ -3824,3 +3824,47 @@ def test_preparation_cli_delegates_to_same_public_relay(monkeypatch,capsys):
     assert m.main(['--prepare-left-response-p','--ssh','am1-pi','--config',config,'--left-response-workspace','current-rest','--left-response-workload','ordinary-arms','--left-shoulder-startup-degrees','1'])==0
     assert calls==[(config,dict(ssh='am1-pi',ttl_seconds=120,workspace_profile=profile,left_shoulder_startup_degrees=1,workload_segment='ordinary-arms'))]
     assert json.loads(capsys.readouterr().out)==receipt
+
+
+@pytest.mark.parametrize("relay", [False, True])
+@pytest.mark.parametrize("expired_pending", [False, True])
+def test_left_entry_canonical_preparer_and_reflected_remote_select_only_baseline_p16(tmp_path, monkeypatch, relay, expired_pending):
+    import io, shlex, subprocess, sys
+    from contextlib import redirect_stdout
+    m = module()
+    path, config, gains, calibration = request_preparation_config(tmp_path, monkeypatch)
+    before = calibration.read_bytes()
+    profile = "ordinary-arms-left-entry-p16-1164-1324"
+    options = dict(workload_segment="ordinary-arms", workspace_profile=profile, left_shoulder_startup_degrees=1)
+    if expired_pending:
+        from pathlib import Path
+        previous = dict(version=1, kind="left-response-p", request_id="33333333-3333-4333-8333-333333333333",
+                        source_head=config["host_head"], proportional=16, workload_segment="ordinary-arms",
+                        workspace_profile=profile, left_shoulder_startup_degrees=1,
+                        boot_id=gains._left_response_p_boot_id(), expires_at_monotonic_s=99.)
+        pending = Path(config["physical_state_directory"])/"left-response-p-request.json"
+        original = gains._right_p20_json(previous)
+        pending.write_bytes(original); pending.chmod(0o600)
+        monkeypatch.setattr(gains.time, "monotonic", lambda: 100.)
+    calls = []
+    def remote(argv, **kwargs):
+        values = shlex.split(argv[7]); calls.append(values)
+        assert values[-3:] == [profile, "1", "ordinary-arms"]
+        output = io.StringIO()
+        with monkeypatch.context() as context, redirect_stdout(output):
+            context.setattr(sys, "argv", ["-", str(path), *values[4:]])
+            context.delattr(m, "prepare_left_response_p_request")
+            exec(compile(kwargs["input"], "<left-entry-canonical-relay>", "exec"), {})
+        return SimpleNamespace(stdout=output.getvalue())
+    monkeypatch.setattr(subprocess, "run", remote)
+    receipt = (m.prepare_left_response_p_remote("/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/"+"a"*16+"/physical.json", **options)
+               if relay else m.prepare_left_response_p_request(str(path), **options))
+    request = receipt["request"]
+    assert request["proportional"] == 16 and request["workspace_profile"] == profile
+    assert request["workload_segment"] == "ordinary-arms" and request["left_shoulder_startup_degrees"] == 1
+    assert receipt["hardware_started"] is False and receipt["canonical_read_verified"] is True
+    assert calibration.read_bytes() == before and len(calls) == int(relay)
+    if expired_pending:
+        archived = pending.with_name("left-response-p-expired-"+previous["request_id"]+".json")
+        assert archived.read_bytes() == original and archived.stat().st_nlink == 1
+        assert request["request_id"] != previous["request_id"] and request["expires_at_monotonic_s"] == 220.

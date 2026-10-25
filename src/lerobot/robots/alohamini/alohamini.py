@@ -1941,6 +1941,14 @@ class AlohaMini(Robot):
             self._service_am1_live_feedback()
             right_pos, right_raw_goals = self._encode_am1_arm_goals(self.right_bus, right_pos, present_right_raw)
 
+        arm_goal_guard = getattr(self, "_am1_live_arm_goal_guard", None)
+        if arm_goal_guard is not None:
+            # Entry-only read-free inspection of final bytes after all existing limiters.
+            if left_pos:
+                arm_goal_guard(self.left_bus, left_raw_goals)
+            if self.right_bus and right_pos:
+                arm_goal_guard(self.right_bus, right_raw_goals)
+
         # Send goal position to the actuators
         # arm_goal_pos_raw = {k.replace(".pos", ""): v for k, v in arm_goal_pos.items()}
         # self.left_bus.sync_write("Goal_Position", arm_goal_pos_raw)
@@ -1976,6 +1984,8 @@ class AlohaMini(Robot):
                 live_before_write()
                 self._service_am1_live_feedback()
                 live_before_write()
+                if arm_goal_guard is not None:
+                    arm_goal_guard(bus, raw_goals)
                 if raw_goals is not None:
                     bus.sync_write("Goal_Position", raw_goals, normalize=False)
                 else:

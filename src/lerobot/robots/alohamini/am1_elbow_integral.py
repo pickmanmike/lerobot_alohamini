@@ -897,7 +897,7 @@ def _left_response_p_boot_id():
 
 def _response_p_request(value, source_head=None, *, kind):
     import re
-    from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES
+    from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES, LEFT_ENTRY_WORKSPACE_PROFILE
 
     if kind not in (LEFT_RESPONSE_P_KIND, RIGHT_RESPONSE_P_KIND):
         raise ValueError("Only the two selected response elbow roles are supported")
@@ -938,18 +938,15 @@ def _response_p_request(value, source_head=None, *, kind):
         raise ValueError("Selected elbow response P requires its closed current-source finite comparison request")
     if value["workload_segment"] == "ordinary-arms" and "workspace_profile" not in value:
         raise ValueError("Ordinary arms requires its explicit current-rest workspace profile")
-    if "workspace_profile" in value and (
-        kind != LEFT_RESPONSE_P_KIND
-        or value["workload_segment"] not in CURRENT_REST_WORKSPACE_PROFILES
-        or type(value["workspace_profile"]) is not str
-        or value["workspace_profile"] != CURRENT_REST_WORKSPACE_PROFILES.get(value["workload_segment"])
-        or value["proportional"] != 32
-    ):
+    entry = value.get("workspace_profile") == LEFT_ENTRY_WORKSPACE_PROFILE
+    profile_matches = (kind == LEFT_RESPONSE_P_KIND and (
+        entry and value["workload_segment"] == "ordinary-arms" and value["proportional"] == 16
+        or not entry and value.get("workspace_profile") == CURRENT_REST_WORKSPACE_PROFILES.get(value["workload_segment"])
+        and value["workload_segment"] in CURRENT_REST_WORKSPACE_PROFILES and value["proportional"] == 32))
+    if "workspace_profile" in value and not profile_matches:
         raise ValueError("Current-rest profile requires its exact explicit LEFT/P32 workload request")
     if "left_shoulder_startup_degrees" in value and (
-        kind != LEFT_RESPONSE_P_KIND
-        or value.get("workspace_profile") != CURRENT_REST_WORKSPACE_PROFILES.get(value["workload_segment"])
-        or value["workload_segment"] not in CURRENT_REST_WORKSPACE_PROFILES or value["proportional"] != 32
+        not profile_matches
         or type(value["left_shoulder_startup_degrees"]) not in (int, float)
         or not math.isfinite(value["left_shoulder_startup_degrees"])
         or value["left_shoulder_startup_degrees"] != 1
@@ -1134,7 +1131,8 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
         self.proportional = self.binding["request"]["proportional"]
         self.workspace_profile = self.binding["request"].get("workspace_profile")
         if self.workspace_profile is not None:
-            self.raw_bounds = (1051, 1164)
+            from examples.alohamini.am1_live_teleop import LEFT_ENTRY_WORKSPACE_PROFILE
+            self.raw_bounds = (1164, 1324) if self.workspace_profile == LEFT_ENTRY_WORKSPACE_PROFILE else (1051, 1164)
         super().__init__(integral=0, snapshot_path=self.directory / (self.kind + "-original.json"))
         self._snapshot = {
             "schema_version": 1,
@@ -1192,7 +1190,8 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
         expected = {k: self.binding[k] for k in ("run_id", "host_incarnation")}
         expected["recipe"] = "physical-live-teleop"
         profile = self.binding["request"].get("workspace_profile")
-        expected_bounds = ((1051, 1164) if profile is not None else
+        from examples.alohamini.am1_live_teleop import LEFT_ENTRY_WORKSPACE_PROFILE
+        expected_bounds = ((1164, 1324) if profile == LEFT_ENTRY_WORKSPACE_PROFILE else (1051, 1164) if profile is not None else
                            (2011, 2124) if self.side == "left" else (1847, 1960))
         if (
             self.workspace_profile != profile or self.raw_bounds != expected_bounds
@@ -1296,6 +1295,7 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
         self._robot = robot
         self._same_owner(robot)
         self._prepare_path()
+        from examples.alohamini.am1_live_teleop import LEFT_ENTRY_WORKSPACE_PROFILE
         original = {k: self._read(k, phase="baseline") for k in _LEFT_RESPONSE_P_REGISTERS}
         raw_bytes = self._bytes(phase="baseline")
         from .am1_live_teleop import STATIC
@@ -1342,6 +1342,7 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
             or raw_bytes != {"24": 16, "25": 0}
             or any(original[k] != v for k, v in frozen.items())
             or not self.raw_bounds[0] <= original["Present_Position"] <= self.raw_bounds[1]
+            or self.workspace_profile == LEFT_ENTRY_WORKSPACE_PROFILE and original["Present_Position"] == 1164
             or not (self.calibration[3] if self.workspace_profile else self.raw_bounds[0])
             <= original["Goal_Position"]
             <= (self.calibration[4] if self.workspace_profile else self.raw_bounds[1])
@@ -1423,11 +1424,12 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
     def require_normal_activation_owner(self, robot):
         """Read-free fence while the ordinary owner seeds its fresh measured goals."""
         self._retained_owner(robot)
-        from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES
-        if (self.workspace_profile not in CURRENT_REST_WORKSPACE_PROFILES.values() or self.side != "left"
-                or self.proportional != 32 or not self.restore_required
+        from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES, LEFT_ENTRY_WORKSPACE_PROFILE
+        expected_p = 16 if self.workspace_profile == LEFT_ENTRY_WORKSPACE_PROFILE else 32
+        if (self.workspace_profile not in (*CURRENT_REST_WORKSPACE_PROFILES.values(), LEFT_ENTRY_WORKSPACE_PROFILE) or self.side != "left"
+                or self.proportional != expected_p or not self.restore_required
                 or self._snapshot.get("state") != "configured"
-                or self._snapshot.get("configured_p_readback") != 32
+                or self._snapshot.get("configured_p_readback") != expected_p
                 or getattr(robot, "_am1_shutdown_in_progress", False) is True):
             raise RuntimeError("Current-rest ordinary activation owner/phase changed or Stop prevailed")
 
@@ -1438,16 +1440,19 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
         if "left_shoulder_startup_degrees" not in request:
             return 0.5
         degrees = request["left_shoulder_startup_degrees"]
-        from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES
+        from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES, LEFT_ENTRY_WORKSPACE_PROFILE
         if (type(degrees) not in (int, float) or not math.isfinite(degrees) or degrees != 1
                 or request.get("workload_segment") not in CURRENT_REST_WORKSPACE_PROFILES
-                or request.get("workspace_profile") != CURRENT_REST_WORKSPACE_PROFILES.get(request.get("workload_segment"))
-                or request.get("proportional") != 32):
+                or not (request.get("workspace_profile") == LEFT_ENTRY_WORKSPACE_PROFILE
+                        and request.get("workload_segment") == "ordinary-arms" and request.get("proportional") == 16
+                        or request.get("workspace_profile") == CURRENT_REST_WORKSPACE_PROFILES.get(request.get("workload_segment"))
+                        and request.get("proportional") == 32)):
             raise RuntimeError("Left shoulder startup request authority changed")
         return 1.0
 
     def qualify_normal_activation(self, robot, all_goals):
         self.require_normal_activation_owner(robot)
+        from examples.alohamini.am1_live_teleop import LEFT_ENTRY_WORKSPACE_PROFILE
         matching = [values for bus, values in all_goals if bus is self._bus]
         if len(matching) != 1 or type(matching[0].get(self.motor)) is not int:
             raise RuntimeError("Current-rest ordinary activation needs its exact selected measured map")
@@ -1462,6 +1467,7 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
         position, torque = one("Present_Position"), one("Torque_Enable")
         now = time.monotonic()
         if (not self.raw_bounds[0] <= present <= self.raw_bounds[1]
+                or self.workspace_profile == LEFT_ENTRY_WORKSPACE_PROFILE and present == 1164
                 or position.get("raw") != present or torque.get("raw") != 0
                 or any("unavailable" in row or any(type(row.get(key)) not in (int, float)
                        or not math.isfinite(row[key]) for key in ("read_started_at", "read_completed_at"))

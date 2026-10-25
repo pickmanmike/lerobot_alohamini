@@ -588,7 +588,7 @@ def test_protected_endpoint_rejects_negative_unsigned_current(activation, monkey
     assert not energizing(activation.events) and not goals(activation.events)
 
 
-def current_rest_normal_activation_case(case, tmp_path, monkeypatch, *, workload_segment="left-reach"):
+def current_rest_normal_activation_case(case, tmp_path, monkeypatch, *, workload_segment="left-reach", entry=False):
     """Real protected transaction/activation; replace only external register I/O."""
     import copy
 
@@ -598,7 +598,8 @@ def current_rest_normal_activation_case(case, tmp_path, monkeypatch, *, workload
 
     _, bound, trial, _, _, _ = left_response_p_robot(
         tmp_path, monkeypatch, workload_segment=workload_segment,
-        workspace_profile=("ordinary-arms-left-current-rest-1051-1164" if workload_segment == "ordinary-arms" else CURRENT_REST_PROFILE),
+        workspace_profile=("ordinary-arms-left-entry-p16-1164-1324" if entry else "ordinary-arms-left-current-rest-1051-1164" if workload_segment == "ordinary-arms" else CURRENT_REST_PROFILE),
+        proportional=16 if entry else 32,
         left_shoulder_startup_degrees=1 if workload_segment == "ordinary-arms" else None,
     )
     robot = case.robot
@@ -617,6 +618,8 @@ def current_rest_normal_activation_case(case, tmp_path, monkeypatch, *, workload
     # this fixture runs the actual ordinary arm-calibration/seed/activation code.
     monkeypatch.setattr(am1_live_teleop, "refresh_startup_temperatures", lambda source: None)
     monkeypatch.setattr(am1_live_teleop, "verify_settings", lambda source: None)
+    if entry:
+        robot.left_bus.registers["Present_Position", ELBOW] = 1299
     trial.prepare(robot)
     trial.disable_torque(robot)
     trial.apply(robot)
@@ -728,3 +731,43 @@ def test_current_rest_normal_activation_seed_readback_failure_restores_p_without
     assert robot.left_bus.registers["P_Coefficient", elbow] == 16
     assert robot.left_bus.registers["Torque_Enable", elbow] == 0
     assert robot.left_bus.registers["Lock", elbow] == 0 and not trial.restore_required
+
+
+@pytest.mark.parametrize("after_home", [1165, 1298, 1324])
+def test_left_entry_real_normal_activation_seeds_fresh_rest_at_p16_and_restores_without_goal_replay(
+    activation, tmp_path, monkeypatch, after_home,
+):
+    case = activation
+    robot, trial, elbow = current_rest_normal_activation_case(
+        case, tmp_path, monkeypatch, workload_segment="ordinary-arms", entry=True,
+    )
+    def fresh_home(source):
+        source.left_bus.registers["Present_Position", elbow] = after_home
+        case.clock.now += .25
+    case.home_change = fresh_home
+    robot.activate_motors()
+    selected = [row for row in goals(case.events) if row[3] == elbow]
+    assert len(selected) == 1 and selected[0][4] == after_home
+    assert trial.active_receipt(robot)["configured_p"] == 16
+    assert robot.left_bus.registers["P_Coefficient", elbow] == 16
+    assert trial.evidence["normal_activation"]["position"]["raw"] == after_home
+    boundary = len(case.events)
+    robot._safe_shutdown(close_buses=True)
+    assert not goals(case.events[boundary:])
+    assert robot.left_bus.registers["Goal_Position", elbow] == after_home
+    assert robot.left_bus.registers["P_Coefficient", elbow] == 16
+    assert robot.left_bus.registers["Torque_Enable", elbow] == 0 and not trial.restore_required
+
+
+@pytest.mark.parametrize("after_home", [1164, 1325])
+def test_left_entry_real_normal_activation_refuses_outside_fresh_seed_before_goal_write(
+    activation, tmp_path, monkeypatch, after_home,
+):
+    case = activation
+    robot, trial, elbow = current_rest_normal_activation_case(
+        case, tmp_path, monkeypatch, workload_segment="ordinary-arms", entry=True,
+    )
+    case.home_change = lambda source: source.left_bus.registers.__setitem__(("Present_Position", elbow), after_home)
+    with pytest.raises(RuntimeError): robot.activate_motors()
+    assert not goals(case.events)
+    assert robot.left_bus.registers["P_Coefficient", elbow] == 16

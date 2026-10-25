@@ -968,11 +968,13 @@ def _response_receipt(robot, side):
             or getattr(robot, "_am1_" + other + "_response_p_trial", None) is not None):
         raise RuntimeError(f"AM1 {side} response transaction binding changed")
     receipt = trial.active_receipt(robot)
+    from examples.alohamini.am1_live_teleop import LEFT_ENTRY_WORKSPACE_PROFILE
+    entry = trial.binding["request"].get("workspace_profile") == LEFT_ENTRY_WORKSPACE_PROFILE
     allowed = ("left-maintained", "left-reach", "left-peer-fixed", "ordinary-arms") if side == "left" else ("right-peer-fixed",)
     if (receipt.get("kind") != side + "-response-p" or receipt.get("original_p") != 16
             or receipt.get("configured_p") not in (16, 32) or receipt.get("restore_required") is not True
             or receipt.get("workload_segment") not in allowed
-            or receipt.get("workload_segment") == "ordinary-arms" and receipt.get("configured_p") != 32
+            or receipt.get("workload_segment") == "ordinary-arms" and receipt.get("configured_p") != (16 if entry else 32)
             or any(receipt.get(key) != robot._am1_teleop_binding[key] for key in ("run_id", "host_incarnation"))):
         raise RuntimeError(f"AM1 {side} response active settings proof differs")
     return receipt
@@ -1044,6 +1046,19 @@ def _left_response_target_valid(robot, control, sample):
     if set(sample["body"]) != set(ZERO_BODY) or any(sample["body"][key] != 0 for key in ZERO_BODY):
         return False
     workspace = control._live_summary["workspace"]
+    from examples.alohamini.am1_live_teleop import LEFT_ENTRY_WORKSPACE_PROFILE, validate_target
+    if workspace.get("workspace_profile") == LEFT_ENTRY_WORKSPACE_PROFILE:
+        trial = getattr(robot, "_am1_left_response_p_trial", None)
+        if (trial is None or getattr(robot, "_am1_shutdown_in_progress", False) is True
+                or receipt["configured_p"] != 16 or receipt["workload_segment"] != "ordinary-arms"
+                or trial.binding["request"].get("workspace_profile") != LEFT_ENTRY_WORKSPACE_PROFILE):
+            return False
+        try:
+            validate_target(sample["target"], workspace=workspace)
+            key = "arm_left_elbow_flex.pos"
+            return sample["target"][key] <= min(control._teleop_entry_last_target, control._live_summary["cursor"][key]) + 1e-9
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return False
     shoulder_reference = _current_rest_shoulder_reference(robot, control, workspace, receipt)
     if receipt["workload_segment"] == "ordinary-arms":
         from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES, validate_target
@@ -1449,15 +1464,18 @@ def workspace(robot, identity, measured, *, goals=None):
         raise RuntimeError("AM1 teleop complete actual feedback is unavailable")
     result = {"version": 1, "units": {}, "bounds": {}, "reference": {}, "calibration": {}, "raw_bounds": {}}
     receipt = response_receipt(robot)
+    from examples.alohamini.am1_live_teleop import LEFT_ENTRY_WORKSPACE_PROFILE
     profile = None
     if receipt is not None:
         side = "left" if receipt["kind"] == "left-response-p" else "right"
         trial = getattr(robot, "_am1_" + side + "_response_p_trial")
         profile = trial.binding["request"].get("workspace_profile")
         if profile is not None:
+            entry = profile == LEFT_ENTRY_WORKSPACE_PROFILE
             if (side != "left" or receipt["workload_segment"] not in CURRENT_REST_WORKSPACE_PROFILES
-                    or profile != CURRENT_REST_WORKSPACE_PROFILES.get(receipt["workload_segment"])
-                    or receipt["configured_p"] != 32):
+                    or (profile != CURRENT_REST_WORKSPACE_PROFILES.get(receipt["workload_segment"]) and not entry)
+                    or entry and receipt["workload_segment"] != "ordinary-arms"
+                    or receipt["configured_p"] != (16 if entry else 32)):
                 raise RuntimeError("AM1 current-rest workspace requires its exact active left trial")
             result["workspace_profile"] = profile
     if goals is None:
@@ -1474,7 +1492,14 @@ def workspace(robot, identity, measured, *, goals=None):
             q0 = measured[key]
             if type(q0) not in (int, float) or not math.isfinite(q0):
                 raise RuntimeError("AM1 teleop actual resting pose is invalid")
-            if name.endswith("_elbow_flex"):
+            if profile == LEFT_ENTRY_WORKSPACE_PROFILE:
+                if name == "arm_left_elbow_flex":
+                    if not 1164 < seed <= 1324:
+                        raise RuntimeError("AM1 entry requires its fresh stopped seed in1165..1324")
+                    low, high = 1164, seed
+                else:
+                    low = high = seed
+            elif name.endswith("_elbow_flex"):
                 low, high = ((1051, 1164) if profile is not None else (2011, 2124)) if side == "left" else (1847, 1960)
                 if not low <= seed <= high:
                     raise RuntimeError("AM1 teleop actual elbow rest is outside supported bench workspace")
@@ -1487,7 +1512,7 @@ def workspace(robot, identity, measured, *, goals=None):
             if not cal[3] <= low <= high <= cal[4]:
                 raise RuntimeError("AM1 teleop bench workspace exceeds actual calibration")
             endpoints = sorted(normalized_raw(raw, cal, gripper=gripper) for raw in (low, high))
-            rate = 20.0 if gripper else 5 * 4096 / 360 * 200 / (cal[4] - cal[3])
+            rate = 20.0 if gripper else (1 if profile == LEFT_ENTRY_WORKSPACE_PROFILE else 5) * 4096 / 360 * 200 / (cal[4] - cal[3])
             result["units"][key] = "gripper_opening_percent" if gripper else "normalized_arm"
             result["bounds"][key] = {"min": endpoints[0], "max": endpoints[1], "rate_per_s": rate}
             result["reference"][key] = q0
@@ -1496,9 +1521,32 @@ def workspace(robot, identity, measured, *, goals=None):
     return validate_workspace(result)
 
 
+
+def _entry_encoded_goals(control, robot, bus, raw_goals):
+    """Inspect existing post-limiter bytes; never read a device or override a limiter."""
+    if getattr(robot, "_am1_teleop_first_error", None) is not None:
+        raise robot._am1_teleop_first_error
+    if (getattr(robot, "_am1_shutdown_in_progress", False) is True
+            or not binding_valid(robot) or robot._am1_teleop_binding != {**control.binding, "recipe": RECIPE}
+            or control.live_sample is None or not _left_response_target_valid(robot, control, control.live_sample)):
+        raise RuntimeError("AM1 entry encoded Goal owner/input changed or Stop prevailed")
+    side = "left" if bus is robot.left_bus else "right" if bus is robot.right_bus else None
+    names = robot.left_arm_motors if side == "left" else robot.right_arm_motors if side == "right" else ()
+    if not isinstance(raw_goals, dict) or set(raw_goals) != set(names) or side is None:
+        raise RuntimeError("AM1 entry requires its exact final encoded arm Goal map")
+    workspace = control._live_summary["workspace"]
+    for name, raw in raw_goals.items():
+        low, high = workspace["raw_bounds"][name + ".pos"]
+        if type(raw) is not int or not low <= raw <= high:
+            raise RuntimeError("AM1 entry final encoded Goal exceeds original window/held Goal: " + name)
+    # Original input freshness is checked again after this bounded in-memory inspection.
+    control.before_live_write(robot)
+
+
 def apply_frame(control, robot, command, marker_key):
     """Validate one original frame, then reuse the ordinary protected executor."""
     from examples.alohamini.am1_live_teleop import (
+        LEFT_ENTRY_WORKSPACE_PROFILE,
         TELEOP_ARM_KEYS,
         ZERO_BODY,
         validate_body,
@@ -1642,6 +1690,11 @@ def apply_frame(control, robot, command, marker_key):
             cursor_feedback_sequence=control.observation_id,
             cursor_intent_revision=control.intent_revision,
         )
+        if (control._live_summary["workspace"].get("workspace_profile") == LEFT_ENTRY_WORKSPACE_PROFILE
+                and getattr(control, "_teleop_entry_hold_epoch", None) != control.epoch):
+            # Only a new actual HOLD may rebase an entry, never the old q0 or a reader refresh.
+            control._teleop_entry_last_target = held["arm_left_elbow_flex.pos"]
+            control._teleop_entry_hold_epoch = control.epoch
         control.live_cursor_at = control.clock()
         return True
     if "live_deadline_monotonic_s" not in control._live_summary:
@@ -1694,13 +1747,18 @@ def apply_frame(control, robot, command, marker_key):
         )
         for key in TELEOP_ARM_KEYS
     }
+    entry = control._live_summary["workspace"].get("workspace_profile") == LEFT_ENTRY_WORKSPACE_PROFILE
     action.update(following)
     for key in ZERO_BODY:
         action.pop(key, None)
     action.update(original["body"])
     robot._am1_live_before_write = lambda: before_write(control, robot)
+    robot._am1_live_arm_goal_guard = (
+        (lambda bus, raw: _entry_encoded_goals(control, robot, bus, raw)) if entry else None)
     accepted = control._apply_standard(robot, action)
     if accepted:
+        if entry:
+            control._teleop_entry_last_target = original["target"]["arm_left_elbow_flex.pos"]
         control._live_summary.update(
             state="active",
             cursor=following,

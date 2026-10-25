@@ -1471,6 +1471,15 @@ def test_real_wss_clean_close_ends_qualified_wait_before_timeout(tmp_path):
         "normal_program_finish_ordinary_arms_intents_expired_replacement",
         "normal_program_finish_ordinary_arms_intents_duration",
         "normal_program_finish_ordinary_arms_intents_expired_finish_recovery",
+        "normal_program_finish_ordinary_arms_intents_entry",
+        "normal_program_finish_ordinary_arms_intents_entry_recovery",
+        "normal_program_finish_ordinary_arms_intents_entry_retreat",
+        "normal_program_finish_ordinary_arms_intents_entry_active_cap",
+        "normal_program_finish_ordinary_arms_intents_entry_wall_cap",
+        "normal_program_finish_ordinary_arms_intents_entry_delayed_wall",
+        "normal_program_finish_ordinary_arms_intents_entry_admission_late",
+        "normal_program_finish_ordinary_arms_intents_entry_clock_late",
+        "normal_program_finish_ordinary_arms_intents_entry_clock_no_reply",
     ],
 )
 def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
@@ -1490,8 +1499,11 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
     cycle_run = failure in {"normal_program_finish_left_reach_cycles", "normal_program_finish_left_reach_closing_cycles"}
     ordinary_arms = isinstance(failure, str) and failure.startswith("normal_program_finish_ordinary_arms")
     changing_intents = ordinary_arms and "_intents" in failure
+    entry_case = changing_intents and "_intents_entry" in failure
     finish_recovery = changing_intents and failure.endswith("expired_finish_recovery")
     pending_recovery_finish, recovery_reader = [], []
+    entry_clock_reads, entry_ceilings = [], []
+    entry_get_timeouts, entry_get_cancelled = [], []
     usb_finish = isinstance(failure, str) and failure.startswith(("usb_finite_finish", "usb_quit_"))
     program_finish = failure in {"bench_program_finish", "bench_program_finish_failed"} or normal_finish
     bench_case = failure in {"bench_input_gap", "bench_controller_gap", "bench_renewal_during_resume", "bench_renewal_attach_ceiling", "bench_renewal_snapshot_race",
@@ -1692,6 +1704,9 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 w = held_command119_workspace()
                 if ordinary_arms and not failure.endswith("old_profile"):
                     w["workspace_profile"] = "ordinary-arms-left-current-rest-1051-1164"
+            if entry_case:
+                from tests.robots.test_am1_teleop_workload import left_entry_workload
+                w = left_entry_workload()[2]
             value = {
                 "service_incarnation": "service",
                 "controller": {"device_id": "device", "controller_generation": "control"},
@@ -1740,6 +1755,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 live = value["run"]["live_input"]
                 live.update(cursor={**w["reference"], "arm_left_shoulder_lift.pos": 100.},
                             cursor_intent_revision=0)
+                if entry_case:
+                    live["cursor"] = dict(w["reference"])
                 live["accepted_target"] = dict(live["cursor"])
                 value["evidence"].update(active_acknowledged=False, acknowledged_intent_revision=0)
                 value["evidence"]["accepted_host_action"].update(
@@ -1832,6 +1849,11 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             return {"accepted": True, "status": "stopped"}
 
         async def wait(self, predicate, timeout):
+            if entry_case and failure.endswith("admission_late") and self.snapshot["run"] is None:
+                assert timeout <= 60., "entry admission reused the ordinary180s ceiling"
+                self.snapshot = self.state(owned_id)
+                pc_clock[0] = 70.
+                raise TimeoutError("entry admission conservative Start-request ceiling exhausted")
             if self.snapshot["run"] is None:
                 assert not predicate()
                 self.snapshot = self.state(foreign_id)
@@ -1843,6 +1865,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                     )
                 assert not predicate(), "same recipe on another run is not this accepted Start"
                 self.saw_foreign += 1
+                if entry_case and failure.endswith(("delayed_wall", "clock_late", "clock_no_reply")):
+                    pc_clock[0] += 7.
                 self.snapshot = self.state(owned_id)
                 if bench_case:
                     self.snapshot["run"].update(bench_continuity=True, operation_id=self.start_requests[0]["operation_id"],
@@ -2093,6 +2117,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             )
             if peer_wait_case and "teleop_elbow_settings" not in self.snapshot["evidence"]["accepted_host_action"]:
                 self.snapshot["run"]["live_input"].update(last_input_seq=-1, source=None, state="held", accepted_at=None)
+            if entry_case:
+                self.snapshot["run"]["live_input"].update(cursor=dict(payload["target"]), accepted_target=dict(payload["target"]))
             self.snapshot["evidence"]["measured_positions"] = payload["target"]
             if terminal_hold:
                 self.snapshot["evidence"]["active_acknowledged"] = True
@@ -2126,6 +2152,23 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         async def get(self, op):
             assert op == "state"
             self.cleanup_reads += 1
+            if entry_case and failure.endswith(("clock_late", "clock_no_reply")) and not self.stops and not entry_clock_reads:
+                entry_clock_reads.append(pc_clock[0])
+                try:
+                    if failure.endswith("clock_late"):
+                        await asyncio.sleep(.1)  # Scaled late reply; the earlier deadline must cancel it.
+                        pc_clock[0] = 75.
+                        return {"snapshot": copy.deepcopy(self.snapshot)}
+                    await asyncio.Event().wait()
+                finally:
+                    entry_get_cancelled.append(True)
+            if entry_case and failure.endswith("delayed_wall") and not entry_clock_reads:
+                requested = pc_clock[0]
+                value = copy.deepcopy(self.snapshot)
+                value["run"]["remaining_s"] = 300.-(requested-10.)
+                entry_clock_reads.append((requested, value["run"]["remaining_s"]))
+                pc_clock[0] += 8.  # Delayed reply; no new Pi time is inferred at receipt.
+                return {"snapshot": value}
             if mailbox_case and self.authoritative is not None and not self.stops:
                 pc_clock[0] += 2.01 if failure == "mailbox_zero_budget" else 0.05
                 self.snapshot = copy.deepcopy(self.authoritative)
@@ -2272,6 +2315,10 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 args.workload_segment, args.left_reach_cycles, args.duration_seconds = "left-reach", 3, 60.
             if ordinary_arms:
                 args.workload_segment, args.duration_seconds = "ordinary-arms", 12.
+            if entry_case:
+                args.left_entry, args.prepare_current_rest = True, True
+                args.bindings, args.output_root, args.duration_seconds = "synthetic-binding", str(tmp_path), 60.
+                monkeypatch.setattr(m, "prepare_current_rest_invocation", lambda *args: {"recipe": "physical-live-teleop"})
             if changing_intents:
                 from examples.alohamini import am1_teleop_workload
                 assert hasattr(m, "VirtualIntentReader"), "production runner has no changing-input reader"
@@ -2285,6 +2332,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                     def __init__(self, *values, **options):
                         options["clock"] = lambda: source_clock[0]
                         super().__init__(*values, **options)
+                        if entry_case and failure.endswith("delayed_wall") and options["intent_channel"] != "11111111-1111-4111-8111-111111111111":
+                            pc_clock[0] += 9.  # Workload/ready setup after the frozen admission mapping.
 
                 class Reader:
                     def __init__(self, *values, **options):
@@ -2300,6 +2349,38 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                     def take(self):
                         session = instances[0]
                         count = len(session.inputs)
+                        if entry_case:
+                            if failure.endswith("wall_cap"):
+                                pc_clock[0] += 20.
+                            if failure.endswith(("recovery", "retreat", "delayed_wall")) and count == 10 and count not in self.delivered:
+                                self.delivered.add(count)
+                                state = session.snapshot
+                                revision = state["run"]["intent_revision"]+1
+                                state["run"].update(status="paused", intent_revision=revision, remaining_s=295.)
+                                held = dict(state["run"]["live_input"]["cursor"])
+                                held["arm_left_elbow_flex.pos"] = m.normalized_raw(1298 if failure.endswith("retreat") else 1250, [3, 0, 1845, 864, 3073])
+                                state["run"]["live_input"].update(cursor=held, accepted_target=dict(held), cursor_intent_revision=revision)
+                                state["evidence"].update(active_acknowledged=False, acknowledged_intent_revision=revision)
+                                state["evidence"]["accepted_host_action"].update(state="paused", intent_revision=revision,
+                                    epoch=2, acquired_at_monotonic_s=6., accepted_action={"mode": "raw_goal_hold", "body_velocity": 0.})
+                                state["events"] = [{"kind": "native_input_expired", "at": 6., "run_id": owned_id, "service_incarnation": "service"}]
+                                source_clock[0] += 2.
+                                pc_clock[0] += 4.
+                                return None
+                            cap = failure.endswith(("active_cap", "wall_cap"))
+                            stages = {0: (1, "hold" if cap else "move"),
+                                      203 if failure.endswith("retreat") else 123: (2, "hold"),
+                                      205 if failure.endswith("retreat") else 125: (3, "finish")}
+                            if cap: stages = {0: (1, "hold")}
+                            if count not in stages or count in self.delivered:
+                                return None
+                            self.delivered.add(count)
+                            seq, op = stages[count]
+                            command = {"seq": seq, "op": op, "intent_channel": self.intent_channel,
+                                       "issued_at_perf_counter_s": source_clock[0], "expires_at_perf_counter_s": 70.}
+                            if op == "move":
+                                command.update(transition_seconds=20. if failure.endswith("retreat") else 12., targets={"arm_left_elbow_flex.pos": m.normalized_raw(1164, [3, 0, 1845, 864, 3073])})
+                            return command
                         expired_replacement = failure.endswith("expired_replacement")
                         if (failure.endswith(("expiry", "pause", "invalid")) or expired_replacement or finish_recovery) and count == 3:
                             self.waits += 1
@@ -2343,6 +2424,29 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
 
                 monkeypatch.setattr(am1_teleop_workload, "VirtualIntentWorkload", IntentSource)
                 monkeypatch.setattr(m, "VirtualIntentReader", Reader)
+                if entry_case and failure.endswith(("clock_late", "clock_no_reply")):
+                    original_wait_for = asyncio.wait_for
+                    async def bounded_clock_wait(awaitable, timeout):
+                        if (getattr(getattr(awaitable, "cr_code", None), "co_name", None) != "get"
+                            or entry_get_timeouts):
+                            return await original_wait_for(awaitable, timeout)
+                        entry_get_timeouts.append(timeout)
+                        if timeout > 53.:
+                            awaitable.close()
+                            raise AssertionError("entry timing GET extends the original Start-request+60 ceiling")
+                        task = asyncio.create_task(awaitable)
+                        await asyncio.sleep(0)  # Actual pending coroutine enters before deadline cancellation.
+                        pc_clock[0] = 70.
+                        return await original_wait_for(task, .001)
+                    monkeypatch.setattr(asyncio, "wait_for", bounded_clock_wait)
+                if entry_case and failure.endswith("delayed_wall"):
+                    original_resume = m.SameRunRecovery.resume
+                    async def bounded_resume(guard, **options):
+                        entry_ceilings.append(options["wall_deadline"])
+                        assert options["wall_deadline"] <= 70., "stale native remaining renewed entry wall time"
+                        assert guard.client.snapshot["run"]["remaining_s"] != entry_clock_reads[0][1], "clock-only GET overwrote current WSS state"
+                        return await original_resume(guard, **options)
+                    monkeypatch.setattr(m.SameRunRecovery, "resume", bounded_resume)
             if failure == "normal_program_finish_left_reach_zero_gripper":
                 args.workload_segment = "left-reach"
             if failure == "normal_program_finish_combined_body":
@@ -2382,6 +2486,19 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                     if not ordinary_arms:
                         self.duration_s = .001  # Reporting seam only; real Native held proof is exercised below.
             monkeypatch.setattr(am1_teleop_workload, "TeleopWorkload", ShortProgramme)
+            if entry_case and failure.endswith(("admission_late", "clock_late", "clock_no_reply")):
+                with pytest.raises(TimeoutError):
+                    asyncio.run(asyncio.wait_for(m.run(args), 10))
+                import json
+                session = instances[0]
+                summary = json.loads((tmp_path/"evidence/summary.json").read_text())
+                assert session.starts == 1 and session.resumes == 0 and not session.inputs
+                assert session.stops == [owned_id] and summary["native_cleanup_uncertain"] is False
+                assert summary["cleanup_errors"] == [] and not summary["finish_qualified"]
+                assert pc_clock[0] <= 70. and summary["frame_count"] == 0
+                if not failure.endswith("admission_late"):
+                    assert entry_get_timeouts == [53.] and entry_get_cancelled == [True]
+                return
             if ordinary_arms and failure.endswith(("old_profile", "advisory")):
                 with pytest.raises((RuntimeError, ValueError), match="ordinary-arms"):
                     asyncio.run(asyncio.wait_for(m.run(args), 10))
@@ -2420,6 +2537,48 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             session = instances[0]
             records = [json.loads(line) for line in (tmp_path / "evidence/frames.jsonl").read_text().splitlines()]
             start = next(row for row in records if row["event"] == "start_requested")
+            if entry_case:
+                frames = [row for row in records if row["event"] == "leader_frame"]
+                assert summary["finish_qualified"] and summary["native_held_qualified"]
+                assert session.starts == 1 and len(session.pauses) == 1 and session.stops == [owned_id]
+                assert summary["workspace"]["workspace_profile"] == m.LEFT_ENTRY_WORKSPACE_PROFILE
+                assert summary["original_native_deadline"] == 301. and not summary["producer_program_complete"]
+                assert all(row["frame"]["body"] == m.ZERO_BODY for row in frames)
+                assert all(row["native"]["run"]["live_input"]["required_view"] ==
+                           {"required": True, "qualified": True, "role": "chest"} for row in frames)
+                assert len({row["frame"]["source"]["source_id"] for row in frames}) == 1
+                ready = next(row for row in records if row["event"] == "virtual_input_ready")
+                assert ready["proposed_entry_endpoint_raw"] == 1164 and ready["workspace_profile"] == m.LEFT_ENTRY_WORKSPACE_PROFILE
+                if failure.endswith("active_cap"):
+                    assert summary["active_progress_s"] == 25. and len(frames) == 250
+                    assert summary["clean_input_end"] == "duration_elapsed"
+                elif failure.endswith("wall_cap"):
+                    assert len(frames) <= 2 and summary["active_progress_s"] <= .2
+                    assert summary["clean_input_end"] == "duration_elapsed"
+                else:
+                    assert len(frames) == (205 if failure.endswith("retreat") else 125) and summary["clean_input_end"] == "virtual_finish"
+                    key = "arm_left_elbow_flex.pos"
+                    endpoint = m.normalized_raw(1164, [3, 0, 1845, 864, 3073])
+                    origin = summary["selected_profile"]["command_reference"]
+                    assert all(all(value == origin[joint] for joint, value in row["frame"]["target"].items() if joint != key) for row in frames)
+                    assert frames[-1]["frame"]["target"][key] == endpoint
+                    assert all(b["frame"]["target"][key] <= a["frame"]["target"][key]+1e-9
+                               for index,(a,b) in enumerate(zip(frames,frames[1:]))
+                               if not failure.endswith("retreat") or index != 9)
+                    if failure.endswith(("recovery", "retreat", "delayed_wall")):
+                        assert session.resumes == 2
+                        assert frames[10]["frame"]["target"][key] == m.normalized_raw(1298 if failure.endswith("retreat") else 1250, [3, 0, 1845, 864, 3073])
+                        if failure.endswith("retreat"):
+                            assert frames[10]["frame"]["target"][key] > frames[9]["frame"]["target"][key]
+                        assert frames[10]["progress_s"] == pytest.approx(1.)
+                        assert frames[10]["virtual_intent"]["issued_at_perf_counter_s"] == 10.
+                        assert frames[10]["virtual_intent"]["expires_at_perf_counter_s"] == 70.
+                    else:
+                        assert session.resumes == 1
+                if failure.endswith("delayed_wall"):
+                    assert entry_clock_reads == [(17., 293.)]
+                    assert entry_ceilings == [70., 70.]
+                return
             if changing_intents:
                 frames = [row for row in records if row["event"] == "leader_frame"]
                 if failure.endswith("duration"):
@@ -11297,3 +11456,44 @@ def test_selected_view122_refusal_requires_exact_nonadmission_and_original_ident
     elif changed == "malformed":
         error.response = None
     assert m.selected_view_refusal(error) is (changed in {"grant", "input"})
+
+
+def test_left_entry_cli_selects_only_routine_interactive_frontdoor_and_finite_wall(tmp_path, monkeypatch):
+    m, seen = adapter(), []
+    async def run(args):
+        seen.append(args)
+        return {}
+    monkeypatch.setattr(m, "run", run)
+    argv = ["--url", "unused", "--ca", "unused", "--storage-state", "unused",
+            "--bindings", "unused", "--output-root", str(tmp_path), "--prepare-current-rest",
+            "--virtual-input", "interactive", "--left-entry"]
+    m.main(argv)
+    assert len(seen) == 1 and seen[0].left_entry and seen[0].duration_seconds == 60.
+    assert seen[0].workload_segment == "ordinary-arms" and seen[0].source == "virtual-leaders"
+    for extra in (["--duration-seconds", "61"], ["--virtual-input", "jsonl"], ["--source", "usb-leaders"],
+                  ["--bench-continuity"], ["--workload-segment", "left-reach"], ["--next-start-seconds", "1"]):
+        with pytest.raises(SystemExit): m.main(argv+extra)
+    assert len(seen) == 1
+    with pytest.raises(SystemExit):
+        m.main(["--url", "unused", "--ca", "unused", "--storage-state", "unused", "--output", "unused",
+                "--source", "virtual-leaders", "--workload-segment", "ordinary-arms", "--virtual-input", "interactive", "--left-entry"])
+
+
+def test_left_entry_frontdoor_prepares_new_profile_and_retains_exact_request_metadata(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from tools import am1_physical_executor as executor
+    m, calls = adapter(), []
+    binding = dict(kind="am1-teleop28-feedback-loss-admitted-known-cleanup-bindings", motor_head="a"*40,
+                   executor_head="b"*40, manifest_sha256="c"*64)
+    path = tmp_path/"binding.json"; path.write_text(json.dumps(binding))
+    def prepare(config, **options):
+        calls.append(options)
+        return dict(request=dict(source_head="a"*40, proportional=16, workspace_profile=options["workspace_profile"]),
+                    hardware_started=False, canonical_read_verified=True)
+    monkeypatch.setattr(executor, "prepare_left_response_p_remote", prepare)
+    output = tmp_path/"fresh"; output.mkdir()
+    m.prepare_current_rest_invocation(SimpleNamespace(bindings=str(path), left_entry=True), output)
+    assert calls[0]["workspace_profile"] == "ordinary-arms-left-entry-p16-1164-1324"
+    assert calls[0]["workload_segment"] == "ordinary-arms" and calls[0]["left_shoulder_startup_degrees"] == 1
+    assert json.loads((output/"preparation-receipt.private.json").read_text())["request"]["proportional"] == 16

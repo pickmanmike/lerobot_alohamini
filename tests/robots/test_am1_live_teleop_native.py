@@ -1320,3 +1320,201 @@ def test_current_rest119_original_goal_fence_is_rechecked_before_native_write(mo
     with pytest.raises(RuntimeError, match="response|hold|Stop"):
         control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2, sample=value))
     assert not [event for event in robot.events if event[0] == "action"]
+
+
+
+def left_entry_lane(monkeypatch, seed=1299, *, real_send=False):
+    from lerobot.robots.alohamini.am1_live_teleop import before_write
+    now, identity, owner, robot, control = lane()
+    trial = install_left_response_trial(monkeypatch, robot, workload="ordinary-arms", proportional=16)
+    trial.binding["request"].update(workspace_profile="ordinary-arms-left-entry-p16-1164-1324")
+    robot._am1_left_response_p_binding = copy.deepcopy(trial.binding)
+    robot.left_bus.raw["arm_left_elbow_flex"] = seed
+    robot.left_bus.goals["arm_left_elbow_flex"] = seed
+    robot._am1_live_before_write = lambda: before_write(control, robot)
+    assert control.apply(robot, frame(identity, owner, 0))
+    if real_send:
+        robot.config.max_relative_target = None
+        robot.logs, robot.cameras = {}, {}
+        robot.base_motors = ["base_left_wheel", "base_back_wheel", "base_right_wheel"]
+        robot.wheel_radius, robot.base_radius = .05, .125
+        robot.lift = SimpleNamespace(apply_action=lambda action: None)
+        robot._gripper_current_limit_ma, robot._joint_current_limit_ma = 500., 1800.
+        robot._gripper_release_margin = robot._joint_release_margin = 1.
+        robot._gripper_hold_goal, robot._gripper_hold_direction = {}, {}
+        robot._joint_hold_goal, robot._joint_hold_direction = {}, {}
+        robot._gripper_open_direction, robot._gripper_hold_close_step = {}, 3
+        robot.send_action = AlohaMini.send_action.__get__(robot)
+    return now, identity, owner, robot, control, trial
+
+
+def test_left_entry_native_uses_original_seed_singleton_holds_and_monotone_commands(monkeypatch):
+    from examples.alohamini.am1_live_teleop import normalized_raw
+    now, identity, owner, robot, control, trial = left_entry_lane(monkeypatch)
+    original = copy.deepcopy(control.live_snapshot()["workspace"])
+    key = "arm_left_elbow_flex.pos"
+    assert original["raw_bounds"][key] == [1164, 1299]
+    assert all(bounds[0] == bounds[1] for name, bounds in original["raw_bounds"].items() if name != key)
+    value = sample(control)
+    value["target"] = dict(control._live_summary["cursor"])
+    value["target"][key] = normalized_raw(1164, original["calibration"][key.removesuffix(".pos")])
+    now[0] += .05
+    assert control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2, sample=value))
+    delivered = control.live_snapshot()["cursor"][key]
+    assert delivered < original["reference"][key] and trial.receipt["configured_p"] == 16
+    # Pause reads current held Goals; a resumed input must not replay original q0.
+    robot.left_bus.raw["arm_left_elbow_flex"] = 1290
+    now[0] += .05
+    assert control.apply(robot, frame(identity, owner, 2, epoch=3, revision=1))
+    assert control.live_snapshot()["workspace"] == original
+    replay = sample(control, seq=2, expiry=now[0]+.25, acquired=1.1)
+    replay["target"] = dict(control.live_snapshot()["cursor"])
+    replay["target"][key] = original["reference"][key]
+    now[0] += .05
+    assert not control.apply(robot, frame(identity, owner, 3, mode="active", epoch=4, revision=1, sample=replay))
+
+
+@pytest.mark.parametrize("changed", ["other", "body", "source", "expired", "stop"])
+def test_left_entry_native_preserves_holds_expiry_source_and_stop(monkeypatch, changed):
+    now, identity, owner, robot, control, _ = left_entry_lane(monkeypatch)
+    value = sample(control)
+    value["target"] = dict(control.live_snapshot()["cursor"])
+    if changed == "other": value["target"]["arm_right_gripper.pos"] += .01
+    elif changed == "body": value["body"]["x.vel"] = 1
+    elif changed == "source": value["source"]["kind"] = "usb-leaders"
+    elif changed == "expired": value["valid_until_monotonic_s"] = now[0]
+    else: assert control.apply(robot, dict(ZERO))
+    now[0] += .05
+    assert not control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2, sample=value))
+    assert not [event for event in robot.events if event[0] == "action"]
+
+
+@pytest.mark.parametrize("changed", ["reverse", "expiry", "hard_fault", "stop"])
+def test_left_entry_native_rechecks_original_fences_at_actual_write_boundary(monkeypatch, changed):
+    from examples.alohamini.am1_live_teleop import normalized_raw
+    now, identity, owner, robot, control, _ = left_entry_lane(monkeypatch)
+    key = "arm_left_elbow_flex.pos"
+    value = sample(control)
+    value["target"] = dict(control.live_snapshot()["cursor"])
+    value["target"][key] = normalized_raw(1164, control.live_snapshot()["workspace"]["calibration"][key.removesuffix(".pos")])
+    now[0] += .05
+    assert control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2, sample=value))
+    before = len([event for event in robot.events if event[0] == "action"])
+    send = robot.send_action
+    fault = RuntimeError("original entry status fault")
+    def changed_before_write(action):
+        if changed == "reverse": control.live_sample["target"][key] = control.live_snapshot()["reference"][key]
+        elif changed == "expiry": now[0] += .3
+        elif changed == "hard_fault": robot._am1_teleop_first_error = fault
+        else: robot._am1_shutdown_in_progress = True
+        return send(action)
+    robot.send_action = changed_before_write
+    second = sample(control, seq=2, expiry=now[0]+.25, acquired=1.1, source_id=value["source"]["source_id"])
+    second["target"] = dict(value["target"])
+    now[0] += .05
+    if changed == "expiry":
+        assert control.apply(robot, frame(identity, owner, 2, mode="active", epoch=2, sample=second)) is False
+    else:
+        with pytest.raises(RuntimeError) as error:
+            control.apply(robot, frame(identity, owner, 2, mode="active", epoch=2, sample=second))
+        if changed == "hard_fault": assert error.value is fault
+    assert len([event for event in robot.events if event[0] == "action"]) == before
+
+
+@pytest.mark.parametrize("correction", ["outward_outside", "inward_outside", "other_left", "other_right", "bounded_retreat"])
+def test_left_entry_final_encoded_guard_preserves_limiters_but_refuses_outside_before_sdk_write(monkeypatch, correction):
+    from examples.alohamini.am1_live_teleop import normalized_raw
+    now, identity, owner, robot, control, _ = left_entry_lane(monkeypatch)
+    robot.config.max_relative_target = None
+    robot.logs, robot.cameras = {}, {}
+    robot.base_motors = ["base_left_wheel", "base_back_wheel", "base_right_wheel"]
+    robot.wheel_radius, robot.base_radius = .05, .125
+    robot.lift = SimpleNamespace(apply_action=lambda action: None)
+    robot._gripper_hold_goal = robot._joint_hold_goal = {}
+    robot._limit_gripper_goal_by_current = lambda bus, values: values
+    def limiter(bus, values):
+        values = dict(values)
+        left = bus is robot.left_bus
+        if correction in {"outward_outside", "inward_outside", "bounded_retreat"} and left:
+            raw = {"outward_outside": 1300, "inward_outside": 1163, "bounded_retreat": 1299}[correction]
+            values["arm_left_elbow_flex.pos"] = normalized_raw(raw, control.live_snapshot()["workspace"]["calibration"]["arm_left_elbow_flex"])
+        elif correction == "other_left" and left:
+            values["arm_left_wrist_roll.pos"] += .2
+        elif correction == "other_right" and not left:
+            values["arm_right_gripper.pos"] += .2
+        return values
+    robot._limit_joint_goal_by_current = limiter
+    robot.send_action = AlohaMini.send_action.__get__(robot)
+    value = sample(control)
+    value["target"] = dict(control.live_snapshot()["cursor"])
+    value["target"]["arm_left_elbow_flex.pos"] = normalized_raw(1164, control.live_snapshot()["workspace"]["calibration"]["arm_left_elbow_flex"])
+    now[0] += .05
+    if correction == "bounded_retreat":
+        assert control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2, sample=value))
+        assert robot.left_bus.goals["arm_left_elbow_flex"] == 1299
+    else:
+        with pytest.raises(RuntimeError, match="entry"):
+            control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2, sample=value))
+        assert not any(register == "Goal_Position" for bus in (robot.left_bus, robot.right_bus) for register, _ in bus.writes)
+
+
+
+def test_left_entry_continuous_one_degree_rate_allows_real_fifteen_hz_integer_ticks(monkeypatch):
+    from examples.alohamini.am1_live_teleop import normalized_raw
+    now, identity, owner, robot, control, _ = left_entry_lane(monkeypatch, real_send=True)
+    key = "arm_left_elbow_flex.pos"
+    workspace = copy.deepcopy(control.live_snapshot()["workspace"])
+    source_id = str(uuid4())
+    points = [1299]
+    for index in range(1, 31):
+        now[0] = 10 + index/15
+        value = sample(control, seq=index, expiry=now[0]+.24, acquired=1+index/15, source_id=source_id)
+        value["target"] = dict(control.live_snapshot()["cursor"])
+        value["target"][key] = normalized_raw(1164, workspace["calibration"][key.removesuffix(".pos")])
+        assert control.apply(robot, frame(identity, owner, index, mode="active", epoch=2, sample=value))
+        points.append(robot.left_bus.goals[key.removesuffix(".pos")])
+    assert all(0 <= left-right <= 1 for left, right in zip(points, points[1:]))
+    assert any(left-right == 1 for left, right in zip(points, points[1:]))
+    assert 1299-points[-1] <= 2*4096/360+1
+    assert control.live_snapshot()["workspace"] == workspace
+
+
+def test_left_entry_new_actual_hold_can_rebase_a_bounded_protective_retreat_without_q0_reset(monkeypatch):
+    from examples.alohamini.am1_live_teleop import normalized_raw
+    now, identity, owner, robot, control, _ = left_entry_lane(monkeypatch)
+    key = "arm_left_elbow_flex.pos"
+    frozen = copy.deepcopy(control.live_snapshot())
+    value = sample(control)
+    value["target"] = dict(frozen["cursor"])
+    value["target"][key] = normalized_raw(1164, frozen["workspace"]["calibration"][key.removesuffix(".pos")])
+    now[0] += .05
+    assert control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2, sample=value))
+    robot.left_bus.raw[key.removesuffix(".pos")] = 1295
+    now[0] += .05
+    assert control.apply(robot, frame(identity, owner, 2, epoch=3, revision=1))
+    fresh = sample(control, seq=2, expiry=now[0]+.25, acquired=1.1, source_id=value["source"]["source_id"])
+    fresh["target"] = dict(control.live_snapshot()["cursor"])
+    fresh["target"][key] = normalized_raw(1294, frozen["workspace"]["calibration"][key.removesuffix(".pos")])
+    now[0] += .05
+    assert control.apply(robot, frame(identity, owner, 3, mode="active", epoch=4, revision=1, sample=fresh))
+    for field in ("workspace", "reference", "live_admitted_at_monotonic_s", "live_deadline_monotonic_s"):
+        assert control.live_snapshot()[field] == frozen[field]
+
+
+
+def test_left_entry_encoded_guard_does_not_block_no_input_resume_readiness(monkeypatch):
+    from examples.alohamini.am1_live_teleop import normalized_raw
+    now, identity, owner, robot, control, _ = left_entry_lane(monkeypatch, real_send=True)
+    value = sample(control)
+    value["target"] = dict(control.live_snapshot()["cursor"])
+    key = "arm_left_elbow_flex.pos"
+    value["target"][key] = normalized_raw(1164, control.live_snapshot()["workspace"]["calibration"][key.removesuffix(".pos")])
+    now[0] += .05
+    assert control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2, sample=value))
+    now[0] += .01
+    assert control.apply(robot, frame(identity, owner, 2, epoch=3, revision=1))
+    robot.left_bus.writes.clear()
+    robot.right_bus.writes.clear()
+    now[0] += .01
+    assert control.apply(robot, frame(identity, owner, 3, mode="active", epoch=4, revision=1))
+    assert not any(register == "Goal_Position" for bus in (robot.left_bus, robot.right_bus) for register, _ in bus.writes)

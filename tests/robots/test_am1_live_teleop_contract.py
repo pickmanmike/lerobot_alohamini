@@ -184,3 +184,32 @@ def test_ordinary_arms_workspace_is_a_distinct_closed_current_rest_profile():
     changed["raw_bounds"][key][0] -= 1
     with pytest.raises(ValueError):
         m.validate_workspace(changed)
+
+
+@pytest.mark.parametrize("seed", [1165, 1299, 1324])
+def test_left_entry_workspace_is_closed_to_fresh_seed_and_single_joint(seed):
+    m, value = contract(), workspace()
+    value["workspace_profile"] = "ordinary-arms-left-entry-p16-1164-1324"
+    assert getattr(m, "LEFT_ENTRY_WORKSPACE_PROFILE", None) == value["workspace_profile"]
+    for key in KEYS:
+        cal = value["calibration"][key.removesuffix(".pos")]
+        raw = value["raw_bounds"][key][0]
+        value["raw_bounds"][key] = [raw, raw]
+        point = m.normalized_raw(raw, cal, gripper=key.endswith("gripper.pos"))
+        value["bounds"][key].update(min=point, max=point)
+        value["reference"][key] = point
+    key = "arm_left_elbow_flex.pos"
+    cal = value["calibration"][key.removesuffix(".pos")] = [3, 0, 1845, 864, 3073]
+    value["raw_bounds"][key] = [1164, seed]
+    value["reference"][key] = m.normalized_raw(seed, cal)
+    value["bounds"][key] = {"min": m.normalized_raw(1164, cal), "max": m.normalized_raw(seed, cal),
+                            "rate_per_s": 4096 / 360 * 200 / (3073-864)}
+    assert m.validate_workspace(value) == value
+    for mutation in ("outer", "inner", "reference", "other", "rate"):
+        bad = copy.deepcopy(value)
+        if mutation == "outer": bad["raw_bounds"][key][1] = 1325
+        elif mutation == "inner": bad["raw_bounds"][key][0] = 1163
+        elif mutation == "reference": bad["reference"][key] -= .01
+        elif mutation == "other": bad["raw_bounds"][KEYS[0]][1] += 1
+        else: bad["bounds"][key]["rate_per_s"] *= 1.01
+        with pytest.raises(ValueError): m.validate_workspace(bad)

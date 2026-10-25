@@ -25,6 +25,7 @@ from urllib.parse import urlencode, urlsplit
 from uuid import UUID, uuid4
 
 from examples.alohamini.am1_live_teleop import (
+    LEFT_ENTRY_WORKSPACE_PROFILE,
     TELEOP_ARM_KEYS,
     TELEOP_RECIPE,
     ZERO_BODY,
@@ -245,6 +246,12 @@ def _ordinary_arms_options(args):
         raise ValueError("ordinary-arms requires normal required-view virtual input without diagnostic interruptions")
     if getattr(args, "virtual_input", None) is not None and not selected:
         raise ValueError("changing virtual input requires the ordinary-arms profile")
+    if getattr(args, "left_entry", False) and (
+        not selected or getattr(args, "virtual_input", None) != "interactive"
+        or not getattr(args, "prepare_current_rest", False) or not getattr(args, "bindings", None)
+        or not getattr(args, "output_root", None) or not 0 < args.duration_seconds <= 60.
+    ):
+        raise ValueError("LEFT entry requires the explicit routine interactive current-rest frontdoor and wall budget <=60s")
     return selected
 
 
@@ -288,7 +295,8 @@ def prepare_current_rest_invocation(args, output):
     receipt = prepare_left_response_p_remote(
         str(PurePosixPath(config["sourcePinsPath"]).with_name("physical.json")),
         ssh="am1-pi", ttl_seconds=120, workload_segment="ordinary-arms",
-        workspace_profile=ORDINARY_ARMS_PROFILE, left_shoulder_startup_degrees=1,
+        workspace_profile=LEFT_ENTRY_WORKSPACE_PROFILE if getattr(args, "left_entry", False) else ORDINARY_ARMS_PROFILE,
+        left_shoulder_startup_degrees=1,
     )
     with (output / "preparation-receipt.private.json").open("x", encoding="utf-8") as stream:
         json.dump(receipt, stream, sort_keys=True, indent=2, allow_nan=False)
@@ -2439,7 +2447,7 @@ class SameRunRecovery:
 
     def check(self, state, *, history=True):
         run, evidence, live = state.get("run") or {}, state.get("evidence", {}), _live(state)
-        if self.original["workspace"].get("workspace_profile") == ORDINARY_ARMS_PROFILE and (
+        if self.original["workspace"].get("workspace_profile") in {ORDINARY_ARMS_PROFILE, LEFT_ENTRY_WORKSPACE_PROFILE} and (
             run.get("bench_continuity") is not False
             or (live.get("required_view") or {}).get("required") is not True
         ):
@@ -3883,6 +3891,7 @@ async def run(args):
 
     ordinary_arms = _ordinary_arms_options(args)
     changing_input = getattr(args, "virtual_input", None)
+    left_entry = getattr(args, "left_entry", False)
     left_reach_cycles = _left_reach_cycles(args)
     bench = getattr(args, "bench_continuity", False)
     segment = getattr(args, "workload_segment", "full")
@@ -3928,6 +3937,7 @@ async def run(args):
         "terminal_completion_policy": "owned_pause_native_hold_after_program_complete" if bench else "owned_pause_native_hold_after_finite_input",
         "clean_input_end": None,
         **({"virtual_input": changing_input, "interactive_input_complete": False} if changing_input else {}),
+        **({"left_entry": True, "active_budget_seconds": 25., "wall_budget_seconds": 60.} if left_entry else {}),
         "finish_qualified": False,
         "native_held_qualified": False,
         "zero_body_command": None,
@@ -4134,7 +4144,10 @@ async def run(args):
         reattached = False
 
         def admission_remaining():
-            remaining = admission_until - time.monotonic()
+            # Before a fresh Live clock is mapped, Start precedes every possible
+            # Live instant. Only entry clips this existing admission/GET budget.
+            ceiling = admission_until-120. if left_entry else admission_until
+            remaining = ceiling - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("original native admission ceiling exhausted")
             return remaining
@@ -4257,22 +4270,43 @@ async def run(args):
         run_id, deadline = client.snapshot["run"]["run_id"], client.snapshot["run"]["deadline"]
         summary.update(run_id=run_id, original_native_deadline=deadline, workspace=workspace)
         record({"event": "native_admitted", "snapshot": client.snapshot})
+        entry_wall_deadline = None
+        if left_entry:
+            clock_guard = SameRunRecovery(client, record)
+            requested = time.monotonic()
+            timing_state = (await asyncio.wait_for(client.get("state"), min(60., admission_remaining())))["snapshot"]
+            clock_guard.check(timing_state)
+            native = timing_state["run"]
+            remaining = native.get("remaining_s")
+            if (type(remaining) not in (int, float) or not math.isfinite(remaining)
+                or not 0 < remaining <= native["deadline"]-native["native_live_at"] <= 300.):
+                raise RuntimeError("LEFT entry original native wall clock unavailable")
+            # The request precedes this authenticated Pi sample. Reply/setup time
+            # consumes the ceiling; the clock-only result never replaces WSS proof.
+            live_age = native["deadline"]-native["native_live_at"]-remaining
+            entry_wall_deadline = requested+min(args.duration_seconds, 60.-live_age, remaining)
+            if entry_wall_deadline <= time.monotonic():
+                raise TimeoutError("LEFT entry original Live wall budget exhausted")
         if args.source == "virtual-leaders":
             if ordinary_arms:
-                if (workspace.get("workspace_profile") != ORDINARY_ARMS_PROFILE
+                if (workspace.get("workspace_profile") != (LEFT_ENTRY_WORKSPACE_PROFILE if left_entry else ORDINARY_ARMS_PROFILE)
                     or client.snapshot["run"].get("bench_continuity") is not False
                     or (_live(client.snapshot).get("required_view") or {}).get("required") is not True):
                     raise RuntimeError("ordinary-arms requires its exact qualified native normal required-view profile")
                 commands = _qualified_command_reference(client, workspace)
-                workload = source = (VirtualIntentWorkload(workspace, command_reference=commands, intent_channel=intent_channel)
+                workload = source = (VirtualIntentWorkload(workspace, command_reference=commands, intent_channel=intent_channel,
+                                                                                   **({"left_entry": True} if left_entry else {}))
                                      if changing_input else TeleopWorkload(workspace, segment=segment, command_reference=commands))
                 summary["selected_profile"] = workload.plan()
                 record({"event": "workload_plan", "run_id": run_id, **workload.plan()})
                 if changing_input:
                     record({"event": "virtual_input_ready", "run_id": run_id, "input_mode": changing_input,
                             "intent_channel": intent_channel,
+                            **({"workspace_profile": LEFT_ENTRY_WORKSPACE_PROFILE, "proposed_entry_endpoint_raw": 1164,
+                                "proposed_entry_endpoint": workload.entry_endpoint} if left_entry else {}),
                             "command_reference": commands, "bounds": workspace["bounds"], "units": workspace["units"],
-                            "controls": "move SECONDS VALID_FOR joint=value... | hold VALID_FOR | return SECONDS VALID_FOR | finish"})
+                            "controls": ("move SECONDS VALID_FOR left_elbow_flex="+str(workload.entry_endpoint)+" | hold VALID_FOR | finish"
+                                         if left_entry else "move SECONDS VALID_FOR joint=value... | hold VALID_FOR | return SECONDS VALID_FOR | finish")})
             elif segment in SelectedLeftWorkload.DURATIONS:
                 selected_kwargs = {"peer_side": peer["side"], "peer_direction": peer["direction_raw"], "peer_raw_step": peer["raw_step"],
                                    **({"peer_active_p": peer["active_p"]} if "active_p" in peer else {})} if peer else {}
@@ -4327,13 +4361,18 @@ async def run(args):
             renewal = asyncio.create_task(client.renew())
 
         if not bench:
-            await recovery.resume(renewal_check=renewal_healthy)
+            await recovery.resume(renewal_check=renewal_healthy,
+                                  **({"wall_deadline": entry_wall_deadline} if left_entry else {}))
             producer.native_cursor = _live(client.snapshot)["cursor"]
+            if left_entry:
+                workload.rejoin(producer.native_cursor)
             if workload and not args.next_start_seconds:
                 workload.admit(time.monotonic())
         active_at, interrupted, frame_count = (None if bench else time.monotonic()), False, 0
         activity_ceiling = (active_at + min(args.duration_seconds, client.snapshot["run"]["remaining_s"])
                             if changing_input else None)
+        if left_entry:
+            activity_ceiling = min(activity_ceiling, entry_wall_deadline)
 
         def wall_deadline():
             if changing_input:
@@ -4403,6 +4442,8 @@ async def run(args):
                     require_episode, refusal_identity, expected_pause, grant_error = False, None, None, None
             producer.native_cursor = _live(client.snapshot)["cursor"]
             producer.reacquire = True
+            if left_entry:
+                workload.rejoin(producer.native_cursor)
             if workload and not args.next_start_seconds and active_at is not None:
                 workload.admit(time.monotonic())
             return recovered
@@ -4520,7 +4561,7 @@ async def run(args):
                                    interactive_input_complete=True)
                     record({"event": "virtual_input_finished", "reason": "explicit_finish_or_clean_eof"})
                     break
-                if time.monotonic() >= activity_ceiling:
+                if time.monotonic() >= activity_ceiling or left_entry and workload.elapsed_s >= 25.:
                     summary["clean_input_end"] = "duration_elapsed"
                     record({"event": "virtual_input_finished", "reason": "original_session_budget_elapsed"})
                     break
@@ -4718,7 +4759,7 @@ async def run(args):
                     or args.next_start_seconds
                     and time.monotonic() - active_at >= args.next_start_seconds
                     or not args.next_start_seconds
-                    and workload.elapsed_s >= args.duration_seconds
+                    and workload.elapsed_s >= (min(25., args.duration_seconds) if left_entry else args.duration_seconds)
                 ):
                     if changing_input:
                         summary["clean_input_end"] = "duration_elapsed"
@@ -4998,11 +5039,13 @@ def main(argv=None):
     parser.add_argument("--bindings", help="existing matched component binding for routine invocation metadata")
     parser.add_argument("--prepare-current-rest", action="store_true",
                         help="prepare the explicit ordinary-arms LEFT-P32 request once before Claim/Start")
+    parser.add_argument("--left-entry", action="store_true",
+                        help="explicit P16 inward-only LEFT elbow entry to raw1164; ordinary fresh Stop required before P32")
     parser.add_argument("--virtual-input", choices=("interactive", "jsonl"),
                         help="live stdin intentions instead of the optional fixed12second ordinary-arms preset")
     for name in ("left-port", "right-port", "leader-id", "calibration-dir"):
         parser.add_argument("--" + name)
-    parser.add_argument("--duration-seconds", type=float, default=180.0)
+    parser.add_argument("--duration-seconds", type=float, default=None)
     parser.add_argument("--next-start-seconds", type=float)
     parser.add_argument("--interrupt-at-seconds", type=float)
     parser.add_argument("--interruption-seconds", type=float, default=0.65)
@@ -5019,6 +5062,8 @@ def main(argv=None):
         "--no-keyboard", action="store_true", help="USB stationary probe/arm-only operation; body stays zero"
     )
     args = parser.parse_args(argv)
+    if args.duration_seconds is None:
+        args.duration_seconds = 60. if args.left_entry else 180.
     frontdoor = args.prepare_current_rest or args.bindings is not None or args.output_root is not None
     if frontdoor and not (args.prepare_current_rest and args.bindings and args.output_root):
         parser.error("routine launch requires --bindings, --output-root and --prepare-current-rest together")
