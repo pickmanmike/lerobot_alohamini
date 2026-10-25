@@ -314,20 +314,32 @@ def _validate_response_baseline_refused_origin(run, proof, receipt, chain):
     request = binding["request"]
     source = proof.get("source") or {}
     backend = source.get("backend_contract") or {}
+    current_rest = isinstance(request, dict) and request.get("workload_segment") == "ordinary-arms"
+    request_fields = {"version", "kind", "request_id", "source_head", "proportional",
+                      "workload_segment", "boot_id", "expires_at_monotonic_s"}
     original_motor = "927c17aa52bdf8da3e0ab53d7a122bbb3749b816"
+    if current_rest:
+        request_fields |= {"workspace_profile", "left_shoulder_startup_degrees"}
+        original_motor = source.get("motor_head")
+        require(
+            type(original_motor) is str and re.fullmatch("[0-9a-f]{40}", original_motor) is not None
+            and request.get("workspace_profile") == "ordinary-arms-left-current-rest-1051-1164"
+            and type(request.get("left_shoulder_startup_degrees")) is int
+            and request["left_shoulder_startup_degrees"] == 1,
+            "exact ordinary current-rest profile and startup allowance required",
+        )
     require(
         isinstance(request, dict)
-        and set(request) == {"version", "kind", "request_id", "source_head", "proportional",
-                            "workload_segment", "boot_id", "expires_at_monotonic_s"}
+        and set(request) == request_fields
         and type(request["version"]) is int and request["version"] == 1
         and request["kind"] == "left-response-p"
         and type(request["proportional"]) is int and request["proportional"] == 32
-        and request["workload_segment"] == "left-reach"
+        and request["workload_segment"] == ("ordinary-arms" if current_rest else "left-reach")
         and request["source_head"] == source.get("motor_head") == backend.get("host_head") == original_motor
         and run.get("backend_contract") == backend and run.get("recipe") == "physical-live-teleop"
         and request["boot_id"] == proof.get("boot_id")
         and binding["request_sha256"] == sha(canonical(request)),
-        "exact original motor source and canonical consumed left-reach request required",
+        "exact original motor source and canonical consumed response request required",
     )
     for value in (request["request_id"], request["boot_id"]):
         require(type(value) is str and str(uuid.UUID(value)) == value, "canonical original request identity required")
@@ -351,8 +363,8 @@ def _validate_response_baseline_refused_origin(run, proof, receipt, chain):
         and all(type(value) is int for value in registers.values())
         and all(registers[key] == value for key, value in expected.items())
         and 864 <= registers["Present_Position"] <= 3073
-        and not 2011 <= registers["Present_Position"] <= 2124
-        and 2011 <= registers["Goal_Position"] <= 2124
+        and not (1051 if current_rest else 2011) <= registers["Present_Position"] <= (1164 if current_rest else 2124)
+        and (864 if current_rest else 2011) <= registers["Goal_Position"] <= (3073 if current_rest else 2124)
         and 40 <= registers["Present_Voltage"] <= 140
         and 0 <= registers["Present_Temperature"] < 70
         and individual == {"24": 16, "25": 0}

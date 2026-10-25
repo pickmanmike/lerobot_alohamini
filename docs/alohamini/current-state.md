@@ -1,6 +1,6 @@
 # AM1 current state
 
-Updated 2026-10-24 for the owner’s Packet18 practical ordinary-use continuation. Read [decisions and lessons](decisions-and-lessons.md) before diagnosing a known symptom; detailed commands/results remain in [Packet16](teleop-consolidation-16.md). This is an active index, not a replacement for historical evidence.
+Updated 2026-10-25 for the owner’s changing-operation continuity continuation. Read [decisions and lessons](decisions-and-lessons.md) before diagnosing a known symptom; detailed commands/results remain in [Packet16](teleop-consolidation-16.md). This is an active index, not a replacement for historical evidence.
 
 ## Objective and operating scope
 
@@ -11,6 +11,8 @@ AM1 remains wireless; P1 is temporary/advisory; AM2 and `main` are unchanged. Pi
 The owner’s operation-first continuation ([PR25 comment6258758730](https://github.com/pickmanmike/lerobot_alohamini/pull/25#issuecomment-6258758730)) supersedes earlier application-policy restrictions. The objective is useful starting, sustained control/viewing, recovery and ordinary reuse. Bounded virtual bench operation, focused implementation/testing, affected-component staging, supported retries and ordinary reconciliation/restart are authorized. Ownership leases, renewal/receipt timing, reconnect/rearm budgets and experiment criteria may change with a stated purpose and affected checks; fresh motion-input handling stays separate. Obtain new fenced authority after expiry; newer takeover/revocation/Pause/Stop prevails, including after a competitor’s lease expires. No automatic continuation after owner reboot or old-input replay. Genuine local device, sensing, calibration and motion protections remain binding.
 
 The owner reported widespread home Wi-Fi degradation on October 18, 2026, then restarted the network and expected improved operation ([restart update](https://github.com/pickmanmike/lerobot_alohamini/pull/25#issuecomment-6256276874)). Exact onset and per-event causation remain unknown. Home Network owns investigation. Existing checks and resumed attempts ran; Combined67 still lost required control continuity. The present mandate permits supported application mitigations and environmentally justified bounded retries without exact physical-cause certainty or a code change for every retry. It does not authorize network remediation or repetitive uninformative attempts. This remains the same chat, worktree and environment; knowledge recovery is complete.
+
+The owner separately reported on October25,2026 that MN56 was interrupted by network-connection testing, rebooted and restored. Exact AM1 run/timing and per-event causation were not supplied; retain this attributed event without generalizing it to earlier view/control holds.
 
 For a predetermined virtual bench exercise, explicitly select and record advisory browser presentation before Start; actual task-required local inputs stay mandatory. Keep WebRTC running, measured and recovering. This does not qualify strict-view operation or human visual teleoperation. Declare shortened/reordered segments before Start; later segments and next Start may be checked independently when their own prerequisites hold. Never extend an expired deadline or combine separate segments into a full pass.
 
@@ -33,18 +35,20 @@ The reviewed PC correction at bdcd61a0 shares finishing after a completed declar
 
 | Identity | Recorded state |
 | --- | --- |
-| Repository / integration | PR33/34 are integrated; actual base d4c5a3da69fade1131ff0bb4880ad302829fbdfe. [PR35](https://github.com/pickmanmike/lerobot_alohamini/pull/35) contains the reusable changing-input workflow and focused ordinary-launch fixes. Main/AM2 unchanged. |
+| Repository / integration | PR35 integrated at9fc82c0620756edff2e02fd1242aea05dbef01bf. [PR36](https://github.com/pickmanmike/lerobot_alohamini/pull/36) carries the focused continuity/applied-Goal observation slice and current supported repairs; draft/open. Main/AM2 unchanged. |
 | Packet18 initial source checkpoint | `2647b77c558a36f2b07f5730cf7906b4022ba868`; integration base `386d3c376c51d3431cf379af61ab99be95382ab8` after PR24 |
-| Installed motor | Stage67 retains Stage66 `374af24ab6f0accefa97346a10ac3c0fdebeb6b1`, full13 rows; zero motor builds or source changes in this increment. |
-| Installed runtime | Runtime52 `8d7fecc81d436417715d43dd79aaa8c9070fab79`; only session_transport.js changed, full22 rows. The other21 rows, including installed executor2e15f0b6, are retained. |
+| Installed motor | Stage68 `1a14b2559aebf10df20183aa9fbe094fa0196f94`, full13 rows; only the existing selected Goal reader changed from Stage67. |
+| Installed runtime | Runtime53 `f4a02fa332d0ae41ffe72bf43bac6410d503878d`, full22 rows; only webrtc.js changed from Stage67. Other21 rows, including executor2e15f0b6, retained. |
 | Installed camera / helper-manual | `bc3442b54d9c574a8feddb0ade642c9b351e59f9` / `0fe3997f12b9cdfdd01fda6f4c6b102781252448` |
-| Installed matched manifest | Stage67 `680fab7e8a0206f3de79fe47302b2babdea36cd331740c7c1945dbe76d40790c`. All ten stopped/idle phases passed; one runtime-only build from clean49a85176. Full13 motor, camera/helper/calibration/enrollment and all Windows configuration bytes/permissions retained. |
-| Immediate full matched predecessor | Full Stage66 motor374af24a/runtimec0b49e9f/MF920da4d7 bundles and manifest archived BEFORE Stage67 upload. Stage65 and older matched rollback records remain retained. |
+| Installed matched manifest | Stage68 `5308399a138a529036b9f46914b88552729808421f7e437a50b79f383b0026e1`. All ten existing stopped/idle phases completed. Windows motor pin changed byte-preserving, with other bytes and Owner/SDDL retained; calibration/enrollment unchanged. |
+| Immediate full matched predecessor | Full matched Stage67 motor374af24a/runtime8d7fecc8/MF680fab7e bundles/manifest archived before Stage68 upload. Earlier Stage66 and older matched rollbacks remain retained. |
 | Earlier full matched predecessor | Stage46 motor `8a3a91edb5cc299899db472c8e012ded43cc8258`, runtime `d80c7d28c52448d98a78f4f8ba8b7d0dfedcfc29`, manifest `11027f16780c32b46a69d57ea1cfd0b1e7f10e4d8e4fa38d297ff7a12d565653`, same camera/helper. Full bundles/manifest, the matched thirteen-file private backup and Windows bytes/ACL were retained before Stage48 advance. Stage47's temporary validator-only child and source-restoration receipt remain separate. Older matched rollbacks remain. |
 
 The table is the current deployment summary. The existing private `.cache/am1-knowledge-reuse-18/current-work.private.md` points to the single sealed stage receipt, full matched bundles and rollback; `.cache/am1-teleop-consolidation-16/current-state-16-published.private.md` is its publication companion. [Packet16](teleop-consolidation-16.md#current-status-and-source) retains procedure and historical provenance. Keep private bytes, permissions and credentials outside Git. Verify actual service interpreter/cwd/import roots before crediting changed code as deployed; a rollback identity is not proof of a cure.
 
 ## Resume work here
+
+The Stage68 first Start stopped before Live/0 streamed frames: actual LEFT elbow rest1299 was outside the explicitly selected1051..1164 corridor. P16/I0/D32 and all other baseline settings matched; no temporary P32 write occurred. All20 OFF/zero reads and camera release are retained, but unavailable pre-home lift qualification leaves native uncertainty true. The existing stopped reconciliation classifier is being corrected for this ordinary-profile no-write refusal; no movement or complete cleanup is credited from it. The measured pose change is unexplained, and neither the refused Start nor the owner-reported restored MN56 connection establishes its cause. Preserve the supported workspace; do not silently widen it or replay the inactive Goal.
 
 The reusable changing-input workflow is demonstrated in two distinct normal-required-Chest sessions. One ordinary command creates fresh UUID outputs, matched configuration and canonical preparation; use printed legal origins/bounds with move, hold, return and finish. It changes selected targets within one original workspace/reference/deadline rather than replaying the optional12-second preset. [Invocation and evidence](teleop-consolidation-16.md#verification-and-ordinary-use) retain the exact procedure.
 
