@@ -143,10 +143,65 @@ class VirtualIntentReader:
         def read():
             try:
                 if self.raw_stdin:
-                    # Raw reads own no BufferedReader lock at interpreter shutdown.
                     descriptor, pending = self.stream.fileno(), b""
+                    if os.name == "nt" and os.isatty(descriptor):
+                        # A blocking CRT console read can obstruct cold NumPy/torch
+                        # extension initialization. Poll before reading each character.
+                        import msvcrt
+
+                        line, extended = "", False
+                        while not self.closed:
+                            if not msvcrt.kbhit():
+                                time.sleep(.01)
+                                continue
+                            char = msvcrt.getwch()
+                            if extended:
+                                extended = False
+                            elif char in {"\x00", "\xe0"}:
+                                extended = True
+                            elif char in {"\x04", "\x1a"}:
+                                deliver("")
+                                return
+                            elif char in {"\r", "\n"}:
+                                if deliver(line+"\n"):
+                                    return
+                                line = ""
+                            elif char in {"\b", "\x7f"}:
+                                line = line[:-1]
+                            else:
+                                line += char
+                                if len(line.encode("utf-8")) > 4096:
+                                    raise ValueError("virtual input line exceeds4096UTF8bytes")
+                        return
+                    pipe_available = None
+                    if os.name == "nt":
+                        import ctypes
+                        import msvcrt
+                        from ctypes import wintypes
+
+                        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+                        kernel.GetFileType.argtypes = [wintypes.HANDLE]
+                        kernel.GetFileType.restype = wintypes.DWORD
+                        handle = msvcrt.get_osfhandle(descriptor)
+                        if kernel.GetFileType(handle) == 3:  # FILE_TYPE_PIPE
+                            kernel.PeekNamedPipe.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+                                                            wintypes.LPDWORD, wintypes.LPDWORD, wintypes.LPDWORD]
+                            kernel.PeekNamedPipe.restype = wintypes.BOOL
+
+                            def pipe_available():
+                                available = wintypes.DWORD()
+                                if not kernel.PeekNamedPipe(handle, None, 0, None, ctypes.byref(available), None):
+                                    error = ctypes.get_last_error()
+                                    if error in {109, 232, 233}:  # Closed/disconnected producer.
+                                        return -1
+                                    raise ctypes.WinError(error)
+                                return available.value
                     while not self.closed:
-                        chunk = os.read(descriptor, 4096)
+                        available = pipe_available() if pipe_available is not None else 4096
+                        if available == 0:
+                            time.sleep(.01)
+                            continue
+                        chunk = os.read(descriptor, min(4096, available)) if available > 0 else b""
                         if not chunk:
                             if pending:
                                 deliver(pending.decode("utf-8"))

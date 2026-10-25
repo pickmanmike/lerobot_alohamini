@@ -2969,18 +2969,30 @@ def test_ordinary_arms_preparation_is_explicit_closed_canonical_and_keeps_left_p
 
 
 @pytest.mark.parametrize("shoulder", [False, True])
-def test_ordinary_arms_preparer_relay_uses_exact_installed_profile_without_new_runtime_helper(tmp_path, monkeypatch, capsys, shoulder):
+@pytest.mark.parametrize("expired_pending", [False, True])
+def test_ordinary_arms_preparer_relay_uses_exact_installed_profile_without_new_runtime_helper(tmp_path, monkeypatch, capsys, shoulder, expired_pending):
     import io
     import json
     import shlex
     import subprocess
     import sys
     from contextlib import redirect_stdout
+    from pathlib import Path
 
     m = module()
-    path, config, _gains, _calibration = request_preparation_config(tmp_path, monkeypatch)
+    path, config, gains, _calibration = request_preparation_config(tmp_path, monkeypatch)
     native_config = "/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/7438c74662d59a02/physical.json"
     profile = "ordinary-arms-left-current-rest-1051-1164"
+    if expired_pending:
+        nonce = "33333333-3333-4333-8333-333333333333"
+        previous = dict(version=1, kind="left-response-p", request_id=nonce, source_head=config["host_head"],
+                        proportional=32, workload_segment="ordinary-arms", boot_id=gains._left_response_p_boot_id(),
+                        expires_at_monotonic_s=99., workspace_profile=profile)
+        raw = gains._right_p20_json(previous)
+        state = Path(config["physical_state_directory"])
+        (state / "left-response-p-request.json").write_bytes(raw)
+        (state / "left-response-p-request.json").chmod(0o600)
+        monkeypatch.setattr(gains.time, "monotonic", lambda: 100.)
     calls = []
     def remote(args, **options):
         values = shlex.split(args[7])
@@ -3002,7 +3014,130 @@ def test_ordinary_arms_preparer_relay_uses_exact_installed_profile_without_new_r
     assert result["request"]["workload_segment"] == "ordinary-arms" and result["request"]["proportional"] == 32
     assert result["request"].get("left_shoulder_startup_degrees") == (1 if shoulder else None)
     assert result["request"]["source_head"] == config["host_head"] and result["hardware_started"] is False
+    if expired_pending:
+        assert (state / ("left-response-p-expired-" + nonce + ".json")).read_bytes() == raw
+        assert result["request"]["request_id"] != nonce and result["request"]["expires_at_monotonic_s"] == 220.
     assert len(calls) == 1
+
+
+def test_expired_left_preparation_preserves_original_before_fresh_nonce(tmp_path, monkeypatch):
+    import uuid
+    from pathlib import Path
+    from tools import am1_physical_reconciliation as reconciliation
+
+    m = module()
+    path, config, gains, _calibration = request_preparation_config(tmp_path, monkeypatch)
+    state = Path(config["physical_state_directory"])
+    nonce = "33333333-3333-4333-8333-333333333333"
+    pending, retired = state / "left-response-p-request.json", state / ("left-response-p-expired-" + nonce + ".json")
+    request = dict(version=1, kind="left-response-p", request_id=nonce, source_head=config["host_head"],
+                   proportional=32, workload_segment="ordinary-arms", boot_id=gains._left_response_p_boot_id(),
+                   expires_at_monotonic_s=99., workspace_profile="ordinary-arms-left-current-rest-1051-1164",
+                   left_shoulder_startup_degrees=1)
+    raw = gains._right_p20_json(request)
+    pending.write_bytes(raw);pending.chmod(0o600)
+    original_inode = pending.stat().st_ino
+    monkeypatch.setattr(gains.time, "monotonic", lambda: 100.)
+    held, synced, closed = [], [], []
+    monkeypatch.setattr(reconciliation, "acquire_stopped_guard", lambda value: (held.append(True) or
+        SimpleNamespace(close=lambda: closed.append(True))))
+    sync = gains.AM1ElbowIntegralTrial._sync_directory
+    def synchronized(directory):
+        assert held and not closed
+        synced.append(retired.exists() and not pending.exists())
+        sync(directory)
+    monkeypatch.setattr(gains.AM1ElbowIntegralTrial, "_sync_directory", synchronized)
+    def fresh_nonce():
+        assert held and not closed and synced == [True]
+        assert retired.read_bytes() == raw and not pending.exists()
+        return uuid.UUID("66666666-6666-4666-8666-666666666666")
+    monkeypatch.setattr(uuid, "uuid4", fresh_nonce)
+    monkeypatch.setattr(m.ProtectedHostRun, "start", lambda *args, **kwargs: pytest.fail("no Start"))
+    monkeypatch.setattr(m, "OwnedUnit", lambda *args, **kwargs: pytest.fail("no owned device process"))
+    result = m.prepare_left_response_p_request(str(path), workload_segment="ordinary-arms",
+        workspace_profile="ordinary-arms-left-current-rest-1051-1164", left_shoulder_startup_degrees=1)
+    assert retired.read_bytes() == raw and retired.stat().st_ino == original_inode
+    assert gains._right_p20_file(retired)[0] == request
+    fresh, fresh_raw, _info = gains._right_p20_file(pending)
+    assert fresh == result["request"] and fresh["request_id"] != nonce
+    assert fresh["expires_at_monotonic_s"] == 220. and fresh["boot_id"] == request["boot_id"]
+    assert fresh_raw != raw and result["hardware_started"] is False
+    assert synced == [True, False] and closed == [True]
+    assert not list(state.glob("*-used-*")) and not list(state.glob(".*.tmp"))
+
+
+@pytest.mark.parametrize("obstruction", ["unexpired", "foreign-source", "foreign-boot", "bad-json", "nonfinite",
+    "negative-expiry", "p16", "used-restoration", "right", "legacy-right", "cleanup", "activity", "active-owner",
+    "archive-exists", "archive-race", "replaced", "symlink", "archive-sync-failed", "fresh-nonce-collision"])
+def test_expired_left_preparation_retirement_remains_closed(tmp_path, monkeypatch, obstruction):
+    import uuid
+    from pathlib import Path
+    from tools import am1_physical_reconciliation as reconciliation
+
+    m = module()
+    path, config, gains, _calibration = request_preparation_config(tmp_path, monkeypatch)
+    state = Path(config["physical_state_directory"])
+    nonce = "33333333-3333-4333-8333-333333333333"
+    pending, retired = state / "left-response-p-request.json", state / ("left-response-p-expired-" + nonce + ".json")
+    request = dict(version=1, kind="left-response-p", request_id=nonce, source_head=config["host_head"],
+                   proportional=32, workload_segment="left-reach", boot_id=gains._left_response_p_boot_id(),
+                   expires_at_monotonic_s=99.)
+    if obstruction == "unexpired":request["expires_at_monotonic_s"] = 101.
+    elif obstruction == "foreign-source":request["source_head"] = "a" * 40
+    elif obstruction == "foreign-boot":request["boot_id"] = "88888888-8888-4888-8888-888888888888"
+    elif obstruction == "negative-expiry":request["expires_at_monotonic_s"] = -1.
+    elif obstruction == "p16":request["proportional"] = 16
+    raw = gains._right_p20_json(request)
+    if obstruction == "bad-json":raw += b"\n"
+    elif obstruction == "nonfinite":raw = raw.replace(b"99.0", b"NaN")
+    pending.write_bytes(raw);pending.chmod(0o600)
+    blockers = {"used-restoration": "left-response-p-used-" + nonce + ".json", "right": "right-response-p-request.json",
+                "legacy-right": "response12-right-p20-request.json", "cleanup": "cleanup-uncertain.json",
+                "activity": "physical-in-progress.json"}
+    if obstruction in blockers:(state / blockers[obstruction]).write_bytes(b"retained blocking state")
+    if obstruction == "archive-exists":retired.write_bytes(b"existing expired record")
+    closed = []
+    def guard(value):
+        if obstruction == "active-owner":raise RuntimeError("Another physical owner is active")
+        return SimpleNamespace(close=lambda: closed.append(True))
+    monkeypatch.setattr(reconciliation, "acquire_stopped_guard", guard)
+    monkeypatch.setattr(gains.time, "monotonic", lambda: 100.)
+    monkeypatch.setattr(uuid, "uuid4", lambda: pytest.fail("retirement denial must precede a fresh nonce"))
+    if obstruction == "fresh-nonce-collision":
+        monkeypatch.setattr(uuid, "uuid4", lambda: uuid.UUID(nonce))
+    if obstruction == "archive-race":
+        publish = reconciliation._publish_no_replace
+        def archive_race(source, target):
+            assert source == pending and target == retired
+            retired.write_bytes(b"racing expired record")
+            publish(source, target)
+        monkeypatch.setattr(reconciliation, "_publish_no_replace", archive_race)
+    elif obstruction == "replaced":
+        read = gains._right_p20_file
+        def replaced(target):
+            value = read(target)
+            if target == pending:
+                pending.unlink();pending.write_bytes(b"replacement preserved")
+            return value
+        monkeypatch.setattr(gains, "_right_p20_file", replaced)
+    elif obstruction == "symlink":
+        is_symlink = Path.is_symlink
+        monkeypatch.setattr(Path, "is_symlink", lambda target: target == pending or is_symlink(target))
+    elif obstruction == "archive-sync-failed":
+        monkeypatch.setattr(gains.AM1ElbowIntegralTrial, "_sync_directory",
+                            lambda directory: (_ for _ in ()).throw(RuntimeError("archive sync failed")))
+    with pytest.raises((ValueError, RuntimeError, OSError)):
+        m.prepare_left_response_p_request(str(path))
+    assert closed == ([] if obstruction == "active-owner" else [True])
+    if obstruction in {"archive-sync-failed", "fresh-nonce-collision"}:
+        assert retired.read_bytes() == raw and not pending.exists()
+    else:
+        assert pending.read_bytes() == (b"replacement preserved" if obstruction == "replaced" else raw)
+        if obstruction in {"archive-exists", "archive-race"}:
+            assert retired.read_bytes() == (b"existing expired record" if obstruction == "archive-exists" else b"racing expired record")
+        else:assert not retired.exists()
+    if obstruction in blockers:assert (state / blockers[obstruction]).read_bytes() == b"retained blocking state"
+    assert not list(state.glob(".*.tmp"))
 
 
 def test_left_response_preparation_canonical_once_only_and_no_hardware(tmp_path, monkeypatch):

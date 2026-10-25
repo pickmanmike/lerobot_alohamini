@@ -2361,10 +2361,29 @@ def prepare_left_response_p_request(config_path, *, ttl_seconds=120, workspace_p
     try:
         forbidden = [state / name for name in (
             "cleanup-uncertain.json", "physical-in-progress.json",
-            "left-response-p-request.json", "right-response-p-request.json",
+            "right-response-p-request.json",
             "response12-right-p20-request.json")]
         if any(p.exists() or p.is_symlink() for p in forbidden):
             raise ValueError("Stopped known-clean state and no pending response request required")
+        pending = state / "left-response-p-request.json"
+        if pending.exists() or pending.is_symlink():
+            previous, original, info = _right_p20_file(pending)
+            _left_response_p_request(previous, config["host_head"])
+            used = state / ("left-response-p-used-" + previous["request_id"] + ".json")
+            if (previous["proportional"] != 32 or previous["boot_id"] != _left_response_p_boot_id()
+                or not 0 < previous["expires_at_monotonic_s"] <= time.monotonic()
+                or used.exists() or used.is_symlink()):
+                raise ValueError("Only an expired unconsumed current-boot LEFT-P32 request can be retired")
+            current = pending.stat(follow_symlinks=False)
+            if (current.st_dev, current.st_ino, current.st_size) != (info.st_dev, info.st_ino, info.st_size):
+                raise ValueError("Expired LEFT request changed before retirement")
+            retired = state / ("left-response-p-expired-" + previous["request_id"] + ".json")
+            _publish_no_replace(pending, retired)
+            AM1ElbowIntegralTrial._sync_directory(state)
+            _, retained, retained_info = _right_p20_file(retired)
+            if retained != original or (retained_info.st_dev, retained_info.st_ino) != (info.st_dev, info.st_ino):
+                raise ValueError("Expired LEFT request changed during retirement")
+        forbidden.append(pending)
         request = {
             "version": 1, "kind": "left-response-p", "request_id": str(uuid.uuid4()),
             "source_head": config["host_head"], "proportional": 32, "workload_segment": workload_segment,
@@ -2376,7 +2395,8 @@ def prepare_left_response_p_request(config_path, *, ttl_seconds=120, workspace_p
             request["left_shoulder_startup_degrees"] = left_shoulder_startup_degrees
         _left_response_p_request(request, config["host_head"])
         used = state / ("left-response-p-used-" + request["request_id"] + ".json")
-        if used.exists() or used.is_symlink():
+        retired_nonce = state / ("left-response-p-expired-" + request["request_id"] + ".json")
+        if any(p.exists() or p.is_symlink() for p in (used, retired_nonce)):
             raise ValueError("Fresh preparation nonce was already retired")
         raw = _right_p20_json(request)
         temporary = state / (".left-response-p-prepare-" + request["request_id"] + ".tmp")

@@ -305,6 +305,43 @@ def test_virtual_intent_real_stdin_uses_raw_read_and_daemon_close(tmp_path, monk
         os.close(descriptor)
 
 
+@pytest.mark.skipif(__import__("os").name != "nt", reason="Windows console backend")
+@pytest.mark.parametrize("has_input", [False, True])
+def test_virtual_intent_windows_console_polls_without_holding_blocking_crt_stdin(monkeypatch, has_input):
+    import msvcrt
+    import threading
+    from collections import deque
+    from types import SimpleNamespace
+
+    m, polled = adapter(), threading.Event()
+    chars = deque("hold 2\rfinish\r" if has_input else "")
+
+    def ready():
+        polled.set()
+        return bool(chars)
+
+    def blocked(*args):
+        raise RuntimeError("blocking CRT stdin read would obstruct cold native imports")
+
+    monkeypatch.setattr(m.sys, "stdin", SimpleNamespace(fileno=lambda: 123))
+    monkeypatch.setattr(m.os, "isatty", lambda descriptor: True)
+    monkeypatch.setattr(m.os, "read", blocked)
+    monkeypatch.setattr(msvcrt, "kbhit", ready)
+    monkeypatch.setattr(msvcrt, "getwch", lambda: chars.popleft())
+    reader = m.VirtualIntentReader("interactive", clock=lambda: 10.)
+    try:
+        reader.start()
+        assert polled.wait(1), "console reader must poll instead of retaining CRT stdin lock"
+        if has_input:
+            reader.thread.join(1)
+            assert reader.take()["op"] == "finish"
+        assert not reader.read_failed
+    finally:
+        reader.close()
+        reader.thread.join(1)
+    assert not reader.thread.is_alive()
+
+
 def test_virtual_intent_clean_eof_before_start_does_not_claim_or_create_motor_task(tmp_path, monkeypatch):
     import asyncio
     from types import SimpleNamespace
