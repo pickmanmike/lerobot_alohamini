@@ -598,7 +598,7 @@ def current_rest_normal_activation_case(case, tmp_path, monkeypatch, *, workload
 
     _, bound, trial, _, _, _ = left_response_p_robot(
         tmp_path, monkeypatch, workload_segment=workload_segment,
-        workspace_profile=("ordinary-arms-left-entry-p16-1164-1324" if entry else "ordinary-arms-left-current-rest-1051-1164" if workload_segment == "ordinary-arms" else CURRENT_REST_PROFILE),
+        workspace_profile=("ordinary-arms-left-entry-p16-1108-1268" if entry else "ordinary-arms-left-current-rest-1051-1164" if workload_segment == "ordinary-arms" else CURRENT_REST_PROFILE),
         proportional=16 if entry else 32,
         left_shoulder_startup_degrees=1 if workload_segment == "ordinary-arms" else None,
     )
@@ -619,7 +619,7 @@ def current_rest_normal_activation_case(case, tmp_path, monkeypatch, *, workload
     monkeypatch.setattr(am1_live_teleop, "refresh_startup_temperatures", lambda source: None)
     monkeypatch.setattr(am1_live_teleop, "verify_settings", lambda source: None)
     if entry:
-        robot.left_bus.registers["Present_Position", ELBOW] = 1299
+        robot.left_bus.registers["Present_Position", ELBOW] = 1204
     trial.prepare(robot)
     trial.disable_torque(robot)
     trial.apply(robot)
@@ -733,7 +733,7 @@ def test_current_rest_normal_activation_seed_readback_failure_restores_p_without
     assert robot.left_bus.registers["Lock", elbow] == 0 and not trial.restore_required
 
 
-@pytest.mark.parametrize("after_home", [1165, 1298, 1324])
+@pytest.mark.parametrize("after_home", [1165, 1204, 1268])
 def test_left_entry_real_normal_activation_seeds_fresh_rest_at_p16_and_restores_without_goal_replay(
     activation, tmp_path, monkeypatch, after_home,
 ):
@@ -759,7 +759,7 @@ def test_left_entry_real_normal_activation_seeds_fresh_rest_at_p16_and_restores_
     assert robot.left_bus.registers["Torque_Enable", elbow] == 0 and not trial.restore_required
 
 
-@pytest.mark.parametrize("after_home", [1164, 1325])
+@pytest.mark.parametrize("after_home", [1108, 1164, 1269])
 def test_left_entry_real_normal_activation_refuses_outside_fresh_seed_before_goal_write(
     activation, tmp_path, monkeypatch, after_home,
 ):

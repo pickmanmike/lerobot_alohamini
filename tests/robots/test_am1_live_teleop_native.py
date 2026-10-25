@@ -1332,11 +1332,11 @@ def test_current_rest119_original_goal_fence_is_rechecked_before_native_write(mo
 
 
 
-def left_entry_lane(monkeypatch, seed=1299, *, real_send=False, pan_hold_raw=None, pan_drive=0):
+def left_entry_lane(monkeypatch, seed=1268, *, real_send=False, pan_hold_raw=None, pan_drive=0):
     from lerobot.robots.alohamini.am1_live_teleop import before_write
     now, identity, owner, robot, control = lane()
     trial = install_left_response_trial(monkeypatch, robot, workload="ordinary-arms", proportional=16)
-    trial.binding["request"].update(workspace_profile="ordinary-arms-left-entry-p16-1164-1324")
+    trial.binding["request"].update(workspace_profile="ordinary-arms-left-entry-p16-1108-1268")
     robot._am1_left_response_p_binding = copy.deepcopy(trial.binding)
     robot.left_bus.raw["arm_left_elbow_flex"] = seed
     robot.left_bus.goals["arm_left_elbow_flex"] = seed
@@ -1366,17 +1366,17 @@ def test_left_entry_native_uses_original_seed_singleton_holds_and_monotone_comma
     now, identity, owner, robot, control, trial = left_entry_lane(monkeypatch)
     original = copy.deepcopy(control.live_snapshot()["workspace"])
     key = "arm_left_elbow_flex.pos"
-    assert original["raw_bounds"][key] == [1164, 1299]
+    assert original["raw_bounds"][key] == [1108, 1268]
     assert all(bounds[0] == bounds[1] for name, bounds in original["raw_bounds"].items() if name != key)
     value = sample(control)
     value["target"] = dict(control._live_summary["cursor"])
-    value["target"][key] = normalized_raw(1164, original["calibration"][key.removesuffix(".pos")])
+    value["target"][key] = normalized_raw(1108, original["calibration"][key.removesuffix(".pos")])
     now[0] += .05
     assert control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2, sample=value))
     delivered = control.live_snapshot()["cursor"][key]
     assert delivered < original["reference"][key] and trial.receipt["configured_p"] == 16
     # Pause reads current held Goals; a resumed input must not replay original q0.
-    robot.left_bus.raw["arm_left_elbow_flex"] = 1290
+    robot.left_bus.raw["arm_left_elbow_flex"] = 1260
     now[0] += .05
     assert control.apply(robot, frame(identity, owner, 2, epoch=3, revision=1))
     assert control.live_snapshot()["workspace"] == original
@@ -1409,7 +1409,7 @@ def test_left_entry_native_rechecks_original_fences_at_actual_write_boundary(mon
     key = "arm_left_elbow_flex.pos"
     value = sample(control)
     value["target"] = dict(control.live_snapshot()["cursor"])
-    value["target"][key] = normalized_raw(1164, control.live_snapshot()["workspace"]["calibration"][key.removesuffix(".pos")])
+    value["target"][key] = normalized_raw(1108, control.live_snapshot()["workspace"]["calibration"][key.removesuffix(".pos")])
     now[0] += .05
     assert control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2, sample=value))
     before = len([event for event in robot.events if event[0] == "action"])
@@ -1451,7 +1451,7 @@ def test_left_entry_final_encoded_guard_preserves_limiters_but_refuses_outside_b
         values = dict(values)
         left = bus is robot.left_bus
         if correction in {"outward_outside", "inward_outside", "bounded_retreat"} and left:
-            raw = {"outward_outside": 1300, "inward_outside": 1163, "bounded_retreat": 1299}[correction]
+            raw = {"outward_outside": 1269, "inward_outside": 1107, "bounded_retreat": 1268}[correction]
             values["arm_left_elbow_flex.pos"] = normalized_raw(raw, control.live_snapshot()["workspace"]["calibration"]["arm_left_elbow_flex"])
         elif correction == "other_left" and left:
             values["arm_left_wrist_roll.pos"] += .2
@@ -1462,11 +1462,11 @@ def test_left_entry_final_encoded_guard_preserves_limiters_but_refuses_outside_b
     robot.send_action = AlohaMini.send_action.__get__(robot)
     value = sample(control)
     value["target"] = dict(control.live_snapshot()["cursor"])
-    value["target"]["arm_left_elbow_flex.pos"] = normalized_raw(1164, control.live_snapshot()["workspace"]["calibration"]["arm_left_elbow_flex"])
+    value["target"]["arm_left_elbow_flex.pos"] = normalized_raw(1108, control.live_snapshot()["workspace"]["calibration"]["arm_left_elbow_flex"])
     now[0] += .05
     if correction == "bounded_retreat":
         assert control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2, sample=value))
-        assert robot.left_bus.goals["arm_left_elbow_flex"] == 1299
+        assert robot.left_bus.goals["arm_left_elbow_flex"] == 1268
     else:
         with pytest.raises(RuntimeError, match="entry"):
             control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2, sample=value))
@@ -1480,17 +1480,17 @@ def test_left_entry_continuous_one_degree_rate_allows_real_fifteen_hz_integer_ti
     key = "arm_left_elbow_flex.pos"
     workspace = copy.deepcopy(control.live_snapshot()["workspace"])
     source_id = str(uuid4())
-    points = [1299]
+    points = [1268]
     for index in range(1, 31):
         now[0] = 10 + index/15
         value = sample(control, seq=index, expiry=now[0]+.24, acquired=1+index/15, source_id=source_id)
         value["target"] = dict(control.live_snapshot()["cursor"])
-        value["target"][key] = normalized_raw(1164, workspace["calibration"][key.removesuffix(".pos")])
+        value["target"][key] = normalized_raw(1108, workspace["calibration"][key.removesuffix(".pos")])
         assert control.apply(robot, frame(identity, owner, index, mode="active", epoch=2, sample=value))
         points.append(robot.left_bus.goals[key.removesuffix(".pos")])
     assert all(0 <= left-right <= 1 for left, right in zip(points, points[1:]))
     assert any(left-right == 1 for left, right in zip(points, points[1:]))
-    assert 1299-points[-1] <= 2*4096/360+1
+    assert 1268-points[-1] <= 2*4096/360+1
     assert control.live_snapshot()["workspace"] == workspace
 
 
@@ -1501,15 +1501,15 @@ def test_left_entry_new_actual_hold_can_rebase_a_bounded_protective_retreat_with
     frozen = copy.deepcopy(control.live_snapshot())
     value = sample(control)
     value["target"] = dict(frozen["cursor"])
-    value["target"][key] = normalized_raw(1164, frozen["workspace"]["calibration"][key.removesuffix(".pos")])
+    value["target"][key] = normalized_raw(1108, frozen["workspace"]["calibration"][key.removesuffix(".pos")])
     now[0] += .05
     assert control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2, sample=value))
-    robot.left_bus.raw[key.removesuffix(".pos")] = 1295
+    robot.left_bus.raw[key.removesuffix(".pos")] = 1264
     now[0] += .05
     assert control.apply(robot, frame(identity, owner, 2, epoch=3, revision=1))
     fresh = sample(control, seq=2, expiry=now[0]+.25, acquired=1.1, source_id=value["source"]["source_id"])
     fresh["target"] = dict(control.live_snapshot()["cursor"])
-    fresh["target"][key] = normalized_raw(1294, frozen["workspace"]["calibration"][key.removesuffix(".pos")])
+    fresh["target"][key] = normalized_raw(1263, frozen["workspace"]["calibration"][key.removesuffix(".pos")])
     now[0] += .05
     assert control.apply(robot, frame(identity, owner, 3, mode="active", epoch=4, revision=1, sample=fresh))
     for field in ("workspace", "reference", "live_admitted_at_monotonic_s", "live_deadline_monotonic_s"):
@@ -1523,7 +1523,7 @@ def test_left_entry_encoded_guard_does_not_block_no_input_resume_readiness(monke
     value = sample(control)
     value["target"] = dict(control.live_snapshot()["cursor"])
     key = "arm_left_elbow_flex.pos"
-    value["target"][key] = normalized_raw(1164, control.live_snapshot()["workspace"]["calibration"][key.removesuffix(".pos")])
+    value["target"][key] = normalized_raw(1108, control.live_snapshot()["workspace"]["calibration"][key.removesuffix(".pos")])
     now[0] += .05
     assert control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2, sample=value))
     now[0] += .01
@@ -1541,7 +1541,7 @@ def test_left_entry_rate_cursor_counts_prior_sdk_work_once_at_real_command_inter
     now, identity, owner, robot, control, _ = left_entry_lane(monkeypatch, real_send=True)
     key = "arm_left_elbow_flex.pos"
     frozen = copy.deepcopy(control.live_snapshot())
-    # First twelve accepted receive/apply intervals, original fa176 native host monotonic clock.
+    # Original fa176 receive/apply intervals, replayed from the current legal1268 seed.
     intervals = [
         (0.000000000, 0.044411324), (0.044582860, 0.076411202),
         (0.101066596, 0.126406708), (0.126577095, 0.163601770),
@@ -1563,15 +1563,15 @@ def test_left_entry_rate_cursor_counts_prior_sdk_work_once_at_real_command_inter
         value = sample(control, seq=index, expiry=now[0]+.24, acquired=1+received, source_id=source_id)
         value["target"] = dict(frozen["cursor"])
         # Original135-tick/15-second intent =9 ticks/s; strictly below unchanged1 degree/s native cap.
-        value["target"][key] = normalized_raw(1299 - 9 * received, frozen["workspace"]["calibration"][key[:-4]])
+        value["target"][key] = normalized_raw(1268 - 9 * received, frozen["workspace"]["calibration"][key[:-4]])
         assert control.apply(robot, frame(identity, owner, index, mode="active", epoch=2, sample=value))
     result = control.live_snapshot()
     cursor_raw = (result["cursor"][key]+100) * 2209 / 200 + 864
     # Independently hand-calculated from last receive time at9 ticks/s.
-    expected_raw = 1293.7796184 if cadence == "actual-fa176" else 1281.
+    expected_raw = 1262.7796184 if cadence == "actual-fa176" else 1250.
     assert cursor_raw == pytest.approx(expected_raw, abs=1e-6)
     # Existing Feetech encoder truncates the positive raw command; cursor fractions remain continuous.
-    expected_encoded = 1293 if cadence == "actual-fa176" else 1281
+    expected_encoded = 1262 if cadence == "actual-fa176" else 1250
     assert robot.left_bus.goals[key[:-4]] == expected_encoded
     assert result["accepted_target"][key] == pytest.approx(normalized_raw(expected_encoded, frozen["workspace"]["calibration"][key[:-4]]))
     assert result["valid_until_monotonic_s"] == value["valid_until_monotonic_s"]
@@ -1596,7 +1596,7 @@ def test_ordinary_arms_five_degree_cursor_also_counts_protected_sdk_work_once(mo
         now[0] = 10 + index * .05
         value = sample(control, seq=index, expiry=now[0]+.24, acquired=1+index*.05, source_id=source_id)
         value["target"] = dict(frozen["cursor"])
-        value["target"][key] = normalized_raw(1164, frozen["workspace"]["calibration"][key[:-4]])
+        value["target"][key] = normalized_raw(1108, frozen["workspace"]["calibration"][key[:-4]])
         assert control.apply(robot, frame(identity, owner, index, mode="active", epoch=2, sample=value))
     cursor_raw = (control.live_snapshot()["cursor"][key]+100) * 2209 / 200 + 864
     # 0.1 active second at the existing5 degree/s ceiling =5.688888889 encoder ticks.
@@ -1624,10 +1624,10 @@ def test_successful_no_input_readiness_excludes_held_wait_from_first_current_inp
     now[0] = 20.05
     value = sample(control, expiry=20.29)
     value["target"] = dict(frozen["cursor"])
-    value["target"][key] = normalized_raw(1164, frozen["workspace"]["calibration"][key[:-4]])
+    value["target"][key] = normalized_raw(1108, frozen["workspace"]["calibration"][key[:-4]])
     assert control.apply(robot, frame(identity, owner, 2, mode="active", epoch=2, sample=value))
     cursor_raw = (control.live_snapshot()["cursor"][key]+100) * 2209 / 200 + 864
-    expected_raw = 1298.4311111111 if profile == "entry" else 1092.8444444444
+    expected_raw = 1267.4311111111 if profile == "entry" else 1092.8444444444
     assert cursor_raw == pytest.approx(expected_raw)
     assert control.live_snapshot()["valid_until_monotonic_s"] == 20.29
     for field in ("workspace", "reference", "live_admitted_at_monotonic_s", "live_deadline_monotonic_s"):
@@ -1644,7 +1644,7 @@ def test_left_entry_f291_literal_pan2628_survives_real_encoder_before_sdk_write(
     assert frozen["workspace"]["raw_bounds"][pan+".pos"] == [2628,2628]
     value = sample(control)
     value["target"] = dict(frozen["cursor"])
-    value["target"]["arm_left_elbow_flex.pos"] = normalized_raw(1164, frozen["workspace"]["calibration"]["arm_left_elbow_flex"])
+    value["target"]["arm_left_elbow_flex.pos"] = normalized_raw(1108, frozen["workspace"]["calibration"]["arm_left_elbow_flex"])
     now[0] += .05
     assert control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2, sample=value))
     assert robot.left_bus.goals[pan] == 2628
@@ -1676,7 +1676,7 @@ def test_left_entry_canonical_pan_still_refuses_genuine_limiter_change_before_sd
     frozen = copy.deepcopy(control.live_snapshot())
     value = sample(control)
     value["target"] = dict(frozen["cursor"])
-    value["target"]["arm_left_elbow_flex.pos"] = normalized_raw(1164, frozen["workspace"]["calibration"]["arm_left_elbow_flex"])
+    value["target"]["arm_left_elbow_flex.pos"] = normalized_raw(1108, frozen["workspace"]["calibration"]["arm_left_elbow_flex"])
     now[0] += .05
     with pytest.raises(RuntimeError, match="entry"):
         control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2, sample=value))
@@ -1684,3 +1684,9 @@ def test_left_entry_canonical_pan_still_refuses_genuine_limiter_change_before_sd
     assert robot.left_bus.goals[pan] == 2628
     if limiter == "current":
         assert robot._joint_hold_goal[pan] == normalized_raw(2627, frozen["workspace"]["calibration"][pan])
+
+
+@pytest.mark.parametrize("seed", [1108,1164,1269,1299,1324])
+def test_current_entry_native_refuses_inside_corridor_or_retired_larger_seed(monkeypatch, seed):
+    with pytest.raises(RuntimeError, match="seed"):
+        left_entry_lane(monkeypatch, seed=seed)

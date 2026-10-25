@@ -2360,7 +2360,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                                 revision = state["run"]["intent_revision"]+1
                                 state["run"].update(status="paused", intent_revision=revision, remaining_s=295.)
                                 held = dict(state["run"]["live_input"]["cursor"])
-                                held["arm_left_elbow_flex.pos"] = m.normalized_raw(1213 if failure.endswith("replan") else 1298 if failure.endswith("retreat") else 1250, [3, 0, 1845, 864, 3073])
+                                held["arm_left_elbow_flex.pos"] = m.normalized_raw(1213 if failure.endswith("replan") else 1267 if failure.endswith("retreat") else 1250, [3, 0, 1845, 864, 3073])
                                 state["run"]["live_input"].update(cursor=held, accepted_target=dict(held), cursor_intent_revision=revision)
                                 state["evidence"].update(active_acknowledged=False, acknowledged_intent_revision=revision)
                                 state["evidence"]["accepted_host_action"].update(state="paused", intent_revision=revision,
@@ -2371,8 +2371,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                                 return None
                             cap = failure.endswith(("active_cap", "wall_cap"))
                             stages = {0: (1, "hold" if cap else "move"),
-                                      295 if failure.endswith("replan") else 203 if failure.endswith("retreat") else 123: (2, "hold"),
-                                      297 if failure.endswith("replan") else 205 if failure.endswith("retreat") else 125: (3, "finish")}
+                                      367 if failure.endswith("replan") else 203 if failure.endswith("retreat") else 153: (2, "hold"),
+                                      369 if failure.endswith("replan") else 205 if failure.endswith("retreat") else 155: (3, "finish")}
                             if cap: stages = {0: (1, "hold")}
                             if count not in stages or count in self.delivered:
                                 return None
@@ -2381,7 +2381,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                             command = {"seq": seq, "op": op, "intent_channel": self.intent_channel,
                                        "issued_at_perf_counter_s": source_clock[0], "expires_at_perf_counter_s": 70.}
                             if op == "move":
-                                command.update(transition_seconds=15. if failure.endswith("replan") else 20. if failure.endswith("retreat") else 12., targets={"arm_left_elbow_flex.pos": m.normalized_raw(1164, [3, 0, 1845, 864, 3073])})
+                                command.update(transition_seconds=15. if failure.endswith("replan") else 20. if failure.endswith("retreat") else 15., targets={"arm_left_elbow_flex.pos": m.normalized_raw(m.LEFT_ENTRY_ENDPOINT_RAW, [3, 0, 1845, 864, 3073])})
                             return command
                         expired_replacement = failure.endswith("expired_replacement")
                         if (failure.endswith(("expiry", "pause", "invalid")) or expired_replacement or finish_recovery) and count == 3:
@@ -2550,7 +2550,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                            {"required": True, "qualified": True, "role": "chest"} for row in frames)
                 assert len({row["frame"]["source"]["source_id"] for row in frames}) == 1
                 ready = next(row for row in records if row["event"] == "virtual_input_ready")
-                assert ready["proposed_entry_endpoint_raw"] == 1164 and ready["workspace_profile"] == m.LEFT_ENTRY_WORKSPACE_PROFILE
+                assert ready["proposed_entry_endpoint_raw"] == m.LEFT_ENTRY_ENDPOINT_RAW and ready["workspace_profile"] == m.LEFT_ENTRY_WORKSPACE_PROFILE
                 if failure.endswith("active_cap"):
                     assert summary["active_progress_s"] == 25. and len(frames) == 250
                     assert summary["clean_input_end"] == "duration_elapsed"
@@ -2558,9 +2558,9 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                     assert len(frames) <= 2 and summary["active_progress_s"] <= .2
                     assert summary["clean_input_end"] == "duration_elapsed"
                 else:
-                    assert len(frames) == (297 if failure.endswith("replan") else 205 if failure.endswith("retreat") else 125) and summary["clean_input_end"] == "virtual_finish"
+                    assert len(frames) == (369 if failure.endswith("replan") else 205 if failure.endswith("retreat") else 155) and summary["clean_input_end"] == "virtual_finish"
                     key = "arm_left_elbow_flex.pos"
-                    endpoint = m.normalized_raw(1164, [3, 0, 1845, 864, 3073])
+                    endpoint = m.normalized_raw(m.LEFT_ENTRY_ENDPOINT_RAW, [3, 0, 1845, 864, 3073])
                     origin = summary["selected_profile"]["command_reference"]
                     assert all(all(value == origin[joint] for joint, value in row["frame"]["target"].items() if joint != key) for row in frames)
                     assert frames[-1]["frame"]["target"][key] == endpoint
@@ -2570,7 +2570,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                     if failure.endswith(("recovery", "retreat", "delayed_wall", "replan")):
                         assert session.resumes == 2
                         recovery_at = 224 if failure.endswith("replan") else 10
-                        assert frames[recovery_at]["frame"]["target"][key] == m.normalized_raw(1213 if failure.endswith("replan") else 1298 if failure.endswith("retreat") else 1250, [3, 0, 1845, 864, 3073])
+                        assert frames[recovery_at]["frame"]["target"][key] == m.normalized_raw(1213 if failure.endswith("replan") else 1267 if failure.endswith("retreat") else 1250, [3, 0, 1845, 864, 3073])
                         if failure.endswith("retreat"):
                             assert frames[10]["frame"]["target"][key] > frames[9]["frame"]["target"][key]
                         assert frames[recovery_at]["progress_s"] == pytest.approx(14.735 if failure.endswith("replan") else 1.)
@@ -11502,6 +11502,6 @@ def test_left_entry_frontdoor_prepares_new_profile_and_retains_exact_request_met
     monkeypatch.setattr(executor, "prepare_left_response_p_remote", prepare)
     output = tmp_path/"fresh"; output.mkdir()
     m.prepare_current_rest_invocation(SimpleNamespace(bindings=str(path), left_entry=True), output)
-    assert calls[0]["workspace_profile"] == "ordinary-arms-left-entry-p16-1164-1324"
+    assert calls[0]["workspace_profile"] == m.LEFT_ENTRY_WORKSPACE_PROFILE
     assert calls[0]["workload_segment"] == "ordinary-arms" and calls[0]["left_shoulder_startup_degrees"] == 1
     assert json.loads((output/"preparation-receipt.private.json").read_text())["request"]["proportional"] == 16

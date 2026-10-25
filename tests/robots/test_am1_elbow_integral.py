@@ -2347,10 +2347,10 @@ def test_left_shoulder_startup_authority_cannot_survive_mutation_or_stop(tmp_pat
     assert r.left_bus.events == boundary
 
 
-LEFT_ENTRY_PROFILE = "ordinary-arms-left-entry-p16-1164-1324"
+LEFT_ENTRY_PROFILE = "ordinary-arms-left-entry-p16-1108-1268"
 
 
-@pytest.mark.parametrize("raw", [1165, 1299, 1324])
+@pytest.mark.parametrize("raw", [1165, 1204, 1268])
 def test_left_entry_p16_transaction_admits_fresh_stopped_origin_without_gain_or_goal_write(tmp_path, monkeypatch, raw):
     _, r, trial, _, _, request = left_response_p_robot(
         tmp_path, monkeypatch, proportional=16, workspace_profile=LEFT_ENTRY_PROFILE,
@@ -2361,7 +2361,7 @@ def test_left_entry_p16_transaction_admits_fresh_stopped_origin_without_gain_or_
     trial.prepare(r)
     trial.disable_torque(r)
     trial.apply(r)
-    assert trial.raw_bounds == (1164, 1324)
+    assert trial.raw_bounds == (1108, 1268)
     assert trial.receipt["configured_p"] == 16 and trial.normal_rest_startup_degrees(r) == 1
     assert not [event for event in writes(r.left_bus) if event[1] in {"P_Coefficient", "Goal_Position"}]
     r._am1_shutdown_in_progress = True
@@ -2376,9 +2376,9 @@ def test_left_entry_p16_refuses_other_gains_unbounded_rest_and_unhealthy_owner(t
         tmp_path, monkeypatch, proportional=16, workspace_profile=LEFT_ENTRY_PROFILE,
         workload_segment="ordinary-arms",
     )
-    r.left_bus.values["Present_Position", ELBOW] = 1299
+    r.left_bus.values["Present_Position", ELBOW] = 1204
     if bad == "inside": r.left_bus.values["Present_Position", ELBOW] = 1164
-    elif bad == "outside": r.left_bus.values["Present_Position", ELBOW] = 1325
+    elif bad == "outside": r.left_bus.values["Present_Position", ELBOW] = 1269
     elif bad == "gain": r.left_bus.values["P_Coefficient", ELBOW] = 32
     elif bad == "status": r.left_bus.values["Status", ELBOW] = 1
     elif bad == "current": r.left_bus.values["Present_Current", ELBOW] = 310
@@ -2388,7 +2388,7 @@ def test_left_entry_p16_refuses_other_gains_unbounded_rest_and_unhealthy_owner(t
     assert not trial.restore_required and not writes(r.left_bus)
 
 
-@pytest.mark.parametrize("changed", ["p32", "side", "workload", "unknown", "allowance"])
+@pytest.mark.parametrize("changed", ["p32", "side", "workload", "unknown", "allowance", "legacy"])
 def test_left_entry_request_cannot_borrow_p32_or_another_role(tmp_path, monkeypatch, changed):
     module, _, _, _, value = left_response_p_files(
         tmp_path, monkeypatch, proportional=16, workspace_profile=LEFT_ENTRY_PROFILE,
@@ -2398,5 +2398,6 @@ def test_left_entry_request_cannot_borrow_p32_or_another_role(tmp_path, monkeypa
     elif changed == "side": value["kind"] = "right-response-p"
     elif changed == "workload": value["workload_segment"] = "left-reach"
     elif changed == "unknown": value["workspace_profile"] += "-other"
+    elif changed == "legacy": value["workspace_profile"] = "ordinary-arms-left-entry-p16-1164-1324"
     else: value["left_shoulder_startup_degrees"] = 2
     with pytest.raises(ValueError): module._left_response_p_request(value, "a" * 40)

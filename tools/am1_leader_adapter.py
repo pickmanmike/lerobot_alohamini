@@ -25,6 +25,7 @@ from urllib.parse import urlencode, urlsplit
 from uuid import UUID, uuid4
 
 from examples.alohamini.am1_live_teleop import (
+    LEFT_ENTRY_ENDPOINT_RAW,
     LEFT_ENTRY_WORKSPACE_PROFILE,
     TELEOP_ARM_KEYS,
     TELEOP_RECIPE,
@@ -4302,7 +4303,7 @@ async def run(args):
                 if changing_input:
                     record({"event": "virtual_input_ready", "run_id": run_id, "input_mode": changing_input,
                             "intent_channel": intent_channel,
-                            **({"workspace_profile": LEFT_ENTRY_WORKSPACE_PROFILE, "proposed_entry_endpoint_raw": 1164,
+                            **({"workspace_profile": LEFT_ENTRY_WORKSPACE_PROFILE, "proposed_entry_endpoint_raw": LEFT_ENTRY_ENDPOINT_RAW,
                                 "proposed_entry_endpoint": workload.entry_endpoint} if left_entry else {}),
                             "command_reference": commands, "bounds": workspace["bounds"], "units": workspace["units"],
                             "controls": ("move SECONDS VALID_FOR left_elbow_flex="+str(workload.entry_endpoint)+" | hold VALID_FOR | finish"
@@ -5040,7 +5041,7 @@ def main(argv=None):
     parser.add_argument("--prepare-current-rest", action="store_true",
                         help="prepare the explicit ordinary-arms LEFT-P32 request once before Claim/Start")
     parser.add_argument("--left-entry", action="store_true",
-                        help="explicit P16 inward-only LEFT elbow entry to raw1164; ordinary fresh Stop required before P32")
+                        help=f"explicit P16 inward-only LEFT elbow entry to raw{LEFT_ENTRY_ENDPOINT_RAW}; ordinary fresh Stop required before P32")
     parser.add_argument("--virtual-input", choices=("interactive", "jsonl"),
                         help="live stdin intentions instead of the optional fixed12second ordinary-arms preset")
     for name in ("left-port", "right-port", "leader-id", "calibration-dir"):

@@ -236,18 +236,18 @@ def test_changing_intent_closed_contract_refuses_before_changing_legal_targets(c
     assert not source.active and source.cursor == value["reference"]
 
 
-def left_entry_workload(seed=1299):
-    from examples.alohamini.am1_live_teleop import normalized_raw
+def left_entry_workload(seed=1268):
+    from examples.alohamini.am1_live_teleop import LEFT_ENTRY_ENDPOINT_RAW, LEFT_ENTRY_WORKSPACE_PROFILE, normalized_raw
     from examples.alohamini.am1_teleop_workload import VirtualIntentWorkload
 
     value = workspace()
-    value["workspace_profile"] = "ordinary-arms-left-entry-p16-1164-1324"
+    value["workspace_profile"] = LEFT_ENTRY_WORKSPACE_PROFILE
     key = "arm_left_elbow_flex.pos"
     value["calibration"][key[:-4]] = [3, 0, 1845, 864, 3073]
     for joint, raw in value["raw_bounds"].items():
         cal = value["calibration"][joint[:-4]]
         held = seed if joint == key else raw[0]
-        value["raw_bounds"][joint] = [1164, seed] if joint == key else [held, held]
+        value["raw_bounds"][joint] = [LEFT_ENTRY_ENDPOINT_RAW, seed] if joint == key else [held, held]
         lo, hi = value["raw_bounds"][joint]
         value["reference"][joint] = normalized_raw(held, cal, gripper=joint.endswith("gripper.pos"))
         value["bounds"][joint] = dict(min=normalized_raw(lo, cal, gripper=joint.endswith("gripper.pos")),
@@ -256,16 +256,16 @@ def left_entry_workload(seed=1299):
     now = [10.]
     source = VirtualIntentWorkload(value, command_reference=value["reference"], left_entry=True,
                                   clock=lambda: now[0], intent_channel="11111111-1111-4111-8111-111111111111")
-    endpoint = normalized_raw(1164, value["calibration"][key[:-4]])
+    endpoint = normalized_raw(LEFT_ENTRY_ENDPOINT_RAW, value["calibration"][key[:-4]])
     return source, now, value, endpoint
 
 
 def test_left_entry_intent_uses_actual_calibration_slow_endpoint_and_fixed_other_goals():
-    from examples.alohamini.am1_live_teleop import map_leader_action
+    from examples.alohamini.am1_live_teleop import LEFT_ENTRY_ENDPOINT_RAW, map_leader_action
 
     source, now, value, endpoint = left_entry_workload()
     key = "arm_left_elbow_flex.pos"
-    assert source.submit(intent(1, expiry=40., targets={key: endpoint}, seconds=12.))
+    assert source.submit(intent(1, expiry=40., targets={key: endpoint}, seconds=15.))
     source.admit(20.)
     source.advance(20.1)
     action = map_leader_action(source.get_action())
@@ -273,17 +273,20 @@ def test_left_entry_intent_uses_actual_calibration_slow_endpoint_and_fixed_other
     assert all(action[joint] == origin for joint, origin in source.origin.items() if joint != key)
     plan = source.plan()
     assert plan["workspace_profile"] == value["workspace_profile"]
-    assert plan["proposed_entry_endpoint_raw"] == 1164 and plan["proposed_entry_endpoint"] == endpoint
+    assert plan["proposed_entry_endpoint_raw"] == LEFT_ENTRY_ENDPOINT_RAW and plan["proposed_entry_endpoint"] == endpoint
     assert plan["physical_endpoint_verified"] is False
 
 
-@pytest.mark.parametrize("change", ["return", "away", "nonselected", "fast", "too_long"])
+@pytest.mark.parametrize("change", ["return", "away", "retired_endpoint", "nonselected", "fast", "too_long"])
 def test_left_entry_refuses_return_away_other_joints_and_unsafe_ramp(change):
     source, now, value, endpoint = left_entry_workload()
     key = "arm_left_elbow_flex.pos"
-    command = intent(1, expiry=40., targets={key: endpoint}, seconds=12.)
-    if change == "return": command = intent(1, op="return", seconds=12.)
+    command = intent(1, expiry=40., targets={key: endpoint}, seconds=15.)
+    if change == "return": command = intent(1, op="return", seconds=15.)
     elif change == "away": command["targets"][key] = source.origin[key]
+    elif change == "retired_endpoint":
+        from examples.alohamini.am1_live_teleop import normalized_raw
+        command["targets"][key] = normalized_raw(1164, value["calibration"][key[:-4]])
     elif change == "nonselected": command["targets"]["arm_right_elbow_flex.pos"] = source.origin["arm_right_elbow_flex.pos"]
     elif change == "fast": command["transition_seconds"] = 1.
     elif change == "too_long": command["transition_seconds"] = 26.
@@ -297,7 +300,7 @@ def test_left_entry_rejoin_uses_inward_held_cursor_without_renewing_original_bud
 
     source, now, value, endpoint = left_entry_workload()
     key = "arm_left_elbow_flex.pos"
-    assert source.submit(intent(1, expiry=30., targets={key: endpoint}, seconds=12.))
+    assert source.submit(intent(1, expiry=30., targets={key: endpoint}, seconds=15.))
     source.admit(20.)
     for index in range(10):
         source.advance(20.+(index+1)/10)
@@ -325,17 +328,17 @@ def test_left_entry_rejoin_uses_inward_held_cursor_without_renewing_original_bud
 def test_left_entry_hold_and_finish_are_inward_only_and_active_budget_is_not_reset():
     source, now, value, endpoint = left_entry_workload(seed=1165)
     key = "arm_left_elbow_flex.pos"
-    assert source.submit(intent(1, expiry=40., targets={key: endpoint}, seconds=.1))
+    assert source.submit(intent(1, expiry=40., targets={key: endpoint}, seconds=6.))
     source.admit(20.)
-    source.advance(20.1)
+    for step in range(60): source.advance(20.+(step+1)/10)
     source.accepted({"arm_"+joint: value for joint, value in source.get_action().items()})
     assert source.submit(intent(2, op="hold", expiry=40.))
     assert source.get_action()[key.removeprefix("arm_")] == endpoint
     source.elapsed_s = 24.95
-    source.admit(20.1)
-    source.advance(20.2)
+    source.admit(26.)
+    source.advance(26.1)
     assert source.elapsed_s == 25. and not source.active
-    assert not source.submit(intent(3, expiry=40., targets={key: endpoint}, seconds=.1))
+    assert not source.submit(intent(3, expiry=40., targets={key: endpoint}, seconds=6.))
     assert source.submit(intent(4, op="finish", expiry=40.)) and source.complete
 
 
@@ -347,7 +350,7 @@ def test_left_entry_fresh_qualified_limiter_retreat_rebases_without_old_source_c
     source.admit(20.)
     for index in range(10): source.advance(20.+(index+1)/10)
     source.accepted(map_leader_action(source.get_action()))
-    held = dict(source.cursor, **{key: normalized_raw(1298, value["calibration"][key[:-4]])})
+    held = dict(source.cursor, **{key: normalized_raw(1267, value["calibration"][key[:-4]])})
     assert held[key] > source.cursor[key]
     source.freeze(); source.rejoin(held, remaining_wall_s=26.)
     assert map_leader_action(source.get_action()) == held
@@ -358,26 +361,26 @@ def test_left_entry_fresh_qualified_limiter_retreat_rebases_without_old_source_c
     assert source.origin == value["reference"] and source.targets[key] == endpoint
 
 
-def test_left_entry_actual_fa176_rejoin_replans_remaining_ramp_without_new_intent_or_budget():
+def test_left_entry_current_profile_late_rejoin_replans_remaining_ramp_without_new_intent_or_budget():
     from examples.alohamini.am1_live_teleop import normalized_raw, map_leader_action
-    source, now, value, endpoint = left_entry_workload(seed=1299)
+    source, now, value, endpoint = left_entry_workload(seed=1268)
     key = "arm_left_elbow_flex.pos"
-    issued, expiry = 298098.1593407, 298143.1593407
+    issued, expiry = 10., 55.
     now[0] = issued
     command = intent(1, issued=issued, expiry=expiry, targets={key:endpoint}, seconds=15.)
     assert source.submit(command)
     source.elapsed_s = source.ramp_elapsed_s = 14.735
-    previous = dict(source.cursor, **{key:-72.54096876414668})
+    previous = dict(source.cursor, **{key:normalized_raw(1111,value["calibration"][key[:-4]])})
     source.accepted(previous)
     held = dict(source.cursor, **{key:normalized_raw(1213,value["calibration"][key[:-4]])})
-    now[0] = 298113.8849095
+    now[0] = 25.7255688
     source.freeze()
     source.rejoin(held, remaining_wall_s=26.)
     assert source.command == command and source.origin == value["reference"]
     assert source.elapsed_s == source.ramp_elapsed_s == 14.735
     assert source.get_action()[key.removeprefix("arm_")] == held[key]
     source.admit(100.)
-    for index in range(44): source.advance(100.+(index+1)/10)
+    for index in range(94): source.advance(100.+(index+1)/10)
     result = map_leader_action(source.get_action())
     assert result[key] == endpoint and source.elapsed_s <= 25.
     assert all(result[joint] == value for joint,value in source.origin.items() if joint != key)

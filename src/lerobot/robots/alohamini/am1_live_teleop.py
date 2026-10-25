@@ -1464,7 +1464,7 @@ def workspace(robot, identity, measured, *, goals=None):
         raise RuntimeError("AM1 teleop complete actual feedback is unavailable")
     result = {"version": 1, "units": {}, "bounds": {}, "reference": {}, "calibration": {}, "raw_bounds": {}}
     receipt = response_receipt(robot)
-    from examples.alohamini.am1_live_teleop import LEFT_ENTRY_WORKSPACE_PROFILE
+    from examples.alohamini.am1_live_teleop import LEFT_ENTRY_ENDPOINT_RAW, LEFT_ENTRY_START_MIN_RAW, LEFT_ENTRY_START_MAX_RAW, LEFT_ENTRY_WORKSPACE_PROFILE
     profile = None
     if receipt is not None:
         side = "left" if receipt["kind"] == "left-response-p" else "right"
@@ -1494,9 +1494,9 @@ def workspace(robot, identity, measured, *, goals=None):
                 raise RuntimeError("AM1 teleop actual resting pose is invalid")
             if profile == LEFT_ENTRY_WORKSPACE_PROFILE:
                 if name == "arm_left_elbow_flex":
-                    if not 1164 < seed <= 1324:
-                        raise RuntimeError("AM1 entry requires its fresh stopped seed in1165..1324")
-                    low, high = 1164, seed
+                    if not LEFT_ENTRY_START_MIN_RAW <= seed <= LEFT_ENTRY_START_MAX_RAW:
+                        raise RuntimeError("AM1 entry requires its fresh stopped seed in1165..1268")
+                    low, high = LEFT_ENTRY_ENDPOINT_RAW, seed
                 else:
                     low = high = seed
             elif name.endswith("_elbow_flex"):

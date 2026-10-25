@@ -3834,7 +3834,8 @@ def test_left_entry_canonical_preparer_and_reflected_remote_select_only_baseline
     m = module()
     path, config, gains, calibration = request_preparation_config(tmp_path, monkeypatch)
     before = calibration.read_bytes()
-    profile = "ordinary-arms-left-entry-p16-1164-1324"
+    from examples.alohamini.am1_live_teleop import LEFT_ENTRY_WORKSPACE_PROFILE
+    profile = LEFT_ENTRY_WORKSPACE_PROFILE
     options = dict(workload_segment="ordinary-arms", workspace_profile=profile, left_shoulder_startup_degrees=1)
     if expired_pending:
         from pathlib import Path
@@ -3868,3 +3869,22 @@ def test_left_entry_canonical_preparer_and_reflected_remote_select_only_baseline
         archived = pending.with_name("left-response-p-expired-"+previous["request_id"]+".json")
         assert archived.read_bytes() == original and archived.stat().st_nlink == 1
         assert request["request_id"] != previous["request_id"] and request["expires_at_monotonic_s"] == 220.
+
+
+@pytest.mark.parametrize("relay", [False, True])
+def test_left_entry_fresh_preparer_refuses_retired_profile_without_remote_work(tmp_path, monkeypatch, relay):
+    import subprocess
+    m = module()
+    path, config, gains, calibration = request_preparation_config(tmp_path, monkeypatch)
+    before = calibration.read_bytes()
+    def forbidden(*args, **kwargs):
+        raise AssertionError("retired entry profile must refuse before remote work")
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    options = dict(workload_segment="ordinary-arms", workspace_profile="ordinary-arms-left-entry-p16-1164-1324",
+                   left_shoulder_startup_degrees=1)
+    with pytest.raises(ValueError):
+        if relay:
+            m.prepare_left_response_p_remote("/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/"+"a"*16+"/physical.json", **options)
+        else:
+            m.prepare_left_response_p_request(str(path), **options)
+    assert calibration.read_bytes() == before

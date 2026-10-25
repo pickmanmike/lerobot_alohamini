@@ -8,7 +8,7 @@ import math
 import time
 from uuid import UUID, uuid4
 
-from .am1_live_teleop import LEFT_ENTRY_WORKSPACE_PROFILE, TELEOP_ARM_KEYS, normalized_raw, validate_target, validate_workspace
+from .am1_live_teleop import LEFT_ENTRY_ENDPOINT_RAW, LEFT_ENTRY_WORKSPACE_PROFILE, TELEOP_ARM_KEYS, normalized_raw, validate_target, validate_workspace
 
 
 class TeleopWorkload:
@@ -201,7 +201,7 @@ class VirtualIntentWorkload:
         if left_entry:
             self.entry_key = "arm_left_elbow_flex.pos"
             calibration = self.workspace["calibration"][self.entry_key[:-4]]
-            self.entry_endpoint = normalized_raw(1164, calibration)
+            self.entry_endpoint = normalized_raw(LEFT_ENTRY_ENDPOINT_RAW, calibration)
             self.entry_rate = min(self.workspace["bounds"][self.entry_key]["rate_per_s"],
                                   4096/360*200/(calibration[4]-calibration[3]))
         self._ramp_rebased_at = self._ramp_end_elapsed_s = 0.
@@ -259,7 +259,7 @@ class VirtualIntentWorkload:
                     or not abs(self.entry_endpoint-self.cursor[self.entry_key])/self.entry_rate
                            <= command["transition_seconds"] <= min(25., 25.-self.elapsed_s)
                 ):
-                    raise ValueError("LEFT entry permits only a slow move to raw1164, hold or finish")
+                    raise ValueError(f"LEFT entry permits only a slow move to raw{LEFT_ENTRY_ENDPOINT_RAW}, hold or finish")
         except ValueError:
             self.invalidate()
             raise
@@ -337,7 +337,7 @@ class VirtualIntentWorkload:
 
     def plan(self):
         return {"segment": self.segment, "input_mode": "changing-intent", "program_active_seconds": None,
-                **({"workspace_profile": LEFT_ENTRY_WORKSPACE_PROFILE, "proposed_entry_endpoint_raw": 1164,
+                **({"workspace_profile": LEFT_ENTRY_WORKSPACE_PROFILE, "proposed_entry_endpoint_raw": LEFT_ENTRY_ENDPOINT_RAW,
                     "proposed_entry_endpoint": self.entry_endpoint, "last_accepted_entry_command": self.cursor[self.entry_key],
                     "physical_endpoint_verified": False, "entry_duration_replans": self.entry_duration_replans,
                     "entry_ramp_remaining_active_s": max(0., self._ramp_end_elapsed_s-self.ramp_elapsed_s),
