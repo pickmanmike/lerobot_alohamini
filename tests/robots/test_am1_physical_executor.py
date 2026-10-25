@@ -2969,18 +2969,30 @@ def test_ordinary_arms_preparation_is_explicit_closed_canonical_and_keeps_left_p
 
 
 @pytest.mark.parametrize("shoulder", [False, True])
-def test_ordinary_arms_preparer_relay_uses_exact_installed_profile_without_new_runtime_helper(tmp_path, monkeypatch, capsys, shoulder):
+@pytest.mark.parametrize("expired_pending", [False, True])
+def test_ordinary_arms_preparer_relay_uses_exact_installed_profile_without_new_runtime_helper(tmp_path, monkeypatch, capsys, shoulder, expired_pending):
     import io
     import json
     import shlex
     import subprocess
     import sys
     from contextlib import redirect_stdout
+    from pathlib import Path
 
     m = module()
-    path, config, _gains, _calibration = request_preparation_config(tmp_path, monkeypatch)
+    path, config, gains, _calibration = request_preparation_config(tmp_path, monkeypatch)
     native_config = "/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/7438c74662d59a02/physical.json"
     profile = "ordinary-arms-left-current-rest-1051-1164"
+    if expired_pending:
+        nonce = "33333333-3333-4333-8333-333333333333"
+        previous = dict(version=1, kind="left-response-p", request_id=nonce, source_head=config["host_head"],
+                        proportional=32, workload_segment="ordinary-arms", boot_id=gains._left_response_p_boot_id(),
+                        expires_at_monotonic_s=99., workspace_profile=profile)
+        raw = gains._right_p20_json(previous)
+        state = Path(config["physical_state_directory"])
+        (state / "left-response-p-request.json").write_bytes(raw)
+        (state / "left-response-p-request.json").chmod(0o600)
+        monkeypatch.setattr(gains.time, "monotonic", lambda: 100.)
     calls = []
     def remote(args, **options):
         values = shlex.split(args[7])
@@ -3002,7 +3014,130 @@ def test_ordinary_arms_preparer_relay_uses_exact_installed_profile_without_new_r
     assert result["request"]["workload_segment"] == "ordinary-arms" and result["request"]["proportional"] == 32
     assert result["request"].get("left_shoulder_startup_degrees") == (1 if shoulder else None)
     assert result["request"]["source_head"] == config["host_head"] and result["hardware_started"] is False
+    if expired_pending:
+        assert (state / ("left-response-p-expired-" + nonce + ".json")).read_bytes() == raw
+        assert result["request"]["request_id"] != nonce and result["request"]["expires_at_monotonic_s"] == 220.
     assert len(calls) == 1
+
+
+def test_expired_left_preparation_preserves_original_before_fresh_nonce(tmp_path, monkeypatch):
+    import uuid
+    from pathlib import Path
+    from tools import am1_physical_reconciliation as reconciliation
+
+    m = module()
+    path, config, gains, _calibration = request_preparation_config(tmp_path, monkeypatch)
+    state = Path(config["physical_state_directory"])
+    nonce = "33333333-3333-4333-8333-333333333333"
+    pending, retired = state / "left-response-p-request.json", state / ("left-response-p-expired-" + nonce + ".json")
+    request = dict(version=1, kind="left-response-p", request_id=nonce, source_head=config["host_head"],
+                   proportional=32, workload_segment="ordinary-arms", boot_id=gains._left_response_p_boot_id(),
+                   expires_at_monotonic_s=99., workspace_profile="ordinary-arms-left-current-rest-1051-1164",
+                   left_shoulder_startup_degrees=1)
+    raw = gains._right_p20_json(request)
+    pending.write_bytes(raw);pending.chmod(0o600)
+    original_inode = pending.stat().st_ino
+    monkeypatch.setattr(gains.time, "monotonic", lambda: 100.)
+    held, synced, closed = [], [], []
+    monkeypatch.setattr(reconciliation, "acquire_stopped_guard", lambda value: (held.append(True) or
+        SimpleNamespace(close=lambda: closed.append(True))))
+    sync = gains.AM1ElbowIntegralTrial._sync_directory
+    def synchronized(directory):
+        assert held and not closed
+        synced.append(retired.exists() and not pending.exists())
+        sync(directory)
+    monkeypatch.setattr(gains.AM1ElbowIntegralTrial, "_sync_directory", synchronized)
+    def fresh_nonce():
+        assert held and not closed and synced == [True]
+        assert retired.read_bytes() == raw and not pending.exists()
+        return uuid.UUID("66666666-6666-4666-8666-666666666666")
+    monkeypatch.setattr(uuid, "uuid4", fresh_nonce)
+    monkeypatch.setattr(m.ProtectedHostRun, "start", lambda *args, **kwargs: pytest.fail("no Start"))
+    monkeypatch.setattr(m, "OwnedUnit", lambda *args, **kwargs: pytest.fail("no owned device process"))
+    result = m.prepare_left_response_p_request(str(path), workload_segment="ordinary-arms",
+        workspace_profile="ordinary-arms-left-current-rest-1051-1164", left_shoulder_startup_degrees=1)
+    assert retired.read_bytes() == raw and retired.stat().st_ino == original_inode
+    assert gains._right_p20_file(retired)[0] == request
+    fresh, fresh_raw, _info = gains._right_p20_file(pending)
+    assert fresh == result["request"] and fresh["request_id"] != nonce
+    assert fresh["expires_at_monotonic_s"] == 220. and fresh["boot_id"] == request["boot_id"]
+    assert fresh_raw != raw and result["hardware_started"] is False
+    assert synced == [True, False] and closed == [True]
+    assert not list(state.glob("*-used-*")) and not list(state.glob(".*.tmp"))
+
+
+@pytest.mark.parametrize("obstruction", ["unexpired", "foreign-source", "foreign-boot", "bad-json", "nonfinite",
+    "negative-expiry", "p16", "used-restoration", "right", "legacy-right", "cleanup", "activity", "active-owner",
+    "archive-exists", "archive-race", "replaced", "symlink", "archive-sync-failed", "fresh-nonce-collision"])
+def test_expired_left_preparation_retirement_remains_closed(tmp_path, monkeypatch, obstruction):
+    import uuid
+    from pathlib import Path
+    from tools import am1_physical_reconciliation as reconciliation
+
+    m = module()
+    path, config, gains, _calibration = request_preparation_config(tmp_path, monkeypatch)
+    state = Path(config["physical_state_directory"])
+    nonce = "33333333-3333-4333-8333-333333333333"
+    pending, retired = state / "left-response-p-request.json", state / ("left-response-p-expired-" + nonce + ".json")
+    request = dict(version=1, kind="left-response-p", request_id=nonce, source_head=config["host_head"],
+                   proportional=32, workload_segment="left-reach", boot_id=gains._left_response_p_boot_id(),
+                   expires_at_monotonic_s=99.)
+    if obstruction == "unexpired":request["expires_at_monotonic_s"] = 101.
+    elif obstruction == "foreign-source":request["source_head"] = "a" * 40
+    elif obstruction == "foreign-boot":request["boot_id"] = "88888888-8888-4888-8888-888888888888"
+    elif obstruction == "negative-expiry":request["expires_at_monotonic_s"] = -1.
+    elif obstruction == "p16":request["proportional"] = 16
+    raw = gains._right_p20_json(request)
+    if obstruction == "bad-json":raw += b"\n"
+    elif obstruction == "nonfinite":raw = raw.replace(b"99.0", b"NaN")
+    pending.write_bytes(raw);pending.chmod(0o600)
+    blockers = {"used-restoration": "left-response-p-used-" + nonce + ".json", "right": "right-response-p-request.json",
+                "legacy-right": "response12-right-p20-request.json", "cleanup": "cleanup-uncertain.json",
+                "activity": "physical-in-progress.json"}
+    if obstruction in blockers:(state / blockers[obstruction]).write_bytes(b"retained blocking state")
+    if obstruction == "archive-exists":retired.write_bytes(b"existing expired record")
+    closed = []
+    def guard(value):
+        if obstruction == "active-owner":raise RuntimeError("Another physical owner is active")
+        return SimpleNamespace(close=lambda: closed.append(True))
+    monkeypatch.setattr(reconciliation, "acquire_stopped_guard", guard)
+    monkeypatch.setattr(gains.time, "monotonic", lambda: 100.)
+    monkeypatch.setattr(uuid, "uuid4", lambda: pytest.fail("retirement denial must precede a fresh nonce"))
+    if obstruction == "fresh-nonce-collision":
+        monkeypatch.setattr(uuid, "uuid4", lambda: uuid.UUID(nonce))
+    if obstruction == "archive-race":
+        publish = reconciliation._publish_no_replace
+        def archive_race(source, target):
+            assert source == pending and target == retired
+            retired.write_bytes(b"racing expired record")
+            publish(source, target)
+        monkeypatch.setattr(reconciliation, "_publish_no_replace", archive_race)
+    elif obstruction == "replaced":
+        read = gains._right_p20_file
+        def replaced(target):
+            value = read(target)
+            if target == pending:
+                pending.unlink();pending.write_bytes(b"replacement preserved")
+            return value
+        monkeypatch.setattr(gains, "_right_p20_file", replaced)
+    elif obstruction == "symlink":
+        is_symlink = Path.is_symlink
+        monkeypatch.setattr(Path, "is_symlink", lambda target: target == pending or is_symlink(target))
+    elif obstruction == "archive-sync-failed":
+        monkeypatch.setattr(gains.AM1ElbowIntegralTrial, "_sync_directory",
+                            lambda directory: (_ for _ in ()).throw(RuntimeError("archive sync failed")))
+    with pytest.raises((ValueError, RuntimeError, OSError)):
+        m.prepare_left_response_p_request(str(path))
+    assert closed == ([] if obstruction == "active-owner" else [True])
+    if obstruction in {"archive-sync-failed", "fresh-nonce-collision"}:
+        assert retired.read_bytes() == raw and not pending.exists()
+    else:
+        assert pending.read_bytes() == (b"replacement preserved" if obstruction == "replaced" else raw)
+        if obstruction in {"archive-exists", "archive-race"}:
+            assert retired.read_bytes() == (b"existing expired record" if obstruction == "archive-exists" else b"racing expired record")
+        else:assert not retired.exists()
+    if obstruction in blockers:assert (state / blockers[obstruction]).read_bytes() == b"retained blocking state"
+    assert not list(state.glob(".*.tmp"))
 
 
 def test_left_response_preparation_canonical_once_only_and_no_hardware(tmp_path, monkeypatch):
@@ -3095,7 +3230,7 @@ def test_left_response_preparation_cli_uses_only_fixed_reviewed_ssh_payload(monk
     calls = []
     def run(args, **kwargs):
         calls.append((args, kwargs))
-        return SimpleNamespace(returncode=0, stdout=json.dumps({"prepared": True}), stderr="")
+        return SimpleNamespace(returncode=0, stdout=json.dumps(public_remote_preparation_receipt()), stderr="")
     monkeypatch.setattr(subprocess, "run", run)
     assert m.main(["--prepare-left-response-p", "--ssh", "am1-pi", "--config", config]) == 0
     args, options = calls.pop()
@@ -3106,7 +3241,7 @@ def test_left_response_preparation_cli_uses_only_fixed_reviewed_ssh_payload(monk
     assert "def prepare_left_response_p_request(" in options["input"]
     assert "/home/pickmanmike/am1_physical_trial" in options["input"]
     assert "consume_left_response_p_request" not in options["input"]
-    assert json.loads(capsys.readouterr().out) == {"prepared": True}
+    assert json.loads(capsys.readouterr().out) == public_remote_preparation_receipt()
     for changed in (["--ssh", "am1-pi;echo"], ["--config", config + "';echo bad"],
                     ["--config", "../../etc/passwd"], ["--ttl-seconds", "121"]):
         with pytest.raises((SystemExit, ValueError)):
@@ -3580,3 +3715,112 @@ def test_readiness_gate_rechecks_cancellation_after_socket_before_client(readine
     with pytest.raises(RuntimeError, match="cancelled by Stop" if fault == "stop" else "startup deadline expired"):
         case.start()
     assert not case.clients
+
+
+def public_remote_preparation_receipt(*,workload='left-reach',profile=None,shoulder=None):
+    import hashlib,json
+    request=dict(version=1,kind='left-response-p',request_id='66666666-6666-4666-8666-666666666666',source_head='a'*40,proportional=32,workload_segment=workload,boot_id='77777777-7777-4777-8777-777777777777',expires_at_monotonic_s=12345.0)
+    if profile is not None:request['workspace_profile']=profile
+    if shoulder is not None:request['left_shoulder_startup_degrees']=shoulder
+    raw=json.dumps(request,sort_keys=True,separators=(',',':'),allow_nan=False).encode()
+    return dict(path='/home/pickmanmike/.local/state/am1-session/left-response-p-request.json',sha256=hashlib.sha256(raw).hexdigest(),request=request,canonical_read_verified=True,hardware_started=False)
+
+
+def test_public_invocation_factory_preserves_actual_stage66_legacy_seven_field_bytes():
+    import json
+    m=module();factory=getattr(m,'invocation_config',None)
+    assert callable(factory),'public matched invocation factory missing'
+    binding=dict(kind='am1-teleop28-feedback-loss-admitted-known-cleanup-bindings',motor_head='374af24ab6f0accefa97346a10ac3c0fdebeb6b1',executor_head='c0b49e9f28432c3b39860831b54feb1eab0e5aa2',manifest_sha256='920da4d77fc3ab1c952f9fe9d02b30af473d94c35fce41ba654d547003b42a33')
+    before=copy.deepcopy(binding);binding['sourcePinsPath']='copied-stale-path'
+    # Literal seven-field Stage66 invocation contract, with no staged-path copying.
+    expected=dict(recipe='physical-live-teleop',teleopConsolidation16=True,source='virtual-leaders',motorSourceSha='374af24ab6f0accefa97346a10ac3c0fdebeb6b1',runtimeSourceSha='c0b49e9f28432c3b39860831b54feb1eab0e5aa2',manifestSha256='920da4d77fc3ab1c952f9fe9d02b30af473d94c35fce41ba654d547003b42a33',sourcePinsPath='/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/920da4d77fc3ab1c/manifest.json')
+    for source in ('virtual-leaders','usb-leaders'):
+        expected['source']=source;actual=factory(binding,source)
+        assert len(actual)==7 and actual==expected
+        assert json.dumps(actual)==json.dumps(expected)
+    assert {k:v for k,v in binding.items() if k!='sourcePinsPath'}==before
+
+
+@pytest.mark.parametrize('key,value',[('kind','wrong'),('manifest_sha256','F'*64),('motor_head',None),('executor_head',True),('motor_head','a'*39)])
+def test_public_invocation_factory_refuses_unbound_or_malformed_fields(key,value):
+    m=module();factory=getattr(m,'invocation_config',None);assert callable(factory),'public factory missing'
+    binding=dict(kind='am1-teleop28-feedback-loss-admitted-known-cleanup-bindings',motor_head='a'*40,executor_head='b'*40,manifest_sha256='c'*64)
+    with pytest.raises(ValueError):factory(dict(binding,**{key:value}))
+    for source in ('scripted',None,True):
+        with pytest.raises(ValueError):factory(binding,source=source)
+
+
+def test_public_remote_preparer_returns_real_canonical_receipt_without_new_installed_helper(tmp_path,monkeypatch,capsys):
+    import io,json,shlex,subprocess,sys
+    from contextlib import redirect_stdout
+    m=module();relay=getattr(m,'prepare_left_response_p_remote',None);assert callable(relay),'public preparation relay missing'
+    path,config,_gains,_calibration=request_preparation_config(tmp_path,monkeypatch)
+    native='/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/920da4d77fc3ab1c/physical.json';profile='ordinary-arms-left-current-rest-1051-1164';calls=[]
+    def remote(args,**options):
+        calls.append((args,options));values=shlex.split(args[7]);assert values[-3:]==[profile,'1','ordinary-arms']
+        assert options['timeout']==30 and options['shell'] is False and options['check'] is True
+        output=io.StringIO()
+        with monkeypatch.context() as context,redirect_stdout(output):
+            context.setattr(sys,'argv',['-',str(path),*values[4:]])
+            context.delattr(m,'prepare_left_response_p_request')
+            exec(compile(options['input'],'<public-canonical-preparer-relay>','exec'),{})
+        return SimpleNamespace(stdout=output.getvalue(),stderr='',returncode=0)
+    monkeypatch.setattr(subprocess,'run',remote)
+    receipt=relay(native,ssh='am1-pi',ttl_seconds=120,workspace_profile=profile,left_shoulder_startup_degrees=1,workload_segment='ordinary-arms')
+    assert receipt['request']['source_head']==config['host_head'] and receipt['request']['workload_segment']=='ordinary-arms'
+    assert receipt['canonical_read_verified'] is True and receipt['hardware_started'] is False
+    assert len(calls)==1 and capsys.readouterr().out==''
+
+
+@pytest.mark.parametrize('options',[
+    {'ssh':'am1-pi;echo'}, {'ttl_seconds':True},{'ttl_seconds':0},{'ttl_seconds':121},
+    {'workload_segment':'other'}, {'workload_segment':'ordinary-arms'},
+    {'workspace_profile':'ordinary-arms-left-current-rest-1051-1164'},
+    {'workspace_profile':True},{'left_shoulder_startup_degrees':1},{'left_shoulder_startup_degrees':True},
+])
+def test_public_remote_preparer_refuses_invalid_scope_before_transport(monkeypatch,options):
+    import subprocess
+    m=module();relay=getattr(m,'prepare_left_response_p_remote',None);assert callable(relay),'public preparation relay missing'
+    monkeypatch.setattr(subprocess,'run',lambda *a,**k:pytest.fail('invalid preparation touched transport'))
+    with pytest.raises(ValueError):relay('/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/920da4d77fc3ab1c/physical.json',**options)
+
+
+@pytest.mark.parametrize('fault',['valid','schema','hash','p16','workload','extra_profile','flags','oversized','duplicate','timeout','oserror','exit'])
+def test_public_remote_preparer_strict_receipt_and_single_attempt(monkeypatch,fault):
+    import json,subprocess
+    m=module();relay=getattr(m,'prepare_left_response_p_remote',None);assert callable(relay),'public preparation relay missing'
+    value=public_remote_preparation_receipt()
+    if fault=='schema':value['extra']=True
+    if fault=='hash':value['sha256']='f'*64
+    if fault=='p16':value['request']['proportional']=16
+    if fault=='workload':value['request']['workload_segment']='left-maintained'
+    if fault=='extra_profile':value['request']['workspace_profile']='left-current-rest-1051-1164'
+    if fault=='flags':value['hardware_started']=True
+    raw=json.dumps(value)
+    if fault=='oversized':raw=' '*4097+raw
+    if fault=='duplicate':raw=raw[:-1]+',"hardware_started": false}'
+    calls=[]
+    def remote(args,**kwargs):
+        calls.append(args)
+        if fault=='timeout':raise subprocess.TimeoutExpired(args,kwargs['timeout'])
+        if fault=='oserror':raise OSError('original preparation transport failure')
+        if fault=='exit':raise subprocess.CalledProcessError(2,args,stderr='original native refusal')
+        return SimpleNamespace(stdout=raw,stderr='',returncode=0)
+    monkeypatch.setattr(subprocess,'run',remote)
+    config='/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/920da4d77fc3ab1c/physical.json'
+    if fault=='valid':assert relay(config)==value
+    else:
+        with pytest.raises((ValueError,OSError,subprocess.SubprocessError)):relay(config)
+    assert len(calls)==1
+
+
+def test_preparation_cli_delegates_to_same_public_relay(monkeypatch,capsys):
+    import json
+    m=module();assert callable(getattr(m,'prepare_left_response_p_remote',None)),'public preparation relay missing'
+    profile='ordinary-arms-left-current-rest-1051-1164';receipt=public_remote_preparation_receipt(workload='ordinary-arms',profile=profile,shoulder=1);calls=[]
+    def remote(config,**options):calls.append((config,options));return receipt
+    monkeypatch.setattr(m,'prepare_left_response_p_remote',remote)
+    config='/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/920da4d77fc3ab1c/physical.json'
+    assert m.main(['--prepare-left-response-p','--ssh','am1-pi','--config',config,'--left-response-workspace','current-rest','--left-response-workload','ordinary-arms','--left-shoulder-startup-degrees','1'])==0
+    assert calls==[(config,dict(ssh='am1-pi',ttl_seconds=120,workspace_profile=profile,left_shoulder_startup_degrees=1,workload_segment='ordinary-arms'))]
+    assert json.loads(capsys.readouterr().out)==receipt

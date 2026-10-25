@@ -2286,6 +2286,25 @@ def wait_required_camera(camera, observation, cancel, *, sleep=time.sleep):
         sleep(0.05)
 
 
+def invocation_config(binding, source="virtual-leaders"):
+    """Derive the existing seven-field invocation from the actual matched binding."""
+    import re
+
+    if not isinstance(binding, dict) or binding.get("kind") != "am1-teleop28-feedback-loss-admitted-known-cleanup-bindings":
+        raise ValueError("existing Packet16 matched binding kind required")
+    if type(source) is not str or source not in ("virtual-leaders", "usb-leaders"):
+        raise ValueError("supported whole-frame source required")
+    heads = (binding.get("motor_head"), binding.get("executor_head"))
+    manifest = binding.get("manifest_sha256")
+    if not (all(type(head) is str and re.fullmatch("[0-9a-f]{40}", head) for head in heads)
+            and type(manifest) is str and re.fullmatch("[0-9a-f]{64}", manifest)):
+        raise ValueError("actual matched motor/runtime heads and manifest SHA required")
+    return dict(recipe="physical-live-teleop", teleopConsolidation16=True, source=source,
+                motorSourceSha=heads[0], runtimeSourceSha=heads[1], manifestSha256=manifest,
+                sourcePinsPath="/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/"
+                               + manifest[:16] + "/manifest.json")
+
+
 def prepare_left_response_p_request(config_path, *, ttl_seconds=120, workspace_profile=None,
                                     left_shoulder_startup_degrees=None, workload_segment="left-reach"):
     """Prepare one explicit boot-local LEFT-P32 workload request; never consume or Start it.
@@ -2342,10 +2361,29 @@ def prepare_left_response_p_request(config_path, *, ttl_seconds=120, workspace_p
     try:
         forbidden = [state / name for name in (
             "cleanup-uncertain.json", "physical-in-progress.json",
-            "left-response-p-request.json", "right-response-p-request.json",
+            "right-response-p-request.json",
             "response12-right-p20-request.json")]
         if any(p.exists() or p.is_symlink() for p in forbidden):
             raise ValueError("Stopped known-clean state and no pending response request required")
+        pending = state / "left-response-p-request.json"
+        if pending.exists() or pending.is_symlink():
+            previous, original, info = _right_p20_file(pending)
+            _left_response_p_request(previous, config["host_head"])
+            used = state / ("left-response-p-used-" + previous["request_id"] + ".json")
+            if (previous["proportional"] != 32 or previous["boot_id"] != _left_response_p_boot_id()
+                or not 0 < previous["expires_at_monotonic_s"] <= time.monotonic()
+                or used.exists() or used.is_symlink()):
+                raise ValueError("Only an expired unconsumed current-boot LEFT-P32 request can be retired")
+            current = pending.stat(follow_symlinks=False)
+            if (current.st_dev, current.st_ino, current.st_size) != (info.st_dev, info.st_ino, info.st_size):
+                raise ValueError("Expired LEFT request changed before retirement")
+            retired = state / ("left-response-p-expired-" + previous["request_id"] + ".json")
+            _publish_no_replace(pending, retired)
+            AM1ElbowIntegralTrial._sync_directory(state)
+            _, retained, retained_info = _right_p20_file(retired)
+            if retained != original or (retained_info.st_dev, retained_info.st_ino) != (info.st_dev, info.st_ino):
+                raise ValueError("Expired LEFT request changed during retirement")
+        forbidden.append(pending)
         request = {
             "version": 1, "kind": "left-response-p", "request_id": str(uuid.uuid4()),
             "source_head": config["host_head"], "proportional": 32, "workload_segment": workload_segment,
@@ -2357,7 +2395,8 @@ def prepare_left_response_p_request(config_path, *, ttl_seconds=120, workspace_p
             request["left_shoulder_startup_degrees"] = left_shoulder_startup_degrees
         _left_response_p_request(request, config["host_head"])
         used = state / ("left-response-p-used-" + request["request_id"] + ".json")
-        if used.exists() or used.is_symlink():
+        retired_nonce = state / ("left-response-p-expired-" + request["request_id"] + ".json")
+        if any(p.exists() or p.is_symlink() for p in (used, retired_nonce)):
             raise ValueError("Fresh preparation nonce was already retired")
         raw = _right_p20_json(request)
         temporary = state / (".left-response-p-prepare-" + request["request_id"] + ".tmp")
@@ -2386,49 +2425,51 @@ def prepare_left_response_p_request(config_path, *, ttl_seconds=120, workspace_p
         guard.close()
 
 
-def main(argv=None):
-    """Administrative PC relay only; the persistent execution path is unchanged."""
-    import argparse
+def prepare_left_response_p_remote(config_path, *, ssh="am1-pi", ttl_seconds=120,
+                                   workspace_profile=None, left_shoulder_startup_degrees=None,
+                                   workload_segment="left-reach"):
+    """Relay the canonical stopped preparer once and return its bounded receipt.
+
+    Transport ambiguity is never retried: the pending request may already exist.
+    Native boot/expiry remain native facts and are never compared to a PC clock.
+    """
     import inspect
     import re
     import shlex
     import subprocess
     from pathlib import PurePosixPath
 
+    from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES
     from tools.am1_session_ipc import strict_json
 
-    parser = argparse.ArgumentParser(description=main.__doc__)
-    parser.add_argument("--prepare-left-response-p", action="store_true", required=True,
-                        help="Prepare one explicit temporary LEFT-P32 workload without starting hardware")
-    parser.add_argument("--ssh", choices=("am1-pi",), required=True)
-    parser.add_argument("--config", required=True, help="Existing installed Pi physical.json")
-    parser.add_argument("--ttl-seconds", type=int, default=120)
-    parser.add_argument("--left-response-workspace", choices=("current-rest",), default=None,
-                        help="Explicitly select the approved LEFT1051..1164 corridor and ordinary measured-q startup")
-    parser.add_argument("--left-response-workload", choices=("left-reach", "ordinary-arms"), default="left-reach",
-                        help="Explicit target scope; ordinary-arms preserves only LEFT elbow P32 and zero body intent")
-    parser.add_argument("--left-shoulder-startup-degrees", type=int, choices=(1,), default=None,
-                        help="Explicit temporary 1-degree inward LEFT shoulder startup allowance for current-rest only")
-    args = parser.parse_args(argv)
-    if args.left_shoulder_startup_degrees is not None and args.left_response_workspace is None:
-        parser.error("Left shoulder startup allowance requires --left-response-workspace current-rest")
-    if args.left_response_workload == "ordinary-arms" and args.left_response_workspace is None:
-        parser.error("Ordinary arms requires --left-response-workspace current-rest")
-    if (not 1 <= args.ttl_seconds <= 120
+    if ssh != "am1-pi" or type(ssh) is not str:
+        raise ValueError("only the existing am1-pi SSH target is supported")
+    if (type(ttl_seconds) is not int or not 1 <= ttl_seconds <= 120
+            or type(config_path) is not str
             or re.fullmatch(r"/home/pickmanmike/\.local/share/am1-physical-adapter-01/"
-                            r"deployments/[0-9a-f]{16}/physical\.json", args.config) is None
-            or str(PurePosixPath(args.config)) != args.config):
-        parser.error("Existing installed physical.json and preparation expiry within 1–120 seconds required")
-    from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES
-    profile_args = [CURRENT_REST_WORKSPACE_PROFILES[args.left_response_workload]] if args.left_response_workspace is not None else []
+                            r"deployments/[0-9a-f]{16}/physical\.json", config_path) is None
+            or str(PurePosixPath(config_path)) != config_path):
+        raise ValueError("Existing installed physical.json and preparation expiry within 1–120 seconds required")
+    if type(workload_segment) is not str or workload_segment not in CURRENT_REST_WORKSPACE_PROFILES:
+        raise ValueError("Only left-reach and explicit ordinary-arms preparation are supported")
+    if workload_segment == "ordinary-arms" and workspace_profile is None:
+        raise ValueError("Ordinary arms requires explicit current-rest preparation")
+    if workspace_profile is not None and (type(workspace_profile) is not str
+            or workspace_profile != CURRENT_REST_WORKSPACE_PROFILES[workload_segment]):
+        raise ValueError("Only the explicit current-rest workspace profile is supported")
+    if left_shoulder_startup_degrees is not None and (
+        type(left_shoulder_startup_degrees) not in (int, float)
+        or left_shoulder_startup_degrees != 1
+        or workspace_profile != CURRENT_REST_WORKSPACE_PROFILES[workload_segment]
+    ):
+        raise ValueError("Left shoulder startup allowance requires exactly 1 degree and the current-rest workspace")
+    profile_args = [workspace_profile] if workspace_profile is not None else []
     profile_keyword = ", workspace_profile=sys.argv[3]" if profile_args else ""
-    startup_args = ["1"] if args.left_shoulder_startup_degrees is not None else []
+    startup_args = ["1"] if left_shoulder_startup_degrees is not None else []
     startup_keyword = ", left_shoulder_startup_degrees=int(sys.argv[4])" if startup_args else ""
-    workload_args = ["ordinary-arms"] if args.left_response_workload == "ordinary-arms" else []
+    workload_args = ["ordinary-arms"] if workload_segment == "ordinary-arms" else []
     workload_keyword = (", workload_segment=sys.argv[" + str(3 + len(profile_args) + len(startup_args)) + "]"
                         if workload_args else "")
-    # Fixed reviewed code, no command/interpreter/source/nonce override. SSH's remote
-    # shell receives only quoted fixed arguments, never interpolated source text.
     payload = (
         "import json, sys\n"
         "sys.path[:0] = ['/home/pickmanmike/am1_physical_trial', "
@@ -2438,16 +2479,58 @@ def main(argv=None):
         "ttl_seconds=int(sys.argv[2])" + profile_keyword + startup_keyword + workload_keyword + "), sort_keys=True))\n"
     )
     remote = shlex.join(["/home/pickmanmike/lerobot_alohamini/.venv/bin/python", "-B", "-",
-                         args.config, str(args.ttl_seconds), *profile_args, *startup_args, *workload_args])
-    # An ambiguous SSH receipt is never retried automatically: the pending request
-    # may already exist and must remain available for explicit inspection.
+                         config_path, str(ttl_seconds), *profile_args, *startup_args, *workload_args])
     reply = subprocess.run(
-        ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", args.ssh, remote],
+        ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", ssh, remote],
         input=payload, text=True, encoding="utf-8", capture_output=True, timeout=30, check=True, shell=False,
     )
-    if len(reply.stdout) > 4096 or type(strict_json(reply.stdout)) is not dict:
+    if type(reply.stdout) is not str or len(reply.stdout.encode("utf-8")) > 4096:
         raise ValueError("Bounded preparation receipt unavailable; do not retry or overwrite pending authority")
-    print(reply.stdout.strip())
+    receipt = strict_json(reply.stdout)
+    if (not isinstance(receipt, dict)
+            or set(receipt) != {"path", "sha256", "request", "canonical_read_verified", "hardware_started"}
+            or type(receipt["path"]) is not str or not receipt["path"] or len(receipt["path"]) > 4096
+            or receipt["canonical_read_verified"] is not True or receipt["hardware_started"] is not False
+            or type(receipt["sha256"]) is not str or re.fullmatch("[0-9a-f]{64}", receipt["sha256"]) is None):
+        raise ValueError("Exact canonical preparation receipt required; do not retry pending authority")
+    from lerobot.robots.alohamini.am1_elbow_integral import _left_response_p_request, _right_p20_json
+
+    request = receipt["request"]
+    _left_response_p_request(request, request.get("source_head") if isinstance(request, dict) else None)
+    if (request["proportional"] != 32 or request["workload_segment"] != workload_segment
+            or request.get("workspace_profile") != workspace_profile
+            or ("workspace_profile" in request) != (workspace_profile is not None)
+            or request.get("left_shoulder_startup_degrees") != left_shoulder_startup_degrees
+            or ("left_shoulder_startup_degrees" in request) != (left_shoulder_startup_degrees is not None)
+            or hashlib.sha256(_right_p20_json(request)).hexdigest() != receipt["sha256"]):
+        raise ValueError("Preparation receipt differs from the requested canonical scope; do not retry pending authority")
+    return receipt
+
+
+def main(argv=None):
+    """Administrative PC relay only; the persistent execution path is unchanged."""
+    import argparse
+
+    from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES
+
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    parser.add_argument("--prepare-left-response-p", action="store_true", required=True,
+                        help="Prepare one explicit temporary LEFT-P32 workload without starting hardware")
+    parser.add_argument("--ssh", choices=("am1-pi",), required=True)
+    parser.add_argument("--config", required=True, help="Existing installed Pi physical.json")
+    parser.add_argument("--ttl-seconds", type=int, default=120)
+    parser.add_argument("--left-response-workspace", choices=("current-rest",), default=None,
+                        help="Explicitly select the approved LEFT1051..1164 corridor and ordinary measured-q startup")
+    parser.add_argument("--left-response-workload", choices=tuple(CURRENT_REST_WORKSPACE_PROFILES), default="left-reach",
+                        help="Explicit target scope; ordinary-arms preserves only LEFT elbow P32 and zero body intent")
+    parser.add_argument("--left-shoulder-startup-degrees", type=int, choices=(1,), default=None,
+                        help="Explicit temporary 1-degree inward LEFT shoulder startup allowance for current-rest only")
+    args = parser.parse_args(argv)
+    profile = CURRENT_REST_WORKSPACE_PROFILES[args.left_response_workload] if args.left_response_workspace is not None else None
+    receipt = prepare_left_response_p_remote(args.config, ssh=args.ssh, ttl_seconds=args.ttl_seconds,
+        workspace_profile=profile, left_shoulder_startup_degrees=args.left_shoulder_startup_degrees,
+        workload_segment=args.left_response_workload)
+    print(json.dumps(receipt, sort_keys=True))
     return 0
 
 

@@ -112,6 +112,62 @@ def test_ordinary_arms_cli_selects_only_normal_uninterrupted_virtual_input(monke
     assert len(seen) == 1
 
 
+@pytest.mark.parametrize("changing", [False, True])
+def test_changing_input_cli_prints_scalar_result_while_full_summary_file_and_legacy_output_remain(tmp_path, monkeypatch, capsys, changing):
+    import json
+    from pathlib import Path
+
+    m = adapter()
+    summary = {"run_id": "11111111-1111-4111-8111-111111111111", "active_progress_s": 17.25,
+               "frame_count": 123, "finish_qualified": True, "native_held_qualified": True,
+               "native_cleanup_uncertain": False, "physical_register_off_readback_verified": True,
+               "interactive_input_complete": True, "clean_input_end": "virtual_finish", "cleanup_errors": [],
+               "final_native_ack": {"native_proof_marker": "x"*30000, "calibration": {"device": [1, 2, 3]}}}
+    output = tmp_path / "recorded-run"
+
+    async def run(args):
+        Path(args.output).mkdir()
+        (Path(args.output)/"summary.json").write_text(json.dumps(summary), encoding="utf-8")
+        return summary
+
+    monkeypatch.setattr(m, "run", run)
+    argv = ["--source", "virtual-leaders", "--workload-segment", "ordinary-arms", "--url", "unused",
+            "--ca", "unused", "--storage-state", "unused", "--output", str(output)]
+    m.main(argv + (["--virtual-input", "interactive"] if changing else []))
+    text = capsys.readouterr().out
+    printed = json.loads(text)
+    assert json.loads((output/"summary.json").read_text(encoding="utf-8")) == summary
+    if changing:
+        assert len(text.encode("utf-8")) < 2048 and "native_proof_marker" not in text and "calibration" not in text
+        assert all(value is None or type(value) in (str, bool, int, float) for value in printed.values())
+        assert printed["event"] == "virtual_input_result" and printed["outcome"] == "finished"
+        assert printed["run_id"] == summary["run_id"] and printed["frame_count"] == 123
+        assert printed["active_progress_s"] == 17.25 and printed["cleanup_error_count"] == 0
+        assert Path(printed["summary_path"]) == output/"summary.json"
+    else:
+        assert printed == summary and len(text) > 30000
+
+
+@pytest.mark.parametrize("uncertain,errors", [(True, []), (False, [{"step": "native_stop", "message": "cleanup failed"}])])
+def test_changing_input_cli_never_calls_qualified_finish_success_when_cleanup_is_unqualified(tmp_path, monkeypatch, capsys, uncertain, errors):
+    import json
+
+    m = adapter()
+    summary = {"finish_qualified": True, "native_held_qualified": True,
+               "native_cleanup_uncertain": uncertain, "cleanup_errors": errors}
+
+    async def run(args):
+        return summary
+
+    monkeypatch.setattr(m, "run", run)
+    m.main(["--source", "virtual-leaders", "--workload-segment", "ordinary-arms", "--virtual-input", "interactive",
+            "--url", "unused", "--ca", "unused", "--storage-state", "unused", "--output", str(tmp_path/"run")])
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["outcome"] == "cleanup_incomplete" and printed["finish_qualified"] is True
+    assert printed["native_cleanup_uncertain"] is uncertain and printed["cleanup_error_count"] == len(errors)
+    assert summary["cleanup_errors"] == errors
+
+
 @pytest.mark.parametrize("changed", [{"source": "usb-leaders"}, {"bench_continuity": True},
                                     {"next_start_seconds": 1.}, {"interrupt_at_seconds": 1.},
                                     {"interrupt_controller": True}])
@@ -152,6 +208,451 @@ def test_ordinary_arms_absolute_targets_keep_original_reference_across_reacquisi
     assert second["target"] == first["target"] and second["source"]["sample_seq"] == 2
     assert task.measured_reference == native["reference"] == reference
     assert task.plan()["command_reference"] == commands
+
+
+def test_virtual_intent_reader_stamps_friendly_input_and_keeps_only_latest_command():
+    m = adapter()
+    assert hasattr(m, "VirtualIntentReader"), "practical changing-input reader is missing"
+    now = [10.]
+    reader = m.VirtualIntentReader("interactive", clock=lambda: now[0],
+                                  intent_channel="11111111-1111-4111-8111-111111111111")
+    reader.receive_line("move 1 4 left_elbow_flex=2\n")
+    now[0] = 10.1
+    reader.receive_line("hold 2\n")
+    command = reader.take()
+    assert command == {"seq": 2, "op": "hold", "intent_channel": reader.intent_channel,
+                       "issued_at_perf_counter_s": 10.1,
+                       "expires_at_perf_counter_s": 12.1}
+    assert reader.take() is None and reader.superseded == 1
+    reader.receive_line("return 2 3\n")
+    assert reader.take()["op"] == "return"
+    reader.receive_line("")
+    assert reader.take()["op"] == "finish" and reader.eof
+    reader.close()
+
+
+@pytest.mark.parametrize("line", ["move 1 2 body.x=1\n", "move nan 2 left_gripper=4\n",
+                                 "hold inf\n", "{" * 4097], ids=["body", "nan", "infinite", "oversized"])
+def test_virtual_intent_reader_rejects_invalid_or_oversized_input_without_fresh_sample(line):
+    m = adapter()
+    assert hasattr(m, "VirtualIntentReader"), "practical changing-input reader is missing"
+    reader = m.VirtualIntentReader("interactive", clock=lambda: 10.)
+    with pytest.raises(ValueError):
+        reader.receive_line(line)
+    assert reader.take() is None
+
+
+def test_virtual_intent_reader_daemon_close_does_not_wait_for_stdin():
+    import threading
+
+    m = adapter()
+    assert hasattr(m, "VirtualIntentReader"), "practical changing-input reader is missing"
+    entered, release = threading.Event(), threading.Event()
+
+    class Input:
+        def readline(self, limit):
+            assert limit == 4097
+            entered.set()
+            release.wait(2)
+            return "finish\n"
+
+    reader = m.VirtualIntentReader("interactive", stream=Input())
+    reader.start()
+    assert entered.wait(1) and reader.thread.daemon
+    reader.close()
+    assert not release.is_set() and reader.closed
+    release.set()
+    reader.thread.join(1)
+    assert not reader.thread.is_alive() and reader.take() is None
+
+
+def test_virtual_intent_finish_expired_during_recovery_keeps_reader_available_for_fresh_input():
+    import queue
+    import threading
+    from examples.alohamini.am1_teleop_workload import VirtualIntentWorkload
+
+    m, now, lines = adapter(), [10.], queue.Queue()
+    reading_again, fresh_read = threading.Event(), threading.Event()
+
+    class Input:
+        count = 0
+        def readline(self, limit):
+            self.count += 1
+            if self.count == 2:
+                reading_again.set()
+            if self.count == 3:
+                fresh_read.set()
+            return lines.get()
+
+    reader = m.VirtualIntentReader("interactive", stream=Input(), clock=lambda: now[0])
+    native = workspace()
+    source = VirtualIntentWorkload(native, command_reference=native["reference"], clock=lambda: now[0],
+                                  intent_channel=reader.intent_channel)
+    try:
+        source.freeze()  # The production recovery wait does not consume pending input.
+        lines.put("finish\n")
+        reader.start()
+        assert reading_again.wait(1), "raw finish must not end the input reader before main accepts it"
+        now[0] = 12.  # Existing recovery took2s; the original finish TTL remains1s.
+        finish = reader.take()
+        assert finish["issued_at_perf_counter_s"] == 10. and finish["expires_at_perf_counter_s"] == 11.
+        assert not source.submit(finish) and not source.complete and not source.active
+        assert reader.finished and not reader.eof  # Conservative before-Start cancellation stays latched.
+        lines.put("hold 5\n")
+        assert fresh_read.wait(1)
+        assert source.submit(reader.take()) and source.active and not source.complete
+        lines.put("")
+        reader.thread.join(1)
+        assert reader.eof and not reader.thread.is_alive()
+        assert source.submit(reader.take()) and source.complete
+    finally:
+        reader.close()
+        lines.put("")
+        reader.thread.join(1)
+
+
+@pytest.mark.parametrize("invalid_last", [True, False])
+def test_virtual_intent_reader_burst_retains_only_latest_valid_or_rejected_input(invalid_last):
+    import threading
+
+    m = adapter()
+    entered, release = threading.Event(), threading.Event()
+    valid, invalid = "move 1 5 left_gripper=2\n", "move nan 5 left_gripper=4\n"
+
+    class Input:
+        def __init__(self):
+            self.lines = iter([valid, invalid] if invalid_last else [invalid, valid])
+        def readline(self, limit):
+            try:
+                return next(self.lines)
+            except StopIteration:
+                entered.set()
+                release.wait(2)
+                return ""
+
+    reader = m.VirtualIntentReader("interactive", stream=Input(), clock=lambda: 10.)
+    try:
+        reader.start()
+        assert entered.wait(1)
+        if invalid_last:
+            with pytest.raises(ValueError):
+                reader.take()
+            assert reader.take() is None, "older queued target must not resurrect after rejection"
+        else:
+            assert reader.take()["targets"] == {"arm_left_gripper.pos": 2.}
+    finally:
+        reader.close()
+        release.set()
+        reader.thread.join(1)
+
+
+def test_virtual_intent_jsonl_replay_cannot_replace_newer_pending_intent():
+    import json
+    m = adapter()
+    reader = m.VirtualIntentReader("jsonl", clock=lambda: 10.)
+    for seq, target in ((5, 4.), (4, 2.)):
+        reader.receive_line(json.dumps({"seq": seq, "op": "move", "intent_channel": reader.intent_channel,
+                                       "issued_at_perf_counter_s": 10., "expires_at_perf_counter_s": 15.,
+                                       "transition_seconds": 1., "targets": {"arm_left_gripper.pos": target}}))
+    assert reader.take()["seq"] == 5
+
+
+def test_virtual_intent_jsonl_eof_is_new_finite_finish_bound_to_current_channel():
+    import json
+    m = adapter()
+    reader = m.VirtualIntentReader("jsonl", clock=lambda: 20.,
+                                  intent_channel="11111111-1111-4111-8111-111111111111")
+    reader.receive_line(json.dumps({"seq": 8, "op": "hold", "intent_channel": reader.intent_channel,
+                                   "issued_at_perf_counter_s": 19., "expires_at_perf_counter_s": 21.}))
+    assert reader.take()["seq"] == 8
+    reader.receive_line("")
+    assert reader.take() == {"seq": 9, "op": "finish", "intent_channel": reader.intent_channel,
+                             "issued_at_perf_counter_s": 20., "expires_at_perf_counter_s": 21.}
+
+
+def test_virtual_intent_pre_ready_text_keeps_early_acquisition_and_expires_during_startup():
+    from examples.alohamini.am1_teleop_workload import VirtualIntentWorkload
+    m, now = adapter(), [10.]
+    reader = m.VirtualIntentReader("interactive", clock=lambda: now[0])
+    reader.receive_line("hold 2\n")
+    now[0] = 26.
+    native = workspace()
+    source = VirtualIntentWorkload(native, command_reference=native["reference"], clock=lambda: now[0],
+                                  intent_channel=reader.intent_channel)
+    command = reader.take()
+    assert command["issued_at_perf_counter_s"] == 10. and command["expires_at_perf_counter_s"] == 12.
+    assert not source.submit(command) and not source.active
+
+
+def test_virtual_intent_real_stdin_uses_raw_read_and_daemon_close(tmp_path, monkeypatch):
+    import os
+    from types import SimpleNamespace
+
+    m = adapter()
+    descriptor, writer = os.pipe()
+    monkeypatch.setattr(m.sys, "stdin", SimpleNamespace(fileno=lambda: descriptor))
+    reader = m.VirtualIntentReader("interactive")
+    try:
+        reader.start()
+        reader.close()  # Must return while raw stdin is blocked; no BufferedReader lock.
+        assert reader.thread.daemon
+        os.close(writer)
+        writer = None
+        reader.thread.join(1)
+        assert not reader.thread.is_alive() and reader.take() is None
+    finally:
+        if writer is not None:
+            os.close(writer)
+        os.close(descriptor)
+
+
+@pytest.mark.skipif(__import__("os").name != "nt", reason="Windows console backend")
+@pytest.mark.parametrize("has_input", [False, True])
+def test_virtual_intent_windows_console_polls_without_holding_blocking_crt_stdin(monkeypatch, has_input):
+    import msvcrt
+    import threading
+    from collections import deque
+    from types import SimpleNamespace
+
+    m, polled = adapter(), threading.Event()
+    chars = deque("hold 2\rfinish\r" if has_input else "")
+
+    def ready():
+        polled.set()
+        return bool(chars)
+
+    def blocked(*args):
+        raise RuntimeError("blocking CRT stdin read would obstruct cold native imports")
+
+    monkeypatch.setattr(m.sys, "stdin", SimpleNamespace(fileno=lambda: 123))
+    monkeypatch.setattr(m.os, "isatty", lambda descriptor: True)
+    monkeypatch.setattr(m.os, "read", blocked)
+    monkeypatch.setattr(msvcrt, "kbhit", ready)
+    monkeypatch.setattr(msvcrt, "getwch", lambda: chars.popleft())
+    reader = m.VirtualIntentReader("interactive", clock=lambda: 10.)
+    try:
+        reader.start()
+        assert polled.wait(1), "console reader must poll instead of retaining CRT stdin lock"
+        if has_input:
+            reader.thread.join(1)
+            assert reader.take()["op"] == "finish"
+        assert not reader.read_failed
+    finally:
+        reader.close()
+        reader.thread.join(1)
+    assert not reader.thread.is_alive()
+
+
+@pytest.mark.parametrize("marker", ["eof", "finished"])
+def test_virtual_intent_clean_eof_before_start_does_not_claim_or_create_motor_task(tmp_path, monkeypatch, marker):
+    import asyncio
+    from types import SimpleNamespace
+
+    m = adapter()
+
+    class Reader:
+        eof = marker == "eof"
+        finished = marker == "finished"
+        def __init__(self, *args, **kwargs):
+            pass
+        def start(self):
+            pass
+        def close(self):
+            pass
+
+    monkeypatch.setattr(m, "VirtualIntentReader", Reader)
+    monkeypatch.setattr(m, "SessionClient", lambda *args: pytest.fail("closed input reached ownership"))
+    args = SimpleNamespace(source="virtual-leaders", workload_segment="ordinary-arms", virtual_input="interactive",
+                           bench_continuity=False, next_start_seconds=None, interrupt_at_seconds=None,
+                           interrupt_controller=False, output=str(tmp_path/"run"), duration_seconds=30.,
+                           url="unused", ca="unused", storage_state="unused")
+    summary = asyncio.run(m.run(args))
+    assert summary["interactive_input_complete"] and summary["clean_input_end"] == "virtual_eof"
+    assert not summary["finish_qualified"] and summary["frame_count"] == 0
+
+
+@pytest.mark.parametrize("expires_during", ["grant", "serialization", "recording"])
+def test_virtual_intent_expiry_through_grant_capture_and_dispatch_never_sends_old_intent(monkeypatch, expires_during):
+    import asyncio
+    from types import SimpleNamespace
+    from examples.alohamini.am1_teleop_workload import VirtualIntentWorkload
+
+    m, now, sent = adapter(), [10.], []
+    monkeypatch.setattr(m, "time", SimpleNamespace(monotonic=lambda: now[0], perf_counter=lambda: now[0]))
+    native = workspace()
+    source = VirtualIntentWorkload(native, command_reference=native["reference"], clock=lambda: now[0])
+    source.submit({"seq": 1, "op": "hold", "intent_channel": source.intent_channel,
+                   "issued_at_perf_counter_s": 10., "expires_at_perf_counter_s": 10.05})
+    producer = m.FrameProducer(source, clock=lambda: now[0], source_id=source.intent_channel)
+    producer.workspace, producer.native_cursor = native, dict(native["reference"])
+    serialize = producer.serialize
+
+    def delayed_serialize(frame):
+        result = serialize(frame)
+        if expires_during == "serialization":
+            now[0] = 10.06
+        return result
+
+    producer.serialize = delayed_serialize
+
+    async def command(value):
+        if value["op"] == "grant":
+            if expires_during == "grant":
+                now[0] = 10.06
+            return {"grant_id": str(uuid4())}
+        sent.append(value)
+        return {"accepted": True}
+
+    def record(value):
+        if value["event"] == "leader_frame_attempt" and expires_during == "recording":
+            now[0] = 10.06
+
+    client = SimpleNamespace(identities=lambda: {}, command=command, sequence=0)
+    result = asyncio.run(m.send_leader_sample(client, producer, m.ZERO_BODY, record,
+                                             phase="intent-1-hold", progress_s=0.))
+    assert result is None and sent == [] and not source.active
+
+
+@pytest.mark.parametrize("replacement", ["grant", "recording"])
+def test_virtual_intent_replacement_uses_new_capture_or_discards_old_sample_before_wire(monkeypatch, replacement):
+    import asyncio
+    from types import SimpleNamespace
+    from examples.alohamini.am1_teleop_workload import VirtualIntentWorkload
+
+    m, now, sent, records = adapter(), [10.], [], []
+    monkeypatch.setattr(m, "time", SimpleNamespace(monotonic=lambda: now[0], perf_counter=lambda: now[0]))
+    reader = m.VirtualIntentReader("interactive", clock=lambda: now[0])
+    native = workspace()
+    source = VirtualIntentWorkload(native, command_reference=native["reference"], clock=lambda: now[0],
+                                  intent_channel=reader.intent_channel)
+    reader.receive_line("move 1 5 left_gripper=2\n")
+    source.submit(reader.take())
+    source.admit(20.)
+    source.advance(20.1)
+    applied = [reader.sequence]
+    producer = m.FrameProducer(source, clock=lambda: now[0], source_id=reader.intent_channel)
+    producer.workspace, producer.native_cursor = native, dict(native["reference"])
+
+    def refresh():
+        command = reader.take()
+        if command is not None:
+            source.submit(command)
+            applied[0] = reader.sequence
+
+    producer.refresh_intent = refresh
+    producer.intent_is_current = lambda captured: source.active and source.command == captured and reader.sequence == applied[0]
+
+    async def command(value, *, check=None):
+        if value["op"] == "grant":
+            if replacement == "grant":
+                reader.receive_line("move 1 5 right_gripper=4\n")
+            return {"grant_id": str(uuid4())}
+        if check is not None:
+            check()
+        sent.append(value)
+        return {"accepted": True}
+
+    def record(value):
+        records.append(value)
+        if value["event"] == "leader_frame_attempt" and replacement == "recording":
+            reader.receive_line("hold 5\n")
+
+    client = SimpleNamespace(identities=lambda: {}, command=command, sequence=0)
+    result = asyncio.run(m.send_leader_sample(client, producer, m.ZERO_BODY, record,
+                                             phase="intent-1-move", progress_s=.1))
+    if replacement == "recording":
+        assert result is None and sent == []
+    else:
+        assert len(sent) == 1 and sent[0]["target"]["arm_left_gripper.pos"] == 0.
+        assert producer.last_capture_intent["seq"] == 2
+        attempt = next(row for row in records if row["event"] == "leader_frame_attempt")
+        assert attempt["phase"] == "intent-2-move" and attempt["virtual_intent"]["seq"] == 2
+
+
+def test_virtual_intent_real_client_rechecks_after_ack_wait_before_socket_send(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from examples.alohamini.am1_teleop_workload import InputUnavailable
+
+    m, current = adapter(), [True]
+
+    async def wait_ack(self, ws, ceiling):
+        await asyncio.sleep(0)
+        current[0] = False
+
+    class Socket:
+        closed = False
+        async def send_json(self, value):
+            pytest.fail("superseded virtual intent reached the socket")
+
+    def check():
+        if not current[0]:
+            raise InputUnavailable("superseded while awaiting current ACK")
+
+    monkeypatch.setattr(m.SessionClient, "_wait_current_ack", wait_ack)
+    client = SimpleNamespace(transport_error=None, ws=Socket(), reader=None, pending={})
+    with pytest.raises(InputUnavailable):
+        asyncio.run(m.SessionClient.command(client, {"op": "input"}, check=check))
+    assert client.pending == {}
+
+
+@pytest.mark.parametrize("foreign", [False, True])
+def test_changing_activity_frontdoor_derives_fresh_invocation_and_prepares_before_ownership(tmp_path, monkeypatch, foreign):
+    import hashlib
+    import json
+    from pathlib import Path
+    from tools import am1_physical_executor as executor
+
+    m, calls = adapter(), []
+    binding = {"kind": "am1-teleop28-feedback-loss-admitted-known-cleanup-bindings",
+               "motor_head": "a"*40, "executor_head": "b"*40, "manifest_sha256": "c"*64}
+    bindings = tmp_path / "binding.json"
+    bindings.write_text(json.dumps(binding))
+    context = {"STAGER_SHA": "1"*64, "BINDINGS_HELPER_SHA": "2"*64,
+               "BINDING_SHA": hashlib.sha256(bindings.read_bytes()).hexdigest(), "MANIFEST_SHA": "c"*64,
+               "STAGE": "/home/pickmanmike/.local/share/am1-lift-startup-01/staging/test-active",
+               "MANIFEST": "/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/"+"c"*16+"/manifest.json"}
+    (tmp_path/"audit-context.private.json").write_text(json.dumps(context))
+
+    def prepare(config, **options):
+        calls.append((config, options))
+        return {"canonical_read_verified": True, "hardware_started": False,
+                "request": {"source_head": "d"*40 if foreign else "a"*40}}
+
+    async def run(args):
+        # Exercise preparation/metadata creation at the actual before-ownership boundary.
+        output = Path(args.output)
+        output.mkdir()
+        result = m.prepare_current_rest_invocation(args, output)
+        assert result["sourcePinsPath"].endswith("/" + "c"*16 + "/manifest.json")
+        calls.append(args.output)
+        return {}
+
+    monkeypatch.setattr(executor, "prepare_left_response_p_remote", prepare)
+    monkeypatch.setattr(m, "run", run)
+    argv = ["--url", "unused", "--ca", "unused", "--storage-state", "unused",
+            "--bindings", str(bindings), "--output-root", str(tmp_path), "--prepare-current-rest",
+            "--virtual-input", "interactive"]
+    if foreign:
+        with pytest.raises(ValueError, match="source"):
+            m.main(argv)
+        assert len(calls) == 1
+    else:
+        m.main(argv)
+        m.main(argv)
+        assert calls[1] != calls[3]
+        for config, options in calls[::2]:
+            assert config == "/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/" + "c"*16 + "/physical.json"
+            assert options == {"ssh": "am1-pi", "ttl_seconds": 120, "workload_segment": "ordinary-arms",
+                               "workspace_profile": m.ORDINARY_ARMS_PROFILE, "left_shoulder_startup_degrees": 1}
+        assert all((Path(output)/"invocation-config.private.json").is_file() for output in calls[1::2])
+        for output in calls[1::2]:
+            metadata = json.loads((Path(output)/"launch-metadata.private.json").read_text())
+            assert metadata["version"] == 1
+            for key in ("bindings", "invocation_config", "preparation_receipt", "audit_context"):
+                pointer = metadata[key]
+                assert Path(pointer["path"]).is_absolute()
+                assert hashlib.sha256(Path(pointer["path"]).read_bytes()).hexdigest() == pointer["sha256"]
 
 
 @pytest.mark.parametrize("changed", ["bench", "advisory", "temporarily_unqualified"])
@@ -813,6 +1314,12 @@ def test_real_wss_clean_close_ends_qualified_wait_before_timeout(tmp_path):
         "normal_program_finish", "normal_program_finish_failed", "normal_program_finish_combined_body",
         "normal_program_finish_left_maintained", "normal_program_finish_left_reach", "normal_program_finish_left_reach_held", "normal_program_finish_left_reach_cycles", "normal_program_finish_left_reach_closing_cycles", "normal_program_finish_left_reach_zero_gripper", "normal_program_finish_left_supported", "normal_program_finish_left_opposite", "usb_finite_finish", "usb_finite_finish_failed", "usb_quit_finish", "usb_quit_empty_finish",
         "normal_program_finish_ordinary_arms", "normal_program_finish_ordinary_arms_old_profile", "normal_program_finish_ordinary_arms_advisory",
+        "normal_program_finish_ordinary_arms_intents", "normal_program_finish_ordinary_arms_intents_expiry",
+        "normal_program_finish_ordinary_arms_intents_pause",
+        "normal_program_finish_ordinary_arms_intents_invalid",
+        "normal_program_finish_ordinary_arms_intents_expired_replacement",
+        "normal_program_finish_ordinary_arms_intents_duration",
+        "normal_program_finish_ordinary_arms_intents_expired_finish_recovery",
     ],
 )
 def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
@@ -831,6 +1338,9 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
     normal_finish = isinstance(failure, str) and failure.startswith(("normal_program_finish", "usb_finite_finish", "usb_quit_"))
     cycle_run = failure in {"normal_program_finish_left_reach_cycles", "normal_program_finish_left_reach_closing_cycles"}
     ordinary_arms = isinstance(failure, str) and failure.startswith("normal_program_finish_ordinary_arms")
+    changing_intents = ordinary_arms and "_intents" in failure
+    finish_recovery = changing_intents and failure.endswith("expired_finish_recovery")
+    pending_recovery_finish, recovery_reader = [], []
     usb_finish = isinstance(failure, str) and failure.startswith(("usb_finite_finish", "usb_quit_"))
     program_finish = failure in {"bench_program_finish", "bench_program_finish_failed"} or normal_finish
     bench_case = failure in {"bench_input_gap", "bench_controller_gap", "bench_renewal_during_resume", "bench_renewal_attach_ceiling", "bench_renewal_snapshot_race",
@@ -1131,7 +1641,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 current["run"]["live_input"].update(body=dict(m.ZERO_BODY), cursor_intent_revision=revision)
                 current["evidence"].update(active_acknowledged=False, acknowledged_intent_revision=revision)
                 current["evidence"]["accepted_host_action"].update(state="paused", intent_revision=revision,
-                    epoch=2, acquired_at_monotonic_s=now, accepted_action={"mode": "raw_goal_hold", "body_velocity": 0.})
+                    epoch=current["evidence"]["accepted_host_action"].get("epoch", 1)+1,
+                    acquired_at_monotonic_s=now, accepted_action={"mode": "raw_goal_hold", "body_velocity": 0.})
                 current["evidence"]["measured_body"].update({"lift_axis.vel": -50, "theta.vel": .5859375})
                 current["events"] = [{"kind": "pause", "at": now, "run_id": owned_id, "service_incarnation": "service"}]
                 if failure.endswith("failed"):
@@ -1285,6 +1796,14 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             if recovery_case or ordinary_case or mailbox_case or bench_case:
                 assert self.snapshot["run"]["status"] != "recovering"
                 self.resumes += 1
+                if finish_recovery and self.resumes == 2:
+                    # Receipt during the existing recovery wait; main consumes it only afterwards.
+                    pending_recovery_finish.append({"seq": 2, "op": "finish",
+                        "intent_channel": recovery_reader[0].intent_channel,
+                        "issued_at_perf_counter_s": source_clock[0],
+                        "expires_at_perf_counter_s": source_clock[0]+1.})
+                    await asyncio.sleep(0)
+                    source_clock[0] += 2.
                 if terminal_hold and self.resumes == 2:
                     assert self.snapshot["events"][-1]["kind"] == "native_input_expired"
                     assert self.snapshot["evidence"]["hold_acknowledged"] is True
@@ -1300,7 +1819,9 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 self.connection = str(uuid4())
                 self.sequence = 0
 
-        async def command(self, payload):
+        async def command(self, payload, *, check=None):
+            if check is not None:
+                check()
             if initial_pause_case:
                 assert self.resumes == 2, "grant/input cannot precede initial true active ACK"
             if payload["op"] == "grant":
@@ -1600,6 +2121,77 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 args.workload_segment, args.left_reach_cycles, args.duration_seconds = "left-reach", 3, 60.
             if ordinary_arms:
                 args.workload_segment, args.duration_seconds = "ordinary-arms", 12.
+            if changing_intents:
+                from examples.alohamini import am1_teleop_workload
+                assert hasattr(m, "VirtualIntentReader"), "production runner has no changing-input reader"
+                args.virtual_input = "interactive"
+                if failure.endswith("duration"):
+                    args.duration_seconds = .15
+                source_clock = [10.]
+                original_intent = am1_teleop_workload.VirtualIntentWorkload
+
+                class IntentSource(original_intent):
+                    def __init__(self, *values, **options):
+                        options["clock"] = lambda: source_clock[0]
+                        super().__init__(*values, **options)
+
+                class Reader:
+                    def __init__(self, *values, **options):
+                        self.delivered = set()
+                        self.waits = 0
+                        self.intent_channel = options["intent_channel"]
+                        if finish_recovery:
+                            recovery_reader.append(self)
+                    def start(self):
+                        assert not instances, "stdin acquisition must begin before ownership/cold startup"
+                    def close(self):
+                        pass
+                    def take(self):
+                        session = instances[0]
+                        count = len(session.inputs)
+                        expired_replacement = failure.endswith("expired_replacement")
+                        if (failure.endswith(("expiry", "pause", "invalid")) or expired_replacement or finish_recovery) and count == 3:
+                            self.waits += 1
+                            if self.waits == 1:
+                                if not finish_recovery:
+                                    source_clock[0] = 10.2 if expired_replacement else 16.
+                                state = session.snapshot
+                                revision = state["run"]["intent_revision"] + 1
+                                state["run"].update(status="paused", intent_revision=revision, remaining_s=299.)
+                                state["run"]["live_input"].update(cursor_intent_revision=revision)
+                                state["evidence"].update(active_acknowledged=False, acknowledged_intent_revision=revision)
+                                state["evidence"]["accepted_host_action"].update(
+                                    state="paused", intent_revision=revision, epoch=2, acquired_at_monotonic_s=2.)
+                                state["events"] = [{"kind": "pause" if failure.endswith("pause") else "input_expired",
+                                                    "at": 2., "run_id": owned_id, "service_incarnation": "service"}]
+                                if failure.endswith("invalid"):
+                                    raise ValueError("invalid interactive target; old motion must not continue")
+                                if expired_replacement:
+                                    return {"seq": 2, "op": "hold", "intent_channel": self.intent_channel,
+                                            "issued_at_perf_counter_s": 10., "expires_at_perf_counter_s": 10.1}
+                                return None
+                            if finish_recovery and pending_recovery_finish:
+                                return pending_recovery_finish.pop()
+                        stages = {0: (1, "move", {"arm_left_gripper.pos": 4.}), 3: (2, "hold", None),
+                                  5: (3, "move", {"arm_right_gripper.pos": 6.}),
+                                  8: (4, "return", None), 11: (5, "finish", None)}
+                        if count not in stages or count in self.delivered:
+                            return None
+                        self.delivered.add(count)
+                        seq, op, targets = stages[count]
+                        if (expired_replacement or finish_recovery) and count >= 3:
+                            seq += 1
+                        command = {"seq": seq, "op": op, "intent_channel": self.intent_channel,
+                                   "issued_at_perf_counter_s": source_clock[0],
+                                   "expires_at_perf_counter_s": source_clock[0]+5.}
+                        if op in {"move", "return"}:
+                            command["transition_seconds"] = .2
+                        if targets is not None:
+                            command["targets"] = targets
+                        return command
+
+                monkeypatch.setattr(am1_teleop_workload, "VirtualIntentWorkload", IntentSource)
+                monkeypatch.setattr(m, "VirtualIntentReader", Reader)
             if failure == "normal_program_finish_left_reach_zero_gripper":
                 args.workload_segment = "left-reach"
             if failure == "normal_program_finish_combined_body":
@@ -1660,6 +2252,12 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 assert session.starts == 1 and session.resumes == 0 and not session.inputs
                 assert session.stops == [owned_id]
                 return
+            if changing_intents and failure.endswith("pause"):
+                with pytest.raises(RuntimeError, match="held|superseded|pause"):
+                    asyncio.run(asyncio.wait_for(m.run(args), 10))
+                session = instances[0]
+                assert len(session.inputs) == 3 and session.resumes == 1 and session.stops == [owned_id]
+                return
             if failure.endswith("failed"):
                 with pytest.raises(RuntimeError, match="Native held qualification unavailable"):
                     asyncio.run(asyncio.wait_for(m.run(args), 10))
@@ -1671,6 +2269,39 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             session = instances[0]
             records = [json.loads(line) for line in (tmp_path / "evidence/frames.jsonl").read_text().splitlines()]
             start = next(row for row in records if row["event"] == "start_requested")
+            if changing_intents:
+                frames = [row for row in records if row["event"] == "leader_frame"]
+                if failure.endswith("duration"):
+                    assert len(frames) == 2 and summary["clean_input_end"] == "duration_elapsed"
+                    assert summary["finish_qualified"] and not summary["interactive_input_complete"]
+                    assert not any(row["phase"] == "terminal_zero_qualification" for row in frames)
+                    assert session.starts == 1 and len(session.pauses) == 1 and session.stops == [owned_id]
+                    return
+                assert len(frames) == 11 and summary["finish_qualified"]
+                assert summary["clean_input_end"] == "virtual_finish" and not summary["producer_program_complete"]
+                assert summary["interactive_input_complete"] and start["program_active_seconds"] is None
+                origin = summary["selected_profile"]["command_reference"]
+                assert frames[2]["frame"]["target"]["arm_left_gripper.pos"] == 4.
+                assert frames[4]["frame"]["target"]["arm_left_gripper.pos"] == 4.
+                assert frames[7]["frame"]["target"]["arm_right_gripper.pos"] == 6.
+                assert frames[10]["frame"]["target"] == origin
+                for row in frames:
+                    assert row["frame"]["body"] == m.ZERO_BODY
+                    assert row["native"]["run"]["run_id"] == owned_id and row["native"]["run"]["deadline"] == 301.
+                    assert all(value == origin[key] for key, value in row["frame"]["target"].items()
+                               if key not in {"arm_left_gripper.pos", "arm_right_gripper.pos"})
+                    assert row["virtual_intent"]["intent_channel"] == row["frame"]["source"]["source_id"] == summary["selected_profile"]["intent_channel"]
+                if failure.endswith("expired_replacement"):
+                    assert all(row["virtual_intent"]["seq"] != 2 for row in frames)
+                if finish_recovery:
+                    discarded = next(row for row in records if row["event"] == "virtual_intent_discarded")
+                    assert discarded["op"] == "finish" and discarded["seq"] == 2
+                    assert discarded["issued_at_perf_counter_s"] == 10. and discarded["expires_at_perf_counter_s"] == 11.
+                    assert all(row["virtual_intent"]["seq"] != 2 for row in frames)
+                    assert summary["original_native_deadline"] == 301.
+                assert session.starts == 1 and len(session.pauses) == 1 and session.stops == [owned_id]
+                assert session.resumes == (2 if finish_recovery or failure.endswith(("expiry", "invalid", "expired_replacement")) else 1)
+                return
             if normal_finish:
                 assert start["terminal_completion_policy"] == "owned_pause_native_hold_after_finite_input"
                 assert start["view_policy"] == "required_presentation"
