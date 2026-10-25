@@ -4365,7 +4365,7 @@ async def run(args):
                                   **({"wall_deadline": entry_wall_deadline} if left_entry else {}))
             producer.native_cursor = _live(client.snapshot)["cursor"]
             if left_entry:
-                workload.rejoin(producer.native_cursor)
+                workload.rejoin(producer.native_cursor, remaining_wall_s=entry_wall_deadline-time.monotonic())
             if workload and not args.next_start_seconds:
                 workload.admit(time.monotonic())
         active_at, interrupted, frame_count = (None if bench else time.monotonic()), False, 0
@@ -4443,7 +4443,7 @@ async def run(args):
             producer.native_cursor = _live(client.snapshot)["cursor"]
             producer.reacquire = True
             if left_entry:
-                workload.rejoin(producer.native_cursor)
+                workload.rejoin(producer.native_cursor, remaining_wall_s=ceiling-time.monotonic())
             if workload and not args.next_start_seconds and active_at is not None:
                 workload.admit(time.monotonic())
             return recovered

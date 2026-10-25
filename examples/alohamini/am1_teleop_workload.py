@@ -204,7 +204,8 @@ class VirtualIntentWorkload:
             self.entry_endpoint = normalized_raw(1164, calibration)
             self.entry_rate = min(self.workspace["bounds"][self.entry_key]["rate_per_s"],
                                   4096/360*200/(calibration[4]-calibration[3]))
-        self._ramp_rebased_at = 0.
+        self._ramp_rebased_at = self._ramp_end_elapsed_s = 0.
+        self.entry_duration_replans = 0
         self.clock = clock
         self.intent_channel = str(uuid4()) if intent_channel is None else intent_channel
         self.command = None
@@ -269,6 +270,7 @@ class VirtualIntentWorkload:
         self.command = command
         self.start_target, self.targets = dict(self.cursor), target
         self.ramp_elapsed_s = self._ramp_rebased_at = 0.
+        self._ramp_end_elapsed_s = command.get("transition_seconds", 0.)
         self._last = None
         self.complete = op == "finish"
         return True
@@ -282,7 +284,7 @@ class VirtualIntentWorkload:
     def invalidate(self):
         self.command, self._last = None, None
 
-    def rejoin(self, held):
+    def rejoin(self, held, *, remaining_wall_s=None):
         """Entry-only current qualified held command; original intent/time remain unchanged."""
         if not self.left_entry:
             return
@@ -291,9 +293,18 @@ class VirtualIntentWorkload:
         if any(held[joint] != self.origin[joint] for joint in held if joint != key):
             raise ValueError("LEFT entry qualified held cursor changed another fixed joint")
         if self.command is not None and self.command["op"] == "move":
-            remaining = max(0., self.command["transition_seconds"]-self.ramp_elapsed_s)
-            if abs(self.entry_endpoint-held[key]) > self.entry_rate*remaining+1e-9:
-                raise ValueError("LEFT entry original remaining ramp budget cannot reach its endpoint")
+            if type(remaining_wall_s) not in (int, float) or not math.isfinite(remaining_wall_s):
+                raise ValueError("LEFT entry finite remaining original wall budget required")
+            available = min(25.-self.elapsed_s, remaining_wall_s,
+                            self.command["expires_at_perf_counter_s"]-self.clock())
+            needed = abs(self.entry_endpoint-held[key])/self.entry_rate
+            if available <= 0 or needed > available+1e-9:
+                raise ValueError("LEFT entry remaining original TTL/active/wall budget cannot reach its endpoint")
+            remaining = max(0., self._ramp_end_elapsed_s-self.ramp_elapsed_s)
+            planned = remaining if needed <= remaining <= available else needed
+            if abs(planned-remaining) > 1e-9:
+                self.entry_duration_replans += 1
+            self._ramp_end_elapsed_s = self.ramp_elapsed_s+planned
         self.cursor = dict(held)
         if self.command is not None:
             self.start_target = dict(held)
@@ -309,13 +320,13 @@ class VirtualIntentWorkload:
         self.elapsed_s = min(25., round(self.elapsed_s+delta, 9)) if self.left_entry else round(self.elapsed_s+delta, 9)
         self.ramp_elapsed_s = round(self.ramp_elapsed_s+delta, 9)
         self._last = now
-        if self.ramp_elapsed_s >= self.command.get("transition_seconds", 0.):
+        if self.ramp_elapsed_s >= (self._ramp_end_elapsed_s if self.left_entry else self.command.get("transition_seconds", 0.)):
             self.phases_completed.add(self.phase)
 
     def get_action(self):
         if not self.active:
             raise InputUnavailable("original virtual intent expired or unavailable")
-        duration = self.command.get("transition_seconds", 0.)
+        duration = self._ramp_end_elapsed_s if self.left_entry else self.command.get("transition_seconds", 0.)
         remaining = duration-self._ramp_rebased_at
         fraction = min(1., (self.ramp_elapsed_s-self._ramp_rebased_at)/remaining) if remaining > 0 else 1.
         return {key.removeprefix("arm_"): self.start_target[key]+fraction*(target-self.start_target[key])
@@ -328,7 +339,8 @@ class VirtualIntentWorkload:
         return {"segment": self.segment, "input_mode": "changing-intent", "program_active_seconds": None,
                 **({"workspace_profile": LEFT_ENTRY_WORKSPACE_PROFILE, "proposed_entry_endpoint_raw": 1164,
                     "proposed_entry_endpoint": self.entry_endpoint, "last_accepted_entry_command": self.cursor[self.entry_key],
-                    "physical_endpoint_verified": False,
+                    "physical_endpoint_verified": False, "entry_duration_replans": self.entry_duration_replans,
+                    "entry_ramp_remaining_active_s": max(0., self._ramp_end_elapsed_s-self.ramp_elapsed_s),
                     "active_budget_seconds": 25., "wall_budget_seconds": 60.} if self.left_entry else {}),
                 "intent_channel": self.intent_channel,
                 "measured_reference": dict(self.measured_reference), "command_reference": dict(self.origin),

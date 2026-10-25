@@ -1474,6 +1474,7 @@ def test_real_wss_clean_close_ends_qualified_wait_before_timeout(tmp_path):
         "normal_program_finish_ordinary_arms_intents_entry",
         "normal_program_finish_ordinary_arms_intents_entry_recovery",
         "normal_program_finish_ordinary_arms_intents_entry_retreat",
+        "normal_program_finish_ordinary_arms_intents_entry_replan",
         "normal_program_finish_ordinary_arms_intents_entry_active_cap",
         "normal_program_finish_ordinary_arms_intents_entry_wall_cap",
         "normal_program_finish_ordinary_arms_intents_entry_delayed_wall",
@@ -2035,7 +2036,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             assert payload["op"] == "input"
             self.inputs.append(copy.deepcopy(payload))
             if cycle_run or ordinary_arms:
-                pc_clock[0] += .1  # Full real60-active-second schedule; only PC time is accelerated.
+                pc_clock[0] += 14.735/224 if entry_case and failure.endswith("replan") else .1  # Full real60-active-second schedule; only PC time is accelerated.
             if peer_wait_case:
                 if failure == "peer_fixed_baseline_blocked":
                     await asyncio.sleep(10.)  # The one original baseline ceiling must cancel an in-flight receipt wait.
@@ -2352,13 +2353,14 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                         if entry_case:
                             if failure.endswith("wall_cap"):
                                 pc_clock[0] += 20.
-                            if failure.endswith(("recovery", "retreat", "delayed_wall")) and count == 10 and count not in self.delivered:
+                            recovery_at = 224 if failure.endswith("replan") else 10
+                            if failure.endswith(("recovery", "retreat", "delayed_wall", "replan")) and count == recovery_at and count not in self.delivered:
                                 self.delivered.add(count)
                                 state = session.snapshot
                                 revision = state["run"]["intent_revision"]+1
                                 state["run"].update(status="paused", intent_revision=revision, remaining_s=295.)
                                 held = dict(state["run"]["live_input"]["cursor"])
-                                held["arm_left_elbow_flex.pos"] = m.normalized_raw(1298 if failure.endswith("retreat") else 1250, [3, 0, 1845, 864, 3073])
+                                held["arm_left_elbow_flex.pos"] = m.normalized_raw(1213 if failure.endswith("replan") else 1298 if failure.endswith("retreat") else 1250, [3, 0, 1845, 864, 3073])
                                 state["run"]["live_input"].update(cursor=held, accepted_target=dict(held), cursor_intent_revision=revision)
                                 state["evidence"].update(active_acknowledged=False, acknowledged_intent_revision=revision)
                                 state["evidence"]["accepted_host_action"].update(state="paused", intent_revision=revision,
@@ -2369,8 +2371,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                                 return None
                             cap = failure.endswith(("active_cap", "wall_cap"))
                             stages = {0: (1, "hold" if cap else "move"),
-                                      203 if failure.endswith("retreat") else 123: (2, "hold"),
-                                      205 if failure.endswith("retreat") else 125: (3, "finish")}
+                                      295 if failure.endswith("replan") else 203 if failure.endswith("retreat") else 123: (2, "hold"),
+                                      297 if failure.endswith("replan") else 205 if failure.endswith("retreat") else 125: (3, "finish")}
                             if cap: stages = {0: (1, "hold")}
                             if count not in stages or count in self.delivered:
                                 return None
@@ -2379,7 +2381,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                             command = {"seq": seq, "op": op, "intent_channel": self.intent_channel,
                                        "issued_at_perf_counter_s": source_clock[0], "expires_at_perf_counter_s": 70.}
                             if op == "move":
-                                command.update(transition_seconds=20. if failure.endswith("retreat") else 12., targets={"arm_left_elbow_flex.pos": m.normalized_raw(1164, [3, 0, 1845, 864, 3073])})
+                                command.update(transition_seconds=15. if failure.endswith("replan") else 20. if failure.endswith("retreat") else 12., targets={"arm_left_elbow_flex.pos": m.normalized_raw(1164, [3, 0, 1845, 864, 3073])})
                             return command
                         expired_replacement = failure.endswith("expired_replacement")
                         if (failure.endswith(("expiry", "pause", "invalid")) or expired_replacement or finish_recovery) and count == 3:
@@ -2556,7 +2558,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                     assert len(frames) <= 2 and summary["active_progress_s"] <= .2
                     assert summary["clean_input_end"] == "duration_elapsed"
                 else:
-                    assert len(frames) == (205 if failure.endswith("retreat") else 125) and summary["clean_input_end"] == "virtual_finish"
+                    assert len(frames) == (297 if failure.endswith("replan") else 205 if failure.endswith("retreat") else 125) and summary["clean_input_end"] == "virtual_finish"
                     key = "arm_left_elbow_flex.pos"
                     endpoint = m.normalized_raw(1164, [3, 0, 1845, 864, 3073])
                     origin = summary["selected_profile"]["command_reference"]
@@ -2564,15 +2566,21 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                     assert frames[-1]["frame"]["target"][key] == endpoint
                     assert all(b["frame"]["target"][key] <= a["frame"]["target"][key]+1e-9
                                for index,(a,b) in enumerate(zip(frames,frames[1:]))
-                               if not failure.endswith("retreat") or index != 9)
-                    if failure.endswith(("recovery", "retreat", "delayed_wall")):
+                               if not (failure.endswith("retreat") and index == 9 or failure.endswith("replan") and index == 223))
+                    if failure.endswith(("recovery", "retreat", "delayed_wall", "replan")):
                         assert session.resumes == 2
-                        assert frames[10]["frame"]["target"][key] == m.normalized_raw(1298 if failure.endswith("retreat") else 1250, [3, 0, 1845, 864, 3073])
+                        recovery_at = 224 if failure.endswith("replan") else 10
+                        assert frames[recovery_at]["frame"]["target"][key] == m.normalized_raw(1213 if failure.endswith("replan") else 1298 if failure.endswith("retreat") else 1250, [3, 0, 1845, 864, 3073])
                         if failure.endswith("retreat"):
                             assert frames[10]["frame"]["target"][key] > frames[9]["frame"]["target"][key]
-                        assert frames[10]["progress_s"] == pytest.approx(1.)
-                        assert frames[10]["virtual_intent"]["issued_at_perf_counter_s"] == 10.
-                        assert frames[10]["virtual_intent"]["expires_at_perf_counter_s"] == 70.
+                        assert frames[recovery_at]["progress_s"] == pytest.approx(14.735 if failure.endswith("replan") else 1.)
+                        assert frames[recovery_at]["virtual_intent"]["issued_at_perf_counter_s"] == 10.
+                        assert frames[recovery_at]["virtual_intent"]["expires_at_perf_counter_s"] == 70.
+                        if failure.endswith("replan"):
+                            assert frames[recovery_at]["virtual_intent"]["transition_seconds"] == 15.
+                            assert summary["selected_profile"]["entry_duration_replans"] == 1
+                            assert summary["selected_profile"]["physical_endpoint_verified"] is False
+                            assert summary["active_progress_s"] < 25.
                     else:
                         assert session.resumes == 1
                 if failure.endswith("delayed_wall"):

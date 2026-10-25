@@ -305,7 +305,7 @@ def test_left_entry_rejoin_uses_inward_held_cursor_without_renewing_original_bud
     source.freeze()
     before = (source.elapsed_s, source.ramp_elapsed_s, dict(source.command), dict(source.origin))
     held = dict(source.cursor, **{key: normalized_raw(1250, value["calibration"][key[:-4]])})
-    source.rejoin(held)
+    source.rejoin(held, remaining_wall_s=26.)
     assert map_leader_action(source.get_action()) == held
     assert (source.elapsed_s, source.ramp_elapsed_s, source.command, source.origin) == before
     source.admit(80.)
@@ -349,10 +349,55 @@ def test_left_entry_fresh_qualified_limiter_retreat_rebases_without_old_source_c
     source.accepted(map_leader_action(source.get_action()))
     held = dict(source.cursor, **{key: normalized_raw(1298, value["calibration"][key[:-4]])})
     assert held[key] > source.cursor[key]
-    source.freeze(); source.rejoin(held)
+    source.freeze(); source.rejoin(held, remaining_wall_s=26.)
     assert map_leader_action(source.get_action()) == held
     assert source.elapsed_s == source.ramp_elapsed_s == 1.
     assert source.command["transition_seconds"] == 20. and source.command["expires_at_perf_counter_s"] == 40.
     source.admit(80.); source.advance(80.1)
     assert endpoint < map_leader_action(source.get_action())[key] < held[key]
     assert source.origin == value["reference"] and source.targets[key] == endpoint
+
+
+def test_left_entry_actual_fa176_rejoin_replans_remaining_ramp_without_new_intent_or_budget():
+    from examples.alohamini.am1_live_teleop import normalized_raw, map_leader_action
+    source, now, value, endpoint = left_entry_workload(seed=1299)
+    key = "arm_left_elbow_flex.pos"
+    issued, expiry = 298098.1593407, 298143.1593407
+    now[0] = issued
+    command = intent(1, issued=issued, expiry=expiry, targets={key:endpoint}, seconds=15.)
+    assert source.submit(command)
+    source.elapsed_s = source.ramp_elapsed_s = 14.735
+    previous = dict(source.cursor, **{key:-72.54096876414668})
+    source.accepted(previous)
+    held = dict(source.cursor, **{key:normalized_raw(1213,value["calibration"][key[:-4]])})
+    now[0] = 298113.8849095
+    source.freeze()
+    source.rejoin(held, remaining_wall_s=26.)
+    assert source.command == command and source.origin == value["reference"]
+    assert source.elapsed_s == source.ramp_elapsed_s == 14.735
+    assert source.get_action()[key.removeprefix("arm_")] == held[key]
+    source.admit(100.)
+    for index in range(44): source.advance(100.+(index+1)/10)
+    result = map_leader_action(source.get_action())
+    assert result[key] == endpoint and source.elapsed_s <= 25.
+    assert all(result[joint] == value for joint,value in source.origin.items() if joint != key)
+    assert source.plan()["physical_endpoint_verified"] is False
+
+
+@pytest.mark.parametrize("budget", ["ttl", "active", "wall", "unknown_wall"])
+def test_left_entry_actual_replan_refuses_only_insufficient_original_budgets(budget):
+    from examples.alohamini.am1_live_teleop import normalized_raw
+    source, now, value, endpoint = left_entry_workload()
+    key = "arm_left_elbow_flex.pos"
+    assert source.submit(intent(1, expiry=40., targets={key:endpoint}, seconds=15.))
+    source.elapsed_s = source.ramp_elapsed_s = 14.735
+    held = dict(source.cursor, **{key:normalized_raw(1213,value["calibration"][key[:-4]])})
+    remaining_wall = 26.
+    if budget == "ttl": now[0] = 38.
+    elif budget == "active": source.elapsed_s = 24.
+    elif budget == "wall": remaining_wall = 2.
+    elif budget == "unknown_wall": remaining_wall = None
+    before = (dict(source.command), dict(source.origin), source.elapsed_s, source.ramp_elapsed_s)
+    with pytest.raises(ValueError, match="entry"):
+        source.rejoin(held, remaining_wall_s=remaining_wall)
+    assert (source.command, source.origin, source.elapsed_s, source.ramp_elapsed_s) == before

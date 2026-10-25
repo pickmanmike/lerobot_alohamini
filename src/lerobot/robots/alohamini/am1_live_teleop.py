@@ -1716,6 +1716,9 @@ def apply_frame(control, robot, command, marker_key):
                 raise ThermalHistoryHoldRequiredError("AM1 thermal history has not requalified")
             if current["deficit_started_at_monotonic_s"] is not None:
                 robot._am1_thermal_history_episode = None
+        if accepted:
+            # Readiness has no arm target: held/recovery waiting earns no motion budget.
+            control.live_cursor_at = control.clock()
         return accepted
     if control.state == "paused" and control._live_summary["state"] == "expired":
         return False
@@ -1734,7 +1737,8 @@ def apply_frame(control, robot, command, marker_key):
             valid_until_monotonic_s=original["valid_until_monotonic_s"],
             accepted_at_monotonic_s=control.clock(),
         )
-    elapsed = max(0, control.clock() - control.live_cursor_at)
+    cursor_at = control.clock()
+    elapsed = max(0, cursor_at - control.live_cursor_at)
     cursor = control._live_summary["cursor"]
     following = {
         key: cursor[key]
@@ -1766,5 +1770,6 @@ def apply_frame(control, robot, command, marker_key):
             body=copy.deepcopy(original["body"]),
             write_acknowledged=False,
         )
-        control.live_cursor_at = control.clock()
+        # Count this protected SDK work once, on the next active cursor step.
+        control.live_cursor_at = cursor_at
     return accepted

@@ -544,6 +544,7 @@ def test_whole_robot_goal_evidence_uses_real_apply_standard_and_existing_nonbloc
     import threading
 
     import scservo_sdk as scs
+    from examples.alohamini.am1_live_teleop import normalized_raw
 
     from tests.robots.test_alohamini_lift_motor_feedback import ByteStreamPort, status
     from tests.robots.test_am1_selected_joint_evidence import group_payload
@@ -557,7 +558,7 @@ def test_whole_robot_goal_evidence_uses_real_apply_standard_and_existing_nonbloc
     control.selected_evidence = evidence
     bus = robot.left_bus
     codec = FeetechMotorsBus("unused-whole-goal", bus.motors, bus.calibration)
-    port = ByteStreamPort([status(group_payload(goal=2124, present=2120), motor_id=3)])
+    port = ByteStreamPort([status(group_payload(goal=2122, present=2120), motor_id=3)])
     bus.port, bus.port_handler, bus.packet_handler = codec.port, port, scs.PacketHandler(0)
     bus.model_ctrl_table, bus._decode_sign = codec.model_ctrl_table, codec._decode_sign
     bus._encode_sign, bus._split_into_byte_chunks = codec._encode_sign, codec._split_into_byte_chunks
@@ -586,8 +587,11 @@ def test_whole_robot_goal_evidence_uses_real_apply_standard_and_existing_nonbloc
     robot.send_action = send
     assert control.apply(robot, frame(identity, binding, 1))
     frozen = control.live_snapshot()
+    changed_target = dict(frozen["cursor"])
+    # Stage68 reserves reads for changed targets; retain the original HOLD/reference separately.
+    changed_target["arm_left_elbow_flex.pos"] = normalized_raw(2122, frozen["workspace"]["calibration"]["arm_left_elbow_flex"])
     original = sample(control, expiry=10.34)
-    original["target"] = dict(frozen["cursor"])
+    original["target"] = dict(changed_target)
     now[0] = 10.1
     assert control.apply(robot, frame(identity, binding, 2, mode="active", epoch=2, sample=original))
     assert evidence.teleop_action["action_sequence"] == control.accepted_action_sequence == 2
@@ -595,7 +599,7 @@ def test_whole_robot_goal_evidence_uses_real_apply_standard_and_existing_nonbloc
         now[0] = 10.+index/10
         fresh = sample(control, seq=index, expiry=now[0]+.24,
                        source_id=original["source"]["source_id"], acquired=1.01+(index-1)/10)
-        fresh["target"] = dict(frozen["cursor"])
+        fresh["target"] = dict(changed_target)
         assert control.apply(robot, frame(identity, binding, index+1, mode="active", epoch=2, sample=fresh))
     observation = robot.get_observation()
     observation["_am1_arm_feedback"] = {"version": 1, "positions": {
@@ -621,7 +625,7 @@ def test_whole_robot_goal_evidence_uses_real_apply_standard_and_existing_nonbloc
         evidence.publish(robot, control, observation)
         row = next(iter(observation["_am1_local_feedback"]["selected_joint"]["goal_readbacks"].values()))
         assert row["diagnostic_available"] is True
-        assert row["goal_position_raw"] == row["requested_goal_raw"] == 2124 and row["present_position_raw"] == 2120
+        assert row["goal_position_raw"] == row["requested_goal_raw"] == 2122 and row["present_position_raw"] == 2120
         assert row["position"]["raw"] == 2124 and row["position"]["read_started_at_monotonic_s"] == 10.59
         assert row["action_sequence"] == control.accepted_action_sequence == 7 and row["last_input_seq"] == 6
         assert row["epoch"] == control.epoch == 2 and row["intent_revision"] == control.intent_revision == 0
@@ -645,7 +649,7 @@ def test_whole_robot_goal_evidence_uses_real_apply_standard_and_existing_nonbloc
         if last_outcome != "accepted":
             now[0] = 10.7
             next_sample = sample(control, seq=7, expiry=10.94, source_id=original["source"]["source_id"], acquired=1.61)
-            next_sample["target"] = dict(frozen["cursor"])
+            next_sample["target"] = dict(changed_target)
             assert control.apply(robot, frame(identity, binding, 8, mode="active", epoch=2, sample=next_sample)) is (last_outcome == "none")
             assert evidence.teleop_action is None
         else:
@@ -659,7 +663,7 @@ def test_whole_robot_goal_evidence_uses_real_apply_standard_and_existing_nonbloc
         release.set()
         writer.close()
     emitted = json.loads(written[0].decode().removeprefix("[AM1 SELECTED JOINT] "))
-    assert emitted["goal_position_raw"] == 2124 and emitted["action"]["write_acknowledged"] is False
+    assert emitted["goal_position_raw"] == 2122 and emitted["action"]["write_acknowledged"] is False
 
 
 # Existing native lane; the gain transaction itself has separate injected-wire tests.
@@ -869,6 +873,7 @@ def test_left_response_explicit_comparison_refuses_usb_source_without_changing_o
 
 def test_whole_robot_bilateral_elbow_readbacks_follow_actual_apply_and_cached_settings(monkeypatch):
     import scservo_sdk as scs
+    from examples.alohamini.am1_live_teleop import normalized_raw
 
     from tests.robots.test_alohamini_lift_motor_feedback import ByteStreamPort, status
     from tests.robots.test_am1_selected_joint_evidence import cached_elbow_settings, group_payload
@@ -882,7 +887,7 @@ def test_whole_robot_bilateral_elbow_readbacks_follow_actual_apply_and_cached_se
     evidence = host.AM1SelectedJointEvidence(enabled=False, clock=lambda: now[0], emit=rows.append)
     control.selected_evidence = evidence
     ports = {}
-    for side, goal, present in (("left", 2124, 2120), ("right", 1847, 1834)):
+    for side, goal, present in (("left", 2122, 2120), ("right", 1849, 1834)):
         bus = getattr(robot, side+"_bus")
         codec = FeetechMotorsBus("unused-bilateral-"+side, bus.motors, bus.calibration)
         port = ports[side] = ByteStreamPort([status(group_payload(goal=goal, present=present), motor_id=3)])
@@ -904,10 +909,14 @@ def test_whole_robot_bilateral_elbow_readbacks_follow_actual_apply_and_cached_se
     assert control.apply(robot, frame(identity, binding, 1))
     frozen = control.live_snapshot()
     source_id = str(uuid4())
+    changed_target = dict(frozen["cursor"])
+    for side, goal in (("left", 2122), ("right", 1849)):
+        key = "arm_"+side+"_elbow_flex.pos"
+        changed_target[key] = normalized_raw(goal, frozen["workspace"]["calibration"][key[:-4]])
     for index in range(1, 17):
         now[0] = 10.+index/10
         fresh = sample(control, seq=index, expiry=now[0]+.24, source_id=source_id, acquired=1.+index/10)
-        fresh["target"] = dict(frozen["cursor"])
+        fresh["target"] = dict(changed_target)
         assert control.apply(robot, frame(identity, binding, index+1, mode="active", epoch=2, sample=fresh))
         observation = robot.get_observation()
         observation["_am1_arm_feedback"] = {"version": 1, "positions": {
@@ -919,7 +928,7 @@ def test_whole_robot_bilateral_elbow_readbacks_follow_actual_apply_and_cached_se
         evidence.report(robot, control, observation)
     assert len(ports["left"].writes) == len(ports["right"].writes) == 1
     assert [row["action"]["side"] for row in rows] == ["left", "right"]
-    assert [(row["requested_goal_raw"], row["goal_position_raw"], row["present_position_raw"]) for row in rows] == [(2124, 2124, 2120), (1847, 1847, 1834)]
+    assert [(row["requested_goal_raw"], row["goal_position_raw"], row["present_position_raw"]) for row in rows] == [(2122, 2122, 2120), (1849, 1849, 1834)]
     evidence.publish(robot, control, observation)
     consumer = SimpleNamespace(get_observation=lambda: observation,
         latest_am1_local_feedback=copy.deepcopy(observation[host.AM1_LOCAL_FEEDBACK_KEY]),
@@ -1400,6 +1409,7 @@ def test_left_entry_native_rechecks_original_fences_at_actual_write_boundary(mon
     now[0] += .05
     assert control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2, sample=value))
     before = len([event for event in robot.events if event[0] == "action"])
+    original_anchor = control.live_cursor_at
     send = robot.send_action
     fault = RuntimeError("original entry status fault")
     def changed_before_write(action):
@@ -1419,6 +1429,7 @@ def test_left_entry_native_rechecks_original_fences_at_actual_write_boundary(mon
             control.apply(robot, frame(identity, owner, 2, mode="active", epoch=2, sample=second))
         if changed == "hard_fault": assert error.value is fault
     assert len([event for event in robot.events if event[0] == "action"]) == before
+    assert control.live_cursor_at == original_anchor, "failed/expired action cannot advance the rate anchor"
 
 
 @pytest.mark.parametrize("correction", ["outward_outside", "inward_outside", "other_left", "other_right", "bounded_retreat"])
@@ -1518,3 +1529,102 @@ def test_left_entry_encoded_guard_does_not_block_no_input_resume_readiness(monke
     now[0] += .01
     assert control.apply(robot, frame(identity, owner, 3, mode="active", epoch=4, revision=1))
     assert not any(register == "Goal_Position" for bus in (robot.left_bus, robot.right_bus) for register, _ in bus.writes)
+
+
+@pytest.mark.parametrize("cadence", ["actual-fa176", "fixed-fifteen-hz"])
+def test_left_entry_rate_cursor_counts_prior_sdk_work_once_at_real_command_intervals(monkeypatch, cadence):
+    from examples.alohamini.am1_live_teleop import normalized_raw
+    now, identity, owner, robot, control, _ = left_entry_lane(monkeypatch, real_send=True)
+    key = "arm_left_elbow_flex.pos"
+    frozen = copy.deepcopy(control.live_snapshot())
+    # First twelve accepted receive/apply intervals, original fa176 native host monotonic clock.
+    intervals = [
+        (0.000000000, 0.044411324), (0.044582860, 0.076411202),
+        (0.101066596, 0.126406708), (0.126577095, 0.163601770),
+        (0.190128447, 0.215808222), (0.275055920, 0.297424349),
+        (0.325070426, 0.358466127), (0.384044903, 0.407414455),
+        (0.434632238, 0.466405913), (0.492066152, 0.520706129),
+        (0.521393438, 0.549453771), (0.580042400, 0.604460240),
+    ] if cadence == "actual-fa176" else [(i / 15, i / 15 + .03) for i in range(31)]
+    source_id = str(uuid4())
+    send = robot.send_action
+    completed = [10.]
+    def sdk_work_then_send(action):
+        # Keep real local control, guards, limiter/encoder and bus writes; inject only device work time.
+        now[0] = completed[0]
+        return send(action)
+    robot.send_action = sdk_work_then_send
+    for index, (received, finished) in enumerate(intervals, 1):
+        now[0], completed[0] = 10 + received, 10 + finished
+        value = sample(control, seq=index, expiry=now[0]+.24, acquired=1+received, source_id=source_id)
+        value["target"] = dict(frozen["cursor"])
+        # Original135-tick/15-second intent =9 ticks/s; strictly below unchanged1 degree/s native cap.
+        value["target"][key] = normalized_raw(1299 - 9 * received, frozen["workspace"]["calibration"][key[:-4]])
+        assert control.apply(robot, frame(identity, owner, index, mode="active", epoch=2, sample=value))
+    result = control.live_snapshot()
+    cursor_raw = (result["cursor"][key]+100) * 2209 / 200 + 864
+    # Independently hand-calculated from last receive time at9 ticks/s.
+    expected_raw = 1293.7796184 if cadence == "actual-fa176" else 1281.
+    assert cursor_raw == pytest.approx(expected_raw, abs=1e-6)
+    # Existing Feetech encoder truncates the positive raw command; cursor fractions remain continuous.
+    expected_encoded = 1293 if cadence == "actual-fa176" else 1281
+    assert robot.left_bus.goals[key[:-4]] == expected_encoded
+    assert result["accepted_target"][key] == pytest.approx(normalized_raw(expected_encoded, frozen["workspace"]["calibration"][key[:-4]]))
+    assert result["valid_until_monotonic_s"] == value["valid_until_monotonic_s"]
+    for field in ("workspace", "reference", "live_admitted_at_monotonic_s", "live_deadline_monotonic_s"):
+        assert result[field] == frozen[field]
+    assert all(robot.left_bus.goals[name] == bounds[0] for name, bounds in
+               ((k[:-4], b) for k, b in frozen["workspace"]["raw_bounds"].items() if k.startswith("arm_left_") and k != key))
+
+
+def test_ordinary_arms_five_degree_cursor_also_counts_protected_sdk_work_once(monkeypatch):
+    from examples.alohamini.am1_live_teleop import normalized_raw
+    now, identity, owner, robot, control, _ = current_rest119_lane(monkeypatch, workload_segment="ordinary-arms")
+    frozen = copy.deepcopy(control.live_snapshot())
+    key = "arm_left_elbow_flex.pos"
+    source_id = str(uuid4())
+    send = robot.send_action
+    def protected_sdk_work(action):
+        now[0] += .03
+        return send(action)
+    robot.send_action = protected_sdk_work
+    for index in range(1, 3):
+        now[0] = 10 + index * .05
+        value = sample(control, seq=index, expiry=now[0]+.24, acquired=1+index*.05, source_id=source_id)
+        value["target"] = dict(frozen["cursor"])
+        value["target"][key] = normalized_raw(1164, frozen["workspace"]["calibration"][key[:-4]])
+        assert control.apply(robot, frame(identity, owner, index, mode="active", epoch=2, sample=value))
+    cursor_raw = (control.live_snapshot()["cursor"][key]+100) * 2209 / 200 + 864
+    # 0.1 active second at the existing5 degree/s ceiling =5.688888889 encoder ticks.
+    assert cursor_raw == pytest.approx(1095.6888888889)
+    assert control.live_snapshot()["workspace"] == frozen["workspace"]
+
+
+@pytest.mark.parametrize("profile", ["entry", "ordinary"])
+def test_successful_no_input_readiness_excludes_held_wait_from_first_current_input_rate(monkeypatch, profile):
+    from examples.alohamini.am1_live_teleop import normalized_raw
+    if profile == "entry":
+        now, identity, owner, robot, control, _ = left_entry_lane(monkeypatch)
+    else:
+        now, identity, owner, robot, control, _ = current_rest119_lane(monkeypatch, workload_segment="ordinary-arms")
+    frozen = copy.deepcopy(control.live_snapshot())
+    key = "arm_left_elbow_flex.pos"
+    now[0] = 20.
+    assert control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2))
+    assert control.live_sample is None
+    assert all(key not in event[1] for event in robot.events if event[0] == "action")
+    ready_anchor = control.live_cursor_at
+    now[0] = 20.02
+    assert not control.apply(robot, frame(identity, owner, 1, mode="active", epoch=2))
+    assert control.live_cursor_at == ready_anchor, "stale/no-op ACK cannot move the rate anchor"
+    now[0] = 20.05
+    value = sample(control, expiry=20.29)
+    value["target"] = dict(frozen["cursor"])
+    value["target"][key] = normalized_raw(1164, frozen["workspace"]["calibration"][key[:-4]])
+    assert control.apply(robot, frame(identity, owner, 2, mode="active", epoch=2, sample=value))
+    cursor_raw = (control.live_snapshot()["cursor"][key]+100) * 2209 / 200 + 864
+    expected_raw = 1298.4311111111 if profile == "entry" else 1092.8444444444
+    assert cursor_raw == pytest.approx(expected_raw)
+    assert control.live_snapshot()["valid_until_monotonic_s"] == 20.29
+    for field in ("workspace", "reference", "live_admitted_at_monotonic_s", "live_deadline_monotonic_s"):
+        assert control.live_snapshot()[field] == frozen[field]
