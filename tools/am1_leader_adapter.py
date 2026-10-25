@@ -4976,7 +4976,27 @@ def main(argv=None):
         parser.error("bounded duration <=180s and selected finite interruption required")
     if args.next_start_seconds is not None and not 0 < args.next_start_seconds <= 5:
         parser.error("next Start check must be greater than zero through5s")
-    print(json.dumps(asyncio.run(run(args)), sort_keys=True))
+    summary = asyncio.run(run(args))
+    if args.virtual_input:
+        # run() already sealed the complete proof; keep the interactive console useful.
+        cleanup_ok = summary.get("native_cleanup_uncertain") is False and summary.get("cleanup_errors") == []
+        result = {"event": "virtual_input_result",
+                  "outcome": ("finished" if summary.get("finish_qualified") is True else "input_closed")
+                             if cleanup_ok else "cleanup_incomplete",
+                  "run_id": summary.get("run_id", summary.get("owned_run_id")),
+                  "output": str(Path(args.output).resolve()),
+                  "summary_path": str((Path(args.output)/"summary.json").resolve()),
+                  "active_progress_s": summary.get("active_progress_s"), "frame_count": summary.get("frame_count", 0),
+                  "interactive_input_complete": summary.get("interactive_input_complete", False),
+                  "clean_input_end": summary.get("clean_input_end"),
+                  "finish_qualified": summary.get("finish_qualified", False),
+                  "native_held_qualified": summary.get("native_held_qualified", False),
+                  "native_cleanup_uncertain": summary.get("native_cleanup_uncertain"),
+                  "physical_register_off_readback_verified": summary.get("physical_register_off_readback_verified", False),
+                  "cleanup_error_count": len(summary.get("cleanup_errors", []))}
+    else:
+        result = summary
+    print(json.dumps(result, sort_keys=True))
 
 
 if __name__ == "__main__":

@@ -112,6 +112,62 @@ def test_ordinary_arms_cli_selects_only_normal_uninterrupted_virtual_input(monke
     assert len(seen) == 1
 
 
+@pytest.mark.parametrize("changing", [False, True])
+def test_changing_input_cli_prints_scalar_result_while_full_summary_file_and_legacy_output_remain(tmp_path, monkeypatch, capsys, changing):
+    import json
+    from pathlib import Path
+
+    m = adapter()
+    summary = {"run_id": "11111111-1111-4111-8111-111111111111", "active_progress_s": 17.25,
+               "frame_count": 123, "finish_qualified": True, "native_held_qualified": True,
+               "native_cleanup_uncertain": False, "physical_register_off_readback_verified": True,
+               "interactive_input_complete": True, "clean_input_end": "virtual_finish", "cleanup_errors": [],
+               "final_native_ack": {"native_proof_marker": "x"*30000, "calibration": {"device": [1, 2, 3]}}}
+    output = tmp_path / "recorded-run"
+
+    async def run(args):
+        Path(args.output).mkdir()
+        (Path(args.output)/"summary.json").write_text(json.dumps(summary), encoding="utf-8")
+        return summary
+
+    monkeypatch.setattr(m, "run", run)
+    argv = ["--source", "virtual-leaders", "--workload-segment", "ordinary-arms", "--url", "unused",
+            "--ca", "unused", "--storage-state", "unused", "--output", str(output)]
+    m.main(argv + (["--virtual-input", "interactive"] if changing else []))
+    text = capsys.readouterr().out
+    printed = json.loads(text)
+    assert json.loads((output/"summary.json").read_text(encoding="utf-8")) == summary
+    if changing:
+        assert len(text.encode("utf-8")) < 2048 and "native_proof_marker" not in text and "calibration" not in text
+        assert all(value is None or type(value) in (str, bool, int, float) for value in printed.values())
+        assert printed["event"] == "virtual_input_result" and printed["outcome"] == "finished"
+        assert printed["run_id"] == summary["run_id"] and printed["frame_count"] == 123
+        assert printed["active_progress_s"] == 17.25 and printed["cleanup_error_count"] == 0
+        assert Path(printed["summary_path"]) == output/"summary.json"
+    else:
+        assert printed == summary and len(text) > 30000
+
+
+@pytest.mark.parametrize("uncertain,errors", [(True, []), (False, [{"step": "native_stop", "message": "cleanup failed"}])])
+def test_changing_input_cli_never_calls_qualified_finish_success_when_cleanup_is_unqualified(tmp_path, monkeypatch, capsys, uncertain, errors):
+    import json
+
+    m = adapter()
+    summary = {"finish_qualified": True, "native_held_qualified": True,
+               "native_cleanup_uncertain": uncertain, "cleanup_errors": errors}
+
+    async def run(args):
+        return summary
+
+    monkeypatch.setattr(m, "run", run)
+    m.main(["--source", "virtual-leaders", "--workload-segment", "ordinary-arms", "--virtual-input", "interactive",
+            "--url", "unused", "--ca", "unused", "--storage-state", "unused", "--output", str(tmp_path/"run")])
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["outcome"] == "cleanup_incomplete" and printed["finish_qualified"] is True
+    assert printed["native_cleanup_uncertain"] is uncertain and printed["cleanup_error_count"] == len(errors)
+    assert summary["cleanup_errors"] == errors
+
+
 @pytest.mark.parametrize("changed", [{"source": "usb-leaders"}, {"bench_continuity": True},
                                     {"next_start_seconds": 1.}, {"interrupt_at_seconds": 1.},
                                     {"interrupt_controller": True}])
