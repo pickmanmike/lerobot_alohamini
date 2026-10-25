@@ -2587,7 +2587,7 @@ ACTUAL114_RESPONSE_BASELINE = {'binding': {'host_incarnation': '1a96514b-89e7-49
  'status': 'baseline_refused'}
 
 
-def response_baseline_refused_fixture(tmp_path, monkeypatch, *, ordinary_current_rest=False):
+def response_baseline_refused_fixture(tmp_path, monkeypatch, *, ordinary_current_rest=False, volatile_stopped=False):
     m, config, run, proof, state = incomplete_preactivation_fixture(tmp_path, monkeypatch)
     old = run["physical_result"]["readback"]
     trial = copy.deepcopy(ACTUAL114_RESPONSE_BASELINE)
@@ -2604,6 +2604,13 @@ def response_baseline_refused_fixture(tmp_path, monkeypatch, *, ordinary_current
         trial["binding"]["request_sha256"] = hashlib.sha256(canonical(trial["binding"]["request"])).hexdigest()
         registers = trial["original_registers"]
         registers.update(Present_Position=1299, Goal_Position=1140, Present_Temperature=28, Present_Voltage=118)
+        if volatile_stopped:
+            # Actual963 has a legal current rest but uninitialized volatile fields;
+            # it supplies no powered readiness, writes, or restoration obligation.
+            trial["binding"]["request"]["source_head"] = "6325b718315257b59dc419e88744e7122bfc561d"
+            trial["binding"]["request_sha256"] = hashlib.sha256(canonical(trial["binding"]["request"])).hexdigest()
+            registers.update(Present_Position=1142, Goal_Position=0, Acceleration=0)
+            trial["frozen_teleop_registers"]["Acceleration"] = 0
         for event in trial["events"]:
             event["value"] = registers[event["register"]] if "register" in event else trial["original_bytes"][str(event["address"])]
         trial["original_settings_sha256"] = hashlib.sha256(canonical({"registers": registers, "individual_bytes": trial["original_bytes"]})).hexdigest()
@@ -3232,3 +3239,81 @@ def test_response_goal_completion115_changed_after_validation_never_receives_ack
     with pytest.raises(ValueError):
         m.archive_and_ack(config, actual, received, markers, str(uuid.uuid4()))
     assert received == raw and all((state / name).exists() for name in m.MARKERS)
+
+
+
+def test_response_baseline_volatile_stopped_requires_fresh_proof_and_distinct_ack(tmp_path, monkeypatch):
+    m, config, run, proof, state = response_baseline_refused_fixture(
+        tmp_path, monkeypatch, ordinary_current_rest=True, volatile_stopped=True
+    )
+    before = copy.deepcopy(run)
+    raw = publish_incomplete_fixture(config, run, proof, state)
+    actual, received, inventory = m.load_qualified_proof(config, run)
+    assert actual == proof and received == raw and inventory == dict.fromkeys(m.MARKERS)
+    assert not m.acknowledged_receipt(actual, run, str(uuid.uuid4()))
+    ack_operation, consumed = str(uuid.uuid4()), str(uuid.uuid4())
+    ack = m.archive_and_ack(config, actual, received, inventory, ack_operation)
+    assert m.acknowledged_receipt({**actual, "acknowledgment": {**ack, "consumed_operation_id": consumed}}, run, consumed)
+    assert run == before and run["uncertain"] is True and run["status"] == "faulted"
+    assert run["native_live_at"] is None and run["progress_s"] == 0
+    trial = run["physical_result"]["readback"]["readback"]["left_response_p_trial"]
+    assert (trial["original_registers"]["Present_Position"], trial["original_registers"]["Goal_Position"],
+            trial["original_registers"]["Acceleration"]) == (1142, 0, 0)
+    assert not trial["restore_required"] and all(row["operation"] == "read" for row in trial["events"])
+    assert all(not (state / name).exists() for name in m.MARKERS)
+
+
+@pytest.mark.parametrize("broken", [
+    "outside_corridor", "outside_calibration", "goal_only", "acceleration_only", "other_goal", "other_acceleration",
+    "maximum_acceleration", "p32", "torque", "lock", "status", "current", "frozen", "byte", "digest",
+    "write", "missing_event", "obligation", "configured", "source", "host", "boot", "request_hash",
+    "calibration", "live", "progress", "fresh_lift", "fresh_thermal", "fresh_nonzero", "proof_age", "proof_boot",
+])
+def test_response_baseline_volatile_stopped_denies_other_states_and_incomplete_proof(tmp_path, monkeypatch, broken):
+    m, config, run, proof, state = response_baseline_refused_fixture(
+        tmp_path, monkeypatch, ordinary_current_rest=True, volatile_stopped=True
+    )
+    trial = run["physical_result"]["readback"]["readback"]["left_response_p_trial"]
+    registers, binding = trial["original_registers"], trial["binding"]
+    if broken == "outside_corridor": registers["Present_Position"] = 1299
+    elif broken == "outside_calibration": registers["Present_Position"] = 3074
+    elif broken == "goal_only": registers["Acceleration"] = 254
+    elif broken == "acceleration_only": registers["Goal_Position"] = 1142
+    elif broken == "other_goal": registers["Goal_Position"] = 1
+    elif broken == "other_acceleration": registers["Acceleration"] = 1
+    elif broken == "maximum_acceleration": registers["Maximum_Acceleration"] = 0
+    elif broken == "p32": registers["P_Coefficient"] = 32
+    elif broken == "torque": registers["Torque_Enable"] = 1
+    elif broken == "lock": registers["Lock"] = 1
+    elif broken == "status": registers["Status"] = 1
+    elif broken == "current": registers["Present_Current"] = 1
+    elif broken == "frozen": trial["frozen_teleop_registers"]["Acceleration"] = 254
+    elif broken == "byte": trial["original_bytes"]["24"] = 32
+    elif broken == "digest": trial["original_settings_sha256"] = "a" * 64
+    elif broken == "write": trial["events"][-1]["operation"] = "write"
+    elif broken == "missing_event": trial["events"].pop()
+    elif broken == "obligation": trial["restore_required"] = True
+    elif broken == "configured": trial["configured_p_readback"] = 32
+    elif broken == "source": binding["request"]["source_head"] = "a" * 40
+    elif broken == "host": binding["host_incarnation"] = str(uuid.uuid4())
+    elif broken == "boot": binding["request"]["boot_id"] = str(uuid.uuid4())
+    elif broken == "request_hash": binding["request_sha256"] = "a" * 64
+    elif broken == "calibration": registers["Min_Position_Limit"] = 863
+    elif broken == "live": run["native_live_at"] = 525863.0
+    elif broken == "progress": run["progress_s"] = .1
+    elif broken == "fresh_lift": proof["readback"]["lift_stationary"] = None
+    elif broken == "fresh_thermal": proof["readback"]["lift_stationary"]["temperature_slots"][0][0] -= 1
+    elif broken == "fresh_nonzero": proof["readback"]["readbacks"][0]["value"] = 1
+    elif broken == "proof_age": monkeypatch.setattr(m.time, "monotonic", lambda: proof["completed_at_monotonic_s"] + 181)
+    elif broken == "proof_boot": monkeypatch.setattr(m, "current_boot_id", lambda: str(uuid.uuid4()))
+    if broken not in {"frozen", "byte", "digest", "write", "missing_event", "obligation", "configured", "source", "host", "boot", "request_hash", "live", "progress", "fresh_lift", "fresh_thermal", "fresh_nonzero", "proof_age", "proof_boot"}:
+        trial["frozen_teleop_registers"] = {key: registers[key] for key in trial["frozen_teleop_registers"]}
+        for row in trial["events"]:
+            row["value"] = registers[row["register"]] if "register" in row else trial["original_bytes"][str(row["address"])]
+        trial["original_settings_sha256"] = hashlib.sha256(canonical({"registers": registers, "individual_bytes": trial["original_bytes"]})).hexdigest()
+    if broken in {"source", "boot"}: binding["request_sha256"] = hashlib.sha256(canonical(binding["request"])).hexdigest()
+    publish_incomplete_fixture(config, run, proof, state)
+    before = copy.deepcopy(run)
+    with pytest.raises((ValueError, KeyError, TypeError)):
+        m.load_qualified_proof(config, run)
+    assert run == before and not m._ack_path(state, run["run_id"]).exists()

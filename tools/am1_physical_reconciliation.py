@@ -357,20 +357,27 @@ def _validate_response_baseline_refused_origin(run, proof, receipt, chain):
         "Velocity_closed_loop_I_integral_coefficient": 200, "Present_Current": 0, "Status": 0,
     }
     registers, individual = trial["original_registers"], trial["original_bytes"]
+    # This exact OFF/no-write state is an origin only, never powered readiness.
+    volatile_stopped = (current_rest and isinstance(registers, dict)
+                        and registers.get("Goal_Position") == 0 and registers.get("Acceleration") == 0)
+    if volatile_stopped:
+        expected["Acceleration"] = 0
     require(
         isinstance(registers, dict)
         and set(registers) == set(expected) | {"Present_Position", "Goal_Position", "Present_Voltage", "Present_Temperature"}
         and all(type(value) is int for value in registers.values())
         and all(registers[key] == value for key, value in expected.items())
         and 864 <= registers["Present_Position"] <= 3073
-        and not (1051 if current_rest else 2011) <= registers["Present_Position"] <= (1164 if current_rest else 2124)
-        and (864 if current_rest else 2011) <= registers["Goal_Position"] <= (3073 if current_rest else 2124)
+        and (1051 <= registers["Present_Position"] <= 1164 if volatile_stopped else
+             not (1051 if current_rest else 2011) <= registers["Present_Position"] <= (1164 if current_rest else 2124))
+        and (registers["Goal_Position"] == 0 if volatile_stopped else
+             (864 if current_rest else 2011) <= registers["Goal_Position"] <= (3073 if current_rest else 2124))
         and 40 <= registers["Present_Voltage"] <= 140
         and 0 <= registers["Present_Temperature"] < 70
         and individual == {"24": 16, "25": 0}
         and all(type(value) is int for value in individual.values())
         and trial["original_settings_sha256"] == sha(canonical({"registers": registers, "individual_bytes": individual})),
-        "only calibrated out-of-corridor position with unchanged safe stopped settings required",
+        "only reviewed out-of-corridor or volatile OFF baseline with unchanged safe stopped settings required",
     )
     frozen_keys = {
         "ID", "Model_Number", "Firmware_Major_Version", "Firmware_Minor_Version",
