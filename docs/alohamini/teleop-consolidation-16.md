@@ -356,6 +356,31 @@ $sessionArgs = @('--url', '<existing-HTTPS-origin>',
                  '--storage-state', '<existing-enrolled-state>')
 ```
 
+**Changing activity: software-ready; physical verification pending.** Set `$bindings` to the exact selected binding named by the current installed-component pointer, then use the existing adapter directly:
+
+```powershell
+$bindings = '<exact-current-selected06-bindings.json>'
+uv run --no-sync --project C:/Users/pickm/lerobot_alohamini_client python -B -m tools.am1_leader_adapter `
+  @sessionArgs --bindings $bindings `
+  --output-root '.cache/am1-teleop-consolidation-16/physical-runs' `
+  --prepare-current-rest --virtual-input interactive --duration-seconds 180
+```
+
+The output root must already be private. Each invocation creates its own fresh UUID directory, freezes the matched binding/audit context, derives the installed configuration and source hashes, prepares the explicit current-rest LEFT P32 request once, then performs ordinary Claim/Start. No per-attempt output name, configuration or hash reconstruction is needed. The browser supplies required viewing and enrolled protective Pause/Stop; arm/gripper intentions come from this PC input. Body/lift intent remains zero, and ordinary settings restoration and finishing remain in force. The 180-second producer-active window is an example, not a readiness requirement; the original native Live deadline also bounds the session.
+
+Wait for the printed `virtual_input_ready` record with the original qualified command origin, legal bounds, joint names and units. Choose targets from those actual values; do not guess, scale or clamp them. Arm targets use the printed calibrated normalized coordinates; grippers use opening percentage points. Enter one line at a time in the same terminal:
+
+```text
+move <transition_s> <ttl_s> <joint>=<legal_target> [<joint>=<legal_target> ...]
+hold <ttl_s>
+return <transition_s> <ttl_s>
+finish
+```
+
+`move` changes only the named arm/gripper targets; other targets stay at their accepted cursor. `hold` retains those targets for its declared lifetime, and `return` requests the original qualified command origin. A newer intention replaces the prior ramp, and the pending input mailbox keeps only the latest line. The original PC-clock expiry continues through holds, viewing interruptions and recovery, including for `hold`; controller renewal never refreshes it. Expired or obsolete buffered input is discarded. Recovery keeps the original measured reference, command origin, workspace and native deadline, and needs fresh intent rather than replaying an old line. `finish` (or clean end of input) uses the existing qualified HOLD, Stop/readback and settings restoration path.
+
+Omit `--virtual-input interactive` to retain the optional known-working 12-active-second ordinary-arms preset, with its six-second coordinated reach and six-second return. Increasing the outer duration does not turn that preset into ongoing input. The historical procedures below remain separate from this new workflow and its pending physical verification.
+
 **Historical Stage57/116 execution checkpoint, superseded by Stage63 above:** All ten Stage57 stopped/idle phases installed motorbe7e8169/runtime d2b663db/MF30f6f04c, retaining full matched Stage55 rollback/private state. Actual115 recovery is complete. Actual116 restored temporary LEFT P32 to P16/Lock0 without transaction Goal writes, but refused before home/Goal seeding/Live at LEFT shoulder-lift ID2 PP3232 against legal maximum3223. Nine ticks/0.791deg exceeds the deliberate half-degree inward acquisition bound. Zero streamed frames/active seconds and no116 in-run viewing credit. All20 host OFF/zero reads passed; unavailable pre-home lift qualification originally kept native uncertainty. Separate fresh proof0f0acd1a/ACKb37678c3/accepted consumption now closed it, preserving the original fault/cleanup label. That read-only recovery/eight OFF samples are complete and all positions remain3232. The owner approved a temporary at-most1deg inward LEFT shoulder acquisition on2026-10-22 for this action only; the explicit fresh canonical request and focused review/stopped staging are required before use. Ordinary absence retains0.5deg; no repeated recovery or consumed-request replay. Camera30 separately demonstrated illuminated coarse Chest source/display agreement and finite release. The invocation below remains the existing action after uncertainty and supported startup admission are resolved; always prepare a fresh canonical request.
 
 The current short normal-view procedure uses the existing `left-reach` selector:20 producer-active seconds inside the unchanged300-second native ceiling, with fresh streamed targets, required useful viewing, existing travel/rate and baseline settings on other joints. Actual128 completed this action; no additional run is requested automatically. For a later authorized action, prepare immediately beforehand through the existing PC administrative relay and `am1-pi` SSH alias, using the installed Stage63 configuration. Current-rest support carried forward from Stage57 selects raw1051..1164. The explicit fresh-request-bound at-most1degree inward LEFT shoulder startup allowance remains scoped to this temporary LEFT P32/I0/D32 action; omission retains the ordinary0.5degree bound. Its P transaction writes no Goal. Ordinary owned after-home activation still qualifies fresh measured vectors, quiet rest, selected binding, Stop and original freshness before seeding measured q0; cleanup restores P16 and original Lock after OFF without replaying the inactive Goal. Required useful decoded viewing must also qualify. Ordinary requests without the current-rest option retain their existing corridor:
