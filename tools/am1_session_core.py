@@ -45,7 +45,9 @@ TERMINAL = {"stopped", "completed", "faulted", "interrupted"}
 _input_diagnostic_clock = time.monotonic
 _INPUT_DIAGNOSTIC_MARKS = (
     "gateway_received", "gateway_dispatch", "gateway_ipc_started", "core_entered",
-    "core_locked", "core_tick_completed", "core_returned", "gateway_ipc_completed",
+    "core_locked", "core_checkpoint_started", "core_tick_completed",
+    "core_deferred_checkpoint_started", "core_returned", "gateway_ipc_completed",
+    "reply_ready", "reply_send_preparation_started",
 )
 
 
@@ -58,7 +60,7 @@ def _input_diagnostic_monotonic():
 
 
 def _input_diagnostic_result(result, marks):
-    """A closed, bounded observation on an existing input result, never authority."""
+    """A closed, bounded observation on an existing input/grant result, never authority."""
     try:
         previous = result.get("diagnostic_timing", {})
         if previous and (type(previous) is not dict or type(previous.get("version")) is not int
@@ -72,10 +74,15 @@ def _input_diagnostic_result(result, marks):
             type(value) not in (int, float) or not math.isfinite(value) or value < 0 for value in merged.values()
         ):
             raise ValueError("invalid diagnostic mark")
+        if {"core_checkpoint_started", "core_deferred_checkpoint_started"} <= set(merged):
+            raise ValueError("incompatible checkpoint marks")
         ordered = [merged[key] for key in _INPUT_DIAGNOSTIC_MARKS if key in merged]
         if ordered != sorted(ordered):
             raise ValueError("unordered diagnostic marks")
-        return dict(result, diagnostic_timing={"version": 1, "clock": "pi-monotonic", **merged})
+        timing = {"version": 1, "clock": "pi-monotonic", **merged}
+        if len(json.dumps(timing).encode("utf-8")) > 512:
+            raise ValueError("diagnostic metadata exceeds bound")
+        return dict(result, diagnostic_timing=timing)
     except Exception:
         return {key: value for key, value in result.items() if key != "diagnostic_timing"} if isinstance(result, dict) else result
 
@@ -2167,7 +2174,7 @@ class SessionAuthority:
             return None
 
     def handle(self, command, device_id):
-        marks = {"core_entered": _input_diagnostic_monotonic()} if isinstance(command, dict) and command.get("op") == "input" else None
+        marks = {"core_entered": _input_diagnostic_monotonic()} if isinstance(command, dict) and command.get("op") in {"input", "grant"} else None
         with self.mutex:
             if marks is not None:
                 marks["core_locked"] = _input_diagnostic_monotonic()
@@ -2177,6 +2184,7 @@ class SessionAuthority:
                 return self._refuse("invalid command or trusted identity")
             if "device_id" in command:
                 return self._refuse("identity is adapter supplied")
+            deferred_checkpoint = None
             try:
                 mutation_ops = {"pause", "stop", "resume", "reconcile", "release", "handoff"}
                 if command.get("op") == "claim" and "reacquire" in command:
@@ -2207,6 +2215,12 @@ class SessionAuthority:
                     # Lease/grant expiry still runs, but operator intent precedes motion admission.
                     self._expire_controls(self.clock())
                     self.last_tick = self.clock()
+                elif marks is not None:
+                    deferred_checkpoint = self.tick(
+                        _diagnostic_marks=marks,
+                        _defer_periodic_checkpoint=(command.get("op") == "input" and self._physical_interactive()
+                                                    and self.run["recipe"] == TELEOP_RECIPE),
+                    )
                 else:
                     self.tick()
                 if marks is not None:
@@ -2217,12 +2231,22 @@ class SessionAuthority:
                 if oid:
                     self.db.execute("UPDATE mutations SET result=? WHERE id=?", (json.dumps(result), oid))
                     self.db.commit()
-                if marks is not None:
-                    marks["core_returned"] = _input_diagnostic_monotonic()
-                    result = _input_diagnostic_result(result, marks)
-                return result
             except (ValueError, TypeError, KeyError, OverflowError):
-                return self._refuse("malformed command")
+                if deferred_checkpoint is None:
+                    return self._refuse("malformed command")
+                result = self._refuse("malformed command")
+            if deferred_checkpoint is not None:
+                # Input is volatile and freshly fenced above. Keep its due durable
+                # checkpoint before the reply, but do not delay native admission.
+                # Save failures must escape: admission cannot be reported as no effect.
+                if marks is not None:
+                    marks["core_deferred_checkpoint_started"] = _input_diagnostic_monotonic()
+                self._save()
+                self.last_checkpoint = deferred_checkpoint
+            if marks is not None:
+                marks["core_returned"] = _input_diagnostic_monotonic()
+                result = _input_diagnostic_result(result, marks)
+            return result
 
     def _handle(self, c, d):
         op = c.get("op")
@@ -2941,7 +2965,7 @@ class SessionAuthority:
             return True
         return False
 
-    def tick(self):
+    def tick(self, *, _diagnostic_marks=None, _defer_periodic_checkpoint=False):
         with self.mutex:
             if self.closed:
                 return
@@ -3122,6 +3146,10 @@ class SessionAuthority:
                     self._finish("completed")
                     return
             if r["status"] != previous_status or now - self.last_checkpoint >= 1.0:
+                if _defer_periodic_checkpoint and previous_status == r["status"] == "running":
+                    return now
+                if _diagnostic_marks is not None:
+                    _diagnostic_marks["core_checkpoint_started"] = _input_diagnostic_monotonic()
                 self._save()
                 self.last_checkpoint = now
 

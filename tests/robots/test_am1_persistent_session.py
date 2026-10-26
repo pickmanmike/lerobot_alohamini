@@ -1800,7 +1800,7 @@ def test_input_diagnostic_core_marks_are_separate_from_authority_clock(tmp_path,
         run = start(a, "fake-interactive")
         base = interactive_controls(a, run)
         grant = a.handle(command("grant", **base), "owner")
-        assert "diagnostic_timing" not in grant
+        assert set(grant) - {"diagnostic_timing"} == {"accepted", "status", "grant_id", "issued", "expires"}
         if expired:
             c.advance(.251)
         stamps = iter((100., 100.01, 100.03, 100.04))
@@ -1854,9 +1854,9 @@ def test_input_diagnostic_marks_bound_actual_mutex_wait_and_tick(tmp_path, monke
         calls.append(value)
         entered.set()
         return value
-    def tick():
+    def tick(**kwargs):
         tick_bounds.append(time.monotonic())
-        original_tick()
+        original_tick(**kwargs)
         tick_bounds.append(time.monotonic())
     try:
         run = start(a, "fake-interactive")
@@ -1904,4 +1904,175 @@ def test_input_diagnostic_failure_preserves_original_executor_exception(tmp_path
             a.handle(command("input", **base, grant_id=grant["grant_id"], seq=1, target=[.2]), "owner")
         assert raised.value is original
     finally:
+        a.close()
+
+@pytest.mark.parametrize("refused", [False, True])
+def test_grant_diagnostic_core_marks_preserve_authority_and_original_ttl(tmp_path, monkeypatch, refused):
+    from tools import am1_session_core as core
+
+    c = Clock()
+    a = SessionAuthority(tmp_path, clock=c)
+    try:
+        run = start(a, "fake-interactive")
+        base = interactive_controls(a, run)
+        original_run = a.run["run_id"], a.run["deadline"], a.run["intent_revision"]
+        stamps = iter((100., 100.01, 100.03, 100.04))
+        monkeypatch.setattr(core, "_input_diagnostic_clock", lambda: next(stamps))
+        result = a.handle(command("grant", **dict(base, connection_generation=str(uuid.uuid4()))) if refused
+                          else command("grant", **base), "owner")
+        assert result["accepted"] is (not refused)
+        assert result["diagnostic_timing"] == {
+            "version": 1, "clock": "pi-monotonic", "core_entered": 100., "core_locked": 100.01,
+            "core_tick_completed": 100.03, "core_returned": 100.04}
+        authority = {key: value for key, value in result.items() if key != "diagnostic_timing"}
+        if refused:
+            assert authority["effect_admitted"] is False and a.grant is None
+        else:
+            assert authority == {"accepted": True, "status": "granted", "grant_id": a.grant["id"],
+                                 "issued": 0., "expires": .25}
+        assert c.now == 0. and (a.run["run_id"], a.run["deadline"], a.run["intent_revision"]) == original_run
+    finally:
+        a.close()
+
+
+@pytest.mark.parametrize("failure", [None, float("nan"), True, "raise"])
+def test_grant_diagnostic_failure_never_changes_authority(tmp_path, monkeypatch, failure):
+    from tools import am1_session_core as core
+
+    c = Clock()
+    a = SessionAuthority(tmp_path, clock=c)
+    try:
+        run = start(a, "fake-interactive")
+        base = interactive_controls(a, run)
+        def failed_clock():
+            if failure == "raise":
+                raise RuntimeError("diagnostic clock unavailable")
+            return failure
+        monkeypatch.setattr(core, "_input_diagnostic_clock", failed_clock)
+        result = a.handle(command("grant", **base), "owner")
+        assert result == {"accepted": True, "status": "granted", "grant_id": a.grant["id"],
+                          "issued": 0., "expires": .25}
+        assert c.now == 0.
+    finally:
+        a.close()
+
+
+@pytest.mark.parametrize("op", ["grant", "input"])
+@pytest.mark.parametrize("delayed_phase", ["evidence", "checkpoint"])
+def test_command_checkpoint_marker_splits_delay_without_changing_original_expiry(tmp_path, monkeypatch, op, delayed_phase):
+    from tools import am1_session_core as core
+
+    c, diagnostic = Clock(), [100.]
+    a = SessionAuthority(tmp_path, clock=c)
+    try:
+        run = start(a, "fake-interactive")
+        base = interactive_controls(a, run)
+        grant = a.handle(command("grant", **base), "owner") if op == "input" else None
+        a.last_checkpoint = -1.01
+        original_evidence, original_save = a._evidence, a._save
+        checkpoint_starts = []
+        def delay():
+            diagnostic[0] += .4
+            c.advance(.4)
+        def evidence():
+            if delayed_phase == "evidence":
+                delay()
+            return original_evidence()
+        def save():
+            checkpoint_starts.append(diagnostic[0])
+            if delayed_phase == "checkpoint":
+                delay()
+            return original_save()
+        monkeypatch.setattr(core, "_input_diagnostic_clock", lambda: diagnostic[0])
+        monkeypatch.setattr(a, "_evidence", evidence)
+        monkeypatch.setattr(a, "_save", save)
+        result = a.handle(command("grant", **base) if op == "grant" else command(
+            "input", **base, grant_id=grant["grant_id"], seq=1, target=[.2]), "owner")
+        span = result["diagnostic_timing"]
+        marker = span["core_checkpoint_started"]
+        assert marker == checkpoint_starts[0]
+        before, after = marker - span["core_locked"], span["core_tick_completed"] - marker
+        assert before == pytest.approx(.4 if delayed_phase == "evidence" else 0.)
+        assert after == pytest.approx(.4 if delayed_phase == "checkpoint" else 0.)
+        assert c.now == .4 and a.run["first_cause"] is None
+        if op == "input":
+            assert grant["expires"] == .25 and result["reason"] == "expired grant"
+            assert result["accepted"] is False and result["effect_admitted"] is False
+            assert a.applied_input is None
+        else:
+            assert result["accepted"] is True and result["issued"] == .4 and result["expires"] == .65
+    finally:
+        monkeypatch.undo()
+        a.close()
+
+
+@pytest.mark.parametrize("op", ["grant", "input"])
+def test_command_checkpoint_marker_absence_means_only_no_tick_checkpoint(tmp_path, monkeypatch, op):
+    from tools import am1_session_core as core
+
+    c = Clock()
+    a = SessionAuthority(tmp_path, clock=c)
+    try:
+        run = start(a, "fake-interactive")
+        base = interactive_controls(a, run)
+        grant = a.handle(command("grant", **base), "owner") if op == "input" else None
+        saves, original_save = [], a._save
+        def save():
+            saves.append(True)
+            return original_save()
+        monkeypatch.setattr(a, "_save", save)
+        result = a.handle(command("grant", **base) if op == "grant" else command(
+            "input", **base, grant_id=grant["grant_id"], seq=1, target=[.2]), "owner")
+        assert result["accepted"] and "core_checkpoint_started" not in result["diagnostic_timing"]
+        assert saves == [], "this fixture never reached the conditional tick checkpoint"
+        assert c.now == 0.
+    finally:
+        a.close()
+
+
+def test_command_checkpoint_marker_bad_clock_omits_only_diagnostic(tmp_path, monkeypatch):
+    from tools import am1_session_core as core
+
+    c = Clock()
+    a = SessionAuthority(tmp_path, clock=c)
+    try:
+        run = start(a, "fake-interactive")
+        base = interactive_controls(a, run)
+        grant = a.handle(command("grant", **base), "owner")
+        a.last_checkpoint = -1.01
+        stamps = iter((100., 100., None, 100., 100.))
+        monkeypatch.setattr(core, "_input_diagnostic_clock", lambda: next(stamps))
+        result = a.handle(command("input", **base, grant_id=grant["grant_id"], seq=1, target=[.2]), "owner")
+        assert result == {"accepted": True, "status": "input", "effect_admitted": True}
+        assert a.run["intent"] == [.2] and grant["expires"] == .25 and c.now == 0.
+    finally:
+        a.close()
+
+
+def test_command_checkpoint_failure_keeps_original_error_and_default_tick_has_no_diagnostic_clock(tmp_path, monkeypatch):
+    from tools import am1_session_core as core
+
+    c = Clock()
+    a = SessionAuthority(tmp_path, clock=c)
+    try:
+        run = start(a, "fake-interactive")
+        base = interactive_controls(a, run)
+        a.last_checkpoint = -1.01
+        calls = []
+        def failed_clock():
+            calls.append(True)
+            raise ValueError("diagnostic clock failed")
+        monkeypatch.setattr(core, "_input_diagnostic_clock", failed_clock)
+        a.tick()
+        assert calls == [], "ordinary tick never requests command diagnostic timing"
+        a.last_checkpoint = -1.01
+        original = RuntimeError("original checkpoint failure")
+        def failed_save():
+            raise original
+        monkeypatch.setattr(a, "_save", failed_save)
+        with pytest.raises(RuntimeError) as raised:
+            a.handle(command("grant", **base), "owner")
+        assert raised.value is original and c.now == 0.
+    finally:
+        monkeypatch.undo()
         a.close()

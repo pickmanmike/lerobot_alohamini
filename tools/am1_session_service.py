@@ -180,19 +180,22 @@ class Peer:
         self.input_task = None
         self.sender = asyncio.create_task(self.send())
 
-    def put(self, value, snapshot=False):
+    def put(self, value, snapshot=False, *, grant_reply=False):
         if self.closed:
             return False
         data = encode(value)
+        # Grant only: reserve the bounded final diagnostic mark within the same cap.
+        reservation = 80 if grant_reply else 0
+        size = len(data) + reservation
         if snapshot:
             self.queue = deque(item for item in self.queue if not item[1])
-            self.bytes = sum(len(item[0]) for item in self.queue)
-        if self.bytes + self.inflight + len(data) > 65536:
+            self.bytes = sum(len(item[0]) + item[2] for item in self.queue)
+        if self.bytes + self.inflight + size > 65536:
             self.closed = True
             asyncio.create_task(close_socket(self.ws, self.ws._writer.transport, 1013))
             return False
-        self.queue.append((data, snapshot))
-        self.bytes += len(data)
+        self.queue.append((data, snapshot, reservation))
+        self.bytes += size
         self.wake.set()
         return True
 
@@ -201,10 +204,24 @@ class Peer:
             while not self.closed:
                 await self.wake.wait()
                 while self.queue:
-                    data, _ = self.queue.popleft()
-                    self.bytes -= len(data)
-                    self.inflight = len(data)
-                    await asyncio.wait_for(self.ws.send_str(data.decode()), 0.5)
+                    data, _, reservation = self.queue.popleft()
+                    self.bytes -= len(data) + reservation
+                    self.inflight = len(data) + reservation
+                    if reservation:
+                        async def send_grant():
+                            wire = data
+                            try:
+                                marked = _input_diagnostic_result(strict_json(data), {
+                                    "reply_send_preparation_started": _input_diagnostic_monotonic()})
+                                encoded = encode(marked)
+                                if len(encoded) <= self.inflight:
+                                    wire = encoded
+                            except Exception:
+                                pass  # Diagnostics cannot replace the original reply outcome.
+                            await self.ws.send_str(wire.decode())
+                        await asyncio.wait_for(send_grant(), 0.5)
+                    else:
+                        await asyncio.wait_for(self.ws.send_str(data.decode()), 0.5)
                     self.inflight = 0
                 self.wake.clear()
         except (TimeoutError, ConnectionError, RuntimeError):
@@ -436,7 +453,7 @@ class Gateway:
         return value
 
     async def call(self, command, device):
-        marks = {"gateway_dispatch": _input_diagnostic_monotonic()} if command.get("op") == "input" else None
+        marks = {"gateway_dispatch": _input_diagnostic_monotonic()} if command.get("op") in {"input", "grant"} else None
         lane = self.protective if command.get("op") in {"pause", "stop", "release"} else self.normal
         async with asyncio.timeout(1.5):
             async with lane:
@@ -639,19 +656,24 @@ class Gateway:
             raise ValueError("route supplies operation")
         return web.json_response(await self.dispatch(dict(command, op=op), request["device"]))
 
+    def command_reply(self, peer, value, result):
+        op = value["command"].get("op")
+        if op in {"input", "grant"} and "_diagnostic_received" in value:
+            result = _input_diagnostic_result(result, {"gateway_received": value["_diagnostic_received"]})
+        if op == "grant":
+            result = _input_diagnostic_result(result, {"reply_ready": _input_diagnostic_monotonic()})
+            peer.put(dict(result, kind="result", id=value["id"]), grant_reply=True)
+        else:
+            peer.put(dict(result, kind="result", id=value["id"]))
+
     def enqueue(self, peer, value, *, received_at=None):
         op = value["command"].get("op")
+        if op == "grant":
+            value = dict(value, _diagnostic_received=(_input_diagnostic_monotonic() if received_at is None else received_at))
         if not peer.ack and op not in {"pause", "stop"}:
-            peer.put(
-                {
-                    "kind": "result",
-                    "id": value["id"],
-                    "accepted": False,
-                    "status": "refused",
-                    "reason": "acknowledge current snapshot",
-                    "effect_admitted": False,
-                }
-            )
+            self.command_reply(peer, value, {
+                "accepted": False, "status": "refused", "reason": "acknowledge current snapshot",
+                "effect_admitted": False})
             return
         if op == "input":
             value = dict(value, _diagnostic_received=(_input_diagnostic_monotonic() if received_at is None else received_at))
@@ -673,16 +695,8 @@ class Gateway:
             return
         lane = "protective" if op in {"pause", "stop"} else "normal"
         if peer.commands[lane] >= (2 if lane == "protective" else 6):
-            peer.put(
-                {
-                    "kind": "result",
-                    "id": value["id"],
-                    "accepted": False,
-                    "status": "refused",
-                    "reason": "inflight bound",
-                    "effect_admitted": False,
-                }
-            )
+            self.command_reply(peer, value, {
+                "accepted": False, "status": "refused", "reason": "inflight bound", "effect_admitted": False})
             return
         peer.commands[lane] += 1
         task = asyncio.create_task(self.execute_peer(peer, value, lane))
@@ -730,9 +744,7 @@ class Gateway:
         finally:
             if lane:
                 peer.commands[lane] -= 1
-        if value["command"].get("op") == "input" and "_diagnostic_received" in value:
-            result = _input_diagnostic_result(result, {"gateway_received": value["_diagnostic_received"]})
-        peer.put(dict(result, kind="result", id=value["id"]))
+        self.command_reply(peer, value, result)
 
     async def websocket(self, request):
         if self.pending_ws + len(self.peers) >= 4:

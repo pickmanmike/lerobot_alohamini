@@ -61,6 +61,7 @@ async function liveFixture() {
         reference_norm:5,corridor_min_norm:-5,corridor_max_norm:5,cursor_norm:4,cursor_feedback_sequence:30,cursor_intent_revision:7}}};
   const f=fixture(async()=>({ok:true,json:async()=>({ticket:"current",snapshot})}));
   await f.transport.attach();
+  f.transport.socket.onmessage({data:JSON.stringify({kind:"snapshot",revision:"initial-view",snapshot})});
   Object.assign(f.transport,{connected:true,control:true,device:"enrolled",controllerGeneration:"claimed",connection:"wire"});
   const frames=[];f.transport.socket.bufferedAmount=0;f.transport.socket.send=value=>frames.push(JSON.parse(value));
   const reply=(op,value)=>{
@@ -815,4 +816,126 @@ test("bounded renewal leaves ordinary Stop independent while its HTTP result is 
  const stopped=await t.protective("stop");assert.equal(stopped.accepted,true);assert.equal(stopped.status,"stopped");
  assert.equal(f.requests.at(-1).url,"/api/stop");assert.equal(t.pendingRenewal,pending);assert.equal(t.elbowJog,0);
  t.clear("stopped");await task;assert.equal(f.requests.find(row=>row.url==="/api/claim").signal.aborted,true);
+});
+
+
+async function sameSocketViewFixture() {
+ const snapshot={service_incarnation:"current-owner",controller:{device_id:"enrolled",controller_generation:"claimed"},
+  run:{run_id:"ordinary-current",recipe:"physical-live-teleop",source:"protected-physical-provider",status:"running",intent_revision:2},
+  evidence:{fault:null}};
+ const requests=[],frames=[],f=fixture(async(url,options)=>{
+  requests.push({url,method:options?.method});
+  assert.equal(url,"/api/attach");
+  return {ok:true,json:async()=>({ticket:"fresh-view-ticket",snapshot:structuredClone(snapshot)})};
+ });
+ const t=f.transport;
+ Object.assign(t,{device:"enrolled",csrf:"existing",control:true});
+ await t.attach();
+ const socket=t.socket;
+ socket.send=line=>frames.push(JSON.parse(line));
+ const deliver=(view=snapshot,revision,ws=t.socket)=>ws.onmessage({
+  data:JSON.stringify({kind:"snapshot",snapshot:structuredClone(view),...(revision?{revision}:{})})});
+ const unavailable=(value={},ws=t.socket)=>ws.onmessage({data:JSON.stringify({kind:"unavailable",...value})});
+ return {...f,snapshot,requests,frames,deliver,unavailable,socket};
+}
+
+test("same-socket generic unavailable restores only previously ACK-qualified current view",async()=>{
+ const f=await sameSocketViewFixture(),t=f.transport;
+ f.deliver(f.snapshot,"view:1");
+ assert.equal(t.connected,true);
+ Object.assign(t,{controllerGeneration:"claimed",connection:"old-wire",seq:9,inputBusy:true,elbowJog:1});
+ t.held.add("w");
+ f.unavailable();
+ assert.equal(t.connected,false);
+ assert.equal(t.controllerGeneration,null);assert.equal(t.connection,null);assert.equal(t.held.size,0);
+ assert.equal(t.elbowJog,0);assert.equal(t.seq,0);assert.equal(t.pending.size,0);
+ const current=structuredClone(f.snapshot);
+ current.controller={device_id:"pc-adapter",controller_generation:"pc-current"};
+ f.deliver(current); // Gateway's generic failure kept peer.ack true: no revision is resent.
+ assert.equal(t.connected,true,"fresh current snapshot restores the existing connected viewer");
+ assert.equal(t.controllerGeneration,null);assert.equal(t.connection,null);assert.equal(t.held.size,0);
+ assert.equal(t.liveResume,null);assert.equal(t.elbowGesture,null);assert.equal(t.inputBusy,false);
+ assert.equal(t.snapshot.controller.device_id,"pc-adapter");
+ assert.deepEqual(f.frames,[{ack:"view:1"}],"view recovery cannot send input or an automatic control operation");
+ assert.deepEqual(f.requests.map(v=>v.url),["/api/attach"]);
+});
+
+test("same-socket initial unrevisioned snapshots never qualify a new view",async()=>{
+ const f=await sameSocketViewFixture(),t=f.transport;
+ f.deliver();
+ assert.equal(t.connected,false);
+ f.unavailable();f.deliver();
+ assert.equal(t.connected,false,"generic recovery cannot invent the first ACK qualification");
+ assert.equal(f.frames.length,0);
+ f.deliver(f.snapshot,"first-view:1");
+ assert.equal(t.connected,true);
+});
+
+test("same-socket reporting error requires a new revision before restoring view",async()=>{
+ const f=await sameSocketViewFixture(),t=f.transport;
+ f.deliver(f.snapshot,"before-error:1");
+ f.unavailable(reporting);
+ assert.equal(t.connected,false);assert.equal(t.reportingError.code,"response_limit");
+ f.deliver();
+ assert.equal(t.connected,false,"a queued revisionless snapshot cannot recover a reporting-error fence");
+ f.deliver(f.snapshot,"after-error:2");
+ assert.equal(t.connected,true);assert.equal(t.reportingError,null);
+ assert.equal(t.controllerGeneration,null);assert.equal(t.connection,null);
+ assert.deepEqual(f.frames,[{ack:"before-error:1"},{ack:"after-error:2"}]);
+});
+
+test("same-socket REST reporting failure also retires the prior view qualification",async()=>{
+ const f=await sameSocketViewFixture(),t=f.transport;
+ f.deliver(f.snapshot,"before-rest-error:1");
+ t.reportingFailure(reporting); // Shared handler used by the existing REST outcome path.
+ f.deliver();
+ assert.equal(t.connected,false);
+ f.deliver(f.snapshot,"after-rest-error:2");
+ assert.equal(t.connected,true);assert.equal(t.controllerGeneration,null);
+});
+
+test("same-socket late replaced stream cannot qualify or disconnect the current view",async()=>{
+ const f=await sameSocketViewFixture(),t=f.transport,old=f.socket;
+ f.deliver(f.snapshot,"old-view:1");
+ f.unavailable();
+ await t.attach();
+ const current=t.socket;current.send=line=>f.frames.push(JSON.parse(line));
+ f.deliver(f.snapshot,"late-old:2",old);
+ assert.equal(t.connected,false);
+ f.deliver();
+ assert.equal(t.connected,false,"the old stream ACK does not transfer to its replacement");
+ f.deliver(f.snapshot,"current-view:1");
+ assert.equal(t.connected,true);
+ f.unavailable(reporting,old);
+ assert.equal(t.connected,true);assert.equal(t.reportingError,null);
+ assert.equal(f.frames.filter(frame=>frame.command).length,0);
+});
+
+test("same-socket detach and close cannot be revived by queued snapshots",async()=>{
+ for(const detach of [false,true]){
+  const f=await sameSocketViewFixture(),t=f.transport,old=f.socket;
+  f.deliver(f.snapshot,"qualified:1");
+  if(detach)t.detach();else old.close();
+  f.deliver(f.snapshot,undefined,old);
+  assert.equal(t.connected,false);
+  assert.equal(t.controllerGeneration,null);assert.equal(t.connection,null);
+  assert.equal(f.frames.filter(frame=>frame.command).length,0);
+ }
+});
+
+test("same-socket pending unknown control remains rejected after view recovery",async()=>{
+ const f=await sameSocketViewFixture(),t=f.transport;
+ f.deliver(f.snapshot,"view:1");
+ Object.assign(t,{controllerGeneration:"claimed",connection:"wire"});
+ const pending=t.command({op:"resume",run_id:f.snapshot.run.run_id,operation_id:"original-only"});
+ const outcome=pending.then(()=>assert.fail("unknown control cannot become acknowledged by a snapshot"),error=>error);
+ const sent=f.frames.find(frame=>frame.command);
+ f.unavailable();
+ assert.match((await outcome).message,/owner unavailable/);
+ f.deliver();
+ assert.equal(t.connected,true);
+ t.socket.onmessage({data:JSON.stringify({kind:"result",id:sent.id,accepted:true,status:"resuming"})});
+ assert.equal(t.pending.size,0);assert.equal(t.controllerGeneration,null);assert.equal(t.connection,null);
+ assert.equal(f.frames.filter(frame=>frame.command).length,1,"no control retry or replay on view recovery");
+ assert.equal(t.snapshot.run.run_id,f.snapshot.run.run_id);
 });

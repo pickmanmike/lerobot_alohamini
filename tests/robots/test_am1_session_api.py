@@ -1159,10 +1159,25 @@ def test_wss_input_diagnostic_span_survives_real_ipc_and_tls(cluster, monkeypatc
                    "controller_generation": claim["controller_generation"],
                    "connection_generation": connected["connection_generation"]}
             await ws_command(ws, {"op": "release_input", **ids})
+            refused_grant = await ws_command(ws, {"op": "grant", **ids})
+            assert refused_grant["accepted"] is False and refused_grant["reason"] == "interactive running required"
             await ws_command(ws, {"op": "resume", **ids, "operation_id": oid(),
                 "expected_intent_revision": (await snapshot(a, cluster))["run"]["intent_revision"]})
             grant = await ws_command(ws, {"op": "grant", **ids})
-            assert "diagnostic_timing" not in grant
+            grant_marks = ("gateway_received", "gateway_dispatch", "gateway_ipc_started", "core_entered",
+                           "core_locked", "core_tick_completed", "core_returned", "gateway_ipc_completed",
+                           "reply_ready", "reply_send_preparation_started")
+            assert set(grant["diagnostic_timing"]) == {"version", "clock", *grant_marks}
+            assert [grant["diagnostic_timing"][key] for key in grant_marks] == sorted(
+                grant["diagnostic_timing"][key] for key in grant_marks)
+            assert grant["expires"] - grant["issued"] == .25
+            assert len(json.dumps(grant["diagnostic_timing"])) <= 512 and len(json.dumps(grant)) <= 1024
+            assert refused_grant["effect_admitted"] is False
+            assert set(refused_grant["diagnostic_timing"]) == set(grant["diagnostic_timing"])
+            foreign_grant = await ws_command(ws, {"op": "grant", **dict(ids, connection_generation=oid())})
+            assert foreign_grant["accepted"] is False and foreign_grant["effect_admitted"] is False
+            assert set(foreign_grant["diagnostic_timing"]) == {
+                "version", "clock", "gateway_received", "reply_ready", "reply_send_preparation_started"}
             result = await ws_command(ws, {"op": "input", **ids, "grant_id": grant["grant_id"],
                                           "seq": 1, "target": [.2]})
             assert result["accepted"] and result["effect_admitted"]
@@ -1199,7 +1214,8 @@ def test_wss_input_diagnostic_span_survives_real_ipc_and_tls(cluster, monkeypatc
     asyncio.run(scenario())
 
 @pytest.mark.parametrize("cancelled", [False, True])
-def test_input_diagnostic_gateway_failure_does_not_replace_unknown_or_cancellation(monkeypatch, cancelled):
+@pytest.mark.parametrize("op", ["input", "grant"])
+def test_input_diagnostic_gateway_failure_does_not_replace_unknown_or_cancellation(monkeypatch, cancelled, op):
     from types import SimpleNamespace
     from tools import am1_session_service as service
     from tools import am1_session_core as core
@@ -1208,13 +1224,13 @@ def test_input_diagnostic_gateway_failure_does_not_replace_unknown_or_cancellati
         gateway = service.Gateway.__new__(service.Gateway)
         gateway.auth = SimpleNamespace(resolve=lambda _: {"id": "owner", "control": True})
         outputs = []
-        peer = SimpleNamespace(token="private-test-token", ack=True, put=outputs.append)
+        peer = SimpleNamespace(token="private-test-token", ack=True, put=lambda value, **kwargs: outputs.append(value))
         original = asyncio.CancelledError() if cancelled else TimeoutError("original owner timeout")
         async def dispatch(*args):
             raise original
         gateway.dispatch = dispatch
         monkeypatch.setattr(core, "_input_diagnostic_clock", lambda: None)
-        value = {"id": "original-request", "command": {"op": "input"}, "_diagnostic_received": None}
+        value = {"id": "original-request", "command": {"op": op}, "_diagnostic_received": None}
         if cancelled:
             with pytest.raises(asyncio.CancelledError) as raised:
                 await gateway.execute_peer(peer, value)
@@ -1296,4 +1312,36 @@ def test_input_diagnostic_websocket_receive_precedes_auth_parse_and_rejects_clie
             assert set(peer.latest_input["command"]) == {"op"}
             gateway.enqueue(peer, {"id": "direct-call", "command": {"op": "input"}})
             assert peer.latest_input["_diagnostic_received"] == 100.5, "direct callers keep diagnostic-clock fallback"
+    asyncio.run(scenario())
+
+@pytest.mark.parametrize("acked,inflight", [(False, 0), (True, 6), (True, 0)])
+def test_grant_receive_anchor_and_early_refusals_stay_server_only(monkeypatch, acked, inflight):
+    from types import SimpleNamespace
+    from tools import am1_session_service as service
+
+    async def scenario():
+        seen, replies = [], []
+        gateway = service.Gateway.__new__(service.Gateway)
+        async def execute(peer, value, lane):
+            seen.append(value)
+            peer.commands[lane] -= 1
+        gateway.execute_peer = execute
+        peer = SimpleNamespace(ack=acked, commands={"normal": inflight, "protective": 0}, tasks=set(),
+            put=lambda result, **kwargs: replies.append((result, kwargs)))
+        monkeypatch.setattr(service, "_input_diagnostic_monotonic", lambda: 200.)
+        envelope = {"id": "grant-request", "command": {"op": "grant"}}
+        gateway.enqueue(peer, envelope, received_at=100.)
+        await asyncio.gather(*tuple(peer.tasks))
+        assert envelope == {"id": "grant-request", "command": {"op": "grant"}}
+        if acked and not inflight:
+            assert seen[0]["_diagnostic_received"] == 100. and not replies
+            gateway.enqueue(peer, envelope)
+            await asyncio.gather(*tuple(peer.tasks))
+            assert seen[1]["_diagnostic_received"] == 200., "direct server calls use diagnostic fallback"
+        else:
+            result, kwargs = replies[0]
+            assert result["accepted"] is False and result["effect_admitted"] is False
+            assert result["diagnostic_timing"] == {"version": 1, "clock": "pi-monotonic",
+                                                     "gateway_received": 100., "reply_ready": 200.}
+            assert kwargs == {"grant_reply": True} and not seen
     asyncio.run(scenario())

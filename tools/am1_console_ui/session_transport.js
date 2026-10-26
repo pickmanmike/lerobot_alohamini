@@ -64,7 +64,7 @@ class AM1SessionTransport {
     this.render=render; this.snapshot=null; this.connected=false; this.csrf=null; this.device=null;
     this.control=false; this.controllerGeneration=null; this.connection=null; this.held=new Set();
     this.pending=new Map(); this.pendingClaim=null; this.pendingRenewal=null; this.seq=0; this.socket=null; this.inputBusy=false; this.epoch=0; this.intent=0;
-    this.reportingError=null;
+    this.reportingError=null;this.acknowledgedViewSocket=null;
     this.elbowJog=0;this.elbowCursor=null;this.elbowBinding=null;this.elbowAt=null;this.elbowReleasedRevision=null;this.liveInputs=new Set();this.liveResume=null;this.elbowGesture=null;this.elbowRelease=null;this.elbowStrict=false;
     this.reconnectTimer=null;this.detached=false;this.initialization=0;
   }
@@ -76,7 +76,7 @@ class AM1SessionTransport {
     this.pending.clear(); this.inputBusy=false;this.liveResume=null;this.clearGesture();this.elbowReleasedRevision=null;this.liveInputs.clear();
   }
   reportingFailure(value) {
-    this.reportingError=value;this.connected=false;this.clear(value.reason);
+    this.reportingError=value;this.acknowledgedViewSocket=null;this.connected=false;this.clear(value.reason);
     this.render(this,value.reason);
   }
   async post(path,body,epoch,current,signal) {
@@ -101,7 +101,7 @@ class AM1SessionTransport {
     this.reconnectTimer=setTimeout(()=>{this.reconnectTimer=null;return this.initialize();},delay);
   }
   detach() {
-    this.detached=true;this.initialization++;this.cancelReconnect();this.connected=false;this.clear("Page detached");
+    this.acknowledgedViewSocket=null;this.detached=true;this.initialization++;this.cancelReconnect();this.connected=false;this.clear("Page detached");
     const socket=this.socket;this.socket=null;socket?.close();
   }
   restore() {
@@ -110,7 +110,7 @@ class AM1SessionTransport {
   }
   async initialize() {
     if(this.detached)return;
-    const initialization=++this.initialization;this.cancelReconnect();this.connected=false;this.clear();
+    const initialization=++this.initialization;this.cancelReconnect();this.acknowledgedViewSocket=null;this.connected=false;this.clear();
     const socket=this.socket;this.socket=null;socket?.close();
     try {
       const response=await fetch("/api/session");
@@ -139,6 +139,7 @@ class AM1SessionTransport {
       if(epoch!==this.epoch)return;
       this.snapshot=attached.snapshot;
       const ws=this.socket=new WebSocket(`${location.origin.replace("https:","wss:")}/api/ws`);
+      this.connected=false;this.acknowledgedViewSocket=null;
       ws.onopen=()=>ws.send(JSON.stringify({ticket:attached.ticket}));
       ws.onmessage=event=> {
         if(this.socket!==ws)return;
@@ -154,7 +155,10 @@ class AM1SessionTransport {
           }
           this.snapshot=value.snapshot;
           if(next?.first_cause||next?.native_first_cause||this.snapshot.evidence?.fault){this.clearGesture(true);this.liveResume=null;}
-          if(value.revision) {ws.send(JSON.stringify({ack:value.revision}));this.connected=true;this.cancelReconnect();}
+          if(value.revision) {ws.send(JSON.stringify({ack:value.revision}));this.acknowledgedViewSocket=ws;}
+          // Generic unavailability clears control, but the same socket's view ACK remains valid.
+          this.connected=this.acknowledgedViewSocket===ws && ws.readyState===WebSocket.OPEN;
+          if(this.connected)this.cancelReconnect();
           const controller=this.snapshot.controller;
           if(this.controllerGeneration && (controller?.device_id!==this.device || controller.controller_generation!==this.controllerGeneration))
             this.clear("Controller generation changed");
@@ -173,7 +177,7 @@ class AM1SessionTransport {
       };
       ws.onclose=()=> {
         if(this.socket!==ws)return;
-        this.connected=false;this.clear();this.render(this,AM1SessionTransport.reconnectNotice);
+        this.acknowledgedViewSocket=null;this.connected=false;this.clear();this.render(this,AM1SessionTransport.reconnectNotice);
         this.reconnect(300);
       };
       ws.onerror=()=>ws.close();
