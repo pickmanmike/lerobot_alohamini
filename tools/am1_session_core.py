@@ -653,6 +653,8 @@ class SessionAuthority:
         self.db = sqlite3.connect(self.directory / "sessions.sqlite3", check_same_thread=False)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
+        self._idle_autocheckpoint = self.db.execute("PRAGMA wal_autocheckpoint").fetchone()[0]
+        self._teleop_checkpoint_deferred = False
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, hash TEXT, device TEXT, result TEXT)"
         )
@@ -663,6 +665,11 @@ class SessionAuthority:
         self.db.execute("CREATE TABLE IF NOT EXISTS state (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT)")
         row = self.db.execute("SELECT data FROM state WHERE id=1").fetchone()
         self.run = json.loads(row[0]) if row else None
+        if (self.run and self.run.get("source") == "protected-physical-provider"
+                and self.run.get("recipe") == TELEOP_RECIPE
+                and (self.run["status"] not in TERMINAL or self.run.get("uncertain") is not False)):
+            # Restart never replays input or consolidates an unqualified old run.
+            self._defer_teleop_checkpoints()
         if self.run and self.run["status"] not in TERMINAL:
             self.run.update(
                 status="interrupted",
@@ -1052,8 +1059,27 @@ class SessionAuthority:
                 (json.dumps(self._run_result()), self.run["operation_id"]),
             )
         self.db.commit()
+        if (self._teleop_checkpoint_deferred and self.run
+                and self.run["status"] in TERMINAL and self.run.get("uncertain") is False):
+            # Restoring a threshold does not itself checkpoint. Cleanup is durable first.
+            self.db.execute(f"PRAGMA wal_autocheckpoint={self._idle_autocheckpoint}")
+            self._teleop_checkpoint_deferred = False
 
         self._archive_terminal()
+
+    def _defer_teleop_checkpoints(self):
+        self.db.execute("PRAGMA wal_autocheckpoint=0")
+        self._teleop_checkpoint_deferred = True
+
+    def _idle_teleop_checkpoint(self):
+        timeout = self.db.execute("PRAGMA busy_timeout").fetchone()[0]
+        try:
+            # A retained reader must refuse Start rather than wait while holding authority.
+            self.db.execute("PRAGMA busy_timeout=0")
+            result = self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        finally:
+            self.db.execute(f"PRAGMA busy_timeout={timeout}")
+        return type(result) is tuple and len(result) == 3 and all(type(v) is int and v == 0 for v in result)
 
     def _run_result(self):
         return {
@@ -2434,6 +2460,16 @@ class SessionAuthority:
             ):
                 self._hold()
                 return self._refuse("fresh qualified feedback/proof and acknowledgement required")
+            teleop_checkpoint = recipe.name == TELEOP_RECIPE and self.executor.source == "protected-physical-provider"
+            if teleop_checkpoint:
+                try:
+                    consolidated = self._idle_teleop_checkpoint()
+                except sqlite3.Error:
+                    return self._refuse("idle checkpoint unavailable")
+                if not consolidated:
+                    return self._refuse("idle checkpoint busy or incomplete")
+                if not self._owned(c, d):
+                    return self._refuse("current controller lease required")
             positive_prerequisite = None
             selected_setter = getattr(self.executor, "set_selected_experiment", None)
             if callable(selected_setter):
@@ -2486,6 +2522,8 @@ class SessionAuthority:
             if not self._owned(c, d):
                 return self._refuse("current controller lease required")
             self._archive_terminal()
+            if teleop_checkpoint:
+                self._defer_teleop_checkpoints()
             self.run = {
                 "run_id": str(uuid.uuid4()),
                 "operation_id": oid,
