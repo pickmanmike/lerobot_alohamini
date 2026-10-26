@@ -1081,7 +1081,9 @@ def teleop_goal_lane(monkeypatch):
     control = host.AM1LocalControl(**ident, selected_evidence=evidence, live=True,
                                    live_recipe="physical-live-teleop", clock=lambda: now[0])
     control.state, control.epoch, control.intent_revision = "active", 2, 0
-    control._live_summary.update(state="active", live_deadline_monotonic_s=310.)
+    control._live_summary.update(state="active", live_deadline_monotonic_s=310.,
+        reference={**dict.fromkeys(TELEOP_ARM_KEYS, 0.), KEY: float(obj.left_bus._normalize({3:2050})[3])},
+        held_goals_raw={"left": {ELBOW: 2050}})
 
     def acquire(raw=2020, *, target_raw=None):
         bus = obj.left_bus
@@ -1308,6 +1310,9 @@ def two_elbow_goal_lane(monkeypatch):
         {right: MotorCalibration(3, 0, -658, 827, 3039)},
     )
     obj.right_arm_motors = [right]
+    control._live_summary["held_goals_raw"]["right"]={right:1866}
+    control._live_summary["reference"].update({KEY: float(obj.left_bus._normalize({3:2050})[3]),
+        right+".pos": float(obj.right_bus._normalize({3:1866})[3])})
     cached_elbow_settings(obj)
 
     def acquire(left_raw=2020, right_raw=1847):
@@ -1584,3 +1589,220 @@ def test_fixed_response_cached_proof_contains_exact_trial_and_both_baselines(mon
         assert proof[current]["original"]["I_Coefficient"] == proof[current]["active"]["I_Coefficient"] == 0
         assert proof[current]["original"]["D_Coefficient"] == proof[current]["active"]["D_Coefficient"] == 32
     assert not writes
+
+
+def three_teleop_goal_lane(monkeypatch, drive=0):
+    """The existing owner/read codec with only its two elbows plus LEFT shoulder ID2."""
+    from examples.alohamini.am1_live_teleop import TELEOP_ARM_KEYS, ZERO_BODY
+
+    obj, evidence, control, now, rows, writes, _ = two_elbow_goal_lane(monkeypatch)
+    shoulder = "arm_left_shoulder_lift"
+    obj.left_bus = FeetechMotorsBus("unused-tracking-left",
+        {**obj.left_bus.motors, shoulder: Motor(2, "sts3215", MotorNormMode.RANGE_M100_100)},
+        {**obj.left_bus.calibration, shoulder: MotorCalibration(2, drive, 515, 848, 3223)})
+    obj.left_arm_motors.append(shoulder)
+    control._live_summary["held_goals_raw"]["left"][shoulder]=3222
+    control._live_summary["reference"][shoulder+".pos"] = float(obj.left_bus._normalize({2:3222})[2])
+
+    def acquire(left=2050, right=1866, lift=3222, lift_target=None):
+        control.accepted_action_sequence += 1
+        values = {KEY: float(obj.left_bus._normalize({3:left})[3]),
+                  "arm_right_elbow_flex.pos": float(obj.right_bus._normalize({3:right})[3]),
+                  shoulder+".pos": float(obj.left_bus._normalize({2:lift})[2])}
+        control.accepted_action = {**dict.fromkeys(TELEOP_ARM_KEYS, 0.), **ZERO_BODY, **values}
+        control.live_sample = {"seq": control.accepted_action_sequence,
+            "target": {key:control.accepted_action[key] for key in TELEOP_ARM_KEYS},
+            "valid_until_monotonic_s": now[0]+.24}
+        if lift_target is not None:
+            control.live_sample["target"][shoulder+".pos"] = float(obj.left_bus._normalize({2:lift_target})[2])
+        evidence.record_teleop_action(obj, control, {**control.binding, "epoch":control.epoch,
+            "intent_revision":control.intent_revision,"action_sequence":control.accepted_action_sequence},
+            control.accepted_action)
+        observation = {}
+        control.annotate(observation, acquired_at=now[0])
+        return observation
+    return obj, evidence, control, now, rows, writes, acquire
+
+
+@pytest.mark.parametrize("drive", [0, 1])
+def test_teleop_tracking_reads_only_closed_left_shoulder_id2_and_pairs_current_goal(monkeypatch, drive):
+    obj, evidence, control, now, rows, writes, acquire = three_teleop_goal_lane(monkeypatch, drive)
+    port = attach_port(obj, [status(group_payload(goal=3187, present=3221), motor_id=2) for _ in range(2)])
+    evidence.report(obj, control, acquire())
+    now[0] = 10.5
+    evidence.report(obj, control, acquire())
+    assert not port.writes, "initial immutable-reference holds cannot spend the finite changed-target budget"
+    now[0] = 11.
+    acquire(lift=3187)
+    now[0] = 11.5
+    evidence.report(obj, control, acquire(lift=3187))
+    now[0] = 12.5
+    evidence.report(obj, control, acquire(lift=3187))
+    assert port.writes == [bytes([255,255,254,5,130,33,38,2,49])]*2 and writes == []
+    assert len(rows) == 2 and all(row["action"]["motor"] == "arm_left_shoulder_lift" for row in rows)
+    assert [row["opportunity_sample_index"] for row in rows] == [1,2]
+    assert len({(row["epoch"],row["intent_revision"],row["opportunity_index"]) for row in rows}) == 1
+    assert rows[1]["read_started_at_monotonic_s"]-rows[0]["read_started_at_monotonic_s"] == 1.
+    for row in rows:
+        assert row["action"]["side"] == "left" and row["action"]["calibration"] == [2,drive,515,848,3223]
+        assert row["requested_goal_raw"] == row["goal_position_raw"] == 3187
+        assert row["present_position_raw"] == 3221 and row["goal_matches_expected_raw"] is True
+        assert row["decoded"]["present_position_normalized"] == pytest.approx((3221-848)/2375*200-100 if not drive else -((3221-848)/2375*200-100))
+    assert not evidence.enabled and obj._am1_selected_joint_evidence_enabled is False
+
+
+def test_teleop_tracking_same_target_recovery_cannot_spend_another_read_or_fabricate_pair(monkeypatch):
+    obj, evidence, control, now, rows, _, acquire = three_teleop_goal_lane(monkeypatch)
+    port = attach_port(obj, [status(group_payload(goal=3187),motor_id=2),
+                             status(group_payload(goal=3200),motor_id=2),status(group_payload(goal=3200),motor_id=2)])
+    acquire(lift=3187)
+    now[0]=10.5
+    evidence.report(obj,control,acquire(lift=3187))
+    control.epoch,control.intent_revision=4,1
+    now[0]=11.5
+    acquire(lift=3187)
+    now[0]=12.
+    evidence.report(obj,control,acquire(lift=3187))
+    assert len(port.writes)==1, "unchanged target in a recovery epoch cannot consume another opportunity"
+    now[0]=13.
+    acquire(lift=3200)
+    now[0]=13.5
+    evidence.report(obj,control,acquire(lift=3200))
+    now[0]=14.5
+    evidence.report(obj,control,acquire(lift=3200))
+    assert len(port.writes)==3
+    assert [(r["epoch"],r["opportunity_sample_index"]) for r in rows]==[(2,1),(4,1),(4,2)]
+
+
+def test_teleop_tracking_reserves_two_attempts_for_late_closed_roles_with_one_shared_budget(monkeypatch):
+    obj,evidence,control,now,rows,writes,acquire=three_teleop_goal_lane(monkeypatch)
+    left=attach_port(obj,[status(group_payload(goal=2020+i),motor_id=3) for i in range(4)]+
+                         [status(group_payload(goal=3187),motor_id=2) for _ in range(2)])
+    right=ByteStreamPort([status(group_payload(goal=1941),motor_id=3) for _ in range(2)])
+    obj.right_bus.port_handler,obj.right_bus.packet_handler=right,scs.PacketHandler(0)
+    for i in range(5):
+        now[0]=10.+2*i
+        acquire(left=2020+i)
+        now[0]+=.5
+        evidence.report(obj,control,acquire(left=2020+i))
+    assert len(left.writes)==4 and not right.writes, "earlier changes must leave two reads for each late role"
+    now[0]=21.
+    acquire(left=2024,right=1941)
+    for at in (21.5,22.5):
+        now[0]=at
+        evidence.report(obj,control,acquire(left=2024,right=1941))
+    now[0]=24.
+    acquire(left=2024,right=1941,lift=3187)
+    for at in (24.5,25.5,26.5):
+        now[0]=at
+        evidence.report(obj,control,acquire(left=2024,right=1941,lift=3187))
+    assert len(rows)==len(left.writes)+len(right.writes)==8 and not writes
+    assert [row["action"]["motor"] for row in rows]==["arm_left_elbow_flex"]*4+["arm_right_elbow_flex"]*2+["arm_left_shoulder_lift"]*2
+    assert all(b["read_started_at_monotonic_s"]-a["read_started_at_monotonic_s"]>=1 for a,b in zip(rows,rows[1:]))
+
+
+@pytest.mark.parametrize("changed", ["id", "calibration", "binding", "expired", "status", "torque", "mode"])
+def test_teleop_tracking_shoulder_keeps_closed_identity_freshness_and_fault_policy(monkeypatch, changed):
+    obj,evidence,control,now,rows,writes,acquire=three_teleop_goal_lane(monkeypatch)
+    payload=group_payload(goal=3187,servo_status=8 if changed=="status" else 0,
+                          torque=0 if changed=="torque" else 1,mode=1 if changed=="mode" else 0)
+    port=attach_port(obj,[status(payload,motor_id=2)])
+    acquire(lift=3187)
+    now[0]=10.5
+    observation=acquire(lift=3187)
+    if changed=="id":obj.left_bus.motors["arm_left_shoulder_lift"].id=1
+    elif changed=="calibration":obj.left_bus.calibration["arm_left_shoulder_lift"].range_min+=1
+    elif changed=="binding":control.binding["run_id"]=str(uuid4())
+    elif changed=="expired":now[0]+=.3
+    if changed in {"status","torque","mode"}:
+        with pytest.raises(RuntimeError):evidence.report(obj,control,observation)
+        assert len(port.writes)==1 and rows[-1]["diagnostic_available"] is False
+    else:
+        evidence.report(obj,control,observation)
+        assert not port.writes and not rows
+    assert not writes and not evidence.enabled and obj._am1_selected_joint_evidence_enabled is False
+
+
+def test_teleop_tracking_later_same_epoch_read_reports_changed_constraint_goal_instead_of_inventing_dwell(monkeypatch):
+    obj,evidence,control,now,rows,_,acquire=three_teleop_goal_lane(monkeypatch)
+    port=attach_port(obj,[status(group_payload(goal=3187,present=3221),motor_id=2),
+                         status(group_payload(goal=3200,present=3221),motor_id=2)])
+    acquire(lift=3187,lift_target=3187)
+    now[0]=10.5
+    evidence.report(obj,control,acquire(lift=3187,lift_target=3187))
+    now[0]=11.
+    acquire(lift=3200,lift_target=3187)
+    now[0]=11.5
+    evidence.report(obj,control,acquire(lift=3200,lift_target=3187))
+    assert len(port.writes)==2
+    assert [row["goal_position_raw"] for row in rows]==[3187,3200]
+    assert [row["requested_goal_raw"] for row in rows]==[3187,3200]
+    assert rows[0]["action"]["requested"]==rows[1]["action"]["requested"]
+    assert [row["opportunity_sample_index"] for row in rows]==[1,2]
+    assert len({(row["epoch"],row["intent_revision"],row["opportunity_index"]) for row in rows})==1
+
+
+def test_teleop_tracking_shoulder_does_not_label_itself_with_the_elbow_p32_transaction(monkeypatch):
+    from tests.robots.test_am1_live_teleop_native import install_left_response_trial
+
+    obj,evidence,control,now,rows,writes,acquire=three_teleop_goal_lane(monkeypatch)
+    trial=install_left_response_trial(monkeypatch,obj)
+    port=attach_port(obj,[status(group_payload(goal=3187),motor_id=2)])
+    acquire(lift=3187)
+    now[0]=10.5
+    evidence.report(obj,control,acquire(lift=3187))
+    assert len(port.writes)==1 and not writes and trial.restore_required
+    assert rows[-1]["action"]["motor"]=="arm_left_shoulder_lift"
+    assert "left_response_p_trial" not in rows[-1], "the run's elbow P32 receipt is not a shoulder setting"
+
+
+def test_teleop_tracking_initial_hold_uses_original_literal_goal_instead_of_measured_rest(monkeypatch):
+    obj,evidence,control,now,rows,_,acquire=three_teleop_goal_lane(monkeypatch)
+    key="arm_left_shoulder_lift.pos"
+    control._live_summary["reference"][key]=float(obj.left_bus._normalize({2:3221})[2])
+    port=attach_port(obj,[status(group_payload(goal=3222,present=3221),motor_id=2)])
+    acquire()
+    now[0]=10.5
+    evidence.report(obj,control,acquire())
+    assert not port.writes and not rows, "an existing rawGoal differing from PP is still the initial hold"
+
+
+@pytest.mark.parametrize("drive", [0, 1])
+@pytest.mark.parametrize("motor,mode,calibration,raws", [
+    ("arm_left_shoulder_pan", MotorNormMode.RANGE_M100_100, (1, -1761, 731, 3438), (731, 2628, 3438)),
+    ("arm_left_gripper", MotorNormMode.RANGE_0_100, (6, 933, 1886, 3401), (1886, 2628, 2980, 3401)),
+    ("arm_left_elbow_flex", MotorNormMode.DEGREES, (3, 1845, 864, 3073), (864, 1299, 2628, 3073)),
+])
+def test_am1_encoder_preserves_exact_canonical_integer_goals_without_io(monkeypatch, drive, motor, mode, calibration, raws):
+    obj,reads,writes = robot(monkeypatch)
+    motor_id,offset,low,high = calibration
+    bus = FeetechMotorsBus("unused-canonical-roundtrip", {motor:Motor(motor_id,"sts3215",mode)},
+                          {motor:MotorCalibration(motor_id,drive,offset,low,high)})
+    obj.config.max_relative_target = None
+    for raw in raws:
+        canonical = obj._normalize_arm_feedback(bus,{motor:raw})[motor]
+        accepted,encoded = obj._encode_am1_arm_goals(bus,{motor+".pos":canonical},{motor:raw})
+        assert encoded == {motor:raw}
+        assert accepted == {motor+".pos":canonical}
+    assert reads == writes == []
+
+
+@pytest.mark.parametrize("drive", [0, 1])
+@pytest.mark.parametrize("mode", [MotorNormMode.RANGE_M100_100, MotorNormMode.RANGE_0_100, MotorNormMode.DEGREES])
+def test_am1_encoder_keeps_noncanonical_fractional_goal_truncation(monkeypatch, drive, mode):
+    obj,_,_ = robot(monkeypatch)
+    name = "arm_left_gripper" if mode is MotorNormMode.RANGE_0_100 else ELBOW
+    bus = FeetechMotorsBus("unused-fractional-roundtrip",{name:Motor(3,"sts3215",mode)},
+                          {name:MotorCalibration(3,drive,-1761,731,3438)})
+    obj.config.max_relative_target = None
+    raw = 2627.75
+    if mode is MotorNormMode.DEGREES:
+        goal = (raw-(731+3438)/2)*360/4095
+    elif mode is MotorNormMode.RANGE_0_100:
+        goal = (raw-731)/2707*100
+        if drive:goal = 100-goal
+    else:
+        goal = (raw-731)/2707*200-100
+        if drive:goal = -goal
+    _,encoded = obj._encode_am1_arm_goals(bus,{name+".pos":goal},{name:2628})
+    assert encoded[name] == 2627, "a noncanonical fractional request keeps existing truncation"

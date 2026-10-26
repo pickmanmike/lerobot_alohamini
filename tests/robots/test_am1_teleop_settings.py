@@ -2048,17 +2048,24 @@ def test_response_fixed_dual_selection_refuses_before_startup_io(activation, mon
     assert activation.events == before
 
 
-def approved_startup_rest_robot(activation, tmp_path, monkeypatch, *, raw=3232):
+def approved_startup_rest_robot(activation, tmp_path, monkeypatch, *, raw=3232,
+                                workload_segment="left-reach", original_acceleration=254, original_goal=2050):
     """Real retained transaction and ordinary rest owner; only register I/O is fake."""
     import copy
     from tests.robots.test_am1_elbow_integral import (
         CURRENT_REST_PROFILE, ELBOW, left_response_p_robot,
     )
 
+    profile = ("ordinary-arms-left-current-rest-1051-1164"
+               if workload_segment == "ordinary-arms" else CURRENT_REST_PROFILE)
     _, bound, trial, _, _, _ = left_response_p_robot(
-        tmp_path, monkeypatch, workspace_profile=CURRENT_REST_PROFILE,
+        tmp_path, monkeypatch, workspace_profile=profile, workload_segment=workload_segment,
         left_shoulder_startup_degrees=1,
     )
+    bound.left_bus.values["Acceleration", ELBOW] = original_acceleration
+    bound.left_bus.values["Goal_Position", ELBOW] = original_goal
+    if workload_segment == "ordinary-arms":
+        bound.left_bus.values["Present_Position", ELBOW] = 1142
     def before_configure(source):
         source._am1_teleop_binding = copy.deepcopy(bound._am1_teleop_binding)
         source.left_bus.calibration[ELBOW] = copy.deepcopy(bound.left_bus.calibration[ELBOW])
@@ -2130,3 +2137,188 @@ def test_one_degree_startup_retains_bound_health_and_current_authority(
     assert not [row for row in activation.events if row[0] == "write" and row[2] == "Goal_Position"]
     assert not [row for row in activation.events if row[0] == "write"
                 and row[2] == "Torque_Enable" and row[3].startswith("arm_") and row[4] == 1]
+
+
+def test_selected_acceleration_activation_seeds_fresh_measured_goal_and_restores_original(
+    activation, tmp_path, monkeypatch,
+):
+    import copy
+    from lerobot.robots.alohamini.am1_live_teleop import verify_settings
+    from tests.robots.test_am1_elbow_integral import ELBOW
+
+    robot, trial = approved_startup_rest_robot(
+        activation, tmp_path, monkeypatch, workload_segment="ordinary-arms",
+        original_acceleration=0, original_goal=0,
+    )
+    original = copy.deepcopy(robot._am1_teleop_settings)
+    assert original["left"]["registers"]["Acceleration"][ELBOW] == 0
+    assert robot.left_bus.registers["Acceleration", ELBOW] == 254
+    robot.activate_motors()
+    assert robot.left_bus.registers["Goal_Position", ELBOW] == 1142
+    assert [row[4] for row in activation.events
+            if row[0] == "write" and row[2:4] == ("Goal_Position", ELBOW)] == [1142]
+    assert robot._am1_teleop_settings == original
+    assert robot._am1_teleop_active_settings["left"]["registers"]["Acceleration"][ELBOW] == 254
+    for side in ("left", "right"):
+        for name, value in original[side]["registers"]["Acceleration"].items():
+            if side != "left" or name != ELBOW:
+                assert value == 73
+                assert getattr(robot, side + "_bus").registers["Acceleration", name] == 73
+                assert getattr(robot, side + "_bus").registers["Maximum_Acceleration", name] == 100
+    robot.left_bus.registers["Acceleration", ELBOW] = 73
+    before = list(activation.events)
+    with pytest.raises(RuntimeError, match="settings changed"):
+        verify_settings(robot)
+    assert not [row for row in activation.events[len(before):] if row[0] == "write"]
+    # This is a readback fault, so the same original OFF restoration still applies.
+    robot.left_bus.registers["Acceleration", ELBOW] = 254
+    assert not robot._safe_shutdown(close_buses=True)
+    assert not trial.restore_required
+    assert robot.left_bus.registers["Acceleration", ELBOW] == 0
+    assert robot.left_bus.registers["P_Coefficient", ELBOW] == 16
+    assert robot.left_bus.registers["Lock", ELBOW] == 0
+    assert robot.left_bus.registers["Goal_Position", ELBOW] == 1142
+
+
+def test_selected_acceleration_real_cleanup_receipt_qualifies_existing_executor_and_core(
+    activation,tmp_path,monkeypatch,
+):
+    import copy
+    from types import SimpleNamespace
+    from lerobot.robots.alohamini import alohamini_host
+    from tests.robots import test_am1_elbow_integral as integral_tests
+    from tests.robots.test_am1_physical_executor import ControlledHost,executor,terminal_cleanup_outcome
+    from tests.robots.test_am1_persistent_session import command,start
+    from tools.am1_physical_executor import qualified_cleanup_receipt
+    from tools.am1_session_core import SessionAuthority
+
+    class RestoredHost(ControlledHost):
+        receipt=None
+        def finish(self,status):
+            assert self.receipt is not None
+            result=terminal_cleanup_outcome(self.run_id,self.incarnation,status)
+            result["first_cause"]=self.receipt["first_cause"]
+            result["readback"]=copy.deepcopy(self.receipt)
+            return result
+
+    io=RestoredHost();e=executor(io)
+    a=SessionAuthority(tmp_path/"authority",executor=e,clock=lambda:activation.clock.now)
+    try:
+        accepted=start(a,"physical-live-teleop")
+        assert accepted["accepted"] and accepted["status"]=="starting"
+        monkeypatch.setattr(integral_tests,"RIGHT_P20_RUN",e.run_id)
+        monkeypatch.setattr(integral_tests,"RIGHT_P20_HOST",e.host_incarnation)
+        selected=tmp_path/"selected";selected.mkdir()
+        robot,trial=approved_startup_rest_robot(activation,selected,monkeypatch,
+            workload_segment="ordinary-arms",original_acceleration=0,original_goal=0)
+        robot.activate_motors()
+        assert robot.left_bus.registers["Acceleration",trial.motor]==254
+        assert not robot._safe_shutdown(close_buses=True)
+        receipt=alohamini_host.write_am1_cleanup_receipt(SimpleNamespace(am1_run_id=e.run_id,
+            am1_host_incarnation=e.host_incarnation,am1_cleanup_receipt=str(tmp_path/"cleanup.json")),robot,None,[])
+        proof=receipt["readback"]["left_response_p_trial"]
+        assert proof["original_registers"]["Goal_Position"]==proof["original_registers"]["Acceleration"]==0
+        assert proof["configured_acceleration_readback"]==254 and proof["restored_acceleration_readback"]==0
+        assert proof["restore_required"] is False and receipt["readback"]["selected_gain_restore_required"] is False
+        assert qualified_cleanup_receipt(receipt,e.run_id,e.host_incarnation)
+        assert any(row.get("operation")=="write" and row.get("register")=="Acceleration" and row["value"]==254 for row in proof["events"])
+        assert not any(row.get("operation")=="write" and row.get("register")=="Goal_Position" for row in proof["events"])
+        io.receipt=receipt
+        stopped=a.handle(command("stop",run_id=e.run_id),"owner")
+        assert stopped["accepted"]
+        e.worker.join(2)
+        assert not e.worker.is_alive()
+        a.tick()
+        assert a.run["status"]=="stopped" and a.run["uncertain"] is False and a.run["first_cause"] is None
+        assert a.run["physical_result"]["readback"]==receipt
+        assert e.evidence()["fault"] is None
+        # Full contract/Core persistence retains the new evidence rather than projecting it into authority.
+        assert a.run["physical_result"]["readback"]["readback"]["left_response_p_trial"]==proof
+    finally:
+        a.close()
+        if e.worker:e.worker.join(2)
+
+
+
+def test_normal_rest_retained41ad_marker_with_representative_goal0_uses_fresh_position(
+    activation,tmp_path,monkeypatch,
+):
+    from lerobot.robots.alohamini.am1_live_teleop import STATIC
+    # Retained41ad before-home marker; no private run artifacts are needed by this test.
+    marker={"phase":"before_home","samples":[],"initial_measured_raw":3228,
+        "calibration":[2,0,515,848,3223],"operating_displacement_bound_degrees":1,
+        "settings":{"ID":2,"Model_Number":777,"Firmware_Major_Version":3,"Firmware_Minor_Version":10,
+            "Min_Position_Limit":848,"Max_Position_Limit":3223,"Homing_Offset":515,"Phase":12,
+            "P_Coefficient":16,"I_Coefficient":0,"D_Coefficient":32,"Acceleration":0,
+            "Maximum_Acceleration":254,"Protection_Current":310,"Max_Temperature_Limit":70,
+            "Min_Voltage_Limit":40,"Max_Voltage_Limit":140,"Operating_Mode":0,
+            "CW_Dead_Zone":1,"CCW_Dead_Zone":1}}
+    robot,trial=approved_startup_rest_robot(activation,tmp_path,monkeypatch,raw=marker["initial_measured_raw"],
+        workload_segment="ordinary-arms",original_acceleration=0,original_goal=0)
+    name="arm_left_shoulder_lift"
+    for register,value in marker["settings"].items():
+        robot.left_bus.registers[register,name]=value
+        if register in STATIC:robot._am1_teleop_settings["left"]["registers"][register][name]=value
+    robot.left_bus.registers["Goal_Position",name]=0  # Representative stale decoded Goal below848; exact41ad ID2Goal was not retained.
+    robot.activate_motors()
+    proof=robot._am1_teleop_rest_evidence
+    assert [row["phase"] for row in proof]==["before_home","after_home"]
+    assert all(row["qualified"] and len(row["samples"])>=9 and row["window_s"]>=.4
+        and row["operating_displacement_bound_degrees"]==1 for row in proof)
+    assert all(sample["Goal_Position"]==0 for row in proof for sample in row["samples"])
+    assert all(row["seed_raw"]==3223 and row["measured_raw"]==3228 for row in proof)
+    assert [row[4] for row in activation.events if row[0]=="write" and row[2:4]==("Goal_Position",name)]==[3223]
+    assert robot.left_bus.registers["Acceleration",name]==0
+    assert not [row for row in activation.events if row[0]=="write" and row[2:4]==("Acceleration",name)]
+    assert not robot._safe_shutdown(close_buses=True) and not trial.restore_required
+
+
+@pytest.mark.parametrize("goal",[0,3223,32767])
+def test_normal_rest_off_goal_format_does_not_replace_measured_rest_anchor(activation,monkeypatch,goal):
+    robot=resting_robot(activation,monkeypatch,raw=3225);name="arm_left_shoulder_lift"
+    robot.left_bus.registers["Goal_Position",name]=goal
+    robot.activate_motors()
+    assert robot.left_bus.registers["Goal_Position",name]==3223
+    assert all(row["qualified"] and row["seed_raw"]==3223 and row["measured_raw"]==3225
+        and len(row["samples"])>=9 and row["window_s"]>=.4 for row in robot._am1_teleop_rest_evidence)
+    assert all(sample["Goal_Position"]==goal for row in robot._am1_teleop_rest_evidence for sample in row["samples"])
+
+
+@pytest.mark.parametrize("phase",["before_home","after_home"])
+@pytest.mark.parametrize("goal",[-1,True,32768,65535])
+def test_normal_rest_off_goal_refuses_invalid_decoded_telemetry_before_seed(activation,monkeypatch,phase,goal):
+    robot=resting_robot(activation,monkeypatch,raw=3225);name="arm_left_shoulder_lift"
+    robot.left_bus.registers["Goal_Position",name]=0
+    def changed(register,motor):
+        if register=="Goal_Position" and motor==name and (phase=="after_home")==bool(activation.home_calls):
+            robot.left_bus.registers[register,name]=goal
+    robot.left_bus.on_read=changed
+    with pytest.raises(RuntimeError,match="activation failed"):robot.activate_motors()
+    assert not [row for row in activation.events if row[0]=="write" and row[2]=="Goal_Position"]
+    assert not [row for row in activation.events if row[0]=="write" and row[2]=="Torque_Enable" and row[3].startswith("arm_") and row[4]==1]
+    assert activation.home_calls==(phase=="after_home")
+
+
+@pytest.mark.parametrize("fault",["outside_allowance","torque","moving","drift","goal_changed"])
+def test_normal_rest_goal0_keeps_actual_position_off_and_quiet_guards(activation,tmp_path,monkeypatch,fault):
+    robot,trial=approved_startup_rest_robot(activation,tmp_path,monkeypatch,raw=3228,workload_segment="ordinary-arms")
+    name="arm_left_shoulder_lift";robot.left_bus.registers["Goal_Position",name]=0
+    if fault=="outside_allowance":robot.left_bus.registers["Present_Position",name]=3235
+    else:
+        counts={}
+        def changed(register,motor):
+            if motor!=name:return
+            counts[register]=counts.get(register,0)+1
+            if fault=="torque" and register=="Torque_Enable" and counts[register]>1:robot.left_bus.registers[register,name]=1
+            elif fault=="moving" and register=="Moving":robot.left_bus.registers[register,name]=1
+            elif fault=="drift" and register=="Present_Position" and counts[register]>2:robot.left_bus.registers[register,name]=3230
+            elif fault=="goal_changed" and register=="Goal_Position" and counts[register]>1:robot.left_bus.registers[register,name]=3223
+        robot.left_bus.on_read=changed
+    with pytest.raises(RuntimeError,match="activation failed"):robot.activate_motors()
+    if fault!="outside_allowance":
+        proof=robot._am1_teleop_rest_evidence[-1]
+        assert proof["samples"] and {"torque":"Torque_Enable","moving":"Moving","drift":"Present_Position","goal_changed":"Goal_Position"}[fault] in proof["first_cause"]
+    assert not [row for row in activation.events if row[0]=="write" and row[2]=="Goal_Position"]
+    assert not [row for row in activation.events if row[0]=="write" and row[2]=="Torque_Enable" and row[3].startswith("arm_") and row[4]==1]
+    robot.left_bus.on_read=None
+    robot._safe_shutdown(close_buses=True)

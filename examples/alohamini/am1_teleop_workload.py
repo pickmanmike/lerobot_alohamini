@@ -8,7 +8,7 @@ import math
 import time
 from uuid import UUID, uuid4
 
-from .am1_live_teleop import TELEOP_ARM_KEYS, validate_target, validate_workspace
+from .am1_live_teleop import LEFT_ENTRY_ENDPOINT_RAW, LEFT_ENTRY_WORKSPACE_PROFILE, TELEOP_ARM_KEYS, normalized_raw, validate_target, validate_workspace
 
 
 class TeleopWorkload:
@@ -190,11 +190,22 @@ class VirtualIntentWorkload:
     body_phase_elapsed = None
     InputUnavailable = InputUnavailable
 
-    def __init__(self, workspace, *, command_reference, clock=time.perf_counter, intent_channel=None):
+    def __init__(self, workspace, *, command_reference, clock=time.perf_counter, intent_channel=None, left_entry=False):
         self.workspace = validate_workspace(workspace)
         self.measured_reference = dict(self.workspace["reference"])
         self.origin = validate_target(command_reference, workspace=self.workspace)
         self.cursor = dict(self.origin)
+        self.left_entry = left_entry
+        if type(left_entry) is not bool or left_entry != (self.workspace.get("workspace_profile") == LEFT_ENTRY_WORKSPACE_PROFILE):
+            raise ValueError("explicit LEFT entry selection must match the qualified workspace")
+        if left_entry:
+            self.entry_key = "arm_left_elbow_flex.pos"
+            calibration = self.workspace["calibration"][self.entry_key[:-4]]
+            self.entry_endpoint = normalized_raw(LEFT_ENTRY_ENDPOINT_RAW, calibration)
+            self.entry_rate = min(self.workspace["bounds"][self.entry_key]["rate_per_s"],
+                                  4096/360*200/(calibration[4]-calibration[3]))
+        self._ramp_rebased_at = self._ramp_end_elapsed_s = 0.
+        self.entry_duration_replans = 0
         self.clock = clock
         self.intent_channel = str(uuid4()) if intent_channel is None else intent_channel
         self.command = None
@@ -207,7 +218,7 @@ class VirtualIntentWorkload:
 
     @property
     def active(self):
-        return (not self.complete and self.command is not None
+        return (not self.complete and (not self.left_entry or self.elapsed_s < 25.) and self.command is not None
                 and self.clock() < self.command["expires_at_perf_counter_s"])
 
     @property
@@ -231,22 +242,35 @@ class VirtualIntentWorkload:
             now = self.clock()
             if issued > now:
                 raise ValueError("virtual intent acquisition cannot be in the future")
+            if self.left_entry and self.elapsed_s >= 25. and op != "finish":
+                self.discarded_commands += 1
+                self.invalidate()
+                return False
             target = dict(self.cursor)
             if op == "move":
                 target.update(command["targets"])
             elif op == "return":
                 target = dict(self.origin)
             target = validate_target(target, workspace=self.workspace)
+            if self.left_entry:
+                if op == "return" or op == "move" and (
+                    set(command["targets"]) != {self.entry_key}
+                    or command["targets"][self.entry_key] != self.entry_endpoint
+                    or not abs(self.entry_endpoint-self.cursor[self.entry_key])/self.entry_rate
+                           <= command["transition_seconds"] <= min(25., 25.-self.elapsed_s)
+                ):
+                    raise ValueError(f"LEFT entry permits only a slow move to raw{LEFT_ENTRY_ENDPOINT_RAW}, hold or finish")
         except ValueError:
             self.invalidate()
             raise
-        if expiry <= now:
+        if expiry <= now or self.left_entry and self.elapsed_s >= 25. and op != "finish":
             self.discarded_commands += 1
             self.invalidate()
             return False
         self.command = command
         self.start_target, self.targets = dict(self.cursor), target
-        self.ramp_elapsed_s = 0.
+        self.ramp_elapsed_s = self._ramp_rebased_at = 0.
+        self._ramp_end_elapsed_s = command.get("transition_seconds", 0.)
         self._last = None
         self.complete = op == "finish"
         return True
@@ -260,23 +284,51 @@ class VirtualIntentWorkload:
     def invalidate(self):
         self.command, self._last = None, None
 
+    def rejoin(self, held, *, remaining_wall_s=None):
+        """Entry-only current qualified held command; original intent/time remain unchanged."""
+        if not self.left_entry:
+            return
+        held = validate_target(held, workspace=self.workspace)
+        key = self.entry_key
+        if any(held[joint] != self.origin[joint] for joint in held if joint != key):
+            raise ValueError("LEFT entry qualified held cursor changed another fixed joint")
+        if self.command is not None and self.command["op"] == "move":
+            if type(remaining_wall_s) not in (int, float) or not math.isfinite(remaining_wall_s):
+                raise ValueError("LEFT entry finite remaining original wall budget required")
+            available = min(25.-self.elapsed_s, remaining_wall_s,
+                            self.command["expires_at_perf_counter_s"]-self.clock())
+            needed = abs(self.entry_endpoint-held[key])/self.entry_rate
+            if available <= 0 or needed > available+1e-9:
+                raise ValueError("LEFT entry remaining original TTL/active/wall budget cannot reach its endpoint")
+            remaining = max(0., self._ramp_end_elapsed_s-self.ramp_elapsed_s)
+            planned = remaining if needed <= remaining <= available else needed
+            if abs(planned-remaining) > 1e-9:
+                self.entry_duration_replans += 1
+            self._ramp_end_elapsed_s = self.ramp_elapsed_s+planned
+        self.cursor = dict(held)
+        if self.command is not None:
+            self.start_target = dict(held)
+            self.targets = dict(held) if self.command["op"] != "move" else dict(held, **{key: self.entry_endpoint})
+            self._ramp_rebased_at = self.ramp_elapsed_s
+
     def advance(self, now):
         if self._last is None or not self.active:
             return
         if now < self._last:
             raise ValueError("virtual intent progress clock regressed")
         delta = min(.1, now-self._last)
-        self.elapsed_s = round(self.elapsed_s+delta, 9)
+        self.elapsed_s = min(25., round(self.elapsed_s+delta, 9)) if self.left_entry else round(self.elapsed_s+delta, 9)
         self.ramp_elapsed_s = round(self.ramp_elapsed_s+delta, 9)
         self._last = now
-        if self.ramp_elapsed_s >= self.command.get("transition_seconds", 0.):
+        if self.ramp_elapsed_s >= (self._ramp_end_elapsed_s if self.left_entry else self.command.get("transition_seconds", 0.)):
             self.phases_completed.add(self.phase)
 
     def get_action(self):
         if not self.active:
             raise InputUnavailable("original virtual intent expired or unavailable")
-        duration = self.command.get("transition_seconds", 0.)
-        fraction = min(1., self.ramp_elapsed_s/duration) if duration else 1.
+        duration = self._ramp_end_elapsed_s if self.left_entry else self.command.get("transition_seconds", 0.)
+        remaining = duration-self._ramp_rebased_at
+        fraction = min(1., (self.ramp_elapsed_s-self._ramp_rebased_at)/remaining) if remaining > 0 else 1.
         return {key.removeprefix("arm_"): self.start_target[key]+fraction*(target-self.start_target[key])
                 for key, target in self.targets.items()}
 
@@ -285,6 +337,11 @@ class VirtualIntentWorkload:
 
     def plan(self):
         return {"segment": self.segment, "input_mode": "changing-intent", "program_active_seconds": None,
+                **({"workspace_profile": LEFT_ENTRY_WORKSPACE_PROFILE, "proposed_entry_endpoint_raw": LEFT_ENTRY_ENDPOINT_RAW,
+                    "proposed_entry_endpoint": self.entry_endpoint, "last_accepted_entry_command": self.cursor[self.entry_key],
+                    "physical_endpoint_verified": False, "entry_duration_replans": self.entry_duration_replans,
+                    "entry_ramp_remaining_active_s": max(0., self._ramp_end_elapsed_s-self.ramp_elapsed_s),
+                    "active_budget_seconds": 25., "wall_budget_seconds": 60.} if self.left_entry else {}),
                 "intent_channel": self.intent_channel,
                 "measured_reference": dict(self.measured_reference), "command_reference": dict(self.origin),
                 "command_reference_basis": "original current native qualified HOLD cursor; measured reference unchanged",

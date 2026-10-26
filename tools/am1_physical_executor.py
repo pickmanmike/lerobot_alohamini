@@ -2307,7 +2307,7 @@ def invocation_config(binding, source="virtual-leaders"):
 
 def prepare_left_response_p_request(config_path, *, ttl_seconds=120, workspace_profile=None,
                                     left_shoulder_startup_degrees=None, workload_segment="left-reach"):
-    """Prepare one explicit boot-local LEFT-P32 workload request; never consume or Start it.
+    """Prepare one explicit boot-local LEFT workload request; never consume or Start it.
 
     This self-contained function is relayed by the PC CLI and imports the installed
     validators. It does not require deploying this CLI into the physical runtime.
@@ -2331,7 +2331,7 @@ def prepare_left_response_p_request(config_path, *, ttl_seconds=120, workspace_p
         _publish_no_replace,
         acquire_stopped_guard,
     )
-    from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES
+    from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES, LEFT_ENTRY_WORKSPACE_PROFILE
 
     if type(ttl_seconds) is not int or not 1 <= ttl_seconds <= 120:
         raise ValueError("Preparation expiry must be within 1–120 seconds")
@@ -2339,13 +2339,14 @@ def prepare_left_response_p_request(config_path, *, ttl_seconds=120, workspace_p
         raise ValueError("Only left-reach and explicit ordinary-arms preparation are supported")
     if workload_segment == "ordinary-arms" and workspace_profile is None:
         raise ValueError("Ordinary arms requires explicit current-rest preparation")
+    entry = workload_segment == "ordinary-arms" and workspace_profile == LEFT_ENTRY_WORKSPACE_PROFILE
     if workspace_profile is not None and (type(workspace_profile) is not str
-            or workspace_profile != CURRENT_REST_WORKSPACE_PROFILES[workload_segment]):
-        raise ValueError("Only the explicit current-rest workspace profile is supported")
+            or workspace_profile != CURRENT_REST_WORKSPACE_PROFILES[workload_segment] and not entry):
+        raise ValueError("Only the explicit current-rest or LEFT entry workspace profile is supported")
     if left_shoulder_startup_degrees is not None and (
         type(left_shoulder_startup_degrees) not in (int, float)
         or left_shoulder_startup_degrees != 1
-        or workspace_profile != CURRENT_REST_WORKSPACE_PROFILES[workload_segment]
+        or workspace_profile != CURRENT_REST_WORKSPACE_PROFILES[workload_segment] and not entry
     ):
         raise ValueError("Left shoulder startup allowance requires exactly 1 degree and the current-rest workspace")
     path = Path(config_path)
@@ -2370,10 +2371,12 @@ def prepare_left_response_p_request(config_path, *, ttl_seconds=120, workspace_p
             previous, original, info = _right_p20_file(pending)
             _left_response_p_request(previous, config["host_head"])
             used = state / ("left-response-p-used-" + previous["request_id"] + ".json")
-            if (previous["proportional"] != 32 or previous["boot_id"] != _left_response_p_boot_id()
+            previous_entry = (previous["proportional"] == 16 and previous.get("workspace_profile") == LEFT_ENTRY_WORKSPACE_PROFILE
+                              and previous["workload_segment"] == "ordinary-arms")
+            if (previous["proportional"] != 32 and not previous_entry or previous["boot_id"] != _left_response_p_boot_id()
                 or not 0 < previous["expires_at_monotonic_s"] <= time.monotonic()
                 or used.exists() or used.is_symlink()):
-                raise ValueError("Only an expired unconsumed current-boot LEFT-P32 request can be retired")
+                raise ValueError("Only an expired unconsumed current-boot LEFT-P32 or exact P16-entry request can be retired")
             current = pending.stat(follow_symlinks=False)
             if (current.st_dev, current.st_ino, current.st_size) != (info.st_dev, info.st_ino, info.st_size):
                 raise ValueError("Expired LEFT request changed before retirement")
@@ -2386,7 +2389,7 @@ def prepare_left_response_p_request(config_path, *, ttl_seconds=120, workspace_p
         forbidden.append(pending)
         request = {
             "version": 1, "kind": "left-response-p", "request_id": str(uuid.uuid4()),
-            "source_head": config["host_head"], "proportional": 32, "workload_segment": workload_segment,
+            "source_head": config["host_head"], "proportional": 16 if entry else 32, "workload_segment": workload_segment,
             "boot_id": _left_response_p_boot_id(), "expires_at_monotonic_s": time.monotonic() + ttl_seconds,
         }
         if workspace_profile is not None:
@@ -2439,7 +2442,7 @@ def prepare_left_response_p_remote(config_path, *, ssh="am1-pi", ttl_seconds=120
     import subprocess
     from pathlib import PurePosixPath
 
-    from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES
+    from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES, LEFT_ENTRY_WORKSPACE_PROFILE
     from tools.am1_session_ipc import strict_json
 
     if ssh != "am1-pi" or type(ssh) is not str:
@@ -2454,13 +2457,14 @@ def prepare_left_response_p_remote(config_path, *, ssh="am1-pi", ttl_seconds=120
         raise ValueError("Only left-reach and explicit ordinary-arms preparation are supported")
     if workload_segment == "ordinary-arms" and workspace_profile is None:
         raise ValueError("Ordinary arms requires explicit current-rest preparation")
+    entry = workload_segment == "ordinary-arms" and workspace_profile == LEFT_ENTRY_WORKSPACE_PROFILE
     if workspace_profile is not None and (type(workspace_profile) is not str
-            or workspace_profile != CURRENT_REST_WORKSPACE_PROFILES[workload_segment]):
-        raise ValueError("Only the explicit current-rest workspace profile is supported")
+            or workspace_profile != CURRENT_REST_WORKSPACE_PROFILES[workload_segment] and not entry):
+        raise ValueError("Only the explicit current-rest or LEFT entry workspace profile is supported")
     if left_shoulder_startup_degrees is not None and (
         type(left_shoulder_startup_degrees) not in (int, float)
         or left_shoulder_startup_degrees != 1
-        or workspace_profile != CURRENT_REST_WORKSPACE_PROFILES[workload_segment]
+        or workspace_profile != CURRENT_REST_WORKSPACE_PROFILES[workload_segment] and not entry
     ):
         raise ValueError("Left shoulder startup allowance requires exactly 1 degree and the current-rest workspace")
     profile_args = [workspace_profile] if workspace_profile is not None else []
@@ -2497,7 +2501,7 @@ def prepare_left_response_p_remote(config_path, *, ssh="am1-pi", ttl_seconds=120
 
     request = receipt["request"]
     _left_response_p_request(request, request.get("source_head") if isinstance(request, dict) else None)
-    if (request["proportional"] != 32 or request["workload_segment"] != workload_segment
+    if (request["proportional"] != (16 if entry else 32) or request["workload_segment"] != workload_segment
             or request.get("workspace_profile") != workspace_profile
             or ("workspace_profile" in request) != (workspace_profile is not None)
             or request.get("left_shoulder_startup_degrees") != left_shoulder_startup_degrees

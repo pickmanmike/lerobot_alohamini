@@ -897,7 +897,7 @@ def _left_response_p_boot_id():
 
 def _response_p_request(value, source_head=None, *, kind):
     import re
-    from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES
+    from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES, LEFT_ENTRY_WORKSPACE_PROFILE
 
     if kind not in (LEFT_RESPONSE_P_KIND, RIGHT_RESPONSE_P_KIND):
         raise ValueError("Only the two selected response elbow roles are supported")
@@ -938,18 +938,15 @@ def _response_p_request(value, source_head=None, *, kind):
         raise ValueError("Selected elbow response P requires its closed current-source finite comparison request")
     if value["workload_segment"] == "ordinary-arms" and "workspace_profile" not in value:
         raise ValueError("Ordinary arms requires its explicit current-rest workspace profile")
-    if "workspace_profile" in value and (
-        kind != LEFT_RESPONSE_P_KIND
-        or value["workload_segment"] not in CURRENT_REST_WORKSPACE_PROFILES
-        or type(value["workspace_profile"]) is not str
-        or value["workspace_profile"] != CURRENT_REST_WORKSPACE_PROFILES.get(value["workload_segment"])
-        or value["proportional"] != 32
-    ):
+    entry = value.get("workspace_profile") == LEFT_ENTRY_WORKSPACE_PROFILE
+    profile_matches = (kind == LEFT_RESPONSE_P_KIND and (
+        entry and value["workload_segment"] == "ordinary-arms" and value["proportional"] == 16
+        or not entry and value.get("workspace_profile") == CURRENT_REST_WORKSPACE_PROFILES.get(value["workload_segment"])
+        and value["workload_segment"] in CURRENT_REST_WORKSPACE_PROFILES and value["proportional"] == 32))
+    if "workspace_profile" in value and not profile_matches:
         raise ValueError("Current-rest profile requires its exact explicit LEFT/P32 workload request")
     if "left_shoulder_startup_degrees" in value and (
-        kind != LEFT_RESPONSE_P_KIND
-        or value.get("workspace_profile") != CURRENT_REST_WORKSPACE_PROFILES.get(value["workload_segment"])
-        or value["workload_segment"] not in CURRENT_REST_WORKSPACE_PROFILES or value["proportional"] != 32
+        not profile_matches
         or type(value["left_shoulder_startup_degrees"]) not in (int, float)
         or not math.isfinite(value["left_shoulder_startup_degrees"])
         or value["left_shoulder_startup_degrees"] != 1
@@ -1108,6 +1105,13 @@ _LEFT_RESPONSE_P_PRESERVED = tuple(
 )
 
 
+def _selected_acceleration_request(request):
+    from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES, LEFT_ENTRY_WORKSPACE_PROFILE
+    return (isinstance(request,dict) and request.get("workload_segment")=="ordinary-arms"
+        and ((request.get("workspace_profile")==CURRENT_REST_WORKSPACE_PROFILES["ordinary-arms"] and request.get("proportional")==32)
+             or (request.get("workspace_profile")==LEFT_ENTRY_WORKSPACE_PROFILE and request.get("proportional")==16)))
+
+
 class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
     """The closed left-ID3 WholeRobot comparison; the right role reuses its transaction."""
 
@@ -1134,7 +1138,8 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
         self.proportional = self.binding["request"]["proportional"]
         self.workspace_profile = self.binding["request"].get("workspace_profile")
         if self.workspace_profile is not None:
-            self.raw_bounds = (1051, 1164)
+            from examples.alohamini.am1_live_teleop import LEFT_ENTRY_ENDPOINT_RAW, LEFT_ENTRY_START_MAX_RAW, LEFT_ENTRY_WORKSPACE_PROFILE
+            self.raw_bounds = (LEFT_ENTRY_ENDPOINT_RAW, LEFT_ENTRY_START_MAX_RAW) if self.workspace_profile == LEFT_ENTRY_WORKSPACE_PROFILE else (1051, 1164)
         super().__init__(integral=0, snapshot_path=self.directory / (self.kind + "-original.json"))
         self._snapshot = {
             "schema_version": 1,
@@ -1192,7 +1197,8 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
         expected = {k: self.binding[k] for k in ("run_id", "host_incarnation")}
         expected["recipe"] = "physical-live-teleop"
         profile = self.binding["request"].get("workspace_profile")
-        expected_bounds = ((1051, 1164) if profile is not None else
+        from examples.alohamini.am1_live_teleop import LEFT_ENTRY_ENDPOINT_RAW, LEFT_ENTRY_START_MAX_RAW, LEFT_ENTRY_WORKSPACE_PROFILE
+        expected_bounds = ((LEFT_ENTRY_ENDPOINT_RAW, LEFT_ENTRY_START_MAX_RAW) if profile == LEFT_ENTRY_WORKSPACE_PROFILE else (1051, 1164) if profile is not None else
                            (2011, 2124) if self.side == "left" else (1847, 1960))
         if (
             self.workspace_profile != profile or self.raw_bounds != expected_bounds
@@ -1296,6 +1302,7 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
         self._robot = robot
         self._same_owner(robot)
         self._prepare_path()
+        from examples.alohamini.am1_live_teleop import LEFT_ENTRY_START_MIN_RAW, LEFT_ENTRY_START_MAX_RAW, LEFT_ENTRY_WORKSPACE_PROFILE
         original = {k: self._read(k, phase="baseline") for k in _LEFT_RESPONSE_P_REGISTERS}
         raw_bytes = self._bytes(phase="baseline")
         from .am1_live_teleop import STATIC
@@ -1312,6 +1319,7 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
                 _right_p20_json({"registers": original, "individual_bytes": raw_bytes})
             ).hexdigest(),
         )
+        selected_acceleration=self.side=="left" and _selected_acceleration_request(self.binding["request"])
         expected = {
             "Model_Number": 777,
             "Firmware_Major_Version": 3,
@@ -1330,7 +1338,7 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
             "Torque_Limit": 1000,
             "CW_Dead_Zone": 1,
             "CCW_Dead_Zone": 1,
-            "Acceleration": 254,
+            "Acceleration": original["Acceleration"] if selected_acceleration else 254,
             "Maximum_Acceleration": 254,
             "Goal_Time": 0,
             "Goal_Velocity": 0,
@@ -1338,13 +1346,16 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
         }
         if (
             any(original[k] != v for k, v in expected.items())
+            or selected_acceleration and original["Acceleration"] not in (0,254)
             or original["Lock"] not in (0, 1)
             or raw_bytes != {"24": 16, "25": 0}
             or any(original[k] != v for k, v in frozen.items())
             or not self.raw_bounds[0] <= original["Present_Position"] <= self.raw_bounds[1]
-            or not (self.calibration[3] if self.workspace_profile else self.raw_bounds[0])
-            <= original["Goal_Position"]
-            <= (self.calibration[4] if self.workspace_profile else self.raw_bounds[1])
+            or self.workspace_profile == LEFT_ENTRY_WORKSPACE_PROFILE
+            and not LEFT_ENTRY_START_MIN_RAW <= original["Present_Position"] <= LEFT_ENTRY_START_MAX_RAW
+            or not ((0 if selected_acceleration else self.calibration[3] if self.workspace_profile else self.raw_bounds[0])
+                    <= original["Goal_Position"]
+                    <= (32767 if selected_acceleration else self.calibration[4] if self.workspace_profile else self.raw_bounds[1]))
             or original["Protection_Current"] <= 0
             or not 0 < original["Max_Temperature_Limit"] <= 100
             or not 0 < original["Min_Voltage_Limit"] < original["Max_Voltage_Limit"]
@@ -1356,6 +1367,8 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
             self._persist_snapshot("baseline_refused", required=False)
             raise RuntimeError("Selected elbow response P actual stopped baseline differs from its reviewed original")
         # The original and restoration obligation reach durable storage before any write.
+        if selected_acceleration:
+            self._snapshot["selected_acceleration_profile"]={"version":1,"original_raw":original["Acceleration"],"active_raw":254,"maximum_raw":254}
         self.restore_required = True
         try:
             self._persist_snapshot("prepared")
@@ -1365,9 +1378,21 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
 
     def _write(self, register, value, *, phase, reconcile=False):
         allowed = {"Torque_Enable": (0,), "Lock": (0, 1), "P_Coefficient": (16, self.proportional)}
+        if self.side=="left" and _selected_acceleration_request(self.binding["request"]) and self._snapshot.get("selected_acceleration_profile") is not None:
+            allowed["Acceleration"]=(254,self._snapshot["original_registers"]["Acceleration"])
         if register not in allowed or type(value) is not int or value not in allowed[register]:
             raise ValueError("Selected elbow response P transaction cannot write that register/value")
         self._service_boundary()
+        if register=="Acceleration":
+            desired=254 if phase=="configure_acceleration" else self._snapshot["original_registers"]["Acceleration"] if phase=="restore_acceleration" else None
+            if value!=desired:
+                raise ValueError("Selected Acceleration write phase/value is not its original or active role")
+            if (self._read("Torque_Enable",phase=phase+"_off")!=0 or self._read("Lock",phase=phase+"_lock")!=1
+                    or self._read("Maximum_Acceleration",phase=phase+"_maximum")!=254
+                    or phase=="configure_acceleration" and (getattr(self._robot,"_am1_shutdown_in_progress",False)
+                        or self._read("Status",phase=phase+"_status")!=0
+                        or abs(self._read("Present_Current",phase=phase+"_current"))>=self._snapshot["original_registers"]["Protection_Current"])):
+                raise RuntimeError("Selected Acceleration requires its fresh healthy OFF/Lock1 role")
         row = {
             "operation": "write",
             "register": register,
@@ -1377,26 +1402,37 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
         }
         self._snapshot["events"].append(row)
         try:
-            self._bus.write(register, self.motor, value, normalize=False, num_retry=0)
-        except BaseException as error:
-            row.update(error_type=type(error).__name__, error=str(error))
-            self._failure(phase + "_failed", error)
-            if not reconcile or not isinstance(error, Exception):
-                raise
             try:
-                actual = self._read(register, phase=phase + "_ack_reconciliation")
-            except BaseException as read_error:
-                error.add_note(
-                    "Selected elbow response P acknowledgement readback failed: " + type(read_error).__name__
-                )
-                raise error from read_error
-            if actual != value:
-                raise
-            row["reconciled"] = True
-        finally:
-            row["completed_at_monotonic_s"] = time.monotonic()
-        if self._read(register, phase=phase + "_verify") != value:
-            raise RuntimeError("Selected elbow response P write verification failed: " + register)
+                self._bus.write(register, self.motor, value, normalize=False, num_retry=0)
+            except BaseException as error:
+                row.update(error_type=type(error).__name__, error=str(error))
+                self._failure(phase + "_failed", error)
+                if not reconcile or not isinstance(error, Exception):
+                    raise
+                try:
+                    actual = self._read(register, phase=phase + "_ack_reconciliation")
+                except BaseException as read_error:
+                    error.add_note(
+                        "Selected elbow response P acknowledgement readback failed: " + type(read_error).__name__
+                    )
+                    raise error from read_error
+                if actual != value:
+                    raise
+                row["reconciled"] = True
+            finally:
+                row["completed_at_monotonic_s"] = time.monotonic()
+            if register == "Acceleration" and self._read("Torque_Enable", phase=phase + "_after_off") != 0:
+                raise RuntimeError("Selected Acceleration write lost actual TorqueOFF")
+            if self._read(register, phase=phase + "_verify") != value:
+                raise RuntimeError("Selected elbow response P write verification failed: " + register)
+        except BaseException as error:
+            if register == "Acceleration":
+                self._failure(phase + "_failed", error)
+                try:
+                    self._write("Torque_Enable", 0, phase=phase + "_failed_torque_off", reconcile=True)
+                except BaseException as off_error:
+                    error.add_note("Selected Acceleration failure OFF also failed: " + type(off_error).__name__)
+            raise
 
     def disable_torque(self, robot):
         if not self._created or not self.restore_required:
@@ -1413,7 +1449,8 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
             self._same_owner(robot)
         original = self._snapshot["original_registers"]
         if (
-            any(self._read(k, phase=phase) != original[k] for k in _LEFT_RESPONSE_P_PRESERVED)
+            any(self._read(k, phase=phase) != (254 if k=="Acceleration" and phase=="active"
+                and self._snapshot.get("selected_acceleration_profile") is not None else original[k]) for k in _LEFT_RESPONSE_P_PRESERVED)
             or self._bytes(phase=phase) != self._snapshot["original_bytes"]
         ):
             raise RuntimeError(
@@ -1423,11 +1460,12 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
     def require_normal_activation_owner(self, robot):
         """Read-free fence while the ordinary owner seeds its fresh measured goals."""
         self._retained_owner(robot)
-        from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES
-        if (self.workspace_profile not in CURRENT_REST_WORKSPACE_PROFILES.values() or self.side != "left"
-                or self.proportional != 32 or not self.restore_required
+        from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES, LEFT_ENTRY_WORKSPACE_PROFILE
+        expected_p = 16 if self.workspace_profile == LEFT_ENTRY_WORKSPACE_PROFILE else 32
+        if (self.workspace_profile not in (*CURRENT_REST_WORKSPACE_PROFILES.values(), LEFT_ENTRY_WORKSPACE_PROFILE) or self.side != "left"
+                or self.proportional != expected_p or not self.restore_required
                 or self._snapshot.get("state") != "configured"
-                or self._snapshot.get("configured_p_readback") != 32
+                or self._snapshot.get("configured_p_readback") != expected_p
                 or getattr(robot, "_am1_shutdown_in_progress", False) is True):
             raise RuntimeError("Current-rest ordinary activation owner/phase changed or Stop prevailed")
 
@@ -1438,16 +1476,19 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
         if "left_shoulder_startup_degrees" not in request:
             return 0.5
         degrees = request["left_shoulder_startup_degrees"]
-        from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES
+        from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES, LEFT_ENTRY_WORKSPACE_PROFILE
         if (type(degrees) not in (int, float) or not math.isfinite(degrees) or degrees != 1
                 or request.get("workload_segment") not in CURRENT_REST_WORKSPACE_PROFILES
-                or request.get("workspace_profile") != CURRENT_REST_WORKSPACE_PROFILES.get(request.get("workload_segment"))
-                or request.get("proportional") != 32):
+                or not (request.get("workspace_profile") == LEFT_ENTRY_WORKSPACE_PROFILE
+                        and request.get("workload_segment") == "ordinary-arms" and request.get("proportional") == 16
+                        or request.get("workspace_profile") == CURRENT_REST_WORKSPACE_PROFILES.get(request.get("workload_segment"))
+                        and request.get("proportional") == 32)):
             raise RuntimeError("Left shoulder startup request authority changed")
         return 1.0
 
     def qualify_normal_activation(self, robot, all_goals):
         self.require_normal_activation_owner(robot)
+        from examples.alohamini.am1_live_teleop import LEFT_ENTRY_START_MIN_RAW, LEFT_ENTRY_START_MAX_RAW, LEFT_ENTRY_WORKSPACE_PROFILE
         matching = [values for bus, values in all_goals if bus is self._bus]
         if len(matching) != 1 or type(matching[0].get(self.motor)) is not int:
             raise RuntimeError("Current-rest ordinary activation needs its exact selected measured map")
@@ -1462,6 +1503,8 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
         position, torque = one("Present_Position"), one("Torque_Enable")
         now = time.monotonic()
         if (not self.raw_bounds[0] <= present <= self.raw_bounds[1]
+                or self.workspace_profile == LEFT_ENTRY_WORKSPACE_PROFILE
+            and not LEFT_ENTRY_START_MIN_RAW <= present <= LEFT_ENTRY_START_MAX_RAW
                 or position.get("raw") != present or torque.get("raw") != 0
                 or any("unavailable" in row or any(type(row.get(key)) not in (int, float)
                        or not math.isfinite(row[key]) for key in ("read_started_at", "read_completed_at"))
@@ -1478,12 +1521,19 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
     def apply(self, robot):
         try:
             if (
-                not self.restore_required
+                not self._created
+                or not self.restore_required
                 or self._apply_attempted
                 or getattr(robot, "_am1_shutdown_in_progress", False) is True
             ):
                 raise RuntimeError("Selected elbow response P requires one fresh durable apply opportunity")
             self._apply_attempted = True
+            if self._snapshot.get("selected_acceleration_profile") is not None:
+                info = self.snapshot_path.lstat()
+                if (self._snapshot.get("state") != "prepared" or not stat.S_ISREG(info.st_mode)
+                        or info.st_nlink != 1
+                        or hashlib.sha256(self.snapshot_path.read_bytes()).hexdigest() != self._state_hash):
+                    raise RuntimeError("Selected Acceleration requires its unchanged durable prepared original")
             self._preserved(robot, phase="before_apply")
             if any(
                 self._read(k, phase="before_apply") != v
@@ -1497,6 +1547,10 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
                 or getattr(robot, "_am1_shutdown_in_progress", False) is True
             ):
                 raise RuntimeError("Current-rest P configuration requires its healthy stopped owner")
+            if self._snapshot.get("selected_acceleration_profile") is not None:
+                if self._read("Acceleration",phase="before_acceleration")!=254:
+                    self._write("Acceleration",254,phase="configure_acceleration")
+                self._snapshot["configured_acceleration_readback"]=254
             if self.proportional != 16:
                 self._write("P_Coefficient", self.proportional, phase="configure_proportional")
             self._snapshot.update(
@@ -1568,6 +1622,18 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
             })
             raise
 
+    def configured_acceleration(self, robot):
+        """Read-free selected-role expectation; captured generic STATIC stays unchanged."""
+        self._retained_owner(robot)
+        if self.side!="left" or not _selected_acceleration_request(self.binding["request"]): return None
+        original=self._snapshot.get("original_registers",{})
+        expected={"version":1,"original_raw":original.get("Acceleration"),"active_raw":254,"maximum_raw":254}
+        if (not self.restore_required or self._snapshot.get("selected_acceleration_profile")!=expected
+                or original.get("Acceleration") not in (0,254) or original.get("Maximum_Acceleration")!=254
+                or self._snapshot.get("configured_acceleration_readback")!=254):
+            raise RuntimeError("Selected elbow configured Acceleration proof unavailable")
+        return 254
+
     @property
     def receipt(self):
         if not self.restore_required or self._snapshot.get("configured_p_readback") != self.proportional:
@@ -1612,6 +1678,13 @@ class AM1LeftResponseProportionalTrial(AM1ElbowIntegralTrial):
                 self._write("P_Coefficient", 16, phase="restore_proportional", reconcile=True)
             if self._read("P_Coefficient", phase="restored") != 16:
                 raise RuntimeError("Selected elbow response P original P16 restoration failed")
+            if self._snapshot.get("selected_acceleration_profile") is not None:
+                original_acceleration=self._snapshot["original_registers"]["Acceleration"]
+                if self._read("Acceleration",phase="before_restore_acceleration")!=original_acceleration:
+                    self._write("Acceleration",original_acceleration,phase="restore_acceleration",reconcile=True)
+                if self._read("Acceleration",phase="restored_acceleration")!=original_acceleration:
+                    raise RuntimeError("Selected elbow original Acceleration restoration failed")
+                self._snapshot["restored_acceleration_readback"]=original_acceleration
             # Goal is the ordinary owner's volatile command, not a gain-setting
             # rollback. Keep its original as evidence; never replay a stale Goal.
             self._preserved(robot, phase="restored")
@@ -1650,9 +1723,11 @@ def complete_stopped_left_response_p_original(
     bus, directory, *, run_id, host_incarnation, original_sha256, source_head,
     completion_id, check_stopped,
 ):
-    """Verify one failed pre-P32 original and finish only its original Lock.
+    """Restore a selected Acceleration obligation while OFF, without native acknowledgement.
 
-    The caller owns the existing stopped maintenance locks/source guard. This
+    The separate historical branch retains its original contract: verify one
+    failed pre-P32 original and finish only its original Lock.
+    The caller owns the existing stopped maintenance locks/source guard. That path
     never opens a bus, changes P/Goal/torque, revives a trial, or acknowledges
     native cleanup. The failed original remains immutable.
     """
@@ -1669,6 +1744,246 @@ def complete_stopped_left_response_p_original(
         raise ValueError("Stopped completion output must be fresh")
     binding = load_left_response_p_binding(directory / "left-response-p.json", directory, run_id, host_incarnation)
     request = _response_p_request(binding["request"], source_head, kind=LEFT_RESPONSE_P_KIND)
+    if _selected_acceleration_request(request):
+        # A separate durable current-profile obligation; the historical115 path below stays exact.
+        path = directory / "left-response-p-original.json"
+
+        def selected_original():
+            if path.is_symlink() or path.resolve() != path:
+                raise ValueError("Selected Acceleration original path changed")
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(fd, "rb") as stream:
+                info = os.fstat(stream.fileno())
+                if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not 0 < info.st_size <= 131072
+                        or os.name != "nt" and (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600)):
+                    raise ValueError("Selected Acceleration requires its owned private original")
+                data = stream.read(131073)
+            if hashlib.sha256(data).hexdigest() != original_sha256:
+                raise ValueError("Selected Acceleration original SHA differs")
+            def unique(pairs):
+                result = {}
+                for key, value in pairs:
+                    if key in result:
+                        raise ValueError("Duplicate selected Acceleration original field")
+                    result[key] = value
+                return result
+            value = json.loads(data, object_pairs_hook=unique,
+                               parse_constant=lambda _: (_ for _ in ()).throw(ValueError("Nonfinite original")))
+            if (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode() != data:
+                raise ValueError("Selected Acceleration original encoding differs")
+            return value
+
+        original = selected_original()
+        if "selected_acceleration_profile" in original:
+            registers, raw_bytes = original.get("original_registers", {}), original.get("original_bytes")
+            profile = original.get("selected_acceleration_profile")
+            from .am1_live_teleop import STATIC
+            from examples.alohamini.am1_live_teleop import (
+                LEFT_ENTRY_START_MIN_RAW, LEFT_ENTRY_START_MAX_RAW, LEFT_ENTRY_WORKSPACE_PROFILE,
+            )
+            seed_bounds = ((LEFT_ENTRY_START_MIN_RAW, LEFT_ENTRY_START_MAX_RAW)
+                           if request["workspace_profile"] == LEFT_ENTRY_WORKSPACE_PROFILE else (1051, 1164))
+            fixed = {"Model_Number": 777, "Firmware_Major_Version": 3, "Firmware_Minor_Version": 10,
+                     "ID": 3, "Operating_Mode": 0, "P_Coefficient": 16, "I_Coefficient": 0,
+                     "D_Coefficient": 32, "Torque_Enable": 0, "Phase": 12,
+                     "Min_Position_Limit": 864, "Max_Position_Limit": 3073, "Homing_Offset": 1845,
+                     "Max_Torque_Limit": 1000, "Torque_Limit": 1000, "CW_Dead_Zone": 1,
+                     "CCW_Dead_Zone": 1, "Maximum_Acceleration": 254, "Goal_Time": 0,
+                     "Goal_Velocity": 0, "Status": 0}
+            events = original.get("events")
+            permitted = {"Torque_Enable": (0,), "Lock": (0, 1), "P_Coefficient": (16, request["proportional"]),
+                         "Acceleration": (0, 254)}
+            if (type(source_head) is not str or re.fullmatch("[0-9a-f]{40}", source_head) is None
+                    or original.get("binding") != binding or original.get("kind") != LEFT_RESPONSE_P_KIND
+                    or type(original.get("schema_version")) is not int or original["schema_version"] != 1
+                    or original.get("restore_required") is not True
+                    or original.get("state") != original.get("status")
+                    or original.get("state") not in {
+                        "prepared", "prepare_failed", "configured", "configure_failed", "active", "active_failed",
+                        "restore_failed", "torque_off_failed", "volatile_lock_failed", "configure_acceleration_failed",
+                        "configure_proportional_failed", "restore_proportional_failed", "restore_acceleration_failed",
+                        "restore_original_lock_failed", "restore_failed_torque_off_failed", "restore_failed_lock_failed",
+                        "configure_acceleration_failed_torque_off_failed", "restore_acceleration_failed_torque_off_failed",
+                    }
+                    or original.get("motor") != ELBOW or type(original.get("motor_id")) is not int
+                    or original["motor_id"] != 3 or not isinstance(registers, dict)
+                    or set(registers) != set(_LEFT_RESPONSE_P_REGISTERS)
+                    or any(type(value) is not int for value in registers.values())
+                    or any(registers[key] != value for key, value in fixed.items())
+                    or registers["Acceleration"] not in (0, 254) or registers["Lock"] not in (0, 1)
+                    or not seed_bounds[0] <= registers["Present_Position"] <= seed_bounds[1]
+                    or not 0 <= registers["Goal_Position"] <= 32767 or raw_bytes != {"24": 16, "25": 0}
+                    or any(type(value) is not int for value in raw_bytes.values())
+                    or profile != {"version": 1, "original_raw": registers["Acceleration"],
+                                   "active_raw": 254, "maximum_raw": 254}
+                    or not isinstance(profile, dict) or any(type(value) is not int for value in profile.values())
+                    or set(original.get("frozen_teleop_registers", {})) != set(STATIC)
+                    or any(type(original["frozen_teleop_registers"][key]) is not int
+                           or original["frozen_teleop_registers"][key] != registers[key] for key in STATIC)
+                    or registers["Protection_Current"] <= 0 or not 0 < registers["Max_Temperature_Limit"] <= 100
+                    or not 0 < registers["Min_Voltage_Limit"] < registers["Max_Voltage_Limit"]
+                    or abs(registers["Present_Current"]) >= registers["Protection_Current"]
+                    or not registers["Min_Voltage_Limit"] <= registers["Present_Voltage"] <= registers["Max_Voltage_Limit"]
+                    or not 0 <= registers["Present_Temperature"] < registers["Max_Temperature_Limit"]
+                    or not isinstance(events, list) or any(not isinstance(row, dict) for row in events)
+                    or any(row.get("operation") == "write" and (
+                        row.get("register") not in permitted or type(row.get("value")) is not int
+                        or row["value"] not in permitted[row["register"]]) for row in events)
+                    or "configured_acceleration_readback" in original and (
+                        type(original["configured_acceleration_readback"]) is not int or original["configured_acceleration_readback"] != 254)
+                    or "configured_p_readback" in original and (
+                        type(original["configured_p_readback"]) is not int or original["configured_p_readback"] != request["proportional"])
+                    or hashlib.sha256(_right_p20_json({"registers": registers, "individual_bytes": raw_bytes})).hexdigest()
+                    != original.get("original_settings_sha256")):
+                raise ValueError("Selected Acceleration requires its exact pending durable original profile")
+            started, rows, attempted = time.monotonic(), [], False
+
+            def check_selected():
+                check_stopped()
+                motor, cal = bus.motors.get(ELBOW), bus.calibration.get(ELBOW)
+                if (not started <= time.monotonic() < started + 20.0
+                        or request["boot_id"] != _left_response_p_boot_id()
+                        or not bus.is_connected or motor is None or type(motor.id) is not int or motor.id != 3
+                        or motor.model != "sts3215" or motor.norm_mode is not MotorNormMode.RANGE_M100_100
+                        or cal is None or any(type(getattr(cal, key)) is not int for key in
+                                             ("id", "drive_mode", "homing_offset", "range_min", "range_max"))
+                        or tuple(getattr(cal, key) for key in ("id", "drive_mode", "homing_offset", "range_min", "range_max"))
+                        != AM1LeftResponseProportionalTrial.calibration
+                        or load_left_response_p_binding(directory / "left-response-p.json", directory, run_id, host_incarnation) != binding
+                        or _response_p_request(binding["request"], source_head, kind=LEFT_RESPONSE_P_KIND) != request
+                        or selected_original() != original):
+                    raise RuntimeError("Selected Acceleration stopped owner/source/boot/original changed")
+
+            def selected_read(register=None, address=None):
+                row = {"operation": "read", "phase": "stopped_acceleration_completion",
+                       "started_at_monotonic_s": time.monotonic()}
+                row.update({"register": register} if address is None else {"address": address, "width": 1})
+                rows.append(row)
+                try:
+                    check_selected()
+                    row["started_at_monotonic_s"] = time.monotonic()
+                    if address is None:
+                        value = bus.read(register, ELBOW, normalize=False, num_retry=0)
+                    else:
+                        value, _, _ = bus._read(address, 1, 3, num_retry=0, raise_on_error=True,
+                                                err_msg="Stopped selected Acceleration byte read failed")
+                    row.update(value=value, completed_at_monotonic_s=time.monotonic())
+                    check_selected()
+                    if type(value) is not int or not 0 <= row["completed_at_monotonic_s"]-row["started_at_monotonic_s"] <= .15:
+                        raise RuntimeError("Selected Acceleration actual bounded integer read required")
+                    return value
+                except BaseException as error:
+                    row.update(error_type=type(error).__name__, error=str(error)[:160])
+                    raise
+                finally:
+                    row.setdefault("completed_at_monotonic_s", time.monotonic())
+
+            def healthy():
+                if (selected_read("Torque_Enable") != 0 or selected_read("Status") != 0
+                        or abs(selected_read("Present_Current")) >= registers["Protection_Current"]
+                        or not registers["Min_Voltage_Limit"] <= selected_read("Present_Voltage") <= registers["Max_Voltage_Limit"]
+                        or not 0 <= selected_read("Present_Temperature") < registers["Max_Temperature_Limit"]):
+                    raise RuntimeError("Selected Acceleration requires its fresh actual OFF/healthy owner")
+
+            def selected_write(register, value):
+                nonlocal attempted
+                if register not in {"P_Coefficient", "Acceleration", "Lock"} or value != {
+                    "P_Coefficient": 16, "Acceleration": registers["Acceleration"], "Lock": registers["Lock"]
+                }[register]:
+                    raise ValueError("Stopped selected restoration cannot write that register/value")
+                healthy()
+                if register != "Lock" and selected_read("Lock") != 1:
+                    raise RuntimeError("Selected Acceleration setting restoration requires actual volatile Lock1")
+                check_selected()
+                row = {"operation": "write", "phase": "stopped_acceleration_completion", "register": register,
+                       "value": value, "started_at_monotonic_s": time.monotonic()}
+                rows.append(row); attempted = True
+                try:
+                    bus.write(register, ELBOW, value, normalize=False, num_retry=0)
+                except Exception as error:
+                    try:
+                        if selected_read(register) != value:
+                            raise error
+                    except BaseException as read_error:
+                        if read_error is error:
+                            raise
+                        raise error from read_error
+                    row["reconciled"] = True
+                finally:
+                    row["completed_at_monotonic_s"] = time.monotonic()
+                check_selected()
+                healthy()  # Verify actual OFF immediately after each setting write, before the next setting.
+                if selected_read(register) != value:
+                    raise RuntimeError("Selected Acceleration actual restoration readback differs")
+
+            try:
+                check_selected()
+                actual = {key: selected_read(key) for key in _LEFT_RESPONSE_P_REGISTERS}
+                actual_bytes = {str(address): selected_read(address=address) for address in (24, 25)}
+                dynamic = {"P_Coefficient", "Acceleration", "Lock", "Present_Position", "Goal_Position",
+                           "Present_Current", "Present_Voltage", "Present_Temperature"}
+                if (any(actual[key] != registers[key] for key in set(registers)-dynamic)
+                        or actual["P_Coefficient"] not in (16, request["proportional"])
+                        or actual["Acceleration"] not in (registers["Acceleration"], 254)
+                        or actual["Lock"] not in (0, 1) or actual_bytes != raw_bytes
+                        or not 864 <= actual["Present_Position"] <= 3073 or not 0 <= actual["Goal_Position"] <= 32767):
+                    raise RuntimeError("Selected Acceleration fresh stopped settings/identity/OFF differ")
+                healthy()
+                for register, value in (("P_Coefficient", 16), ("Acceleration", registers["Acceleration"])):
+                    if actual[register] != value:
+                        selected_write(register, value)
+                if (selected_read("P_Coefficient"), selected_read("Acceleration")) != (16, registers["Acceleration"]):
+                    raise RuntimeError("Selected Acceleration original settings restoration is unverified")
+                if selected_read("Lock") != registers["Lock"]:
+                    selected_write("Lock", registers["Lock"])
+                healthy()
+                if (selected_read("Lock"), selected_read("P_Coefficient"), selected_read("Acceleration")) != (
+                        registers["Lock"], 16, registers["Acceleration"]):
+                    raise RuntimeError("Selected Acceleration final stopped restoration is unverified")
+                check_selected()
+                receipt = {"version": 1, "kind": "left-response-p-stopped-completion", "completion_id": completion_id,
+                           "run_id": run_id, "host_incarnation": host_incarnation, "request_sha256": binding["request_sha256"],
+                           "source_head": source_head, "original_sha256": original_sha256,
+                           "original_settings_sha256": original["original_settings_sha256"], "original_lock": registers["Lock"],
+                           "selected_acceleration_profile": copy.deepcopy(profile), "original_acceleration": registers["Acceleration"],
+                           "restored_acceleration_readback": registers["Acceleration"], "restored_p_readback": 16,
+                           "selected_restoration_verified": True, "native_acknowledged": False, "events": rows,
+                           "started_at_monotonic_s": started, "completed_at_monotonic_s": time.monotonic()}
+                temporary = target.with_name("." + target.name + "." + uuid4().hex + ".tmp")
+                linked = False
+                try:
+                    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+                    with os.fdopen(fd, "wb") as stream:
+                        stream.write(_right_p20_json(receipt)); stream.flush(); os.fsync(stream.fileno())
+                    check_selected()
+                    os.link(temporary, target); linked = True
+                    temporary.unlink()
+                    AM1ElbowIntegralTrial._sync_directory(directory)
+                    check_selected()
+                except BaseException as error:
+                    if linked:
+                        try:
+                            target.unlink()
+                        except BaseException as unlink_error:
+                            error.add_note("Selected completion publication removal failed: " + type(unlink_error).__name__)
+                    try:
+                        temporary.unlink(missing_ok=True)
+                    except BaseException as unlink_error:
+                        error.add_note("Selected completion temporary cleanup failed: " + type(unlink_error).__name__)
+                    raise
+                return receipt
+            except BaseException as error:
+                if attempted:
+                    try:
+                        check_selected()
+                        bus.write("Torque_Enable", ELBOW, 0, normalize=False, num_retry=0)
+                        check_selected()
+                        if selected_read("Torque_Enable") != 0:
+                            raise RuntimeError("Selected Acceleration failure containment OFF is unverified")
+                    except BaseException as off_error:
+                        error.add_note("Selected Acceleration failure containment: " + type(off_error).__name__ + ": " + str(off_error))
+                error.add_note("Selected Acceleration original retained; actual events: " + _right_p20_json(rows).decode())
+                raise
     from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES
     if (request.get("workload_segment") not in CURRENT_REST_WORKSPACE_PROFILES
         or request.get("workspace_profile") != CURRENT_REST_WORKSPACE_PROFILES[request["workload_segment"]]):

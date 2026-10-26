@@ -135,6 +135,16 @@ def normalized_raw(raw, calibration, *, gripper=False):
     return (100 - value if gripper else -value) if direction else value
 
 
+LEFT_ENTRY_WORKSPACE_PROFILE = "ordinary-arms-left-entry-p16-1108-1268"
+LEFT_ENTRY_ENDPOINT_RAW = 1108
+LEFT_ENTRY_START_MIN_RAW = 1165
+LEFT_ENTRY_START_MAX_RAW = 1268
+# Old geometry remains readable as evidence; fresh requests use only the current profile above.
+_LEFT_ENTRY_WORKSPACE_DESCRIPTORS = {
+    "ordinary-arms-left-entry-p16-1164-1324": (1164, 1165, 1324),
+    LEFT_ENTRY_WORKSPACE_PROFILE: (LEFT_ENTRY_ENDPOINT_RAW, LEFT_ENTRY_START_MIN_RAW, LEFT_ENTRY_START_MAX_RAW),
+}
+
 CURRENT_REST_WORKSPACE_PROFILES = {
     "left-reach": "left-current-rest-1051-1164",
     "ordinary-arms": "ordinary-arms-left-current-rest-1051-1164",
@@ -144,7 +154,7 @@ CURRENT_REST_WORKSPACE_PROFILES = {
 def validate_workspace(workspace):
     fields = {"version", "units", "bounds", "reference", "calibration", "raw_bounds"}
     if isinstance(workspace, dict) and "workspace_profile" in workspace:
-        if workspace["workspace_profile"] not in CURRENT_REST_WORKSPACE_PROFILES.values():
+        if workspace["workspace_profile"] not in (*CURRENT_REST_WORKSPACE_PROFILES.values(), *_LEFT_ENTRY_WORKSPACE_DESCRIPTORS):
             raise ValueError("unknown native workspace profile")
         fields.add("workspace_profile")
     if (
@@ -154,6 +164,8 @@ def validate_workspace(workspace):
         or workspace["version"] != 1
     ):
         raise ValueError("closed native workspace required")
+    entry_descriptor = _LEFT_ENTRY_WORKSPACE_DESCRIPTORS.get(workspace.get("workspace_profile"))
+    entry = entry_descriptor is not None
     keys = set(TELEOP_ARM_KEYS)
     for field in ("units", "bounds", "reference", "raw_bounds"):
         if not isinstance(workspace[field], dict) or set(workspace[field]) != keys:
@@ -200,7 +212,16 @@ def validate_workspace(workspace):
         endpoints = sorted(normalized_raw(v, cal, gripper=gripper) for v in raw)
         if any(abs(a - b) > 1e-7 for a, b in zip(endpoints, (bounds["min"], bounds["max"]), strict=True)):
             raise ValueError("native raw/normalized workspace roundtrip differs")
-        if key.endswith("elbow_flex.pos"):
+        if entry:
+            if key == "arm_left_elbow_flex.pos":
+                if (list(cal) != [3, 0, 1845, 864, 3073] or raw[0] != entry_descriptor[0]
+                        or not entry_descriptor[1] <= raw[1] <= entry_descriptor[2]
+                        or abs(workspace["reference"][key] - normalized_raw(raw[1], cal)) > 1e-7
+                        or bounds["rate_per_s"] > 4096 / 360 * 200 / (3073-864) + 1e-9):
+                    raise ValueError("entry workspace requires its original finite inward seed/rate")
+            elif raw[0] != raw[1]:
+                raise ValueError("entry workspace must hold every other admitted Goal exactly")
+        elif key.endswith("elbow_flex.pos"):
             profiled = "workspace_profile" in workspace and key.startswith("arm_left_")
             expected = ([1051, 1164] if profiled else [2011, 2124]) if key.startswith("arm_left_") else [1847, 1960]
             if profiled and (list(cal) != [3, 0, 1845, 864, 3073]
@@ -208,7 +229,8 @@ def validate_workspace(workspace):
                 raise ValueError("current-rest workspace requires its actual calibrated reference")
             if list(raw) != expected:
                 raise ValueError("native elbow workspace differs from demonstrated command bounds")
-        maximum_span = 0.2 * (cal[4] - cal[3]) if gripper else math.floor(10 * 4096 / 360)
+        maximum_span = (160 if entry and key == "arm_left_elbow_flex.pos" else
+                        0.2 * (cal[4] - cal[3]) if gripper else math.floor(10 * 4096 / 360))
         maximum_rate = 20.0 if gripper else 5 * 4096 / 360 * 200 / (cal[4] - cal[3])
         if raw[1] - raw[0] > maximum_span + 1e-9 or bounds["rate_per_s"] > maximum_rate + 1e-9:
             raise ValueError("native workspace exceeds role-specific bench travel/rate")
