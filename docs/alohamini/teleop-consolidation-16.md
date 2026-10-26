@@ -4,6 +4,23 @@ Physical leaders are the primary input for ordinary teleoperation. An explicitly
 
 ## Current checkpoint — measured approach response and input timing, 2026-10-26
 
+Stage79 installs ONLY the reviewed Core/service Grant observations at source051321: M46b3d4/full13 unchanged, R60cad1be2e8caf10d2d874a88f3f150912474d8dee/full22, manifest2ea473616c7650a0271e870df4f59d777bf48be8ac9762ee35da2466cdec3abc. All ten stages completed first try; one runtime build and zero motor/camera builds. Full matched Stage78/private rollback and Windows12ab bytes/Owner/SDDL are preserved. Private helper37/audit27 checks and independent review passed; collector advanced only its current audit pin.
+
+Separate cc4b19cd refused before Live on actual post-home lift velocity/Moving evidence, with zero streamed frames. After torque release, five stationary OFF samples atPP738 over208ms qualified cleanup; native uncertainty was false and settings restored. A fresh retry from that qualified rest retained the guard unchanged. It is not a first-try startup success or a temperature/history failure.
+
+| Useful action2c80682a /native981dc395 | Requested or delivered | Actual result |
+| --- | --- | --- |
+| Increasing elbow workpose |4encoder°; SDK42=67Goal1149 |1104→1145:3.604°, four ticks/.352° short ofGoal |
+| Gripclose at SAMEelbow |71.617 accepted opening points |72.277;9.373point actual close |
+| Reopen ORIGINALgrip |81.650 |81.056; .594point residual |
+| Direct decreasing Return |ORIGINALGoal1104 |1126;22ticks/1.934° return error |
+
+The elbow stayed1145 across86 source-matched close/reopen samples. Nine other joints were exactly fixed; LEFT wrist-flex varied two ticks. Workpose SDK pair spans1.034s with a1.031s unobserved gap: duty4%, current6.5–13mA,11.9–12V,28°C, velocity/Moving/status0. One Return-era SDK row has Goal1104/PP1126, duty18.4%/130mA/11.9V/29°C; its source join is unavailable, so it is sparse static evidence, not qualified continuous dwell. All360 native feedback observations are source-matched. Body/lift commands stayed zero; small wheel-derived feedback values remain distinct from physical stationarity.
+
+2c completed all five intentions and normal finishing/restoration:40.385 actual producer-active seconds/621frames versus39 planned phase-active thresholds (existing status cadence), inside the ORIGINAL120elapsed/300native budgets. Startup14.465s is separate from Live→ownPause49.392s: CoreRunning43.530s, held5.862s including initial qualification, longestRunning21.671s. Five natural input holds requalified; zero required-view expiries/native recovery episodes. In-run Chest AX22.64s/screenshot22.80s showed current qualified coarse imagery; fine occlusion and an old sticky fetch banner remain separate. Interactive input completion is true; fixed programme/native execution-complete remain false. Six originals/full SQL1151/232/3320 and once-only analysis retained; cc4 separately retained six/startup-fault audit/analysis.
+
+New correlated Grant marks locate one consequential Input wait inside Coretick:398.328ms after only.003ms mutex wait, leading to a correct expiredGrant refusal despite current input on receipt. Grant appreceive→send-preparation was6.876ms there. PC logging/ACK/wake and Peerreply queue are not the supported failing layer. Split retained evidence/advance/conditional durable-save behavior with the existing motor-free production fixture before changing policy; intra-tick cause remains unresolved. No timer, gain, SQLite-durability or network change is justified by the label alone.
+
 PR37 is merged atb9be027e. New focused source2f423022 retains bounded PC timing in existing frame records; Stage78 remains unchanged. Run5bf22d08/native9657bab0 completed61.041 producer-active seconds/940frames with six accepted intentions, NORMAL REQUIRED Chest, qualified Finish/OFF and P16/Acceleration0/Lock0 restoration. Its declared ceiling was65active/150elapsed/native300; all fresh intention TTLs remained90s. CoreRunning64.853s, held7.927s including initial qualification, longest Running22.576s and zero required-view expiry are separate measures.
 
 The unchanged-settings comparison approached SAME midpoint from both directions. SDK42 and67 agreed on Goal1107: decreasing approach sampledPP1128/error+21ticks (1.846°), increasing sampledPP1100/error−7ticks (.615°). Later native increasing feedback reached1104/error−3ticks (.264°), without another SDK pair. Upper/lower preparation gates1134/1082 differ from first phase samples1139/1079; full preparation bounds were not achieved or claimed. Final Return to this run's original1109 ended1104, residual−5ticks/.439°. The increasing final approach is a useful LEFT-specific procedure at this pose, not arbitrary-direction accuracy or an internal-defect diagnosis.
