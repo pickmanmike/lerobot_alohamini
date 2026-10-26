@@ -1255,6 +1255,100 @@ async def _startup_run_detail(client, state, remaining):
     return run
 
 
+# Local observation only: these reads never consume a source/authority clock.
+_pc_observation_clock = time.perf_counter
+_PC_COMMAND_MARKS = ("request_started_at_monotonic_s", "ack_completed_at_monotonic_s",
+    "send_started_at_monotonic_s", "send_completed_at_monotonic_s",
+    "result_received_at_monotonic_s", "response_observed_at_monotonic_s")
+
+
+def _pc_observation_now():
+    try:
+        value = _pc_observation_clock()
+        return value if type(value) in (int, float) and math.isfinite(value) and value >= 0 else None
+    except Exception:
+        return None
+
+
+def _pc_command_timing(value, op, request_id):
+    try:
+        if (type(value) is not dict or set(value) != {"version", "clock", "op", "request_id", "timing"}
+            or type(value["version"]) is not int or value["version"] != 1
+            or value["clock"] != "pc_perf_counter" or value["op"] != op or op not in {"grant", "input"}
+            or type(request_id) is not str or not 0 < len(request_id) <= 64 or value["request_id"] != request_id):
+            return None
+        marks = value["timing"]
+        if (type(marks) is not dict or not marks or set(marks) - set(_PC_COMMAND_MARKS)
+            or any(type(v) not in (int, float) or not math.isfinite(v) or v < 0 for v in marks.values())):
+            return None
+        # A reply can arrive while send_json is still awaiting write/drain.
+        ordered = [marks[k] for k in _PC_COMMAND_MARKS if k in marks and k != "result_received_at_monotonic_s"]
+        if ordered != sorted(ordered):
+            return None
+        received = marks.get("result_received_at_monotonic_s")
+        if received is not None and (
+            any(marks[k] > received for k in _PC_COMMAND_MARKS[:3] if k in marks)
+            or "response_observed_at_monotonic_s" in marks and received > marks["response_observed_at_monotonic_s"]
+        ):
+            return None
+        copied = {**value, "timing": dict(marks)}
+        return copied if len(json.dumps(copied, allow_nan=False).encode()) <= 1024 else None
+    except Exception:
+        return None
+
+
+def _copy_pc_command_timing(client, op, reply):
+    try:
+        return _pc_command_timing(getattr(client, "last_command_timing", None), op, reply.get("id"))
+    except Exception:
+        return None
+
+
+def _previous_pc_frame(producer, source, *, value=None):
+    try:
+        value = producer.previous_frame_timing if value is None else value
+        names = ("log_started_at_perf_counter_s", "log_completed_at_perf_counter_s",
+                 "cadence_started_at_perf_counter_s", "cadence_completed_at_perf_counter_s")
+        if (type(value) is not dict or set(value) != {"source_id", "sample_seq", "grant_id", "requested_delay_s", *names}
+            or value["source_id"] != source["source_id"] or type(value["sample_seq"]) is not int
+            or not 0 < value["sample_seq"] < source["sample_seq"]
+            or type(value["grant_id"]) is not str or not 0 < len(value["grant_id"]) <= 128
+            or any(type(value[k]) not in (int, float) or not math.isfinite(value[k]) or value[k] < 0 for k in (*names, "requested_delay_s"))
+            or value["requested_delay_s"] > .06 + 1e-9
+            or [value[k] for k in names] != sorted(value[k] for k in names)):
+            return None
+        return dict(value) if len(json.dumps(value, allow_nan=False).encode()) <= 1024 else None
+    except Exception:
+        return None
+
+
+def _pc_delivery_timing(producer, frame, sequence):
+    try:
+        value = producer.last_delivery_timing
+        expected = {key: frame["source"][key] for key in ("source_id", "sample_seq", "grant_id")}
+        if (type(value) is not dict or set(value) != {"sample", "network_seq", "timing"}
+            or value["sample"] != expected or value["network_seq"] != sequence):
+            return None
+        timing = value["timing"]
+        names = ("grant_request_started_at_monotonic_s", "grant_received_at_monotonic_s", "serialized_at_monotonic_s")
+        if (type(timing) is not dict or not set(names) <= set(timing)
+            or set(timing) - {*names, "grant_command", "input_command", "previous_frame"}
+            or any(type(timing[k]) not in (int, float) or not math.isfinite(timing[k]) or timing[k] < 0 for k in names)
+            or [timing[k] for k in names] != sorted(timing[k] for k in names)):
+            return None
+        for label, op in (("grant_command", "grant"), ("input_command", "input")):
+            if label in timing and (type(timing[label]) is not dict or
+                _pc_command_timing(timing[label], op, timing[label].get("request_id")) is None):
+                return None
+        if "previous_frame" in timing and (type(timing["previous_frame"]) is not dict or
+            _previous_pc_frame(producer, frame["source"], value=timing["previous_frame"]) is None):
+            return None
+        raw = json.dumps(timing, allow_nan=False, separators=(",", ":"))
+        return json.loads(raw) if len(raw.encode()) <= 2048 else None
+    except Exception:
+        return None
+
+
 def _record_controller_command_timing(record, command, request_id, timing, *, phase, outcome,
                                       ack_completed=None, result=None, error=None):
     """Bounded PC-clock observation only; never an admission or Native acknowledgement."""
@@ -1428,6 +1522,7 @@ class SessionClient:
                 if message.type != aiohttp.WSMsgType.TEXT:
                     reason = "message-" + message.type.name.lower()
                     break
+                received_at = _pc_observation_now()
                 value = json.loads(message.data)
                 if value.get("kind") == "snapshot":
                     self.snapshot = value["snapshot"]
@@ -1442,6 +1537,10 @@ class SessionClient:
                 elif value.get("kind") == "result":
                     future = self.pending.pop(value["id"], None)
                     if future and not future.done():
+                        with contextlib.suppress(Exception):
+                            marks = getattr(future, "_am1_command_timing", None)
+                            if type(marks) is dict:
+                                marks["result_received_at_monotonic_s"] = received_at
                         future.set_result(value)
                 elif value.get("kind") == "unavailable":
                     raise RuntimeError("owner reporting unavailable")
@@ -1539,6 +1638,10 @@ class SessionClient:
                 raise self._ack_error from error
 
     async def command(self, command, *, check=None):
+        observed = command.get("op") in {"grant", "input"}
+        if observed:
+            with contextlib.suppress(Exception):
+                self.last_command_timing = None
         record = getattr(self, "record", None) if command.get("op") in ("connect", "release_input", "resume") else None
         record = record if callable(record) else None
         recorded_command = {key: command.get(key) for key in
@@ -1564,6 +1667,9 @@ class SessionClient:
         future = asyncio.get_running_loop().create_future()
         self.pending[identity] = future
         timing = {"request_started_at_monotonic_s": time.perf_counter()}
+        if observed:
+            with contextlib.suppress(Exception):
+                future._am1_command_timing = timing
         ack_ceiling, ws = time.monotonic() + 2, self.ws
         phase, outcome, ack_completed, result, original_error = "ack_wait", "unknown", None, None, None
         try:
@@ -1571,6 +1677,8 @@ class SessionClient:
                 await SessionClient._wait_current_ack(self, ws, ack_ceiling)
             if record:
                 ack_completed = time.perf_counter()
+            if observed:
+                timing["ack_completed_at_monotonic_s"] = _pc_observation_now()
             phase = "pre_send"
             if self.ws is not ws or self.transport_error or ws.closed:
                 raise ConnectionError("bounded current WSS connection required")
@@ -1627,6 +1735,12 @@ class SessionClient:
                 error.input_command_timing = dict(timing, outcome_observed_at_monotonic_s=time.perf_counter())
             raise
         finally:
+            if observed:
+                with contextlib.suppress(Exception):
+                    self.last_command_timing = _pc_command_timing({"version": 1, "clock": "pc_perf_counter",
+                        "op": command.get("op"), "request_id": identity,
+                        "timing": {key: value for key, value in timing.items() if key in _PC_COMMAND_MARKS}},
+                        command.get("op"), identity)
             self.pending.pop(identity, None)
             if not future.done():
                 future.cancel()
@@ -2278,7 +2392,11 @@ def _qualified_command_reference(client, workspace):
 async def _acquisition_delay(requested_at):
     # Receipt cost consumes this cadence; an overdue tick acquires one NEW
     # sample, rather than sleeping again or replaying missed samples.
-    await asyncio.sleep(max(0, requested_at + .06 - time.monotonic()))
+    delay = max(0, requested_at + .06 - time.monotonic())
+    started = _pc_observation_now()
+    await asyncio.sleep(delay)
+    return {"requested_delay_s": delay, "cadence_started_at_perf_counter_s": started,
+            "cadence_completed_at_perf_counter_s": _pc_observation_now()}
 
 
 class SameRunRecovery:
@@ -3777,6 +3895,7 @@ async def send_leader_sample(client, producer, body, record, *, phase, progress_
             error.grant_context = grant_context
         raise
     received = time.perf_counter()
+    grant_timing = _copy_pc_command_timing(client, "grant", grant)
     from examples.alohamini.am1_teleop_workload import InputUnavailable
 
     try:
@@ -3811,6 +3930,11 @@ async def send_leader_sample(client, producer, body, record, *, phase, progress_
             "serialized_at_monotonic_s": time.perf_counter(),
         },
     }
+    if grant_timing is not None:
+        attempt["timing"]["grant_command"] = grant_timing
+    previous = _previous_pc_frame(producer, frame["source"])
+    if previous is not None:
+        attempt["timing"]["previous_frame"] = previous
     if isinstance(producer.input, SelectedLeftWorkload):
         attempt.update(producer.input.cycle_metadata())
     if captured_intent is not None:
@@ -3921,6 +4045,13 @@ async def send_leader_sample(client, producer, body, record, *, phase, progress_
         if not expired_input_refusal(error):
             raise
         return None
+    input_timing = _copy_pc_command_timing(client, "input", result)
+    timing = dict(attempt["timing"])
+    if input_timing is not None:
+        timing["input_command"] = input_timing
+    with contextlib.suppress(Exception):
+        producer.last_delivery_timing = {"sample": {key: frame["source"][key] for key in
+            ("source_id", "sample_seq", "grant_id")}, "network_seq": client.sequence, "timing": timing}
     return grant, frame, result
 
 
@@ -4786,9 +4917,12 @@ async def run(args):
             if producer.last_clutch:
                 record(producer.last_clutch)
                 producer.last_clutch = None
+            frame_timing = _pc_delivery_timing(producer, frame, client.sequence)
+            log_started = _pc_observation_now()
             record(
                 {
                     "event": "leader_frame",
+                    **({"timing": frame_timing} if frame_timing is not None else {}),
                     "network_seq": client.sequence,
                     "grant": grant,
                     "frame": frame,
@@ -4802,6 +4936,7 @@ async def run(args):
                     "native": client.snapshot,
                 }
             )
+            log_completed = _pc_observation_now()
             frame_count += 1
             if changing_input:
                 workload.accepted(frame["target"])
@@ -4825,7 +4960,11 @@ async def run(args):
                 if not args.next_start_seconds:
                     summary["clean_input_end"] = "duration_elapsed"
                 break
-            await _acquisition_delay(acquisition_started)
+            cadence = await _acquisition_delay(acquisition_started)
+            with contextlib.suppress(Exception):
+                producer.previous_frame_timing = {**{key: frame["source"][key] for key in
+                    ("source_id", "sample_seq", "grant_id")}, "log_started_at_perf_counter_s": log_started,
+                    "log_completed_at_perf_counter_s": log_completed, **(cadence if type(cadence) is dict else {})}
         # Qualification time is separate from active program progress. Keep new
         # acquisitions alive while actual body feedback settles; never refresh
         # one retained zero sample with another grant.

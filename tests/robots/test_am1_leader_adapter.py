@@ -1484,7 +1484,7 @@ def test_real_wss_clean_close_ends_qualified_wait_before_timeout(tmp_path):
     ],
 )
 def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
-    tmp_path, monkeypatch, failure
+    tmp_path, monkeypatch, failure, preserve_cadence=False
 ):
     import asyncio
     import copy
@@ -1557,7 +1557,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         monkeypatch.setattr(
             m, "time", SimpleNamespace(monotonic=lambda: pc_clock[0], perf_counter=time.perf_counter)
         )
-        if cycle_run or ordinary_arms:
+        if (cycle_run or ordinary_arms) and not preserve_cadence:
             async def acquisition_delay(_requested):
                 await asyncio.sleep(0)
             monkeypatch.setattr(m, "_acquisition_delay", acquisition_delay)
@@ -11627,3 +11627,329 @@ def test_virtual_input_progress_waiting_and_finish_do_not_change_control():
     status = m.virtual_input_progress(source, window_started_at=20., window_deadline=110.,
                                       now_monotonic=22., now_perf_counter=12.)
     assert status["current_accepted_intent_seq"] is None and status["window_deadline_monotonic_s"] == 110.
+
+
+def test_pc_delivery_observation_correlates_interleaved_success_ack_reader_and_wake(monkeypatch):
+    import asyncio
+    import copy
+    import json
+    from types import SimpleNamespace
+    from aiohttp import WSMsgType
+
+    m, qpc = adapter(), [1000.]
+    original = {"grant": {"accepted": True, "status": "granted", "grant_id": str(uuid4())},
+                "input": {"accepted": True, "status": "input", "effect_admitted": True}}
+    preserved = copy.deepcopy(original)
+    async def scenario():
+        messages, sent, traces = asyncio.Queue(), [], {}
+        class Socket:
+            closed, close_code = False, None
+            def exception(self):
+                return None
+            def __aiter__(self):
+                return self
+            async def __anext__(self):
+                message = await messages.get()
+                asyncio.get_running_loop().call_soon(lambda: qpc.__setitem__(0, qpc[0] + .03))
+                return message
+            async def send_json(self, value):
+                sent.append(value)
+                qpc[0] += .01
+                if len(sent) == 2:
+                    for wire in reversed(sent):
+                        reply = dict(original[wire["command"]["op"]], kind="result", id=wire["id"])
+                        await messages.put(SimpleNamespace(type=WSMsgType.TEXT, data=json.dumps(reply)))
+        ws = Socket()
+        client = SimpleNamespace(ws=ws, pending={}, reader=None, transport_error=None,
+            changed=asyncio.Event(), _detaching=True, _ack_task=None, _ack_slot=None,
+            _ack_changed=asyncio.Event(), _ack_ws=ws)
+        async def ack(self, socket, ceiling):
+            qpc[0] += .02
+        monkeypatch.setattr(m.SessionClient, "_wait_current_ack", ack)
+        monkeypatch.setattr(m, "time", SimpleNamespace(monotonic=lambda: 500., perf_counter=lambda: qpc[0]))
+        monkeypatch.setattr(m, "_pc_observation_clock", lambda: qpc[0], raising=False)
+        reader = asyncio.create_task(m.SessionClient._read(client))
+        async def invoke(op):
+            result = await m.SessionClient.command(client, {"op": op})
+            trace = copy.deepcopy(client.last_command_timing)  # No await before correlated copy.
+            assert trace["request_id"] == result["id"] and trace["op"] == op
+            traces[op] = trace
+            assert {k:v for k,v in result.items() if k not in {"id", "kind"}} == original[op]
+        try:
+            await asyncio.gather(invoke("grant"), invoke("input"))
+        finally:
+            reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
+        for trace in traces.values():
+            assert trace["clock"] == "pc_perf_counter" and trace["version"] == 1
+            marks = trace["timing"]
+            keys = ("request_started_at_monotonic_s", "ack_completed_at_monotonic_s",
+                    "send_started_at_monotonic_s", "send_completed_at_monotonic_s",
+                    "result_received_at_monotonic_s", "response_observed_at_monotonic_s")
+            assert set(marks) == set(keys)
+            assert [marks[k] for k in keys] == sorted(marks[k] for k in keys)
+            assert marks["ack_completed_at_monotonic_s"] - marks["request_started_at_monotonic_s"] >= .019
+            assert marks["response_observed_at_monotonic_s"] - marks["result_received_at_monotonic_s"] >= .029
+            assert len(json.dumps(trace)) <= 1024
+        assert set(sent[0]) == set(sent[1]) == {"id", "command"}
+        assert all(set(value["command"]) == {"op"} for value in sent)
+    asyncio.run(scenario())
+    assert original == preserved
+
+
+@pytest.mark.parametrize("invalid", [False, True])
+def test_pc_delivery_observation_clock_failure_preserves_result_and_original_exception(monkeypatch, invalid):
+    import asyncio
+    from types import SimpleNamespace
+    m = adapter()
+    result = {"accepted": True, "status": "input", "effect_admitted": True}
+    original = ConnectionError("original command send error")
+    async def ack(*args):
+        return None
+    def diagnostic():
+        raise ValueError("diagnostic unavailable")
+    monkeypatch.setattr(m.SessionClient, "_wait_current_ack", ack)
+    monkeypatch.setattr(m, "_pc_observation_clock", diagnostic if invalid else lambda: float("nan"), raising=False)
+    async def scenario():
+        async def send(value):
+            if invalid:
+                raise original
+            client.pending[value["id"]].set_result(result)
+        client = SimpleNamespace(ws=SimpleNamespace(closed=False, send_json=send), pending={},
+                                 reader=None, transport_error=None)
+        if invalid:
+            with pytest.raises(ConnectionError) as raised:
+                await m.SessionClient.command(client, {"op": "input"})
+            assert raised.value is original
+        else:
+            assert await m.SessionClient.command(client, {"op": "input"}) is result
+        assert getattr(client, "last_command_timing", None) is None
+    asyncio.run(scenario())
+
+
+def test_pc_delivery_observation_cadence_keeps_delay_and_retains_actual_wake(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    m, qpc, waits = adapter(), [1000.], []
+    monkeypatch.setattr(m, "time", SimpleNamespace(monotonic=lambda: 10.02))
+    monkeypatch.setattr(m, "_pc_observation_clock", lambda: qpc[0], raising=False)
+    async def sleep(delay):
+        waits.append(delay)
+        qpc[0] += delay + .07  # A delayed event-loop wake must be visible, not credited as a changed cadence.
+    monkeypatch.setattr(m.asyncio, "sleep", sleep)
+    timing = asyncio.run(m._acquisition_delay(10.))
+    assert waits == pytest.approx([.04])
+    assert timing == pytest.approx({"requested_delay_s": .04, "cadence_started_at_perf_counter_s": 1000.,
+                                   "cadence_completed_at_perf_counter_s": 1000.11})
+
+
+def test_pc_delivery_observation_real_runner_carries_previous_log_flush_without_new_events(tmp_path, monkeypatch):
+    import json
+    from pathlib import Path
+    m, qpc = adapter(), [1000.]
+    original_open = Path.open
+    monkeypatch.setattr(m, "_pc_observation_clock", lambda: qpc[0], raising=False)
+    class Log:
+        def __init__(self, stream):
+            self.stream, self.frame = stream, False
+        def write(self, raw):
+            value = json.loads(raw)
+            self.frame = value.get("event") == "leader_frame"
+            if self.frame:
+                qpc[0] += .2
+            return self.stream.write(raw)
+        def flush(self):
+            if self.frame:
+                qpc[0] += .05
+                self.frame = False
+            return self.stream.flush()
+        def __getattr__(self, name):
+            return getattr(self.stream, name)
+    def open_file(path, *args, **kwargs):
+        stream = original_open(path, *args, **kwargs)
+        return Log(stream) if path.name == "frames.jsonl" and args and args[0] == "x" else stream
+    monkeypatch.setattr(Path, "open", open_file)
+    test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
+        tmp_path, monkeypatch, "normal_program_finish_ordinary_arms_intents", preserve_cadence=True)
+    rows = [json.loads(line) for line in (tmp_path/"evidence/frames.jsonl").read_text().splitlines()]
+    frames = [row for row in rows if row["event"] == "leader_frame"]
+    timed = [row for row in frames if row.get("timing", {}).get("previous_frame")]
+    assert timed and not any(row["event"] == "pc_command_timing" for row in rows)
+    for row in timed:
+        previous = row["timing"]["previous_frame"]
+        assert previous["sample_seq"] < row["frame"]["source"]["sample_seq"]
+        assert previous["source_id"] == row["frame"]["source"]["source_id"]
+        assert previous["log_completed_at_perf_counter_s"] - previous["log_started_at_perf_counter_s"] == pytest.approx(.25)
+        assert previous["cadence_started_at_perf_counter_s"] >= previous["log_completed_at_perf_counter_s"]
+        assert len(json.dumps(row["timing"])) <= 2048
+
+@pytest.mark.parametrize("fail_send", [False, True])
+def test_pc_delivery_observation_unavailable_fake_storage_cannot_change_outcome(monkeypatch, fail_send):
+    import asyncio
+    from types import SimpleNamespace
+    m = adapter()
+    original = ConnectionError("original socket failure")
+    reply = {"accepted": True, "status": "input", "effect_admitted": True}
+    class Client:
+        __slots__ = ("ws", "pending", "reader", "transport_error")
+    async def ack(*args):
+        return None
+    monkeypatch.setattr(m.SessionClient, "_wait_current_ack", ack)
+    async def scenario():
+        client = Client()
+        client.pending, client.reader, client.transport_error = {}, None, None
+        async def send(wire):
+            if fail_send:
+                raise original
+            client.pending[wire["id"]].set_result(reply)
+        client.ws = SimpleNamespace(closed=False, send_json=send)
+        if fail_send:
+            with pytest.raises(ConnectionError) as raised:
+                await m.SessionClient.command(client, {"op": "input"})
+            assert raised.value is original
+        else:
+            assert await m.SessionClient.command(client, {"op": "input"}) is reply
+    asyncio.run(scenario())
+
+
+def test_pc_delivery_observation_rejects_finite_oversized_or_uncorrelated_diagnostics():
+    m = adapter()
+    row = {"version":1, "clock":"pc_perf_counter", "op":"input", "request_id":"original",
+           "timing":{key:10**300 for key in m._PC_COMMAND_MARKS}}
+    assert m._pc_command_timing(row, "input", "original") is None
+    row["timing"] = {"request_started_at_monotonic_s":1000.}
+    assert m._pc_command_timing(row, "input", "foreign") is None
+    assert m._pc_command_timing(dict(row, private_token="never-retain"), "input", "original") is None
+
+def test_pc_delivery_observation_sender_keeps_correlated_success_in_existing_frame_carrier():
+    import asyncio
+    import json
+    from types import SimpleNamespace
+    from aiohttp import WSMsgType
+    m = adapter()
+    async def scenario():
+        incoming, wire, replies, records = asyncio.Queue(), [], [], []
+        class Socket:
+            closed, close_code = False, None
+            def exception(self):
+                return None
+            def __aiter__(self):
+                return self
+            async def __anext__(self):
+                return await incoming.get()
+            async def send_json(self, value):
+                wire.append(value)
+                if value["command"]["op"] == "grant":
+                    reply = {"accepted":True, "status":"granted", "grant_id":str(uuid4())}
+                else:
+                    reply = {"accepted":True, "status":"input", "effect_admitted":True}
+                reply.update(kind="result", id=value["id"])
+                replies.append(dict(reply))
+                await incoming.put(SimpleNamespace(type=WSMsgType.TEXT, data=json.dumps(reply)))
+        class Input:
+            kind = "virtual-leaders"
+            def get_action(self):
+                return {key.removeprefix("arm_"):0. for key in KEYS}
+        ws = Socket()
+        client = SimpleNamespace(ws=ws, pending={}, reader=None, transport_error=None, sequence=0,
+            changed=asyncio.Event(), _detaching=True, _ack_task=None, _ack_slot=None,
+            _ack_changed=None, _ack_ws=ws, identities=lambda:{"run_id":"original"})
+        async def command(value, **kwargs):
+            return await m.SessionClient.command(client, value, **kwargs)
+        client.command = command
+        producer = m.FrameProducer(Input())
+        producer.sequence = 1
+        now = __import__("time").perf_counter()
+        producer.previous_frame_timing = {"source_id":producer.source_id, "sample_seq":1, "grant_id":str(uuid4()),
+            "log_started_at_perf_counter_s":now-.005, "log_completed_at_perf_counter_s":now-.004,
+            "cadence_started_at_perf_counter_s":now-.003, "cadence_completed_at_perf_counter_s":now-.001,
+            "requested_delay_s":0.}
+        reader = asyncio.create_task(m.SessionClient._read(client))
+        try:
+            grant, frame, result = await m.send_leader_sample(client, producer, m.ZERO_BODY,
+                records.append, phase="move", progress_s=0.)
+            assert result == replies[1] and grant == replies[0]
+            timing = m._pc_delivery_timing(producer, frame, client.sequence)
+            assert timing["grant_command"]["request_id"] == grant["id"]
+            assert timing["input_command"]["request_id"] == result["id"]
+            assert records[0]["timing"]["grant_command"] == timing["grant_command"]
+            assert "result_received_at_monotonic_s" in timing["input_command"]["timing"]
+            assert wire[1]["command"]["source"] == frame["source"]
+            assert set(wire[1]["command"]) == {"op","run_id","grant_id","seq","target","body","source"}
+            assert timing["previous_frame"]["sample_seq"] == 1
+            assert len(json.dumps(timing)) <= 2048
+            print("PC delivery timing bytes:", len(json.dumps(timing)))
+        finally:
+            reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
+    asyncio.run(scenario())
+
+@pytest.mark.parametrize("field", ["grant_command", "input_command", "previous_frame"])
+def test_pc_delivery_observation_nested_diagnostic_payload_is_closed(field):
+    from types import SimpleNamespace
+    m = adapter()
+    source = {"source_id":"original", "sample_seq":2, "grant_id":"current-grant"}
+    timing = {"grant_request_started_at_monotonic_s":1000., "grant_received_at_monotonic_s":1000.01,
+              "serialized_at_monotonic_s":1000.02, field:{"private_token":"never-retain"}}
+    producer = SimpleNamespace(last_delivery_timing={"sample":dict(source), "network_seq":1, "timing":timing})
+    assert m._pc_delivery_timing(producer, {"source":source}, 1) is None
+
+def test_pc_delivery_observation_reply_can_arrive_before_send_json_returns(monkeypatch):
+    import asyncio
+    import json
+    from types import SimpleNamespace
+    from aiohttp import WSMsgType
+    m, qpc = adapter(), [1000.]
+    async def scenario():
+        incoming, processed = asyncio.Queue(), asyncio.Event()
+        reply = {"accepted":True, "status":"input", "effect_admitted":True}
+        class Socket:
+            closed, close_code = False, None
+            def exception(self):
+                return None
+            def __aiter__(self):
+                return self
+            async def __anext__(self):
+                message = await incoming.get()
+                asyncio.get_running_loop().call_soon(processed.set)
+                return message
+            async def send_json(self, wire):
+                qpc[0] = 1000.01
+                await incoming.put(SimpleNamespace(type=WSMsgType.TEXT,
+                    data=json.dumps(dict(reply, id=wire["id"], kind="result"))))
+                await processed.wait()  # The reader handles the reply while send/drain remains suspended.
+                qpc[0] = 1000.02
+        ws = Socket()
+        client = SimpleNamespace(ws=ws, pending={}, reader=None, transport_error=None,
+            changed=asyncio.Event(), _detaching=True, _ack_task=None, _ack_slot=None,
+            _ack_changed=None, _ack_ws=ws)
+        monkeypatch.setattr(m, "time", SimpleNamespace(monotonic=lambda:500., perf_counter=lambda:qpc[0]))
+        monkeypatch.setattr(m, "_pc_observation_clock", lambda:qpc[0])
+        reader = asyncio.create_task(m.SessionClient._read(client))
+        try:
+            result = await m.SessionClient.command(client, {"op":"input"})
+            assert {key:value for key,value in result.items() if key not in {"id","kind"}} == reply
+            trace = client.last_command_timing
+            assert trace is not None, "legitimate overlapping reply must remain observable"
+            marks = trace["timing"]
+            assert marks["send_started_at_monotonic_s"] == 1000.
+            assert marks["result_received_at_monotonic_s"] == 1000.01
+            assert marks["send_completed_at_monotonic_s"] == marks["response_observed_at_monotonic_s"] == 1000.02
+            assert trace["request_id"] == result["id"]
+        finally:
+            reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
+    asyncio.run(scenario())
+
+@pytest.mark.parametrize("key,value", [
+    ("result_received_at_monotonic_s", 1000.005),
+    ("result_received_at_monotonic_s", 1000.05),
+    ("send_completed_at_monotonic_s", 999.),
+    ("ack_completed_at_monotonic_s", 1000.05),
+])
+def test_pc_delivery_observation_partial_order_still_rejects_impossible_clocks(key, value):
+    m = adapter()
+    marks = dict(zip(m._PC_COMMAND_MARKS, (1000.,1000.01,1000.02,1000.03,1000.025,1000.04)))
+    marks[key] = value
+    row = {"version":1, "clock":"pc_perf_counter", "op":"input", "request_id":"original", "timing":marks}
+    assert m._pc_command_timing(row, "input", "original") is None
