@@ -1551,6 +1551,10 @@ class SessionClient:
             reason = "reader-error"
             reader_error = {"error_type": type(error).__name__, "message": str(error)}
             if self.ws is ws:
+                # Capture BEFORE pending futures are failed/cleared below. A later
+                # empty map cannot prove that no unknown command was in flight.
+                self._idle_reporting_ws = (ws if type(error) is RuntimeError
+                    and str(error) == "owner reporting unavailable" and not self.pending and not self._detaching else None)
                 self.transport_error = self.transport_error or str(error)
         finally:
             if self.ws is ws:
@@ -1656,6 +1660,14 @@ class SessionClient:
             or len(self.pending) >= 4
         ):
             original = ConnectionError("bounded current WSS connection required")
+            close = getattr(self, "transport_close", None) or {}
+            if (command.get("op") == "connect" and self.ws is not None
+                and getattr(self, "_idle_reporting_ws", None) is self.ws
+                and self.reader is not None and self.reader.done() and not self.pending
+                and self.transport_error == "owner reporting unavailable" and not self._detaching
+                and close.get("expected") is False and close.get("reason") == "reader-error"
+                and close.get("reader_error") == {"error_type": "RuntimeError", "message": "owner reporting unavailable"}):
+                original._connect_unsent_ws = self.ws  # Before UUID/future/send creation; never a wire receipt.
             if record:
                 try:
                     _record_controller_command_timing(record, recorded_command, None,
@@ -3537,7 +3549,18 @@ class SameRunRecovery:
                 original.resume_pending_episode = ({"recovery": episode, "count": self.episodes, "cause": self.cause}
                                                    if recovered and self.completed_episodes < self.episodes else None)
                 raise
-            if "held_view_ceiling" in clock:
+            close = dict(getattr(self.client, "transport_close", None) or {})
+            ws = getattr(self.client, "ws", None)
+            unsent_connect = (type(original) is ConnectionError and ws is not None
+                and getattr(original, "_connect_unsent_ws", None) is ws
+                and getattr(self.client, "_idle_reporting_ws", None) is ws
+                and getattr(self.client, "pending", None) == {}
+                and getattr(self.client, "_detaching", True) is False
+                and getattr(self.client, "reader", None) is not None and self.client.reader.done()
+                and getattr(self.client, "transport_error", None) == "owner reporting unavailable"
+                and close.get("expected") is False and close.get("reason") == "reader-error"
+                and close.get("reader_error") == {"error_type": "RuntimeError", "message": "owner reporting unavailable"})
+            if "held_view_ceiling" in clock and not unsent_connect:
                 raise  # A nested ambiguous phase never starts another replacement.
             accepted = getattr(original, "accepted_resume_context", None)
             if accepted is not None:
@@ -3622,7 +3645,6 @@ class SameRunRecovery:
                     raise original from qualification_error
             release = getattr(original, "empty_release_context", None)
             release_loss = isinstance(release, dict) and set(release) == {"identity", "connect_identity", "snapshot"}
-            close = dict(getattr(self.client, "transport_close", None) or {})
             identity = release["identity"] if release_loss else getattr(original, "connect_identity", None)
             expected = dict(
                 run_id=self.original["run"]["run_id"], service_incarnation=self.original["service"],
@@ -3633,9 +3655,9 @@ class SameRunRecovery:
             )
             if (
                 recovered
-                or close.get("reader_error") is not None
-                or not release_loss and (close.get("expected") is not False or close.get("reason") != "stream-ended"
-                                         or close.get("close_code") != 1006)
+                or not unsent_connect and close.get("reader_error") is not None
+                or not release_loss and not unsent_connect and (close.get("expected") is not False or close.get("reason") != "stream-ended"
+                                                                or close.get("close_code") != 1006)
                 or not isinstance(identity, dict) or set(identity) != set(expected)
                 or any(type(identity[k]) is not type(v) or identity[k] != v for k, v in expected.items())
                 or type(identity["intent_revision"]) is not int
@@ -3695,9 +3717,10 @@ class SameRunRecovery:
                     return value
                 if renewal_check:
                     renewal_check()
-                self.record({"event": "ordinary_empty_release_ambiguous" if release_loss else "ordinary_connect_transport_closed", "transport_close": close,
-                             "identity": identity, "pause_event": original_event,
-                             "remaining_s": remaining(), "outcome": "ambiguous"})
+                self.record({"event": "ordinary_empty_release_ambiguous" if release_loss else
+                                     "ordinary_connect_not_dispatched" if unsent_connect else "ordinary_connect_transport_closed",
+                             "transport_close": close, "identity": identity, "pause_event": original_event,
+                             "remaining_s": remaining(), "outcome": "not_dispatched" if unsent_connect else "ambiguous"})
                 await self._attach_transport(state, identity, remaining, renewal_check)
                 budget = remaining()
                 fresh_requested = time.monotonic()
@@ -3727,7 +3750,7 @@ class SameRunRecovery:
                     if (
                         run.get("status") != "paused" or run.get("recovery") is not None
                         or pause_event(snapshot) != original_event
-                        or type(revision) is not int or revision not in ((identity["intent_revision"],) if release_loss else
+                        or type(revision) is not int or revision not in ((identity["intent_revision"],) if release_loss or unsent_connect else
                                                                       (identity["intent_revision"], identity["intent_revision"] + 1))
                         or previous_revision is not None and revision != previous_revision
                         or self.client.connection != identity["connection_generation"]

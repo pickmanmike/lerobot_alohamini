@@ -3729,7 +3729,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "resume_reporting_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal", "peer_start_normal", "peer_start_bench", "peer_bench_unqualified_view", "peer_bench_local_loss", "peer_normal_unqualified_view", "held_command120_view_later", "held_command120_view_never", "held_command120_local_loss", "view_refusal122_input_before", "view_refusal122_input_after", "view_refusal122_grant_before", "view_refusal122_grant_after", "view_refusal122_never", "view_refusal122_pause", "view_refusal122_stop", "view_refusal122_takeover", "view_refusal130_grant_input_race_before", "view_refusal130_grant_input_race_never", "view_refusal130_grant_input_race_pause", "view_refusal130_grant_input_race_stop", "view_refusal130_grant_input_race_takeover", "view_refusal130_grant_input_race_revision", "view_refusal130_grant_input_race_history", "view_refusal130_grant_input_race_time", "renewal_unknown133_grant_before", "renewal_unknown133_grant_pause", "renewal_unknown133_grant_takeover", "renewal_unknown133_grant_unchanged", "renewal_unknown133_grant_receipt_unknown", "renewal_unknown133_grant_second_read", "renewal_unknown133_grant_stream_before"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "resume_reporting_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal", "peer_start_normal", "peer_start_bench", "peer_bench_unqualified_view", "peer_bench_local_loss", "peer_normal_unqualified_view", "held_command120_view_later", "held_command120_view_never", "held_command120_local_loss", "view_refusal122_input_before", "view_refusal122_input_after", "view_refusal122_grant_before", "view_refusal122_grant_after", "view_refusal122_never", "view_refusal122_pause", "view_refusal122_stop", "view_refusal122_takeover", "view_refusal122_grant_connect_preflight_before", "view_refusal122_grant_connect_preflight_pending", "view_refusal122_grant_connect_preflight_queue", "view_refusal122_grant_connect_preflight_sent", "view_refusal122_grant_connect_preflight_pause", "view_refusal122_grant_connect_preflight_stop", "view_refusal122_grant_connect_preflight_takeover", "view_refusal122_grant_connect_preflight_reboot", "view_refusal122_grant_connect_preflight_lease", "view_refusal122_grant_connect_preflight_deadline", "view_refusal122_grant_connect_preflight_cancel", "view_refusal130_grant_input_race_before", "view_refusal130_grant_input_race_never", "view_refusal130_grant_input_race_pause", "view_refusal130_grant_input_race_stop", "view_refusal130_grant_input_race_takeover", "view_refusal130_grant_input_race_revision", "view_refusal130_grant_input_race_history", "view_refusal130_grant_input_race_time", "renewal_unknown133_grant_before", "renewal_unknown133_grant_pause", "renewal_unknown133_grant_takeover", "renewal_unknown133_grant_unchanged", "renewal_unknown133_grant_receipt_unknown", "renewal_unknown133_grant_second_read", "renewal_unknown133_grant_stream_before"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause):
     import asyncio
     import copy
@@ -3753,6 +3753,8 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
     renewal133 = cause.startswith("renewal_unknown133_")
     view_input_race = cause.startswith("view_refusal130_") or renewal133
     view122 = cause.startswith("view_refusal122_") or view_input_race
+    connect_preflight = cause.startswith("view_refusal122_grant_connect_preflight_")
+    preflight_mode = cause.rsplit("_", 1)[1] if connect_preflight else None
     race_waiting = [False]
     if held120 or view122:
         e.desired = "hold"
@@ -3981,6 +3983,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 unknown_posted, fenced_receipt = asyncio.Event(), asyncio.Event()
                 original_unknown = [None]
                 original_attach, attachment_calls, second_read_changed = client.attach, [0], [False]
+                original_command, preflight_failures = client.command, []
                 unknown_result = {"accepted": None, "status": "unknown", "uncertain": True,
                     "reason": "owner outcome unknown; inspect state or lookup the same operation", "effect_admitted": None}
                 original_selected = m.SelectedLeftWorkload
@@ -3992,7 +3995,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     def __new__(cls, *_args):
                         return client
                 async def already_attached():
-                    if renewal133 and attachment_calls[0]:
+                    if (renewal133 or connect_preflight) and attachment_calls[0]:
                         await original_attach()
                     else:
                         assert client.ws is not None and not client.ws.closed
@@ -4073,11 +4076,11 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                             assert a.events[-1]["kind"] == "input_expired"
                             assert sum(op == "resume" for op, _ in commands) == 1
                             assert len(observed) == 1 and not m._view_admitted(a.snapshot())
-                        if cause.endswith("pause"):
+                        if not connect_preflight and cause.endswith("pause"):
                             assert a.handle({"op": "pause", "run_id": e.run_id, "operation_id": str(uuid4())}, enrolled["device_id"])["accepted"]
-                        elif cause.endswith("stop"):
+                        elif not connect_preflight and cause.endswith("stop"):
                             assert a.handle({"op": "stop", "run_id": e.run_id, "operation_id": str(uuid4())}, enrolled["device_id"])["accepted"]
-                        elif cause.endswith("takeover"):
+                        elif not connect_preflight and cause.endswith("takeover"):
                             a.controller["expires"] = a.clock()-1
                             a._expire_controls(a.clock())
                             assert a.handle({"op": "claim"}, "competitor")["accepted"]
@@ -4135,7 +4138,89 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                             return {"accepted": True, "status": "snapshot", "snapshot": a.snapshot()}
                         return await original_call(command, device)
                     gateway.call = selected_view_race
+                async def closed_before_connect(command, **options):
+                    if connect_preflight and command.get("op") == "connect" and refused and not preflight_failures:
+                        if qualification:
+                            await qualification
+                        current = (await original_get("state"))["snapshot"]
+                        client.snapshot = current
+                        assert current["run"]["status"] == "paused" and current["run"]["recovery"] is None
+                        assert all(current["evidence"].get(k) is True for k in
+                                   ("feedback", "required_observation", "hold_acknowledged", "pose_aligned", "native_ack"))
+                        assert m._view_admitted(current) and client.pending == {}
+                        before, queued = list(commands), []
+                        async def unavailable():
+                            for peer in list(gateway.peers):
+                                peer.put({"kind": "unavailable"}, True)
+                            await asyncio.wait_for(asyncio.gather(client.reader, return_exceptions=True), 1.)
+                            assert client.transport_error == "owner reporting unavailable"
+                            assert client.transport_close["expected"] is False
+                            assert client.transport_close["reason"] == "reader-error"
+                            assert client.transport_close["reader_error"] == {
+                                "error_type": "RuntimeError", "message": "owner reporting unavailable"}
+                        if preflight_mode == "pending":
+                            unknown = asyncio.get_running_loop().create_future()
+                            client.pending["earlier-unknown-mutation"] = unknown
+                            queued.append(unknown)
+                        if preflight_mode != "sent":
+                            await unavailable()
+                        if preflight_mode == "pending":
+                            assert isinstance(unknown.exception(), ConnectionError)
+                            assert client.pending == {} and client._idle_reporting_ws is None
+                        if preflight_mode == "queue":
+                            for index in range(4):
+                                future = asyncio.get_running_loop().create_future()
+                                client.pending[str(index)] = future
+                                queued.append(future)
+                        if preflight_mode in {"pause", "stop"}:
+                            assert a.handle({"op": preflight_mode, "run_id": e.run_id,
+                                             "operation_id": str(uuid4())}, enrolled["device_id"])["accepted"]
+                        elif preflight_mode == "takeover":
+                            a.controller["expires"] = a.clock()-1
+                            a._expire_controls(a.clock())
+                            assert a.handle({"op": "claim"}, "competitor")["accepted"]
+                        elif preflight_mode == "reboot":
+                            a.service_incarnation = str(uuid4())
+                        elif preflight_mode == "lease":
+                            later = a.controller["expires"]
+                            a.clock = e.clock = lambda: later
+                            a._expire_controls(a.clock())
+                        elif preflight_mode == "deadline":
+                            a.clock = e.clock = lambda: 309.
+                            a.tick()
+                        elif preflight_mode == "cancel":
+                            cancelled = asyncio.CancelledError()
+                            preflight_failures.append(cancelled)
+                            raise cancelled
+                        old_send = client.ws.send_json
+                        async def forbidden_send(wire):
+                            if preflight_mode == "sent":
+                                assert wire["id"] in client.pending and wire["command"]["op"] == "connect"
+                                await unavailable()  # A created/send-started request is NOT unsent preflight.
+                                assert client._idle_reporting_ws is None
+                                raise ConnectionError("Connect send outcome unknown")
+                            raise AssertionError("known closed-WS preflight cannot dispatch Connect")
+                        client.ws.send_json = forbidden_send
+                        try:
+                            return await original_command(command, **options)
+                        except ConnectionError as error:
+                            assert str(error) == ("Connect send outcome unknown" if preflight_mode == "sent"
+                                                  else "bounded current WSS connection required")
+                            protected = {"connect", "release_input", "resume", "grant", "input"}
+                            assert [row for row in commands if row[0] in protected] == [row for row in before if row[0] in protected]
+                            if preflight_mode in {"pending", "queue", "sent"}:
+                                assert not hasattr(error, "_connect_unsent_ws")
+                            preflight_failures.append(error)
+                            raise
+                        finally:
+                            client.ws.send_json = old_send
+                            for future in queued:
+                                if not future.done(): future.cancel()
+                            client.pending.clear()
+                    return await original_command(command, **options)
                 client.attach, client.post = already_attached, post
+                if connect_preflight:
+                    client.command = closed_before_connect
                 if renewal133:
                     client.get = get
                 monkeypatch.setattr(m, "SessionClient", RunnerSession)
@@ -4147,7 +4232,9 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 if view122:
                     entered_at = asyncio.get_running_loop().time()
                     success = cause.endswith(("before", "after"))
-                    with pytest.raises((RuntimeError, TimeoutError), match="Actual120 fresh first-input" if success else None) as failure:
+                    expected_errors = ((asyncio.CancelledError,) if connect_preflight and preflight_mode == "cancel" else
+                                       (RuntimeError, TimeoutError, ConnectionError) if connect_preflight else (RuntimeError, TimeoutError))
+                    with pytest.raises(expected_errors, match="Actual120 fresh first-input" if success else None) as failure:
                         await m.run(args)
                     assert len(observed) == (2 if success else 1) and len(refused) == 1
                     if renewal133:
@@ -4162,6 +4249,10 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         if "stream" in cause:
                             assert attachment_calls[0] == 2
                     if success:
+                        if connect_preflight:
+                            assert len(preflight_failures) == 1 and attachment_calls[0] == 2
+                            assert sum(op == "connect" for op, _ in commands) == 2
+                            assert sum(op == "resume" for op, _ in commands) == 2
                         assert observed[0][0]["grant_id"] != observed[1][0]["grant_id"]
                         assert observed[1][1]["source"]["sample_seq"] > observed[0][1]["source"]["sample_seq"]
                         assert observed[1][0]["expires"]-observed[1][0]["issued"] == .25
@@ -4174,6 +4265,10 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         assert asyncio.get_running_loop().time()-entered_at < .8
                     if not success:
                         assert sum(op == "resume" for op, _ in commands) == 1
+                        if connect_preflight:
+                            assert len(preflight_failures) == 1 and failure.value is preflight_failures[0]
+                            assert sum(op == "connect" for op, _ in commands) == 1
+                            assert len(observed) == 1 and len(refused) == 1
                     if qualification:
                         await qualification
                 elif cause == "held_command120_view_later":
@@ -7095,7 +7190,18 @@ def test_input_transport_ambiguity_remains_discarded_without_connect_reattachmen
                                        phase="individual", progress_s=0.1)
         assert caught.value is original and not hasattr(original, "connect_identity")
         assert [call["op"] for call in calls] == ["grant", "input"]
-        assert [row["event"] for row in records] == ["leader_frame_attempt"]
+        assert [row["event"] for row in records] == ["leader_frame_attempt", "leader_frame_receipt_unknown"]
+        attempt, unknown = records
+        assert unknown["discarded"] is True and unknown["fresh_acquisition_allowed"] is False
+        assert unknown["identity"] == attempt["identity"] == {key: calls[1][key] for key in attempt["identity"]}
+        assert unknown["frame"] == attempt["frame"]
+        assert unknown["frame"]["source"] == calls[1]["source"]
+        assert unknown["grant"] == attempt["grant"]
+        assert unknown["grant"]["grant_id"] == calls[1]["grant_id"] == unknown["frame"]["source"]["grant_id"]
+        assert unknown["grant"]["expires"] == 400.0
+        assert unknown["network_seq"] == calls[1]["seq"] == 1
+        assert unknown["frame"]["source"]["sample_seq"] == producer.sequence == 1
+        assert not hasattr(original, "_connect_unsent_ws"), "unknown Input cannot borrow unsent Connect recovery"
     asyncio.run(scenario())
 
 
@@ -12013,3 +12119,60 @@ def test_pc_delivery_observation_partial_order_still_rejects_impossible_clocks(k
     marks[key] = value
     row = {"version":1, "clock":"pc_perf_counter", "op":"input", "request_id":"original", "timing":marks}
     assert m._pc_command_timing(row, "input", "original") is None
+
+
+@pytest.mark.parametrize("guard", [None, "pending_at_close", "pending_now", "queue", "wrong_ws", "expected_close",
+                                  "reader_error", "reader_running", "no_stamp", "transport_error", "resume", "input"])
+def test_connect_preflight_marker_requires_actual_idle_current_reporting_failure(guard):
+    import asyncio
+    import json
+    from types import SimpleNamespace
+    from aiohttp import WSMsgType
+
+    m = adapter()
+    async def scenario():
+        sent, unknown = [], None
+        class WS:
+            closed, close_code = False, None
+            def exception(self):
+                return None
+            def __aiter__(self):
+                async def messages():
+                    yield SimpleNamespace(type=WSMsgType.TEXT,
+                        data="invalid JSON" if guard == "reader_error" else json.dumps({"kind": "unavailable"}))
+                return messages()
+            async def send_json(self, wire):
+                sent.append(wire)
+        ws = WS()
+        client = SimpleNamespace(ws=ws, pending={}, reader=None, transport_error=None, transport_close=None,
+            _detaching=guard == "expected_close", _ack_task=None, _ack_slot=None,
+            _ack_changed=asyncio.Event(), changed=asyncio.Event())
+        if guard == "pending_at_close":
+            unknown = asyncio.get_running_loop().create_future()
+            client.pending["unknown-earlier-command"] = unknown
+        client.reader = asyncio.create_task(m.SessionClient._read(client))
+        await asyncio.gather(client.reader, return_exceptions=True)
+        if unknown is not None:
+            assert isinstance(unknown.exception(), ConnectionError)
+            assert client.pending == {} and client._idle_reporting_ws is None
+        if guard == "wrong_ws": client.ws = WS()
+        elif guard == "no_stamp": client._idle_reporting_ws = None
+        elif guard == "transport_error": client.transport_error = "other current transport error"
+        elif guard == "reader_running": client.reader = asyncio.get_running_loop().create_future()
+        if guard in {"pending_now", "queue"}:
+            for index in range(4 if guard == "queue" else 1):
+                client.pending[str(index)] = asyncio.get_running_loop().create_future()
+        try:
+            with pytest.raises(ConnectionError, match="bounded current WSS connection required") as caught:
+                await m.SessionClient.command(client, {"op": guard if guard in {"resume", "input"} else "connect"})
+            if guard is None:
+                assert caught.value._connect_unsent_ws is ws
+            else:
+                assert not hasattr(caught.value, "_connect_unsent_ws")
+            assert sent == [], "preflight never creates or sends a new command"
+        finally:
+            for future in client.pending.values():
+                if not future.done(): future.cancel()
+            client.pending.clear()
+            if not client.reader.done(): client.reader.cancel()
+    asyncio.run(scenario())
