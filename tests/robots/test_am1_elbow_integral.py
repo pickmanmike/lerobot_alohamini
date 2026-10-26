@@ -1949,6 +1949,8 @@ def stopped_115_original(tmp_path, monkeypatch, *, workload_segment="left-reach"
         workspace_profile=("ordinary-arms-left-current-rest-1051-1164" if workload_segment == "ordinary-arms" else CURRENT_REST_PROFILE),
     )
     trial.prepare(r)
+    # Preserve the historical115 schema, before the selected Acceleration obligation existed.
+    trial._snapshot.pop("selected_acceleration_profile", None)
     trial._snapshot.update(
         first_failure={"type": "RuntimeError", "message": "Current-rest Goal write lost actual Torque0"},
         priming_position={"operation": "read", "register": "Present_Position", "value": 1090,
@@ -2401,3 +2403,325 @@ def test_left_entry_request_cannot_borrow_p32_or_another_role(tmp_path, monkeypa
     elif changed == "legacy": value["workspace_profile"] = "ordinary-arms-left-entry-p16-1164-1324"
     else: value["left_shoulder_startup_degrees"] = 2
     with pytest.raises(ValueError): module._left_response_p_request(value, "a" * 40)
+
+
+
+def test_selected_acceleration_actual963_snapshot_is_durable_before_configuration_and_restored(tmp_path,monkeypatch):
+    from pathlib import Path
+    module,r,trial,_,_,_=left_response_p_robot(tmp_path,monkeypatch,workload_segment="ordinary-arms",
+        workspace_profile="ordinary-arms-left-current-rest-1051-1164",left_shoulder_startup_degrees=1)
+    original_run=json.loads((Path(__file__).resolve().parents[2]/".cache/am1-teleop-consolidation-16/physical-runs/am1-virtual-963c01dd-4824-4f6b-ae51-2266312c1c9e/cleanup.json").read_bytes())
+    actual=original_run["readback"]["left_response_p_trial"]["original_registers"]
+    assert actual["Acceleration"]==actual["Goal_Position"]==0 and actual["Present_Position"]==1142
+    r.left_bus.values.update({(k,ELBOW):v for k,v in actual.items()})
+    from lerobot.robots.alohamini.am1_live_teleop import STATIC
+    r._am1_teleop_settings={"left":{"registers":{k:{ELBOW:actual[k]} for k in STATIC}}}
+    trial.prepare(r)
+    saved=json.loads(trial.snapshot_path.read_bytes())
+    assert saved["restore_required"] and saved["original_registers"]==actual and not writes(r.left_bus)
+    trial.disable_torque(r)
+    def before_write(register,motor,value):
+        if register in ("Acceleration","P_Coefficient"):
+            durable=json.loads(trial.snapshot_path.read_bytes())
+            assert durable["restore_required"] and durable["original_registers"]["Acceleration"]==0
+            assert r.left_bus.values["Torque_Enable",ELBOW]==0 and r.left_bus.values["Lock",ELBOW]==1
+    r.left_bus.before_write=before_write
+    trial.apply(r)
+    assert r.left_bus.values["Acceleration",ELBOW]==254 and r.left_bus.values["P_Coefficient",ELBOW]==32
+    assert r.left_bus.values["Goal_Position",ELBOW]==0
+    r.left_bus.values["Goal_Position",ELBOW]=1142  # The ordinary owner later seeds q0; this transaction never writes Goal.
+    trial.restore(r)
+    assert (r.left_bus.values["Acceleration",ELBOW],r.left_bus.values["P_Coefficient",ELBOW],r.left_bus.values["Lock",ELBOW])==(0,16,0)
+    assert r.left_bus.values["Goal_Position",ELBOW]==1142 and not trial.restore_required
+    assert all(row[1] in {"Torque_Enable","Lock","P_Coefficient","Acceleration"} for row in writes(r.left_bus))
+    assert not writes(r.left_bus,OTHER) and not writes(r.right_bus)
+
+
+
+def selected_acceleration_trial(tmp_path,monkeypatch,*,entry=False,acceleration=0,goal=0):
+    from lerobot.robots.alohamini.am1_live_teleop import STATIC
+    from examples.alohamini.am1_live_teleop import LEFT_ENTRY_WORKSPACE_PROFILE
+    module,r,trial,directory,request,value=left_response_p_robot(tmp_path,monkeypatch,proportional=16 if entry else 32,
+        workload_segment="ordinary-arms",workspace_profile=LEFT_ENTRY_WORKSPACE_PROFILE if entry else "ordinary-arms-left-current-rest-1051-1164",left_shoulder_startup_degrees=1)
+    r.left_bus.values["Acceleration",ELBOW]=acceleration;r.left_bus.values["Goal_Position",ELBOW]=goal
+    r.left_bus.values["Present_Position",ELBOW]=1204 if entry else 1142
+    r._am1_teleop_settings={"left":{"registers":{k:{ELBOW:r.left_bus.values[k,ELBOW]} for k in STATIC}}}
+    return module,r,trial,directory
+
+
+@pytest.mark.parametrize("entry",[False,True])
+def test_selected_acceleration_interrupted_profile_uses_existing_stopped_completion_without_goal(tmp_path,monkeypatch,entry):
+    import hashlib
+    from uuid import uuid4
+    module,r,trial,directory=selected_acceleration_trial(tmp_path,monkeypatch,entry=entry)
+    trial.prepare(r);trial.disable_torque(r);trial.apply(r)
+    raw=trial.snapshot_path.read_bytes();before=list(r.left_bus.events);checks=[]
+    def stopped():checks.append(True)
+    result=module.complete_stopped_left_response_p_original(r.left_bus,directory,run_id=trial.binding["run_id"],
+        host_incarnation=trial.binding["host_incarnation"],source_head=trial.binding["request"]["source_head"],
+        original_sha256=hashlib.sha256(raw).hexdigest(),completion_id=str(uuid4()),check_stopped=stopped)
+    assert checks and result["selected_restoration_verified"] and result["native_acknowledged"] is False
+    assert result["original_acceleration"]==result["restored_acceleration_readback"]==0
+    assert (r.left_bus.values["P_Coefficient",ELBOW],r.left_bus.values["Acceleration",ELBOW],r.left_bus.values["Torque_Enable",ELBOW],r.left_bus.values["Lock",ELBOW])==(16,0,0,0)
+    assert trial.snapshot_path.read_bytes()==raw and json.loads(raw)["restore_required"]
+    added=[row for row in r.left_bus.events[len(before):] if row[0]=="write"]
+    assert all(row[1] in {"P_Coefficient","Acceleration","Lock"} for row in added)
+    assert not any(row[1]=="Goal_Position" for row in writes(r.left_bus))
+
+
+@pytest.mark.parametrize("guard",["torque","lock","maximum","status","current"])
+def test_selected_acceleration_configuration_requires_fresh_off_health_before_write(tmp_path,monkeypatch,guard):
+    _,r,trial,_=selected_acceleration_trial(tmp_path,monkeypatch)
+    trial.prepare(r);trial.disable_torque(r)
+    register,value={"torque":("Torque_Enable",1),"lock":("Lock",0),"maximum":("Maximum_Acceleration",100),"status":("Status",1),"current":("Present_Current",310)}[guard]
+    r.left_bus.values[register,ELBOW]=value
+    with pytest.raises(RuntimeError):trial._write("Acceleration",254,phase="configure_acceleration")
+    assert trial.restore_required and r.left_bus.values["Acceleration",ELBOW]==0
+    assert not [row for row in writes(r.left_bus) if row[1] in {"Acceleration","Goal_Position"}]
+
+
+@pytest.mark.parametrize("entry,acceleration,goal",[(False,0,0),(False,254,32767),(True,0,0),(True,254,32767)])
+def test_selected_acceleration_keeps_tested_active_role_and_exact_original(tmp_path,monkeypatch,entry,acceleration,goal):
+    _,r,trial,_=selected_acceleration_trial(tmp_path,monkeypatch,entry=entry,acceleration=acceleration,goal=goal)
+    trial.prepare(r);trial.disable_torque(r);trial.apply(r)
+    assert trial.configured_acceleration(r)==254
+    trial._preserved(r,phase="active")
+    r.left_bus.values["Acceleration",ELBOW]=73
+    with pytest.raises(RuntimeError):trial._preserved(r,phase="active")
+    r.left_bus.values["Acceleration",ELBOW]=254
+    trial.restore(r)
+    assert r.left_bus.values["Acceleration",ELBOW]==acceleration and r.left_bus.values["Goal_Position",ELBOW]==goal
+    assert not trial.restore_required and not any(row[1]=="Goal_Position" for row in writes(r.left_bus))
+
+
+@pytest.mark.parametrize("fault",["configure_lost_ack","configure_cancel","configure_readback","restore_lost_ack","restore_failed","restore_readback"])
+def test_selected_acceleration_write_or_readback_failure_keeps_durable_original_and_off(tmp_path,monkeypatch,fault):
+    _,r,trial,_=selected_acceleration_trial(tmp_path,monkeypatch)
+    trial.prepare(r);trial.disable_torque(r)
+    if fault.startswith("configure"):
+        if fault=="configure_readback":
+            r.left_bus.before_write=lambda reg,name,value:r.left_bus.read_sequences.__setitem__((reg,name),[0]) if reg=="Acceleration" else None
+        else:r.left_bus.fail_writes["Acceleration",ELBOW,254]=(KeyboardInterrupt("interrupted") if fault=="configure_cancel" else OSError("ACK lost"),True)
+        with pytest.raises((RuntimeError,OSError,KeyboardInterrupt)):trial.apply(r)
+        assert trial.restore_required and json.loads(trial.snapshot_path.read_bytes())["restore_required"]
+        r.left_bus.before_write=None
+    else:
+        trial.apply(r)
+        if fault=="restore_readback":
+            r.left_bus.before_write=lambda reg,name,value:r.left_bus.read_sequences.__setitem__((reg,name),[254]) if reg=="Acceleration" and value==0 else None
+        else:r.left_bus.fail_writes["Acceleration",ELBOW,0]=(OSError("restore ACK lost"),fault=="restore_lost_ack")
+    if fault in {"restore_failed","restore_readback"}:
+        with pytest.raises((RuntimeError,OSError)):trial.restore(r)
+        assert trial.restore_required and r.left_bus.values["Torque_Enable",ELBOW]==0 and r.left_bus.values["Lock",ELBOW]==1
+        assert json.loads(trial.snapshot_path.read_bytes())["restore_required"]
+    else:
+        trial.restore(r)
+        assert not trial.restore_required and r.left_bus.values["Acceleration",ELBOW]==0
+    assert not any(row[1]=="Goal_Position" for row in writes(r.left_bus))
+
+
+@pytest.mark.parametrize("fault",["arbitrary","maximum","outside","legacy"])
+def test_selected_acceleration_does_not_authorize_another_profile_or_baseline(tmp_path,monkeypatch,fault):
+    if fault=="legacy":
+        _,r,trial,_,_,_=left_response_p_robot(tmp_path,monkeypatch,workspace_profile=CURRENT_REST_PROFILE)
+        r.left_bus.values["Acceleration",ELBOW]=0
+        r._am1_teleop_settings["left"]["registers"]["Acceleration"][ELBOW]=0
+    else:
+        _,r,trial,_=selected_acceleration_trial(tmp_path,monkeypatch)
+        reg,val={"arbitrary":("Acceleration",73),"maximum":("Maximum_Acceleration",100),"outside":("Present_Position",1165)}[fault]
+        r.left_bus.values[reg,ELBOW]=val
+        if reg in r._am1_teleop_settings["left"]["registers"]:r._am1_teleop_settings["left"]["registers"][reg][ELBOW]=val
+    with pytest.raises(RuntimeError):trial.prepare(r)
+    assert not writes(r.left_bus) and not trial.restore_required
+
+
+def test_selected_acceleration_cannot_apply_after_original_persistence_failure(tmp_path,monkeypatch):
+    _,r,trial,_=selected_acceleration_trial(tmp_path,monkeypatch)
+    def failed(*a,**k):raise OSError("original did not reach durable storage")
+    monkeypatch.setattr(trial,"_persist_snapshot",failed)
+    with pytest.raises(OSError):trial.prepare(r)
+    r.left_bus.values["Lock",ELBOW]=1
+    with pytest.raises(RuntimeError):trial.apply(r)
+    assert not writes(r.left_bus)
+
+
+def stopped_selected_acceleration(module, r, trial, directory, *, check_stopped=lambda: None, completion_id=None, original_sha256=None, source_head=None):
+    import hashlib
+    from uuid import uuid4
+    return module.complete_stopped_left_response_p_original(
+        r.left_bus, directory, run_id=trial.binding["run_id"],
+        host_incarnation=trial.binding["host_incarnation"],
+        source_head=source_head or trial.binding["request"]["source_head"],
+        original_sha256=original_sha256 or hashlib.sha256(trial.snapshot_path.read_bytes()).hexdigest(),
+        completion_id=completion_id or str(uuid4()), check_stopped=check_stopped,
+    )
+
+
+@pytest.mark.parametrize("changed", ["source", "boot", "original_sha", "profile", "snapshot_acceleration", "snapshot_static", "snapshot_event", "torque", "status", "current", "maximum", "static", "actual_acceleration", "lock", "stopped"])
+def test_selected_acceleration_interrupted_completion_refuses_changed_authority_or_hardware(tmp_path, monkeypatch, changed):
+    module,r,trial,directory=selected_acceleration_trial(tmp_path,monkeypatch)
+    trial.prepare(r);trial.disable_torque(r);trial.apply(r)
+    options={}
+    if changed=="source": options["source_head"]="b"*40
+    elif changed=="boot": monkeypatch.setattr(module,"_left_response_p_boot_id",lambda:"88888888-8888-4888-8888-888888888888")
+    elif changed=="original_sha": options["original_sha256"]="0"*64
+    elif changed.startswith("snapshot") or changed=="profile":
+        saved=json.loads(trial.snapshot_path.read_bytes())
+        if changed=="profile": saved["selected_acceleration_profile"]["active_raw"]=73
+        elif changed=="snapshot_acceleration": saved["original_registers"]["Acceleration"]=73
+        elif changed=="snapshot_static": saved["frozen_teleop_registers"]["Acceleration"]=254
+        else: saved["events"].append({"operation":"write","register":"Goal_Position","value":1142})
+        trial.snapshot_path.write_bytes((json.dumps(saved,sort_keys=True,indent=2,allow_nan=False)+"\n").encode())
+    elif changed=="stopped":
+        def lost(): raise RuntimeError("stopped maintenance authority lost")
+        options["check_stopped"]=lost
+    else:
+        register,value={"torque":("Torque_Enable",1),"status":("Status",1),"current":("Present_Current",310),
+                        "maximum":("Maximum_Acceleration",100),"static":("D_Coefficient",31),
+                        "actual_acceleration":("Acceleration",73),"lock":("Lock",0)}[changed]
+        r.left_bus.values[register,ELBOW]=value
+    raw=trial.snapshot_path.read_bytes();before=list(writes(r.left_bus))
+    with pytest.raises((RuntimeError,ValueError)):
+        stopped_selected_acceleration(module,r,trial,directory,**options)
+    assert writes(r.left_bus)==before
+    assert trial.snapshot_path.read_bytes()==raw and json.loads(raw)["restore_required"]
+    assert not list(directory.glob("left-response-p-stopped-completion-*.json"))
+
+
+@pytest.mark.parametrize("fault",["acceleration_lost_ack", "acceleration_failed", "acceleration_readback", "lock_failed", "publication_sync", "cancel_after_write"])
+def test_selected_acceleration_interrupted_completion_retains_original_on_failure(tmp_path,monkeypatch,fault):
+    module,r,trial,directory=selected_acceleration_trial(tmp_path,monkeypatch)
+    trial.prepare(r);trial.disable_torque(r);trial.apply(r)
+    raw=trial.snapshot_path.read_bytes();before=len(writes(r.left_bus))
+    if fault=="acceleration_lost_ack": r.left_bus.fail_writes["Acceleration",ELBOW,0]=(OSError("ACK lost"),True)
+    elif fault=="acceleration_failed": r.left_bus.fail_writes["Acceleration",ELBOW,0]=(OSError("restore failed"),False)
+    elif fault=="acceleration_readback":
+        r.left_bus.before_write=lambda reg,name,value:r.left_bus.read_sequences.__setitem__((reg,name),[254]) if reg=="Acceleration" else None
+    elif fault=="lock_failed": r.left_bus.fail_writes["Lock",ELBOW,0]=(OSError("Lock restore failed"),False)
+    elif fault=="publication_sync":
+        def failed(_): raise OSError("completion sync failed")
+        monkeypatch.setattr(module.AM1ElbowIntegralTrial,"_sync_directory",failed)
+    else: r.left_bus.fail_writes["Acceleration",ELBOW,0]=(KeyboardInterrupt("stopped completion interrupted"),True)
+    if fault=="acceleration_lost_ack":
+        result=stopped_selected_acceleration(module,r,trial,directory)
+        assert result["selected_restoration_verified"] and any(row.get("reconciled") for row in result["events"])
+    else:
+        with pytest.raises((RuntimeError,OSError,KeyboardInterrupt)):
+            stopped_selected_acceleration(module,r,trial,directory)
+        assert not list(directory.glob("left-response-p-stopped-completion-*.json"))
+        assert r.left_bus.values["Torque_Enable",ELBOW]==0
+    assert trial.snapshot_path.read_bytes()==raw and json.loads(raw)["restore_required"]
+    assert all(row[1] in {"P_Coefficient","Acceleration","Lock","Torque_Enable"} for row in writes(r.left_bus)[before:])
+    assert not any(row[1]=="Goal_Position" for row in writes(r.left_bus))
+
+
+def test_selected_acceleration_interrupted_completion_has_separate_expired_motion_authority_and_exclusive_receipt(tmp_path,monkeypatch):
+    from uuid import uuid4
+    module,r,trial,directory=selected_acceleration_trial(tmp_path,monkeypatch)
+    trial.prepare(r);trial.disable_torque(r);trial.apply(r)
+    raw=trial.snapshot_path.read_bytes()
+    monkeypatch.setattr(module.time,"monotonic",lambda:trial.binding["request"]["expires_at_monotonic_s"]+1.)
+    identity=str(uuid4())
+    result=stopped_selected_acceleration(module,r,trial,directory,completion_id=identity)
+    assert result["selected_restoration_verified"] and result["native_acknowledged"] is False
+    target=directory/("left-response-p-stopped-completion-"+identity+".json")
+    receipt=target.read_bytes();before=list(writes(r.left_bus))
+    with pytest.raises(ValueError,match="fresh"):
+        stopped_selected_acceleration(module,r,trial,directory,completion_id=identity)
+    assert target.read_bytes()==receipt and trial.snapshot_path.read_bytes()==raw and writes(r.left_bus)==before
+
+
+@pytest.mark.parametrize("changed", ["deleted", "replaced", "preparation_failed"])
+def test_selected_acceleration_cannot_configure_from_changed_or_failed_durable_original(tmp_path,monkeypatch,changed):
+    _,r,trial,_=selected_acceleration_trial(tmp_path,monkeypatch)
+    trial.prepare(r);trial.disable_torque(r)
+    if changed=="deleted": trial.snapshot_path.unlink()
+    elif changed=="replaced": trial.snapshot_path.write_bytes(trial.snapshot_path.read_bytes()+b" ")
+    else: trial._failure("prepare_failed",OSError("directory sync did not finish"))
+    before=list(writes(r.left_bus))
+    with pytest.raises((RuntimeError,OSError)): trial.apply(r)
+    assert writes(r.left_bus)==before and r.left_bus.values["Acceleration",ELBOW]==0
+
+
+def test_selected_acceleration_interrupted_between_failed_write_and_outer_handler_restores_original(tmp_path,monkeypatch):
+    module,r,trial,directory=selected_acceleration_trial(tmp_path,monkeypatch)
+    trial.prepare(r);trial.disable_torque(r)
+    r.left_bus.fail_writes["Acceleration",ELBOW,254]=(OSError("ACK lost before outer handler"),True)
+    with pytest.raises(OSError): trial._write("Acceleration",254,phase="configure_acceleration")
+    assert json.loads(trial.snapshot_path.read_bytes())["state"]=="configure_acceleration_failed"
+    result=stopped_selected_acceleration(module,r,trial,directory)
+    assert result["selected_restoration_verified"] and r.left_bus.values["Acceleration",ELBOW]==0
+    assert not any(row[1]=="Goal_Position" for row in writes(r.left_bus))
+
+
+@pytest.mark.parametrize("acceleration",[0,254])
+def test_selected_acceleration_missing_marker_cannot_borrow_historical_goal_completion(tmp_path,monkeypatch,acceleration):
+    module,r,trial,directory=selected_acceleration_trial(tmp_path,monkeypatch,acceleration=acceleration)
+    trial.prepare(r);trial.disable_torque(r);trial.apply(r)
+    saved=json.loads(trial.snapshot_path.read_bytes());saved.pop("selected_acceleration_profile")
+    trial.snapshot_path.write_bytes((json.dumps(saved,sort_keys=True,indent=2,allow_nan=False)+"\n").encode())
+    raw=trial.snapshot_path.read_bytes();before=list(writes(r.left_bus))
+    with pytest.raises((RuntimeError,ValueError)):
+        stopped_selected_acceleration(module,r,trial,directory)
+    assert writes(r.left_bus)==before and trial.snapshot_path.read_bytes()==raw
+
+
+@pytest.mark.parametrize("phase",["configure","restore"])
+def test_selected_acceleration_write_rechecks_actual_off_before_further_configuration(tmp_path,monkeypatch,phase):
+    _,r,trial,_=selected_acceleration_trial(tmp_path,monkeypatch)
+    trial.prepare(r);trial.disable_torque(r)
+    if phase=="restore": trial.apply(r)
+    def lost_off(register,motor,value):
+        if register=="Acceleration": r.left_bus.values["Torque_Enable",ELBOW]=1
+    r.left_bus.before_write=lost_off
+    with pytest.raises(RuntimeError,match="OFF|Torque"):
+        trial.apply(r) if phase=="configure" else trial.restore(r)
+    assert r.left_bus.values["Torque_Enable",ELBOW]==0 and trial.restore_required
+    assert json.loads(trial.snapshot_path.read_bytes())["restore_required"]
+    if phase=="configure":
+        assert not [row for row in writes(r.left_bus) if row[1]=="P_Coefficient"]
+    assert not [row for row in writes(r.left_bus) if row[1]=="Goal_Position" or row[1]=="Torque_Enable" and row[3]!=0]
+
+
+@pytest.mark.parametrize("register",["P_Coefficient","Acceleration"])
+def test_selected_acceleration_stopped_write_rechecks_actual_off_before_next_setting(tmp_path,monkeypatch,register):
+    module,r,trial,directory=selected_acceleration_trial(tmp_path,monkeypatch)
+    trial.prepare(r);trial.disable_torque(r);trial.apply(r)
+    original=trial.snapshot_path.read_bytes();before=len(writes(r.left_bus))
+    def lost_off(actual,motor,value):
+        if actual==register:r.left_bus.values["Torque_Enable",ELBOW]=1
+    r.left_bus.before_write=lost_off
+    with pytest.raises(RuntimeError,match="OFF|Torque"):
+        stopped_selected_acceleration(module,r,trial,directory)
+    assert r.left_bus.values["Torque_Enable",ELBOW]==0 and trial.snapshot_path.read_bytes()==original
+    assert not list(directory.glob("left-response-p-stopped-completion-*.json"))
+    added=writes(r.left_bus)[before:]
+    setting=next(row for row in added if row[1]==register)
+    operation=max(index for index,row in enumerate(r.left_bus.events) if row is setting)
+    assert r.left_bus.events[operation+1][0:3]==("read","Torque_Enable",ELBOW)
+    if register=="P_Coefficient":assert not any(row[1]=="Acceleration" for row in added)
+    assert not any(row[1]=="Goal_Position" or row[1]=="Lock" and row[3]==0 for row in added)
+
+
+@pytest.mark.parametrize("goal",[-1,32768,65535,65536])
+def test_selected_acceleration_goal_telemetry_uses_decoded_nonnegative_word_format(tmp_path,monkeypatch,goal):
+    _,r,trial,_=selected_acceleration_trial(tmp_path,monkeypatch,goal=goal)
+    with pytest.raises(RuntimeError):trial.prepare(r)
+    assert not writes(r.left_bus) and not trial.restore_required
+
+
+@pytest.mark.parametrize("location",["original","actual"])
+@pytest.mark.parametrize("goal",[32768,65535])
+def test_selected_acceleration_stopped_goal_telemetry_rejects_impossible_decoded_word(tmp_path,monkeypatch,location,goal):
+    import hashlib
+    module,r,trial,directory=selected_acceleration_trial(tmp_path,monkeypatch)
+    trial.prepare(r);trial.disable_torque(r);trial.apply(r)
+    if location=="original":
+        saved=json.loads(trial.snapshot_path.read_bytes());saved["original_registers"]["Goal_Position"]=goal
+        saved["original_settings_sha256"]=hashlib.sha256(module._right_p20_json({"registers":saved["original_registers"],"individual_bytes":saved["original_bytes"]})).hexdigest()
+        trial.snapshot_path.write_bytes((json.dumps(saved,sort_keys=True,indent=2,allow_nan=False)+"\n").encode())
+    else:r.left_bus.values["Goal_Position",ELBOW]=goal
+    raw=trial.snapshot_path.read_bytes();before=list(writes(r.left_bus))
+    with pytest.raises((ValueError,RuntimeError)):
+        stopped_selected_acceleration(module,r,trial,directory)
+    assert writes(r.left_bus)==before and trial.snapshot_path.read_bytes()==raw

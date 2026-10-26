@@ -1103,6 +1103,10 @@ def verify_settings(robot):
         if expected[side]["P_Coefficient"]["arm_" + side + "_elbow_flex"] != 16:
             raise RuntimeError(f"AM1 {side} response original baseline differs")
         expected[side]["P_Coefficient"]["arm_" + side + "_elbow_flex"] = trial["configured_p"]
+        transaction=getattr(robot,"_am1_"+side+"_response_p_trial")
+        from .am1_elbow_integral import _selected_acceleration_request
+        if side=="left" and _selected_acceleration_request(transaction.binding["request"]):
+            expected[side]["Acceleration"]["arm_"+side+"_elbow_flex"]=transaction.configured_acceleration(robot)
     if any(
         records[side]["registers"][register] != expected[side][register]
         for side, _, _ in _groups(robot)

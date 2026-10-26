@@ -204,7 +204,10 @@ The practical-use continuation supersedes earlier experiment-specific retry/dura
 
 ## EVIDENCE-01: retain success, first cause and limits
 
+- **Captured settings versus selected active role:**963 preserved P16/I0/D32 and measured1142, but stopped Goal0/Acceleration0 differed from the selected profile. Generic STATIC means unchanged relative to capture, not a universal initialization value. Keep its generic behavior; the closed LEFT transaction durably owns tested active254 and restores captured0/254. Check actual OFF after new setting writes. Decoded Goal telemetry is not a fresh reference or restoration target; after-home measured seeding/readback remains mandatory. Fresh stopped proof/ACK may close uncertainty without rewriting the original refusal or qualifying powered startup.
+
 - **Bind cached evidence to its operation:** an ordinary P32 report may depend on an older P16 staging baseline. Dispatch current receipts by exact run/host/recipe; validate the exact sealed baseline with its original reader and original entry selection. Do not transfer current authority to historical receipts or weaken foreign-binding checks. Preserve a refused report and record corrected pure replay separately.
+- **Historical detail versus current service:** a terminal run’s immutable reference retains that run’s service identity across an owner restart. Use the generic hash-bound field reader against that historical identity; an active-startup reader may correctly reject it. Preserve root reader/HTTP-shape errors separately from robot behavior. Generic HTTP mutations, including release, require a fresh operation UUID; a later terminal-only Claim/release is separate evidence, not a rewrite of a malformed original.
 - **Control time is elapsed, useful work is measured:** the ordinary interactive window ages after initial qualified Resume. Read fresh ready metadata, submit current input promptly and keep active HOLD/input waiting distinct from actual outward movement. A root reader error or tool delay is not a robot defect and does not refresh the deadline. Normal ready metadata need not contain an entry-only profile field.
 
 
