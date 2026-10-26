@@ -1709,10 +1709,10 @@ class SessionClient:
             timing["send_completed_at_monotonic_s"] = time.perf_counter()
             phase = "receipt"
             try:
-                # A connect fence can take effect before its receipt arrives.
-                # Allow its bounded gateway call (1.5 s) to return; callers keep
-                # their original phase ceilings and input/grant waits stay 1 s.
-                result = await asyncio.wait_for(future, 2.0 if command.get("op") == "connect" else 1.0)
+                # Allow the bounded gateway call (1.5 s) plus receipt margin for
+                # Connect/Input/Grant. Original source/grant expiries and outer
+                # phase ceilings are unchanged; this never retries a command.
+                result = await asyncio.wait_for(future, 2.0 if command.get("op") in {"connect", "input", "grant"} else 1.0)
             except TimeoutError as error:
                 if command.get("op") == "resume":
                     # Only the actual reply future's timeout is unknown admission;

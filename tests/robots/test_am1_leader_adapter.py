@@ -1101,7 +1101,9 @@ def test_sample_sender_never_sends_under_an_identity_changed_during_capture():
     assert records[-1]["identity"]["run_id"] == "original"
 
 
-def test_real_core_wss_expired_grant_keeps_original_refusal_and_allows_fresh_grant(tmp_path):
+@pytest.mark.parametrize("delayed_op,reply_delay_s", [(None, 0.0), ("input", 1.2), ("grant", 1.2)],
+                         ids=["prompt-reply", "bounded-delayed-input-reply", "bounded-delayed-grant-reply"])
+def test_real_core_wss_expired_grant_keeps_original_refusal_and_allows_fresh_grant(tmp_path, delayed_op, reply_delay_s):
     import asyncio
     import json
 
@@ -1161,16 +1163,65 @@ def test_real_core_wss_expired_grant_keeps_original_refusal_and_allows_fresh_gra
                     operation_id=str(uuid4()),
                 )
             )
-            old = await client.command(dict(op="grant", **base))
-            await asyncio.sleep(0.3)
-            with pytest.raises(m.CommandRefusedError) as caught:
+            delayed_reply = {}
+            release_task = None
+
+            async def release_known_reply():
+                async with asyncio.timeout(2):
+                    while not cluster.flags.with_suffix(".reply").exists():
+                        await asyncio.sleep(0.005)
+                delayed_reply.update(json.loads(cluster.flags.with_suffix(".reply").read_text()))
+                started = asyncio.get_running_loop().time()
+                await asyncio.sleep(reply_delay_s)
+                delayed_reply["test_reply_hold_seconds"] = asyncio.get_running_loop().time() - started
+                cluster.flags.with_suffix(".release").write_text("release")
+
+            if delayed_op == "grant":
+                cluster.flags.write_text(json.dumps({"delay_reply": "grant"}))
+                release_task = asyncio.create_task(release_known_reply())
+            try:
+                old = await client.command(dict(op="grant", **base))
+            finally:
+                if release_task is not None:
+                    await release_task
+            if delayed_op != "grant":
+                await asyncio.sleep(0.3)
+            if delayed_op == "input":
+                # Delay the already computed refusal inside Gateway.call's 1.5 s
+                # bound, without extending the owner's original 250 ms grant.
+                cluster.flags.write_text(json.dumps({"delay_reply": "input"}))
+                release_task = asyncio.create_task(release_known_reply())
+            refusal = None
+            try:
                 await client.command(dict(op="input", **base, grant_id=old["grant_id"], seq=1, target=[0.0]))
-            assert m.expired_input_refusal(caught.value)
-            assert caught.value.response["reason"] == "expired grant"
+            except (m.CommandRefusedError, TimeoutError) as error:
+                refusal = error
+            finally:
+                if release_task is not None:
+                    await release_task
+            if reply_delay_s:
+                assert old["expires"] - old["issued"] == pytest.approx(0.25)
+                assert 1.1 <= delayed_reply["test_reply_hold_seconds"] <= 1.3
+                if delayed_op == "input":
+                    assert delayed_reply["accepted"] is False
+                    assert delayed_reply["status"] == "refused"
+                    assert delayed_reply["effect_admitted"] is False
+                    assert delayed_reply["reason"] == "expired grant"
+                else:
+                    assert delayed_reply["accepted"] is True and delayed_reply["status"] == "granted"
+                    assert all(old[key] == delayed_reply[key] for key in ("grant_id", "issued", "expires"))
+            assert isinstance(refusal, m.CommandRefusedError), {
+                "observed_error": type(refusal).__name__, "known_owner_reply": delayed_reply,
+                "partial_input_timing": getattr(refusal, "input_command_timing", None),
+            }
+            assert m.expired_input_refusal(refusal)
+            assert refusal.response["reason"] == "expired grant"
             assert (
-                caught.value.timing["send_completed_at_monotonic_s"]
-                <= caught.value.timing["response_observed_at_monotonic_s"]
+                refusal.timing["send_completed_at_monotonic_s"]
+                <= refusal.timing["response_observed_at_monotonic_s"]
             )
+            if reply_delay_s:
+                return  # Keep this proof limited to the delayed original refusal.
             fresh = await client.command(dict(op="grant", **base))
             assert fresh["grant_id"] != old["grant_id"]
             assert (
@@ -4387,14 +4438,25 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         assert a.connection["generation"] != old_connection
                         assert a.run["intent_revision"] == old_revision + 1
                     else:
-                        # Invalid while held: withholding a refusal must not
-                        # lengthen ordinary input/grant result waits either.
+                        # A delayed known refusal keeps its original owner
+                        # result and never becomes movement permission.
                         assert result_seen[0]["accepted"] is False
                     if mode in {"fast", "delayed"}:
                         result = await pending
                         assert result == dict(result_seen[0], id=envelopes[0]["id"], kind="result")
                         if mode == "delayed":
                             assert 1.1 < loop.time() - started < 2
+                    elif mode in {"input", "grant"}:
+                        with pytest.raises(m.CommandRefusedError) as caught:
+                            await pending
+                        expected = dict(result_seen[0], id=envelopes[0]["id"], kind="result")
+                        observed = dict(caught.value.response)
+                        # Gateway appends observations after the held IPC result.
+                        expected_timing = expected.pop("diagnostic_timing")
+                        observed_timing = observed.pop("diagnostic_timing")
+                        assert observed == expected
+                        assert expected_timing.items() <= observed_timing.items()
+                        assert 1.1 < loop.time() - started < 2
                     else:
                         with pytest.raises(TimeoutError):
                             if mode == "caller_ceiling":
@@ -4402,9 +4464,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                             else:
                                 await pending
                         elapsed = loop.time() - started
-                        if mode in {"input", "grant"}:
-                            assert .9 < elapsed < 1.5
-                        elif mode == "caller_ceiling":
+                        if mode == "caller_ceiling":
                             assert elapsed < .75
                         else:
                             assert 1.8 < elapsed < 2.6
