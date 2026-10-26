@@ -1789,3 +1789,119 @@ def test_live_legacy_terminal_record_reopen_is_canonically_unchanged(physical_li
         assert _canonical(restored.run) == expected
     finally:
         restored.close()
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_input_diagnostic_core_marks_are_separate_from_authority_clock(tmp_path, monkeypatch, expired):
+    from tools import am1_session_core as core
+
+    c = Clock()
+    a = SessionAuthority(tmp_path, clock=c)
+    try:
+        run = start(a, "fake-interactive")
+        base = interactive_controls(a, run)
+        grant = a.handle(command("grant", **base), "owner")
+        assert "diagnostic_timing" not in grant
+        if expired:
+            c.advance(.251)
+        stamps = iter((100., 100.01, 100.03, 100.04))
+        monkeypatch.setattr(core, "_input_diagnostic_clock", lambda: next(stamps), raising=False)
+        result = a.handle(command("input", **base, grant_id=grant["grant_id"], seq=1, target=[.2]), "owner")
+        assert result["accepted"] is (not expired)
+        if expired:
+            assert result["reason"] == "expired grant" and not result["effect_admitted"]
+        assert result["diagnostic_timing"] == {
+            "version": 1, "clock": "pi-monotonic", "core_entered": 100., "core_locked": 100.01,
+            "core_tick_completed": 100.03, "core_returned": 100.04}
+        assert c.now == (.251 if expired else 0.) and grant["expires"] == .25
+        assert "diagnostic_timing" not in a.handle(command("claim", **base), "owner")
+    finally:
+        a.close()
+
+
+@pytest.mark.parametrize("failure", [None, float("nan"), True, "raise"])
+def test_input_diagnostic_failure_omits_only_diagnostics(tmp_path, monkeypatch, failure):
+    from tools import am1_session_core as core
+
+    c = Clock()
+    a = SessionAuthority(tmp_path, clock=c)
+    try:
+        run = start(a, "fake-interactive")
+        base = interactive_controls(a, run)
+        grant = a.handle(command("grant", **base), "owner")
+        def failed_clock():
+            if failure == "raise":
+                raise RuntimeError("diagnostic clock unavailable")
+            return failure
+        monkeypatch.setattr(core, "_input_diagnostic_clock", failed_clock, raising=False)
+        result = a.handle(command("input", **base, grant_id=grant["grant_id"], seq=1, target=[.2]), "owner")
+        assert result == {"accepted": True, "status": "input", "effect_admitted": True}
+        assert a.run["intent"] == [.2] and c.now == 0.
+    finally:
+        a.close()
+
+def test_input_diagnostic_marks_bound_actual_mutex_wait_and_tick(tmp_path, monkeypatch):
+    import threading
+    import time
+    from tools import am1_session_core as core
+
+    c = Clock()
+    a = SessionAuthority(tmp_path, clock=c)
+    entered = threading.Event()
+    calls, results, errors, tick_bounds = [], [], [], []
+    original_tick = a.tick
+    def diagnostic():
+        value = time.monotonic()
+        calls.append(value)
+        entered.set()
+        return value
+    def tick():
+        tick_bounds.append(time.monotonic())
+        original_tick()
+        tick_bounds.append(time.monotonic())
+    try:
+        run = start(a, "fake-interactive")
+        base = interactive_controls(a, run)
+        grant = a.handle(command("grant", **base), "owner")
+        monkeypatch.setattr(core, "_input_diagnostic_clock", diagnostic)
+        monkeypatch.setattr(a, "tick", tick)
+        def submit():
+            try:
+                results.append(a.handle(command("input", **base, grant_id=grant["grant_id"], seq=1, target=[.2]), "owner"))
+            except BaseException as error:
+                errors.append(error)
+        with a.mutex:
+            worker = threading.Thread(target=submit)
+            worker.start()
+            assert entered.wait(1) and len(calls) == 1 and not results
+            released_at = time.monotonic()
+        worker.join(2)
+        assert not worker.is_alive() and not errors and results[0]["accepted"]
+        span = results[0]["diagnostic_timing"]
+        assert span["core_entered"] <= released_at <= span["core_locked"]
+        assert span["core_locked"] <= tick_bounds[0] <= tick_bounds[1] <= span["core_tick_completed"] <= span["core_returned"]
+        assert c.now == 0. and grant["expires"] == .25
+    finally:
+        a.close()
+
+
+def test_input_diagnostic_failure_preserves_original_executor_exception(tmp_path, monkeypatch):
+    from tools import am1_session_core as core
+
+    c = Clock()
+    a = SessionAuthority(tmp_path, clock=c)
+    original = RuntimeError("original input failure")
+    try:
+        run = start(a, "fake-interactive")
+        base = interactive_controls(a, run)
+        grant = a.handle(command("grant", **base), "owner")
+        def clock_failure():
+            raise ValueError("diagnostic failure")
+        def apply_failure(target):
+            raise original
+        monkeypatch.setattr(core, "_input_diagnostic_clock", clock_failure)
+        monkeypatch.setattr(a.executor, "apply", apply_failure)
+        with pytest.raises(RuntimeError) as raised:
+            a.handle(command("input", **base, grant_id=grant["grant_id"], seq=1, target=[.2]), "owner")
+        assert raised.value is original
+    finally:
+        a.close()
