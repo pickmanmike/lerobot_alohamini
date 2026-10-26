@@ -2190,3 +2190,336 @@ def test_newer_view_request_can_use_older_fresh_source_without_extending_its_age
     finally:
         a.run = None
         a.close()
+
+
+@pytest.fixture
+def periodic_input_order_lane(tmp_path, monkeypatch, request):
+    from types import SimpleNamespace
+    from tests.robots.test_am1_physical_executor import pending_native_worker
+
+    # Actual244c/772 relative clocks: newGrant issued10.1, Coreentry10.118935829,
+    # preceding native expiry10.279131958, newGrant expiry10.35.
+    now, robot, control, e, step, stop = pending_native_worker(expiry=10.279131958)
+    a, unused, _ = authority_lane(tmp_path)
+    try:
+        step()
+        a.executor, a.asynchronous, a.clock = e, True, lambda: now[0]
+        a.service_incarnation = e._live_binding["service_incarnation"]
+        a.run.update(run_id=e.run_id, service_incarnation=a.service_incarnation,
+                     native_live_at=10., deadline=310., intent_revision=0)
+        a.controller = {"device_id": "authorized-test-device", "generation": e._live_binding["controller_generation"], "expires": 20.}
+        a.connection = {"device_id": "authorized-test-device", "generation": e._live_binding["connection_generation"], "seq": 1}
+        a._teleop_view = {"run_id": e.run_id, "qualified_until": 20.}
+        original = copy.deepcopy(e._live_target)
+        a.applied_input = {"expires": original["valid_until_monotonic_s"], "seq": 1, "intent_revision": 0}
+        a.run["intent"], a.run["input_source"] = copy.deepcopy(original["target"]), copy.deepcopy(original["source"])
+        ids = dict(run_id=e.run_id, host_incarnation=e.host_incarnation,
+                   service_incarnation=a.service_incarnation, controller_generation=a.controller["generation"],
+                   connection_generation=a.connection["generation"], intent_revision=0)
+        if getattr(request, "param", False):
+            _bench_intent(a)
+            a.run["control_intent"]["device_id"] = "authorized-test-device"
+        grant = a._handle(dict(op="grant", **ids), "authorized-test-device")
+        assert grant["accepted"] and grant["issued"] == 10.1 and grant["expires"] == 10.35
+        src = source(772, grant=grant["grant_id"])
+        src["source_id"] = original["source"]["source_id"]
+        candidate = dict(op="input", **ids, grant_id=grant["grant_id"], seq=459,
+                         source=src, target=copy.deepcopy(original["target"]), body=copy.deepcopy(original["body"]))
+        now[0] = 10.118935829
+        a.last_checkpoint = now[0] - 1.01
+        evidence, first = a._evidence, [True]
+        def actual_precheckpoint():
+            if first[0]:
+                first[0] = False
+                now[0] += .003190754
+            return evidence()
+        monkeypatch.setattr(a, "_evidence", actual_precheckpoint)
+        yield SimpleNamespace(a=a, e=e, ids=ids, now=now, robot=robot, control=control,
+                              step=step, candidate=candidate, original=original, grant=grant)
+    finally:
+        stop()
+        a.run = None
+        a.executor = unused
+        a.close()
+
+
+@pytest.mark.parametrize("periodic_input_order_lane", [False, True], indirect=True, ids=["normal", "bench"])
+def test_actual772_input_reaches_native_while_periodic_checkpoint_and_rpc_reply_remain_pending(periodic_input_order_lane, monkeypatch):
+    import asyncio
+    import threading
+    from types import SimpleNamespace
+    from tools.am1_session_service import Gateway
+    from tests.robots.test_am1_session_reporting import exchange
+
+    case = periodic_input_order_lane
+    entered, release = threading.Event(), threading.Event()
+    save = case.a._save
+    save_clock = []
+    def checkpoint():
+        start = case.now[0]
+        save_clock.append(start)
+        entered.set()
+        assert release.wait(2), "checkpoint replay was not released"
+        case.now[0] = max(case.now[0], start + .110933985)
+        return save()
+    monkeypatch.setattr(case.a, "_save", checkpoint)
+    async def scenario():
+        gateway = Gateway.__new__(Gateway)
+        gateway.auth = SimpleNamespace(capable=lambda _: True)
+        gateway.normal, gateway.protective = asyncio.Semaphore(6), asyncio.Semaphore(2)
+        async def request(command, device):
+            return (await exchange(None, command, authority=case.a))[0]
+        gateway.ipc = SimpleNamespace(request=request)
+        peer = SimpleNamespace(ack=True, connection=case.ids["connection_generation"])
+        task = asyncio.create_task(gateway.dispatch(case.candidate, {"id": "authorized-test-device", "control": True}, peer))
+        try:
+            assert await asyncio.to_thread(entered.wait, 1)
+            assert not task.done(), "no response may precede the unchanged durable checkpoint"
+            case.now[0] += .039358378  # Actual Core-return to host-receive interval.
+            await asyncio.to_thread(case.step)
+            while_pending = copy.deepcopy(case.control.live_snapshot())
+        finally:
+            release.set()
+        result = await asyncio.wait_for(task, 1)
+        assert result["accepted"] is True
+        assert while_pending["last_input_seq"] == 459, while_pending
+        assert while_pending["source"]["sample_seq"] == 772
+        assert while_pending["valid_until_monotonic_s"] == case.grant["expires"] == 10.35
+        assert case.a.last_checkpoint == 10.118935829, "periodic checkpoint retains original tick time"
+        span = result["diagnostic_timing"]
+        assert span["core_tick_completed"] <= span["core_deferred_checkpoint_started"] <= span["core_returned"]
+        assert "core_checkpoint_started" not in span
+        case.now[0] = case.original["valid_until_monotonic_s"] + .001492752
+        await asyncio.to_thread(case.step)
+        assert case.control.live_snapshot()["state"] == "active"
+        assert case.control.live_snapshot()["valid_until_monotonic_s"] == 10.35
+        assert len(save_clock) == 1 and case.a.run["deadline"] == 310.
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("error_type", [ValueError, TypeError, KeyError, OverflowError, RuntimeError])
+def test_periodic_checkpoint_failure_after_input_admission_preserves_original_exception_and_effect(periodic_input_order_lane, monkeypatch, error_type):
+    case = periodic_input_order_lane
+    original = error_type("original checkpoint failure after admission")
+    first_cause = "retained earlier cause"
+    case.a.run["first_cause"] = first_cause
+    saved_inputs = []
+    def checkpoint():
+        saved_inputs.append(copy.deepcopy(case.e._live_target))
+        raise original
+    monkeypatch.setattr(case.a, "_save", checkpoint)
+    with pytest.raises(error_type) as raised:
+        case.a.handle(case.candidate, "authorized-test-device")
+    assert raised.value is original
+    assert saved_inputs[0]["source"]["sample_seq"] == 772
+    assert case.e._live_target["source"] == case.candidate["source"]
+    assert case.e._live_target["valid_until_monotonic_s"] == case.grant["expires"]
+    assert case.a.run["first_cause"] == first_cause
+
+
+def test_deferred_checkpoint_diagnostic_keeps_real_tick_completion_and_closed_bound():
+    import json
+    from tools.am1_session_core import _input_diagnostic_result
+    authority = {"accepted": True, "status": "input", "effect_admitted": True}
+    marks = dict(gateway_received=10., gateway_dispatch=10.001, gateway_ipc_started=10.002,
+                 core_entered=10.003, core_locked=10.004, core_tick_completed=10.007,
+                 core_deferred_checkpoint_started=10.008, core_returned=10.119,
+                 gateway_ipc_completed=10.120)
+    result = _input_diagnostic_result(authority, marks)
+    assert result["diagnostic_timing"]["core_tick_completed"] == 10.007
+    assert result["diagnostic_timing"]["core_deferred_checkpoint_started"] == 10.008
+    assert len(json.dumps(result["diagnostic_timing"]).encode()) <= 512
+    assert {k:v for k,v in result.items() if k != "diagnostic_timing"} == authority
+    assert _input_diagnostic_result(authority, dict(marks, core_checkpoint_started=10.005)) == authority
+
+
+@pytest.mark.parametrize("fault", ["stale-sequence", "foreign-controller", "wrong-grant", "malformed-target", "expired-during-evidence"])
+def test_due_periodic_checkpoint_still_saves_refused_input_without_admitting_or_replaying(periodic_input_order_lane, monkeypatch, fault):
+    case = periodic_input_order_lane
+    candidate = copy.deepcopy(case.candidate)
+    if fault == "stale-sequence":
+        candidate["seq"] = 1
+    elif fault == "foreign-controller":
+        candidate["controller_generation"] = str(uuid4())
+    elif fault == "wrong-grant":
+        candidate["grant_id"] = str(uuid4())
+    elif fault == "malformed-target":
+        candidate["target"] = None
+    else:
+        evidence, once = case.a._evidence, [True]
+        def expired():
+            if once[0]:
+                once[0] = False
+                case.now[0] = case.grant["expires"] + .001
+            return evidence()
+        monkeypatch.setattr(case.a, "_evidence", expired)
+    snapshots, save = [], case.a._save
+    def checkpoint():
+        snapshots.append(copy.deepcopy(case.e._live_target))
+        return save()
+    monkeypatch.setattr(case.a, "_save", checkpoint)
+    result = case.a.handle(candidate, "authorized-test-device")
+    assert result["accepted"] is False and result["effect_admitted"] is False
+    assert len(snapshots) == 1 and snapshots[0] == case.original
+    assert case.e._live_target == case.original
+    assert case.a.connection["seq"] == 1 and case.a.run["input_source"] == case.original["source"]
+    assert "core_deferred_checkpoint_started" in result["diagnostic_timing"]
+    assert "core_checkpoint_started" not in result["diagnostic_timing"]
+    assert case.a.last_checkpoint == 10.118935829
+
+
+@pytest.mark.parametrize("fence", ["view", "deadline", "pause", "stop"])
+def test_mandatory_checkpoint_and_protective_fences_are_not_deferred(periodic_input_order_lane, monkeypatch, fence):
+    from tests.robots.test_am1_persistent_session import command
+    case = periodic_input_order_lane
+    saves, save = [], case.a._save
+    def checkpoint():
+        saves.append(case.a.run["status"])
+        return save()
+    monkeypatch.setattr(case.a, "_save", checkpoint)
+    candidate = case.candidate
+    if fence == "view":
+        case.a._teleop_view["qualified_until"] = case.now[0] - .001
+    elif fence == "deadline":
+        case.a.run["deadline"] = case.now[0] - .001
+    else:
+        candidate = command(fence, run_id=case.a.run["run_id"])
+    result = case.a.handle(candidate, "authorized-test-device")
+    assert saves and saves[0] != "running"
+    assert "core_deferred_checkpoint_started" not in result.get("diagnostic_timing", {})
+    assert case.a.run["status"] != "running"
+    assert (case.e._live_target or {}).get("source", {}).get("sample_seq") != 772
+    if fence in {"view", "deadline"}:
+        assert result["accepted"] is False and result["effect_admitted"] is False
+
+
+@pytest.mark.parametrize("caller", ["grant", "ticker"])
+def test_grant_and_default_ticker_keep_existing_precommand_checkpoint(periodic_input_order_lane, monkeypatch, caller):
+    case = periodic_input_order_lane
+    saves, save = [], case.a._save
+    def checkpoint():
+        saves.append(copy.deepcopy(case.e._live_target))
+        return save()
+    monkeypatch.setattr(case.a, "_save", checkpoint)
+    if caller == "grant":
+        result = case.a.handle(dict(op="grant", **case.ids), "authorized-test-device")
+        assert result["accepted"] and "core_checkpoint_started" in result["diagnostic_timing"]
+        assert "core_deferred_checkpoint_started" not in result["diagnostic_timing"]
+    else:
+        assert case.a.tick() is None
+    assert saves == [case.original] and case.e._live_target == case.original
+
+
+def test_after_admission_checkpoint_valueerror_is_unknown_over_real_gateway_ipc_not_no_effect(periodic_input_order_lane, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from tools.am1_session_service import Gateway
+    from tests.robots.test_am1_session_reporting import exchange
+
+    case = periodic_input_order_lane
+    original = ValueError("original admitted checkpoint failure")
+    def checkpoint():
+        raise original
+    monkeypatch.setattr(case.a, "_save", checkpoint)
+    async def scenario():
+        gateway = Gateway.__new__(Gateway)
+        gateway.auth = SimpleNamespace(capable=lambda _: True, resolve=lambda _: {"id": "authorized-test-device", "control": True})
+        gateway.normal, gateway.protective = asyncio.Semaphore(6), asyncio.Semaphore(2)
+        async def request(command, device):
+            return (await exchange(None, command, authority=case.a))[0]
+        gateway.ipc = SimpleNamespace(request=request)
+        outputs = []
+        peer = SimpleNamespace(token="private-fixture-token", ack=True, connection=case.ids["connection_generation"], put=outputs.append)
+        await gateway.execute_peer(peer, {"id": "admitted-then-save-failed", "command": case.candidate})
+        assert len(outputs) == 1 and outputs[0]["id"] == "admitted-then-save-failed"
+        assert outputs[0]["accepted"] is None and outputs[0]["effect_admitted"] is None
+        assert outputs[0]["status"] == "unknown" and outputs[0]["uncertain"] is True
+        assert "malformed" not in outputs[0]["reason"]
+        assert case.e._live_target["source"] == case.candidate["source"]
+        assert case.e._live_target["valid_until_monotonic_s"] == case.grant["expires"]
+        # The uncertain original is not retried; its already consumed sequence remains consumed.
+        assert case.a._handle(case.candidate, "authorized-test-device")["accepted"] is False
+        assert case.a.connection["seq"] == 459
+    asyncio.run(scenario())
+
+
+def test_owner_reopen_after_admitted_checkpoint_failure_never_replays_volatile_input(periodic_input_order_lane, monkeypatch):
+    from tools.am1_session_core import SessionAuthority
+    case = periodic_input_order_lane
+    case.a._save()  # Durable pre-input baseline, never a fabricated terminal result.
+    original = RuntimeError("checkpoint failed before persistence")
+    def checkpoint():
+        raise original
+    monkeypatch.setattr(case.a, "_save", checkpoint)
+    with pytest.raises(RuntimeError) as raised:
+        case.a.handle(case.candidate, "authorized-test-device")
+    assert raised.value is original and case.e._live_target["source"]["sample_seq"] == 772
+    case.a.close()  # Simulated owner shutdown uses only the inert worker.
+    replacement = executor(ControlledHost())
+    restored = SessionAuthority(case.a.directory, clock=lambda: case.now[0], executor=replacement)
+    try:
+        assert restored.controller is None and restored.connection is None
+        assert restored.grant is None and restored.applied_input is None
+        assert restored.run["intent"] is None and restored.run["uncertain"] is True
+        assert restored.run["status"] == "interrupted"
+        assert replacement.worker is None and replacement._live_target is None
+    finally:
+        restored.close()
+
+
+@pytest.mark.parametrize("protective", ["pause", "stop"])
+def test_new_protective_command_waiting_on_deferred_checkpoint_fences_every_later_input(periodic_input_order_lane, monkeypatch, protective):
+    import threading
+    from tests.robots.test_am1_persistent_session import command
+    case = periodic_input_order_lane
+    entered, release, protective_started = threading.Event(), threading.Event(), threading.Event()
+    results, errors = {}, []
+    save = case.a._save
+    def checkpoint():
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(2)
+        return save()
+    monkeypatch.setattr(case.a, "_save", checkpoint)
+    def send_input():
+        try:
+            results["input"] = case.a.handle(case.candidate, "authorized-test-device")
+        except BaseException as error:
+            errors.append(error)
+    def protect():
+        protective_started.set()
+        try:
+            results["protective"] = case.a.handle(command(protective, run_id=case.a.run["run_id"]), "authorized-test-device")
+        except BaseException as error:
+            errors.append(error)
+    input_thread = threading.Thread(target=send_input)
+    protective_thread = threading.Thread(target=protect)
+    try:
+        input_thread.start()
+        assert entered.wait(1)
+        assert case.e._live_target["source"]["sample_seq"] == 772
+        protective_thread.start()
+        assert protective_started.wait(1) and "protective" not in results
+    finally:
+        release.set()
+        input_thread.join(2)
+        if protective_thread.ident is not None:
+            protective_thread.join(2)
+    assert not input_thread.is_alive() and not protective_thread.is_alive() and errors == []
+    assert results["input"]["accepted"] and results["protective"]["accepted"]
+    assert case.a.run["status"] != "running" and case.e.desired == "hold"
+    assert case.a.grant is None and case.a.applied_input is None
+    assert case.a._handle(case.candidate, "authorized-test-device")["accepted"] is False
+
+
+
+def test_deferred_checkpoint_invalid_diagnostic_clock_never_changes_admitted_outcome(periodic_input_order_lane, monkeypatch):
+    from tools import am1_session_core as core
+    case = periodic_input_order_lane
+    stamps = iter((100., 100., 100., None, 100.))
+    monkeypatch.setattr(core, "_input_diagnostic_clock", lambda: next(stamps))
+    result = case.a.handle(case.candidate, "authorized-test-device")
+    assert result == {"accepted": True, "status": "input", "effect_admitted": True}
+    assert case.e._live_target["source"] == case.candidate["source"]
+    assert case.e._live_target["valid_until_monotonic_s"] == 10.35
+    assert case.a.last_checkpoint == 10.118935829

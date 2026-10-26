@@ -451,7 +451,7 @@ def executor(host):
     )
 
 
-def pending_native_worker():
+def pending_native_worker(*, expiry=10.25):
     """Actual worker and native control, with queued feedback and inert buses."""
     import queue
 
@@ -460,7 +460,7 @@ def pending_native_worker():
 
     now, identity, binding, robot, control = lane()
     control.apply(robot, frame(identity, binding, 1))
-    original = sample(control)
+    original = sample(control, expiry=expiry)
     now[0] = 10.1
     control.apply(robot, frame(identity, binding, 2, mode="active", epoch=2, sample=original))
     measured = robot.get_observation()
