@@ -2127,11 +2127,20 @@ class SessionClient:
                 ws = getattr(self, "ws", None)
                 stream_error = ws.exception() if ws is not None else None
                 close = dict(getattr(self, "transport_close", None) or {})
-                if (resumed.get("accepted") is True and resumed.get("status") in {"running", "resuming"}
-                    and type(stream_error) is ServerTimeoutError
+                no_pong = (type(stream_error) is ServerTimeoutError
                     and str(stream_error) == f"No PONG received after {ws._pong_heartbeat} seconds"
                     and close.get("expected") is False and close.get("reason") == "message-error"
-                    and close.get("close_code") == 1006 and close.get("reader_error") is None):
+                    and close.get("close_code") == 1006 and close.get("reader_error") is None)
+                reporting_unavailable = (str(error) == "owner reporting unavailable"
+                    and getattr(self, "transport_error", None) == "owner reporting unavailable"
+                    and not getattr(self, "_detaching", False) and stream_error is None
+                    and close.get("expected") is False and close.get("reason") == "reader-error"
+                    and close.get("close_code") is None
+                    and close.get("exception_type") is None and close.get("exception") is None
+                    and close.get("reader_error") == {
+                        "error_type": "RuntimeError", "message": "owner reporting unavailable"})
+                if (resumed.get("accepted") is True and resumed.get("status") in {"running", "resuming"}
+                    and (no_pong or reporting_unavailable)):
                     # This is the known accepted Resume's active-observation
                     # phase, never an unknown command or nonadmission receipt.
                     error.accepted_resume_context = {
