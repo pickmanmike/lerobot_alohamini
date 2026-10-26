@@ -2588,6 +2588,12 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                     assert entry_ceilings == [70., 70.]
                 return
             if changing_intents:
+                statuses = [row for row in records if row["event"] == "virtual_input_status"]
+                assert statuses, "ordinary input must expose its original operating window"
+                assert len({row["window_started_at_monotonic_s"] for row in statuses}) == 1
+                assert len({row["window_deadline_monotonic_s"] for row in statuses}) == 1
+                assert all(0 <= row["window_remaining_s"] <= args.duration_seconds + 1e-9 for row in statuses)
+                assert any(row["current_accepted_intent_seq"] == 1 for row in statuses)
                 frames = [row for row in records if row["event"] == "leader_frame"]
                 if failure.endswith("duration"):
                     assert len(frames) == 2 and summary["clean_input_end"] == "duration_elapsed"
@@ -11505,3 +11511,68 @@ def test_left_entry_frontdoor_prepares_new_profile_and_retains_exact_request_met
     assert calls[0]["workspace_profile"] == m.LEFT_ENTRY_WORKSPACE_PROFILE
     assert calls[0]["workload_segment"] == "ordinary-arms" and calls[0]["left_shoulder_startup_degrees"] == 1
     assert json.loads((output/"preparation-receipt.private.json").read_text())["request"]["proportional"] == 16
+
+
+def test_virtual_input_progress_original_window_and_expiry_survive_wait_recovery_and_replacement():
+    import copy
+    from examples.alohamini.am1_teleop_workload import VirtualIntentWorkload
+
+    m, clock = adapter(), [50.]
+    native = workspace()
+    source = VirtualIntentWorkload(native, command_reference=native["reference"], clock=lambda: clock[0])
+    command = {"seq": 1, "op": "move", "intent_channel": source.intent_channel,
+               "issued_at_perf_counter_s": 50., "expires_at_perf_counter_s": 120.,
+               "transition_seconds": 8., "targets": {"arm_left_gripper.pos": 4.}}
+    assert source.submit(command)
+    source.admit(100.)
+    source.advance(100.1)
+    source.freeze()
+    before = copy.deepcopy(source.__dict__)
+    status = m.virtual_input_progress(source, window_started_at=100., window_deadline=190.,
+                                      now_monotonic=110., now_perf_counter=70.)
+    assert status["window_started_at_monotonic_s"] == 100.
+    assert status["window_deadline_monotonic_s"] == 190.
+    assert status["window_remaining_s"] == 80. and status["window_elapsed_s"] == 10.
+    assert status["intent_remaining_s"] == 50.
+    assert status["intent_expires_at_perf_counter_s"] == 120.
+    assert status["current_accepted_intent_seq"] == 1
+    assert status["ramp_progress_active_s"] == pytest.approx(.1)
+    assert status["ramp_remaining_active_s"] == pytest.approx(7.9)
+    assert status["input_state"] == "current" and status["phase"] == "intent-1-move"
+    clock[0] = 150.
+    expired = m.virtual_input_progress(source, window_started_at=100., window_deadline=190.,
+                                      now_monotonic=195., now_perf_counter=150.)
+    assert expired["window_remaining_s"] == expired["intent_remaining_s"] == 0.
+    assert expired["input_state"] == "expired"
+    assert expired["ramp_progress_active_s"] == status["ramp_progress_active_s"]
+    assert source.__dict__ == before
+    clock[0] = 155.
+    assert source.submit({"seq": 2, "op": "return", "intent_channel": source.intent_channel,
+                          "issued_at_perf_counter_s": 155., "expires_at_perf_counter_s": 225.,
+                          "transition_seconds": 8.})
+    later = m.virtual_input_progress(source, window_started_at=100., window_deadline=190.,
+                                    now_monotonic=196., now_perf_counter=156.)
+    assert later["current_accepted_intent_seq"] == 2 and later["intent_remaining_s"] == 69.
+    assert later["window_deadline_monotonic_s"] == 190. and later["window_remaining_s"] == 0.
+
+
+def test_virtual_input_progress_waiting_and_finish_do_not_change_control():
+    from examples.alohamini.am1_teleop_workload import VirtualIntentWorkload
+
+    m = adapter()
+    native = workspace()
+    source = VirtualIntentWorkload(native, command_reference=native["reference"], clock=lambda: 10.)
+    status = m.virtual_input_progress(source, window_started_at=20., window_deadline=110.,
+                                      now_monotonic=20., now_perf_counter=10.)
+    assert status["input_state"] == "waiting" and status["current_accepted_intent_seq"] is None
+    assert status["intent_remaining_s"] is None and status["ramp_remaining_active_s"] == 0.
+    assert source.submit({"seq": 1, "op": "finish", "intent_channel": source.intent_channel,
+                          "issued_at_perf_counter_s": 10., "expires_at_perf_counter_s": 11.})
+    status = m.virtual_input_progress(source, window_started_at=20., window_deadline=110.,
+                                      now_monotonic=21., now_perf_counter=10.5)
+    assert status["input_state"] == "finished" and status["current_accepted_intent_seq"] == 1
+    assert source.complete
+    source.invalidate()
+    status = m.virtual_input_progress(source, window_started_at=20., window_deadline=110.,
+                                      now_monotonic=22., now_perf_counter=12.)
+    assert status["current_accepted_intent_seq"] is None and status["window_deadline_monotonic_s"] == 110.
