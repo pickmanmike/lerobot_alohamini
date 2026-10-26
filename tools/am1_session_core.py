@@ -45,7 +45,7 @@ TERMINAL = {"stopped", "completed", "faulted", "interrupted"}
 _input_diagnostic_clock = time.monotonic
 _INPUT_DIAGNOSTIC_MARKS = (
     "gateway_received", "gateway_dispatch", "gateway_ipc_started", "core_entered",
-    "core_locked", "core_tick_completed", "core_returned", "gateway_ipc_completed",
+    "core_locked", "core_checkpoint_started", "core_tick_completed", "core_returned", "gateway_ipc_completed",
     "reply_ready", "reply_send_preparation_started",
 )
 
@@ -2211,6 +2211,8 @@ class SessionAuthority:
                     # Lease/grant expiry still runs, but operator intent precedes motion admission.
                     self._expire_controls(self.clock())
                     self.last_tick = self.clock()
+                elif marks is not None:
+                    self.tick(_diagnostic_marks=marks)
                 else:
                     self.tick()
                 if marks is not None:
@@ -2945,7 +2947,7 @@ class SessionAuthority:
             return True
         return False
 
-    def tick(self):
+    def tick(self, *, _diagnostic_marks=None):
         with self.mutex:
             if self.closed:
                 return
@@ -3126,6 +3128,8 @@ class SessionAuthority:
                     self._finish("completed")
                     return
             if r["status"] != previous_status or now - self.last_checkpoint >= 1.0:
+                if _diagnostic_marks is not None:
+                    _diagnostic_marks["core_checkpoint_started"] = _input_diagnostic_monotonic()
                 self._save()
                 self.last_checkpoint = now
 
