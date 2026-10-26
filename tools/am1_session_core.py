@@ -46,6 +46,7 @@ _input_diagnostic_clock = time.monotonic
 _INPUT_DIAGNOSTIC_MARKS = (
     "gateway_received", "gateway_dispatch", "gateway_ipc_started", "core_entered",
     "core_locked", "core_tick_completed", "core_returned", "gateway_ipc_completed",
+    "reply_ready", "reply_send_preparation_started",
 )
 
 
@@ -58,7 +59,7 @@ def _input_diagnostic_monotonic():
 
 
 def _input_diagnostic_result(result, marks):
-    """A closed, bounded observation on an existing input result, never authority."""
+    """A closed, bounded observation on an existing input/grant result, never authority."""
     try:
         previous = result.get("diagnostic_timing", {})
         if previous and (type(previous) is not dict or type(previous.get("version")) is not int
@@ -75,7 +76,10 @@ def _input_diagnostic_result(result, marks):
         ordered = [merged[key] for key in _INPUT_DIAGNOSTIC_MARKS if key in merged]
         if ordered != sorted(ordered):
             raise ValueError("unordered diagnostic marks")
-        return dict(result, diagnostic_timing={"version": 1, "clock": "pi-monotonic", **merged})
+        timing = {"version": 1, "clock": "pi-monotonic", **merged}
+        if len(json.dumps(timing).encode("utf-8")) > 512:
+            raise ValueError("diagnostic metadata exceeds bound")
+        return dict(result, diagnostic_timing=timing)
     except Exception:
         return {key: value for key, value in result.items() if key != "diagnostic_timing"} if isinstance(result, dict) else result
 
@@ -2167,7 +2171,7 @@ class SessionAuthority:
             return None
 
     def handle(self, command, device_id):
-        marks = {"core_entered": _input_diagnostic_monotonic()} if isinstance(command, dict) and command.get("op") == "input" else None
+        marks = {"core_entered": _input_diagnostic_monotonic()} if isinstance(command, dict) and command.get("op") in {"input", "grant"} else None
         with self.mutex:
             if marks is not None:
                 marks["core_locked"] = _input_diagnostic_monotonic()

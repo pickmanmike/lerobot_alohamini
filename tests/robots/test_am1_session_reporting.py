@@ -1087,3 +1087,140 @@ def test_live_gateway_real_owner_adapter_preserves_original_expiry_and_reacquire
                 e.worker.join(2)
 
     asyncio.run(scenario())
+
+
+
+def test_grant_reply_diagnostic_measures_existing_writer_queue_and_preserves_input(monkeypatch):
+    from tools import am1_session_service as service
+
+    async def scenario():
+        clock = [10.]
+        entered, release, delivered = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        sent = []
+        class Socket:
+            async def send_str(self, data):
+                value = json.loads(data)
+                if value.get("id") == "backlog":
+                    entered.set()
+                    await release.wait()
+                sent.append(value)
+                if len(sent) == 3:
+                    delivered.set()
+        monkeypatch.setattr(service, "_input_diagnostic_monotonic", lambda: clock[0])
+        peer = service.Peer(Socket(), "owner", "private-test-token")
+        input_span = {"version": 1, "clock": "pi-monotonic", **dict(zip(
+            ("gateway_received", "gateway_dispatch", "gateway_ipc_started", "core_entered", "core_locked",
+             "core_tick_completed", "core_returned", "gateway_ipc_completed"), range(1, 9)))}
+        grant = {"kind": "result", "id": "grant-request", "accepted": True, "status": "granted",
+                 "grant_id": str(uuid.uuid4()), "issued": 9., "expires": 9.25,
+                 "diagnostic_timing": dict(input_span, reply_ready=10.)}
+        unchanged_input = {"kind": "result", "id": "input-request", "accepted": True, "status": "input",
+                           "effect_admitted": True, "diagnostic_timing": input_span}
+        try:
+            peer.put({"id": "backlog"})
+            await asyncio.wait_for(entered.wait(), .5)
+            assert peer.put(grant, grant_reply=True)
+            assert peer.put(unchanged_input)
+            assert peer.bytes + peer.inflight <= 65536
+            clock[0] = 50.
+            release.set()
+            await asyncio.wait_for(delivered.wait(), .5)
+            assert [value["id"] for value in sent] == ["backlog", "grant-request", "input-request"]
+            marked = sent[1]
+            assert marked["diagnostic_timing"]["reply_send_preparation_started"] == 50.
+            assert marked["diagnostic_timing"]["reply_ready"] == 10.
+            assert {key: value for key, value in marked.items() if key != "diagnostic_timing"} == {
+                key: value for key, value in grant.items() if key != "diagnostic_timing"}
+            assert len(ipc.encode(marked["diagnostic_timing"])) <= 512
+            assert len(ipc.encode(marked)) <= 1024
+            assert sent[2] == unchanged_input and "reply_ready" not in sent[2]["diagnostic_timing"]
+            assert "reply_send_preparation_started" not in grant["diagnostic_timing"], "queued authority is immutable"
+            assert peer.bytes == peer.inflight == 0
+        finally:
+            await peer.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure", [None, float("nan"), "raise"])
+def test_grant_writer_diagnostic_failure_preserves_original_outcome(monkeypatch, failure):
+    from tools import am1_session_service as service
+
+    async def scenario():
+        sent, delivered = [], asyncio.Event()
+        class Socket:
+            async def send_str(self, data):
+                sent.append(json.loads(data)); delivered.set()
+        def clock():
+            if failure == "raise":
+                raise RuntimeError("diagnostic clock unavailable")
+            return failure
+        monkeypatch.setattr(service, "_input_diagnostic_monotonic", clock)
+        peer = service.Peer(Socket(), "owner", "private-test-token")
+        refused = {"kind": "result", "id": "grant-request", "accepted": False, "status": "refused",
+                   "reason": "original refusal", "effect_admitted": False}
+        try:
+            assert peer.put(refused, grant_reply=True)
+            await asyncio.wait_for(delivered.wait(), .5)
+            assert sent == [refused]
+        finally:
+            await peer.close()
+    asyncio.run(scenario())
+
+
+
+def test_grant_queue_reservation_counts_snapshots_inflight_and_overflow(monkeypatch):
+    from tools import am1_session_service as service
+
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+        closed, actual_sizes = [], []
+        peer = None
+        class Socket:
+            _writer = SimpleNamespace(transport=object())
+            async def send_str(self, data):
+                actual_sizes.append((len(data.encode()), peer.inflight, peer.bytes))
+                entered.set()
+                await release.wait()
+        async def close(*args):
+            closed.append(args[-1])
+        monkeypatch.setattr(service, "close_socket", close)
+        monkeypatch.setattr(service, "_input_diagnostic_monotonic", lambda: 10.)
+        peer = service.Peer(Socket(), "owner", "private-test-token")
+        grant = {"kind": "result", "id": "g", "accepted": False, "status": "refused",
+                 "reason": "original refusal", "effect_admitted": False}
+        try:
+            assert peer.put(grant, grant_reply=True)
+            await asyncio.wait_for(entered.wait(), .5)
+            assert actual_sizes[0][0] <= actual_sizes[0][1] == len(ipc.encode(grant)) + 80
+            assert peer.put({"snapshot": "old"}, True)
+            assert peer.put(grant, grant_reply=True)
+            assert peer.put({"snapshot": "new"}, True)
+            assert peer.bytes == len(ipc.encode(grant)) + 80 + len(ipc.encode({"snapshot": "new"}))
+            assert len(peer.queue) == 2, "snapshot replacement preserves queued Grant and its reservation"
+            assert peer.bytes + peer.inflight <= 65536
+            room = 65536 - peer.bytes - peer.inflight
+            padding = {"x": "a" * (room - len(ipc.encode({"x": ""})))}
+            assert peer.put(padding) and peer.bytes + peer.inflight == 65536
+            assert not peer.put(grant, grant_reply=True) and peer.closed
+            await asyncio.sleep(0)
+            assert closed == [1013] and peer.bytes + peer.inflight == 65536
+        finally:
+            release.set()
+            await peer.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("marks", [
+    {"reply_send_preparation_started": True},
+    {"reply_send_preparation_started": float("nan")},
+    {"reply_ready": 10., "reply_send_preparation_started": 9.},
+    {"reply_ready": 1., "target": 2.},
+    {name: 10 ** 200 for name in (
+        "gateway_received", "gateway_dispatch", "gateway_ipc_started", "core_entered", "core_locked",
+        "core_tick_completed", "core_returned", "gateway_ipc_completed", "reply_ready", "reply_send_preparation_started")},
+])
+def test_grant_diagnostic_metadata_is_closed_ordered_and_bounded(marks):
+    from tools.am1_session_core import _input_diagnostic_result
+
+    original = {"accepted": False, "status": "refused", "effect_admitted": False, "reason": "original cause"}
+    assert _input_diagnostic_result(original, marks) == original

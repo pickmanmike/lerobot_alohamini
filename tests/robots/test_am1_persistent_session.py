@@ -1800,7 +1800,7 @@ def test_input_diagnostic_core_marks_are_separate_from_authority_clock(tmp_path,
         run = start(a, "fake-interactive")
         base = interactive_controls(a, run)
         grant = a.handle(command("grant", **base), "owner")
-        assert "diagnostic_timing" not in grant
+        assert set(grant) - {"diagnostic_timing"} == {"accepted", "status", "grant_id", "issued", "expires"}
         if expired:
             c.advance(.251)
         stamps = iter((100., 100.01, 100.03, 100.04))
@@ -1903,5 +1903,55 @@ def test_input_diagnostic_failure_preserves_original_executor_exception(tmp_path
         with pytest.raises(RuntimeError) as raised:
             a.handle(command("input", **base, grant_id=grant["grant_id"], seq=1, target=[.2]), "owner")
         assert raised.value is original
+    finally:
+        a.close()
+
+@pytest.mark.parametrize("refused", [False, True])
+def test_grant_diagnostic_core_marks_preserve_authority_and_original_ttl(tmp_path, monkeypatch, refused):
+    from tools import am1_session_core as core
+
+    c = Clock()
+    a = SessionAuthority(tmp_path, clock=c)
+    try:
+        run = start(a, "fake-interactive")
+        base = interactive_controls(a, run)
+        original_run = a.run["run_id"], a.run["deadline"], a.run["intent_revision"]
+        stamps = iter((100., 100.01, 100.03, 100.04))
+        monkeypatch.setattr(core, "_input_diagnostic_clock", lambda: next(stamps))
+        result = a.handle(command("grant", **dict(base, connection_generation=str(uuid.uuid4()))) if refused
+                          else command("grant", **base), "owner")
+        assert result["accepted"] is (not refused)
+        assert result["diagnostic_timing"] == {
+            "version": 1, "clock": "pi-monotonic", "core_entered": 100., "core_locked": 100.01,
+            "core_tick_completed": 100.03, "core_returned": 100.04}
+        authority = {key: value for key, value in result.items() if key != "diagnostic_timing"}
+        if refused:
+            assert authority["effect_admitted"] is False and a.grant is None
+        else:
+            assert authority == {"accepted": True, "status": "granted", "grant_id": a.grant["id"],
+                                 "issued": 0., "expires": .25}
+        assert c.now == 0. and (a.run["run_id"], a.run["deadline"], a.run["intent_revision"]) == original_run
+    finally:
+        a.close()
+
+
+@pytest.mark.parametrize("failure", [None, float("nan"), True, "raise"])
+def test_grant_diagnostic_failure_never_changes_authority(tmp_path, monkeypatch, failure):
+    from tools import am1_session_core as core
+
+    c = Clock()
+    a = SessionAuthority(tmp_path, clock=c)
+    try:
+        run = start(a, "fake-interactive")
+        base = interactive_controls(a, run)
+        def failed_clock():
+            if failure == "raise":
+                raise RuntimeError("diagnostic clock unavailable")
+            return failure
+        monkeypatch.setattr(core, "_input_diagnostic_clock", failed_clock)
+        result = a.handle(command("grant", **base), "owner")
+        assert result == {"accepted": True, "status": "granted", "grant_id": a.grant["id"],
+                          "issued": 0., "expires": .25}
+        assert c.now == 0.
     finally:
         a.close()
