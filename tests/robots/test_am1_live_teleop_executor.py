@@ -2361,11 +2361,23 @@ def test_due_periodic_checkpoint_still_saves_refused_input_without_admitting_or_
     monkeypatch.setattr(case.a, "_save", checkpoint)
     result = case.a.handle(candidate, "authorized-test-device")
     assert result["accepted"] is False and result["effect_admitted"] is False
-    assert len(snapshots) == 1 and snapshots[0] == case.original
-    assert case.e._live_target == case.original
+    if fault == "expired-during-evidence":
+        # Expiry while tick consumed evidence is now observed before admission.
+        # Its required HOLD commit is not a deferred periodic checkpoint.
+        assert snapshots == [None, None]
+        assert case.e._live_target is case.a.grant is case.a.applied_input is None
+        assert case.a.run["status"] == "paused" and case.a.run["intent"] is None
+        assert case.e.desired == "hold" and case.a.run["first_cause"] is None
+        assert any(row["kind"] == "input_expired" for row in case.a.events)
+        assert "core_checkpoint_started" in result["diagnostic_timing"]
+        assert "core_deferred_checkpoint_started" not in result["diagnostic_timing"]
+        assert case.grant["expires"] == 10.35
+    else:
+        assert len(snapshots) == 1 and snapshots[0] == case.original
+        assert case.e._live_target == case.original
+        assert "core_deferred_checkpoint_started" in result["diagnostic_timing"]
+        assert "core_checkpoint_started" not in result["diagnostic_timing"]
     assert case.a.connection["seq"] == 1 and case.a.run["input_source"] == case.original["source"]
-    assert "core_deferred_checkpoint_started" in result["diagnostic_timing"]
-    assert "core_checkpoint_started" not in result["diagnostic_timing"]
     assert case.a.last_checkpoint == 10.118935829
 
 
@@ -2737,3 +2749,154 @@ def test_active_wal_uncertain_reopen_defers_before_restart_commit_and_existing_r
         assert replacement.worker is None and replacement._live_target is None
     finally:
         restored.close()
+
+
+@pytest.mark.parametrize("latest", ["fresh", "stale", "future", "invalid", "hard_fault"])
+def test_thermal_core_advance_consumes_latest_owned_held_cache_not_aged_local_copy(tmp_path, monkeypatch, latest):
+    # c4-like initial native HOLD, no admitted input: this isolates RAW evidence
+    # age from the independent250ms motion expiry and never invents an active ACK.
+    a, e, _ = authority_lane(tmp_path)
+    now = [10.]
+    a.clock = e.clock = lambda: now[0]
+    a.run.update(status="paused", recovery_episodes=0, resume_ceiling=18.)
+    e._execution = dict(progress_s=0., complete=False, fault=None)
+    e._epoch, e._epoch_mode, e.desired = 0, "pause", "hold"
+    e._aligned.extend([9.7, 9.8, 10.])
+    e.sample["ack"].update(state="paused", epoch=0)
+    e.sample["ack"]["live_input"].update(state="held", reference=e.sample["ack"]["live_input"]["workspace"]["reference"])
+    proof = dict(version=1, raw_sample_at_monotonic_s=9.99, peaks_ready=True,
+                 deficit_started_at_monotonic_s=None, deficit_ceiling_monotonic_s=None,
+                 hold_sample_at_monotonic_s=None, zero_read_started_at_monotonic_s=None,
+                 zero_read_completed_at_monotonic_s=None)
+    e.sample["ack"]["thermal_history"] = copy.deepcopy(proof)
+    original_advance, advances = e.advance, []
+    def delayed_advance(at, dt):
+        advances.append((at, dt))
+        now[0] = 10.6
+        # Explicit new SAME-owner receipt in the actual executor cache, with its
+        # own acquisition/RAW times. The old Core dictionary remains unchanged.
+        with e.mutex:
+            e.sample["at"], e.sample["sequence"] = now[0], 2
+            raw = now[0] - .01
+            if latest == "stale": raw = now[0] - .501
+            elif latest == "future": raw = now[0] + .001
+            elif latest == "invalid": raw = float("nan")
+            e.sample["ack"]["thermal_history"] = dict(proof, raw_sample_at_monotonic_s=raw)
+            if latest == "hard_fault": e._fault = "retained native hardware fault"
+        return original_advance(at, dt)
+    monkeypatch.setattr(e, "advance", delayed_advance)
+    try:
+        initial = e.evidence()
+        assert initial["feedback"] and initial["native_ack"] and initial["hold_acknowledged"]
+        assert initial["thermal_history"] == proof
+        a.tick()
+        current = e.evidence()
+        assert advances == [(10., 0.)]
+        assert initial["thermal_history"] == proof, "never retimestamp the original copied proof"
+        assert a.run["deadline"] == 309. and a.applied_input is a.grant is None
+        assert e._live_target is None and e.desired == "hold"
+        if latest == "fresh":
+            assert current["feedback"] and current["native_ack"] and current["hold_acknowledged"]
+            assert current["thermal_history"]["raw_sample_at_monotonic_s"] == 10.59
+            assert a.run["status"] == "paused" and a.run["first_cause"] is None
+        else:
+            assert a.run["requested_terminal"] == "faulted"
+            assert a.run["first_cause"] == ("retained native hardware fault" if latest == "hard_fault"
+                                             else "native thermal original RAW feedback expired/invalid")
+    finally:
+        a.run = None
+        a.close()
+
+
+@pytest.mark.parametrize("invalid", ["stale", "future", "nan", "hardware"])
+def test_thermal_core_initial_invalid_proof_is_not_discarded_for_a_newer_cache(tmp_path, monkeypatch, invalid):
+    a, e, _ = authority_lane(tmp_path)
+    now = [10.]
+    a.clock = e.clock = lambda: now[0]
+    a.run.update(status="paused", recovery_episodes=0)
+    raw = {"stale": 9.499, "future": 10.001, "nan": float("nan"), "hardware": 9.99}[invalid]
+    e.sample["ack"]["thermal_history"] = dict(version=1, raw_sample_at_monotonic_s=raw, peaks_ready=True,
+        deficit_started_at_monotonic_s=None, deficit_ceiling_monotonic_s=None, hold_sample_at_monotonic_s=None,
+        zero_read_started_at_monotonic_s=None, zero_read_completed_at_monotonic_s=None)
+    if invalid == "hardware": e._fault = "initial native hardware fault"
+    advances = []
+    def would_replace(at, dt):
+        advances.append(True)
+        e.sample["ack"]["thermal_history"]["raw_sample_at_monotonic_s"] = 9.99
+        e._fault = None
+        return dict(progress_s=0., complete=False, fault=None)
+    monkeypatch.setattr(e, "advance", would_replace)
+    try:
+        a.tick()
+        assert advances == [], "a genuine initial invalid proof/fault must win before cache replacement"
+        assert a.run["requested_terminal"] == "faulted"
+        assert a.run["first_cause"] == ("initial native hardware fault" if invalid == "hardware"
+                                         else "native thermal original RAW feedback expired/invalid")
+        assert a.run["deadline"] == 309. and e._live_target is None
+    finally:
+        a.run = None
+        a.close()
+
+
+@pytest.mark.parametrize("expired", ["lease", "deadline"])
+def test_thermal_core_postadvance_clock_keeps_original_expiry_guards(tmp_path, monkeypatch, expired):
+    a, e, _ = authority_lane(tmp_path)
+    now = [10.]
+    a.clock = e.clock = lambda: now[0]
+    a.run.update(status="paused", recovery_episodes=0)
+    a.run["deadline"] = 10.5 if expired == "deadline" else 309.
+    original_deadline = a.run["deadline"]
+    e._execution = dict(progress_s=0., complete=False, fault=None)
+    e._epoch, e._epoch_mode, e.desired = 0, "pause", "hold"
+    e.sample["ack"].update(state="paused", epoch=0)
+    e.sample["ack"]["live_input"].update(state="held", reference=e.sample["ack"]["live_input"]["workspace"]["reference"])
+    proof = dict(version=1, raw_sample_at_monotonic_s=9.99, peaks_ready=True,
+        deficit_started_at_monotonic_s=None, deficit_ceiling_monotonic_s=None, hold_sample_at_monotonic_s=None,
+        zero_read_started_at_monotonic_s=None, zero_read_completed_at_monotonic_s=None)
+    e.sample["ack"]["thermal_history"] = proof
+    advance = e.advance
+    def delayed(at, dt):
+        now[0] = 12. if expired == "lease" else 10.6
+        e.sample["at"] = now[0]
+        e.sample["ack"]["thermal_history"] = dict(proof, raw_sample_at_monotonic_s=now[0]-.01)
+        return advance(at, dt)
+    monkeypatch.setattr(e, "advance", delayed)
+    try:
+        a.tick()
+        assert a.run["deadline"] == original_deadline
+        assert a.grant is a.applied_input is e._live_target is None
+        assert e.desired == "hold"
+        if expired == "lease":
+            assert a.controller is a.connection is None
+            assert a.run["status"] == "paused" and a.run["first_cause"] is None
+            assert any(row["kind"] == "presence_expired" for row in a.events)
+        else:
+            assert a.run["requested_terminal"] == "stopped" and a.run["first_cause"] == "live_deadline"
+    finally:
+        a.run = None
+        a.close()
+
+
+def test_thermal_core_postadvance_fresh_native_expired_hold_never_revives_old_input(periodic_input_order_lane, monkeypatch):
+    case = periodic_input_order_lane
+    a, e = case.a, case.e
+    original_deadline, original_expiry = a.run["deadline"], a.applied_input["expires"]
+    advance = e.advance
+    def delayed(at, dt):
+        case.now[0] += .6
+        case.step()  # Existing real native control detects the original250ms expiry.
+        assert case.control.live_snapshot()["state"] == "expired"
+        with e.mutex:
+            e.sample["ack"]["thermal_history"] = dict(version=1, raw_sample_at_monotonic_s=case.now[0]-.01,
+                peaks_ready=True, deficit_started_at_monotonic_s=None, deficit_ceiling_monotonic_s=None,
+                hold_sample_at_monotonic_s=None, zero_read_started_at_monotonic_s=None,
+                zero_read_completed_at_monotonic_s=None)
+        return advance(at, dt)
+    monkeypatch.setattr(e, "advance", delayed)
+    a.tick()
+    assert case.now[0] > original_expiry
+    assert a.run["deadline"] == original_deadline and a.run["first_cause"] is None
+    assert a.run["status"] == "paused" and a.run["intent"] is None
+    assert a.grant is a.applied_input is e._live_target is None and e.desired == "hold"
+    assert case.control.live_snapshot()["last_input_seq"] == case.original["seq"]
+    assert any(row["kind"] == "input_expired" for row in a.events)

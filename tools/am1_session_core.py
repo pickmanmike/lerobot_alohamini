@@ -3008,6 +3008,7 @@ class SessionAuthority:
             if self.closed:
                 return
             now = self.clock()
+            checkpoint_at = now  # Preserve the existing periodic tick-entry cadence.
             dt = max(0.0, min(0.1, now - self.last_tick))
             self.last_tick = now
             self._expire_controls(now)
@@ -3018,6 +3019,9 @@ class SessionAuthority:
             e = self._evidence()
             self._retain_live_write_history(e, clear_current=r["status"] == "finishing")
             if self._physical_interactive():
+                if r["status"] != "finishing" and e["fault"]:
+                    self._finish("faulted", str(e["fault"]))
+                    return
                 try:
                     execution = self.executor.advance(now, dt)
                 except (OSError, RuntimeError, ValueError) as exc:
@@ -3025,6 +3029,12 @@ class SessionAuthority:
                     return
                 r["execution"] = execution
                 r["progress_s"] = execution["progress_s"]
+                # Retention/advance may outlast a copied proof. Recheck expiry,
+                # then consume one current cache snapshot with its ORIGINAL clocks.
+                now = self.clock()
+                self._expire_controls(now)
+                e = self._evidence()
+                now = self.clock()
             if self.asynchronous and r["status"] == "finishing":
                 self._physical_lifecycle(e, now)
                 return
@@ -3183,13 +3193,13 @@ class SessionAuthority:
                 if execution["complete"]:
                     self._finish("completed")
                     return
-            if r["status"] != previous_status or now - self.last_checkpoint >= 1.0:
+            if r["status"] != previous_status or checkpoint_at - self.last_checkpoint >= 1.0:
                 if _defer_periodic_checkpoint and previous_status == r["status"] == "running":
-                    return now
+                    return checkpoint_at
                 if _diagnostic_marks is not None:
                     _diagnostic_marks["core_checkpoint_started"] = _input_diagnostic_monotonic()
                 self._save()
-                self.last_checkpoint = now
+                self.last_checkpoint = checkpoint_at
 
     def snapshot(self):
         with self.mutex:
