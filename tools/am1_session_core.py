@@ -41,6 +41,45 @@ from tools.am1_fake_executor import FakeExecutor
 
 TERMINAL = {"stopped", "completed", "faulted", "interrupted"}
 
+# Diagnostic clocks never qualify control and never consume the authority clock.
+_input_diagnostic_clock = time.monotonic
+_INPUT_DIAGNOSTIC_MARKS = (
+    "gateway_received", "gateway_dispatch", "gateway_ipc_started", "core_entered",
+    "core_locked", "core_tick_completed", "core_returned", "gateway_ipc_completed",
+)
+
+
+def _input_diagnostic_monotonic():
+    try:
+        value = _input_diagnostic_clock()
+        return value if type(value) in (int, float) and math.isfinite(value) and value >= 0 else None
+    except Exception:
+        return None
+
+
+def _input_diagnostic_result(result, marks):
+    """A closed, bounded observation on an existing input result, never authority."""
+    try:
+        previous = result.get("diagnostic_timing", {})
+        if previous and (type(previous) is not dict or type(previous.get("version")) is not int
+                or previous["version"] != 1 or previous.get("clock") != "pi-monotonic"):
+            raise ValueError("invalid diagnostic metadata")
+        merged = {key: value for key, value in previous.items() if key not in ("version", "clock")}
+        if set(merged) & set(marks):
+            raise ValueError("duplicate diagnostic mark")
+        merged.update(marks)
+        if not merged or set(merged) - set(_INPUT_DIAGNOSTIC_MARKS) or any(
+            type(value) not in (int, float) or not math.isfinite(value) or value < 0 for value in merged.values()
+        ):
+            raise ValueError("invalid diagnostic mark")
+        ordered = [merged[key] for key in _INPUT_DIAGNOSTIC_MARKS if key in merged]
+        if ordered != sorted(ordered):
+            raise ValueError("unordered diagnostic marks")
+        return dict(result, diagnostic_timing={"version": 1, "clock": "pi-monotonic", **merged})
+    except Exception:
+        return {key: value for key, value in result.items() if key != "diagnostic_timing"} if isinstance(result, dict) else result
+
+
 # An ordinary named choice reuses the existing signed finite descriptor. It does
 # not extend the separately pinned positive endpoint-dwell exception.
 LEFT_ELBOW_NEGATIVE_COARSE_BENCH_V2 = SelectedElbowExperiment.from_payload(
@@ -2128,7 +2167,10 @@ class SessionAuthority:
             return None
 
     def handle(self, command, device_id):
+        marks = {"core_entered": _input_diagnostic_monotonic()} if isinstance(command, dict) and command.get("op") == "input" else None
         with self.mutex:
+            if marks is not None:
+                marks["core_locked"] = _input_diagnostic_monotonic()
             if self.closed:
                 return self._refuse("closed")
             if not isinstance(command, dict) or not isinstance(device_id, str) or not device_id:
@@ -2167,12 +2209,17 @@ class SessionAuthority:
                     self.last_tick = self.clock()
                 else:
                     self.tick()
+                if marks is not None:
+                    marks["core_tick_completed"] = _input_diagnostic_monotonic()
                 result = self._handle(command, device_id)
                 if protective:
                     self.tick()
                 if oid:
                     self.db.execute("UPDATE mutations SET result=? WHERE id=?", (json.dumps(result), oid))
                     self.db.commit()
+                if marks is not None:
+                    marks["core_returned"] = _input_diagnostic_monotonic()
+                    result = _input_diagnostic_result(result, marks)
                 return result
             except (ValueError, TypeError, KeyError, OverflowError):
                 return self._refuse("malformed command")

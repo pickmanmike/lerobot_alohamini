@@ -1041,8 +1041,15 @@ def test_live_gateway_real_owner_adapter_preserves_original_expiry_and_reacquire
                          target={"arm_left_elbow_flex.pos": -0.5})
             reply = await gateway.dispatch(frame, device, peer)
             assert reply["accepted"] and reply["effect_admitted"]
-            assert set(reply) == {"accepted", "status", "effect_admitted"}
-            assert len(ipc.encode(reply)) < 256
+            assert {key: value for key, value in reply.items() if key != "diagnostic_timing"} == {
+                "accepted": True, "status": "input", "effect_admitted": True}
+            assert set(reply["diagnostic_timing"]) == {"version", "clock", "gateway_dispatch",
+                "gateway_ipc_started", "core_entered", "core_locked", "core_tick_completed",
+                "core_returned", "gateway_ipc_completed"}
+            assert reply["diagnostic_timing"]["version"] == 1
+            assert reply["diagnostic_timing"]["clock"] == "pi-monotonic"
+            assert len(ipc.encode(reply["diagnostic_timing"])) <= 512
+            assert len(ipc.encode(reply)) <= 1024
             await asyncio.sleep(0.06)
             renewal = await gateway.dispatch(dict(base, op="grant"), device, peer)
             assert renewal["accepted"]

@@ -1002,6 +1002,12 @@ def test_pending_input_is_coalesced_instead_of_replayed(cluster):
                 if value.get("kind") == "result":
                     results[value["id"]] = value
             assert results["2"]["status"] == "superseded" and not results["2"]["effect_admitted"]
+            skipped = results["2"]["diagnostic_timing"]
+            assert set(skipped) == {"version", "clock", "gateway_received"}
+            assert skipped["version"] == 1 and skipped["clock"] == "pi-monotonic"
+            for key in ("1", "3"):
+                assert len(results[key]["diagnostic_timing"]) == 10
+                assert len(json.dumps(results[key])) <= 1024
             assert not results["3"][
                 "accepted"
             ]  # Original grant expires while the first real reply is delayed.
@@ -1134,3 +1140,160 @@ def test_private_state_refuses_nonempty_unrelated_directory(tmp_path):
     with pytest.raises(ValueError):
         private_directory(unrelated)
     assert preserved.read_text() == "unrelated state"
+
+
+def test_wss_input_diagnostic_span_survives_real_ipc_and_tls(cluster, monkeypatch):
+    async def scenario():
+        a = await enrolled(cluster)
+        ws = None
+        try:
+            claim = (await post(a, cluster, "/api/claim", {}))[1]
+            assert "diagnostic_timing" not in claim
+            assert set(claim["timing"]) == {"service_received_at", "service_completed_at"}
+            run = (await post(a, cluster, "/api/start", {
+                "operation_id": oid(), "recipe": "fake-interactive",
+                "controller_generation": claim["controller_generation"]}))[1]
+            ws, state = await ws_attached(a, cluster)
+            connected = await ws_command(ws, {"op": "connect", "run_id": run["run_id"]})
+            ids = {"run_id": run["run_id"], "service_incarnation": state["service_incarnation"],
+                   "controller_generation": claim["controller_generation"],
+                   "connection_generation": connected["connection_generation"]}
+            await ws_command(ws, {"op": "release_input", **ids})
+            await ws_command(ws, {"op": "resume", **ids, "operation_id": oid(),
+                "expected_intent_revision": (await snapshot(a, cluster))["run"]["intent_revision"]})
+            grant = await ws_command(ws, {"op": "grant", **ids})
+            assert "diagnostic_timing" not in grant
+            result = await ws_command(ws, {"op": "input", **ids, "grant_id": grant["grant_id"],
+                                          "seq": 1, "target": [.2]})
+            assert result["accepted"] and result["effect_admitted"]
+            span = result["diagnostic_timing"]
+            ordered = ("gateway_received", "gateway_dispatch", "gateway_ipc_started", "core_entered",
+                       "core_locked", "core_tick_completed", "core_returned", "gateway_ipc_completed")
+            assert set(span) == {"version", "clock", *ordered}
+            assert span["version"] == 1 and span["clock"] == "pi-monotonic"
+            assert all(type(span[key]) is float and span[key] >= 0 for key in ordered)
+            assert [span[key] for key in ordered] == sorted(span[key] for key in ordered)
+            assert len(json.dumps(span)) <= 512 and "target" not in span and "device" not in span
+            stale = await ws_command(ws, {"op": "input", **ids, "grant_id": oid(), "seq": 2, "target": [.3]})
+            assert not stale["accepted"] and stale["reason"] == "expired grant"
+            assert set(stale["diagnostic_timing"]) == set(span)
+            assert len(json.dumps(result)) <= 1024
+            # Exercise the actual PC result consumer with the real refused reply.
+            from types import SimpleNamespace
+            from tools.am1_leader_adapter import SessionClient, CommandRefusedError, expired_input_refusal
+            async def acknowledged(client, socket, ceiling):
+                return None
+            async def send(value):
+                client.pending[value["id"]].set_result(stale)
+            client = SimpleNamespace(transport_error=None, reader=None, pending={},
+                                     ws=SimpleNamespace(closed=False, send_json=send))
+            monkeypatch.setattr(SessionClient, "_wait_current_ack", acknowledged)
+            with pytest.raises(CommandRefusedError) as refused:
+                await SessionClient.command(client, {"op": "input"})
+            assert refused.value.response == stale and expired_input_refusal(refused.value)
+            assert refused.value.response["diagnostic_timing"] == stale["diagnostic_timing"]
+        finally:
+            if ws:
+                await ws.close()
+            await a.close()
+    asyncio.run(scenario())
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_input_diagnostic_gateway_failure_does_not_replace_unknown_or_cancellation(monkeypatch, cancelled):
+    from types import SimpleNamespace
+    from tools import am1_session_service as service
+    from tools import am1_session_core as core
+
+    async def scenario():
+        gateway = service.Gateway.__new__(service.Gateway)
+        gateway.auth = SimpleNamespace(resolve=lambda _: {"id": "owner", "control": True})
+        outputs = []
+        peer = SimpleNamespace(token="private-test-token", ack=True, put=outputs.append)
+        original = asyncio.CancelledError() if cancelled else TimeoutError("original owner timeout")
+        async def dispatch(*args):
+            raise original
+        gateway.dispatch = dispatch
+        monkeypatch.setattr(core, "_input_diagnostic_clock", lambda: None)
+        value = {"id": "original-request", "command": {"op": "input"}, "_diagnostic_received": None}
+        if cancelled:
+            with pytest.raises(asyncio.CancelledError) as raised:
+                await gateway.execute_peer(peer, value)
+            assert raised.value is original and outputs == []
+        else:
+            await gateway.execute_peer(peer, value)
+            assert outputs == [dict(service.unknown_outcome(), kind="result", id="original-request")]
+    asyncio.run(scenario())
+
+@pytest.mark.parametrize("client_timestamp", [False, True])
+def test_input_diagnostic_websocket_receive_precedes_auth_parse_and_rejects_client_stamp(monkeypatch, client_timestamp):
+    from types import SimpleNamespace
+    from tools import am1_session_service as service
+
+    async def scenario():
+        clock, resolved, parsed, queued = [100.], [], [], []
+        command = {"id": "original-input", "command": {"op": "input"}}
+        if client_timestamp:
+            command["received_at"] = 1.
+        text = json.dumps(command)
+        class Socket:
+            async def prepare(self, request):
+                return None
+            async def receive(self):
+                return SimpleNamespace(type=WSMsgType.TEXT, data=json.dumps({"ticket": "once"}))
+            async def messages(self):
+                yield SimpleNamespace(type=WSMsgType.TEXT, data=text)
+            def __aiter__(self):
+                return self.messages()
+        class Peer:
+            def __init__(self, socket, device, token):
+                self.device, self.token, self.connection = device, token, None
+                self.ack, self.latest_input, self.input_task = True, None, object()
+            def put(self, value, snapshot=False):
+                queued.append(value)
+            async def close(self):
+                return None
+        peer = Peer(None, "owner", "private-test-token")
+        def resolve(token):
+            resolved.append(clock[0])
+            if len(resolved) == 2:
+                clock[0] += .2  # Work after TEXT delivery, before envelope parsing.
+            return {"id": "owner", "control": True}
+        original_json = service.strict_json
+        def parse(value):
+            parsed.append(clock[0])
+            result = original_json(value)
+            if value == text:
+                clock[0] += .3
+            return result
+        async def close(*args):
+            return None
+        gateway = service.Gateway.__new__(service.Gateway)
+        gateway.pending_ws, gateway.peers, gateway.revision = 0, set(), 0
+        gateway.incarnation = "test-gateway"
+        gateway.tickets = {service.digest("once"): ("owner", 200.)}
+        gateway.auth = SimpleNamespace(resolve=resolve)
+        async def current():
+            return {}
+        gateway.current = current
+        monkeypatch.setattr(service.web, "WebSocketResponse", lambda **kwargs: Socket())
+        monkeypatch.setattr(service, "Peer", lambda *args: peer)
+        monkeypatch.setattr(service, "strict_json", parse)
+        monkeypatch.setattr(service, "close_socket", close)
+        monkeypatch.setattr(service, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+        monkeypatch.setattr(service, "_input_diagnostic_monotonic", lambda: clock[0])
+        transport = SimpleNamespace(set_write_buffer_limits=lambda **kwargs: None,
+            get_extra_info=lambda key: SimpleNamespace(setsockopt=lambda *args: None))
+        class Request(dict):
+            pass
+        request = Request(token="private-test-token", device={"id": "owner"})
+        request.transport = transport
+        await gateway.websocket(request)
+        assert len(resolved) == 2 and len(parsed) == 2 and clock[0] == 100.5
+        if client_timestamp:
+            assert peer.latest_input is None, "external envelope cannot provide a receive timestamp"
+        else:
+            assert peer.latest_input["_diagnostic_received"] == 100., "receive must precede auth/parse work"
+            assert set(peer.latest_input["command"]) == {"op"}
+            gateway.enqueue(peer, {"id": "direct-call", "command": {"op": "input"}})
+            assert peer.latest_input["_diagnostic_received"] == 100.5, "direct callers keep diagnostic-clock fallback"
+    asyncio.run(scenario())

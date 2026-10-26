@@ -41,6 +41,34 @@ from examples.alohamini.am1_live_teleop import (
 ORDINARY_ARMS_PROFILE = "ordinary-arms-left-current-rest-1051-1164"
 
 
+def virtual_input_progress(workload, *, window_started_at, window_deadline, now_monotonic, now_perf_counter):
+    """Observational clocks only; reporting cannot acquire, advance or renew input."""
+    command = workload.command
+    duration = (workload._ramp_end_elapsed_s if workload.left_entry else
+                command.get("transition_seconds", 0.) if command else 0.)
+    expiry = command["expires_at_perf_counter_s"] if command else None
+    return {
+        "event": "virtual_input_status",
+        "window_clock": "PC time.monotonic",
+        "window_started_at_monotonic_s": window_started_at,
+        "window_deadline_monotonic_s": window_deadline,
+        "window_elapsed_s": max(0., now_monotonic-window_started_at),
+        "window_remaining_s": max(0., window_deadline-now_monotonic),
+        "intent_clock": "PC time.perf_counter",
+        "current_accepted_intent_seq": command["seq"] if command else None,
+        "intent_issued_at_perf_counter_s": command["issued_at_perf_counter_s"] if command else None,
+        "intent_expires_at_perf_counter_s": expiry,
+        "intent_remaining_s": max(0., expiry-now_perf_counter) if expiry is not None else None,
+        "input_state": ("finished" if workload.complete else "waiting" if command is None else
+                        "current" if now_perf_counter < expiry else "expired"),
+        "phase": workload.phase,
+        "active_progress_s": workload.elapsed_s,
+        "ramp_progress_active_s": workload.ramp_elapsed_s,
+        "ramp_duration_active_s": duration,
+        "ramp_remaining_active_s": max(0., duration-workload.ramp_elapsed_s),
+    }
+
+
 class VirtualIntentReader:
     """One bounded latest-intent mailbox; stdin never blocks the control loop."""
 
@@ -2099,11 +2127,20 @@ class SessionClient:
                 ws = getattr(self, "ws", None)
                 stream_error = ws.exception() if ws is not None else None
                 close = dict(getattr(self, "transport_close", None) or {})
-                if (resumed.get("accepted") is True and resumed.get("status") in {"running", "resuming"}
-                    and type(stream_error) is ServerTimeoutError
+                no_pong = (type(stream_error) is ServerTimeoutError
                     and str(stream_error) == f"No PONG received after {ws._pong_heartbeat} seconds"
                     and close.get("expected") is False and close.get("reason") == "message-error"
-                    and close.get("close_code") == 1006 and close.get("reader_error") is None):
+                    and close.get("close_code") == 1006 and close.get("reader_error") is None)
+                reporting_unavailable = (str(error) == "owner reporting unavailable"
+                    and getattr(self, "transport_error", None) == "owner reporting unavailable"
+                    and not getattr(self, "_detaching", False) and stream_error is None
+                    and close.get("expected") is False and close.get("reason") == "reader-error"
+                    and close.get("close_code") is None
+                    and close.get("exception_type") is None and close.get("exception") is None
+                    and close.get("reader_error") == {
+                        "error_type": "RuntimeError", "message": "owner reporting unavailable"})
+                if (resumed.get("accepted") is True and resumed.get("status") in {"running", "resuming"}
+                    and (no_pong or reporting_unavailable)):
                     # This is the known accepted Resume's active-observation
                     # phase, never an unknown command or nonadmission receipt.
                     error.accepted_resume_context = {
@@ -4338,6 +4375,7 @@ async def run(args):
                             "seq": command["seq"], "op": command["op"], "intent_channel": intent_channel,
                             "issued_at_perf_counter_s": command["issued_at_perf_counter_s"],
                             "expires_at_perf_counter_s": command["expires_at_perf_counter_s"]})
+                    record_input_progress(force=True)
             except ValueError as error:
                 if changing_input != "interactive" or getattr(intent_reader, "read_failed", False):
                     raise
@@ -4380,6 +4418,20 @@ async def run(args):
                 return activity_ceiling
             duration = args.next_start_seconds or (args.duration_seconds if workload is None else None)
             return None if duration is None or active_at is None else active_at + duration
+
+        last_input_progress_at = active_at
+
+        def record_input_progress(*, force=False):
+            nonlocal last_input_progress_at
+            if not changing_input:
+                return
+            now = time.monotonic()
+            if force or now-last_input_progress_at >= 1.:
+                record(virtual_input_progress(workload, window_started_at=active_at,
+                    window_deadline=activity_ceiling, now_monotonic=now, now_perf_counter=workload.clock()))
+                last_input_progress_at = now
+
+        record_input_progress(force=True)
 
         async def rejoin(*, require_episode=False, refusal_identity=None, expected_pause=None, until=None, grant_error=None,
                          input_error=None):
@@ -4556,6 +4608,7 @@ async def run(args):
                 if latest.get("kind") in {"pause", "stop", "handoff", "released", "revoked"}:
                     raise RuntimeError("changing input held: explicit control intent was superseded")
                 refresh_intent()
+                record_input_progress()
                 if workload.complete or getattr(intent_reader, "eof", False):
                     workload.complete = True
                     summary.update(clean_input_end="virtual_eof" if getattr(intent_reader, "eof", False) else "virtual_finish",
@@ -4755,6 +4808,8 @@ async def run(args):
             if workload:
                 if not args.next_start_seconds:
                     workload.advance(time.monotonic())
+                if changing_input:
+                    record_input_progress()
                 if (
                     workload.complete
                     or args.next_start_seconds

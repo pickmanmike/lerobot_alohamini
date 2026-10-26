@@ -23,6 +23,7 @@ from aiohttp import WSMsgType, web
 
 from examples.alohamini.am1_live_teleop import TELEOP_RECIPE
 from examples.alohamini.am1_session_contract import LIVE_ELBOW_SPECS
+from tools.am1_session_core import _input_diagnostic_monotonic, _input_diagnostic_result
 from tools.am1_session_ipc import (
     CONTROL_LIMIT,
     IPCClient,
@@ -435,6 +436,7 @@ class Gateway:
         return value
 
     async def call(self, command, device):
+        marks = {"gateway_dispatch": _input_diagnostic_monotonic()} if command.get("op") == "input" else None
         lane = self.protective if command.get("op") in {"pause", "stop", "release"} else self.normal
         async with asyncio.timeout(1.5):
             async with lane:
@@ -445,7 +447,13 @@ class Gateway:
                         "reason": "revoked control context",
                         "effect_admitted": False,
                     }
-                return await self.ipc.request(command, device)
+                if marks is not None:
+                    marks["gateway_ipc_started"] = _input_diagnostic_monotonic()
+                result = await self.ipc.request(command, device)
+                if marks is not None:
+                    marks["gateway_ipc_completed"] = _input_diagnostic_monotonic()
+                    result = _input_diagnostic_result(result, marks)
+                return result
 
     async def current(self):
         result = await self.call({"op": "snapshot"}, "gateway-view")
@@ -631,7 +639,7 @@ class Gateway:
             raise ValueError("route supplies operation")
         return web.json_response(await self.dispatch(dict(command, op=op), request["device"]))
 
-    def enqueue(self, peer, value):
+    def enqueue(self, peer, value, *, received_at=None):
         op = value["command"].get("op")
         if not peer.ack and op not in {"pause", "stop"}:
             peer.put(
@@ -646,16 +654,17 @@ class Gateway:
             )
             return
         if op == "input":
+            value = dict(value, _diagnostic_received=(_input_diagnostic_monotonic() if received_at is None else received_at))
             if peer.latest_input:
-                peer.put(
+                peer.put(_input_diagnostic_result(
                     {
                         "kind": "result",
                         "id": peer.latest_input["id"],
                         "accepted": False,
                         "status": "superseded",
                         "effect_admitted": False,
-                    }
-                )
+                    }, {"gateway_received": peer.latest_input["_diagnostic_received"]}
+                ))
             peer.latest_input = value
             if not peer.input_task:
                 peer.input_task = asyncio.create_task(self.inputs(peer))
@@ -721,6 +730,8 @@ class Gateway:
         finally:
             if lane:
                 peer.commands[lane] -= 1
+        if value["command"].get("op") == "input" and "_diagnostic_received" in value:
+            result = _input_diagnostic_result(result, {"gateway_received": value["_diagnostic_received"]})
         peer.put(dict(result, kind="result", id=value["id"]))
 
     async def websocket(self, request):
@@ -792,7 +803,7 @@ class Gateway:
                     or not isinstance(value["command"], dict)
                 ):
                     raise ValueError("command envelope")
-                self.enqueue(peer, value)
+                self.enqueue(peer, value, received_at=now)
         except ReportingError as exc:
             with contextlib.suppress(TimeoutError, ConnectionError):
                 await asyncio.wait_for(

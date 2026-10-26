@@ -1,6 +1,6 @@
 # AM1 current state
 
-Updated 2026-10-25 for the owner’s Stage77 ordinary-operation closeout. Read [decisions and lessons](decisions-and-lessons.md) before diagnosing a known symptom; detailed commands/results remain in [Packet16](teleop-consolidation-16.md). This is an active index, not a replacement for historical evidence.
+Updated 2026-10-26 for Stage78 live-phase continuity and ordinary reuse. Read [decisions and lessons](decisions-and-lessons.md) before diagnosing a known symptom; detailed commands/results remain in [Packet16](teleop-consolidation-16.md). This is an active index, not a replacement for historical evidence.
 
 ## Objective and operating scope
 
@@ -35,20 +35,30 @@ The reviewed PC correction at bdcd61a0 shares finishing after a completed declar
 
 | Identity | Recorded state |
 | --- | --- |
-| Repository / integration | PR35 integrated at9fc82c0620756edff2e02fd1242aea05dbef01bf. [PR36](https://github.com/pickmanmike/lerobot_alohamini/pull/36) records completed implementation and useful ordinary-operation closeout; consult the PR for actual integration status. Integration is authorized only into integrate/am1-local-teleop after applicable genuine review/checks. Main/AM2 unchanged. |
+| Repository / integration | PR36 merged at5e1e412caa0311ed43a8736dcfbfe978b012e1b2. PR37 records live-phase progress, input observation, ordinary operation/reuse and the focused post-ACK reporting correction. Integration is authorized only into integrate/am1-local-teleop after applicable checks; main/AM2 unchanged. |
 | Packet18 initial source checkpoint | `2647b77c558a36f2b07f5730cf7906b4022ba868`; integration base `386d3c376c51d3431cf379af61ab99be95382ab8` after PR24 |
-| Installed motor | Stage77 `b3d4e6cd03e9d093f8249ab6c16777b1c5f7dd04`, full13 rows; one native normal-rest row changed from Stage75. |
-| Installed runtime | Stage75 runtime58 `201f45c2efb24ee8d7993c359cf72d5d5b18be74` retained, full22 rows; no runtime build or change for Stage77. |
+| Installed motor | Stage78 retains M46 b3d4e6cd03e9d093f8249ab6c16777b1c5f7dd04/full13 from Stage77; no motor rebuild. |
+| Installed runtime | Stage78 runtime59 c8e377cb89a4a41ebaecc3a83d34a1ba8149aea5/full22, changing only Core/service observational input timing over R58. Authority and expiry unchanged. |
 | Installed camera / helper-manual | `bc3442b54d9c574a8feddb0ade642c9b351e59f9` / `0fe3997f12b9cdfdd01fda6f4c6b102781252448` |
-| Installed matched manifest | Stage77 `bb29b7a74226942c9a5c9f997e0fcc43154849c7e179d0585390531fe5232825`. All ten stopped phases completed, with one preserved unpersist reader refusal and retry of that phase after supported stopped restart. One motor46 build/runtime0. Only Windows motor pin changed (config12abf2eb); other bytes and Owner/SDDL retained, calibration/enrollment unchanged. |
-| Immediate full matched predecessor | Full matched Stage75 motor139ae108/runtime201f45c2/MF6ce7a304 bundles/manifest archived before Stage77 upload; Windows originals retained before their pin change. Earlier full matched rollbacks remain. |
+| Installed matched manifest | Stage78 31770c14a530f6b364fd7ce135b7b9171d4b09913b7b6641d93538d8bffa737f. All ten stopped phases completed. Wrong wrapper-input and missing Windows-receipt refusals remain Root tool outcomes; actual unchanged config12abf2eb was verified and only remaining phases resumed. One runtime build, zero motor/camera builds. Calibration/enrollment/private bytes/ACL unchanged. |
+| Immediate full matched predecessor | Full matched Stage77 motorb3d4e6cd/runtime201f45c2/MFbb29b7a7 archived before Stage78 bundle upload; frozen D77 and earlier rollback retained. |
 | Earlier full matched predecessor | Stage46 motor `8a3a91edb5cc299899db472c8e012ded43cc8258`, runtime `d80c7d28c52448d98a78f4f8ba8b7d0dfedcfc29`, manifest `11027f16780c32b46a69d57ea1cfd0b1e7f10e4d8e4fa38d297ff7a12d565653`, same camera/helper. Full bundles/manifest, the matched thirteen-file private backup and Windows bytes/ACL were retained before Stage48 advance. Stage47's temporary validator-only child and source-restoration receipt remain separate. Older matched rollbacks remain. |
 
 The table is the current deployment summary. The existing private `.cache/am1-knowledge-reuse-18/current-work.private.md` points to the single sealed stage receipt, full matched bundles and rollback; `.cache/am1-teleop-consolidation-16/current-state-16-published.private.md` is its publication companion. [Packet16](teleop-consolidation-16.md#current-status-and-source) retains procedure and historical provenance. Keep private bytes, permissions and credentials outside Git. Verify actual service interpreter/cwd/import roots before crediting changed code as deployed; a rollback identity is not proof of a cure.
 
 ## Resume work here
 
-Implementation and useful ordinary closeout are complete on Stage77. Both fresh Starts qualified the repaired native startup with the unchanged runtime. Fresh next Start bdc4 accepted Move→Return→explicit Finish: 51.082 active seconds/757 frames under required Chest, qualified HOLD/OFF, certain cleanup and P16/Acceleration0/Lock0 restoration. Interactive input completed; producer-programme and native execution-complete remain false. No first cause, errors or transport failure was recorded.
+Continue from actual Stage78 and PR37. Continuous LOCAL orchestration uses the EXISTING interactive stdin: derive fresh targets, wait for the original qualified window and each accepted intention, then advance Move/Return/Finish by acknowledged active progress. Do not burst its latest-only mailbox. cbf completed32.235 active seconds and separate fresh ba72 reuse27.208 under normal required Chest, with certain finishing/restoration. d31 initial-view and intervening125 post-Resume reporting failures remain separate. Keep directional LEFT undertravel and fine-view limits. Restore the actually minimized enrolled viewer window for presentation; do not weaken freshness or change network/graphics settings. PR37 includes bounded Pi input observations and a software-checked narrow known-accepted-Resume reporting correction; physical results remain at d655eb7f. Use current-state/private Resume for exact source and next work. No powered repeat for publication, unchanged-component deployment, completed entry/reconciliation repeat, tuning or deferred-leader/camera question. Preserve250ms input,500ms required view, references/deadlines, ownership/cancellation and restoration. Integration authority is only integrate/am1-local-teleop.
+
+At physically exercised PC d655eb7f, cbf completed Move→Return→Finish (32.235active seconds/489frames) and ba72 separately demonstrated fresh reuse (27.208/427). Startup15.904/15.866s; CoreRunning34.344/28.635s, held4.010/2.970s including initial qualification; longest Running25.849/12.906s. Both had two input holds and no Core required-view/native-input hold. These are separate short programmes, not continuous motion or a matched full-benchmark comparison.
+
+LEFT requested4° in the decreasing coordinate direction; SDK Goals1075/1069 reached PP1097/1090 from fresh1121/1115:2.109°/2.197° achieved,1.934°/1.846° endpoint undertravel. Increasing Return reached1115/1109, each0.527° short of its ORIGINAL fresh reference. Other11 requested targets held; body/lift intent zero. Sparse SDK reads and sampled accepted-target plateaus do not establish continuous hardware Goal dwell or fine positioning.
+
+d31 failed initial required view with0frames.125 admitted42frames/2.715active seconds then failed reporting after accepted Resume. Both stopped/restored certainly and remain failed results. Restoring the minimized dedicated viewer preceded decoded Chest and accepted progress, without changing hardware, network, graphics or enrollment. cbf has coarse in-run images; ba72 has no independent screenshot claim. [Packet16](teleop-consolidation-16.md#current-closeout--live-phase-continuity-2026-10-26) retains exact clocks, source, diagnostics and practical invocation.
+
+### Historical PR36 checkpoints
+
+Completed PR36 checkpoint: implementation and useful ordinary closeout are complete on Stage77. Both fresh Starts qualified the repaired native startup with the unchanged runtime. Fresh next Start bdc4 accepted Move→Return→explicit Finish: 51.082 active seconds/757 frames under required Chest, qualified HOLD/OFF, certain cleanup and P16/Acceleration0/Lock0 restoration. Interactive input completed; producer-programme and native execution-complete remain false. No first cause, errors or transport failure was recorded.
 
 Against approximately 4° Move requests, measured shoulder/RIGHT/LEFT-elbow travel was 0.967°/0.527°/3.691°. Grippers closed 9.505/9.061 points and returned. LEFT return error remains 23 ticks/2.021°; shoulder’s physical reference3230 differs from legal command3223. Coarse in-run Chest PNGs/progress support awareness with fine occlusion. Sparse SDK reads match accepted encoded targets; faithful full-amplitude tracking is not demonstrated.
 
@@ -56,7 +66,7 @@ Aligned accepted-Start→Live was 15.971s. CoreRunning 60.051s (longest11.260s) 
 
 Both preserved six original artifacts/full SQL once. Original full audits remain refused on repeated healthy OFF/Lock evidence. A reporting-only correction passed14 focused checks/independent review; separate pure selected-settings replays pass both runs without changing original audit_ok=false. [Packet16](teleop-consolidation-16.md) retains the SDK table and detailed clocks. Consult [PR36](https://github.com/pickmanmike/lerobot_alohamini/pull/36) for actual integration status; authorized integration remains only integrate/am1-local-teleop after genuine applicable checks. No further powered repeat is required solely for publication.
 
-### Historical PR36 checkpoints
+
 
 Stage75 first ordinary Start41ad87f1 passed the repaired selected settings transaction but refused before home/Live/zero streamed frames at normal-rest qualification. LEFT shoulder measured3228 is within the existing1° startup allowance above calibration maximum3223. The trace reaches seed_for(old_goal), so the old decoded Goal was below848; its exact ID2 value was not retained. Do not transfer selected-elbow Goal0 to the shoulder. The stale command was incorrectly tested as a physical rest coordinate despite the comment saying it was merely observed.
 

@@ -2588,6 +2588,12 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                     assert entry_ceilings == [70., 70.]
                 return
             if changing_intents:
+                statuses = [row for row in records if row["event"] == "virtual_input_status"]
+                assert statuses, "ordinary input must expose its original operating window"
+                assert len({row["window_started_at_monotonic_s"] for row in statuses}) == 1
+                assert len({row["window_deadline_monotonic_s"] for row in statuses}) == 1
+                assert all(0 <= row["window_remaining_s"] <= args.duration_seconds + 1e-9 for row in statuses)
+                assert any(row["current_accepted_intent_seq"] == 1 for row in statuses)
                 frames = [row for row in records if row["event"] == "leader_frame"]
                 if failure.endswith("duration"):
                     assert len(frames) == 2 and summary["clean_input_end"] == "duration_elapsed"
@@ -3672,7 +3678,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal", "peer_start_normal", "peer_start_bench", "peer_bench_unqualified_view", "peer_bench_local_loss", "peer_normal_unqualified_view", "held_command120_view_later", "held_command120_view_never", "held_command120_local_loss", "view_refusal122_input_before", "view_refusal122_input_after", "view_refusal122_grant_before", "view_refusal122_grant_after", "view_refusal122_never", "view_refusal122_pause", "view_refusal122_stop", "view_refusal122_takeover", "view_refusal130_grant_input_race_before", "view_refusal130_grant_input_race_never", "view_refusal130_grant_input_race_pause", "view_refusal130_grant_input_race_stop", "view_refusal130_grant_input_race_takeover", "view_refusal130_grant_input_race_revision", "view_refusal130_grant_input_race_history", "view_refusal130_grant_input_race_time", "renewal_unknown133_grant_before", "renewal_unknown133_grant_pause", "renewal_unknown133_grant_takeover", "renewal_unknown133_grant_unchanged", "renewal_unknown133_grant_receipt_unknown", "renewal_unknown133_grant_second_read", "renewal_unknown133_grant_stream_before"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "resume_reporting_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal", "peer_start_normal", "peer_start_bench", "peer_bench_unqualified_view", "peer_bench_local_loss", "peer_normal_unqualified_view", "held_command120_view_later", "held_command120_view_never", "held_command120_local_loss", "view_refusal122_input_before", "view_refusal122_input_after", "view_refusal122_grant_before", "view_refusal122_grant_after", "view_refusal122_never", "view_refusal122_pause", "view_refusal122_stop", "view_refusal122_takeover", "view_refusal130_grant_input_race_before", "view_refusal130_grant_input_race_never", "view_refusal130_grant_input_race_pause", "view_refusal130_grant_input_race_stop", "view_refusal130_grant_input_race_takeover", "view_refusal130_grant_input_race_revision", "view_refusal130_grant_input_race_history", "view_refusal130_grant_input_race_time", "renewal_unknown133_grant_before", "renewal_unknown133_grant_pause", "renewal_unknown133_grant_takeover", "renewal_unknown133_grant_unchanged", "renewal_unknown133_grant_receipt_unknown", "renewal_unknown133_grant_second_read", "renewal_unknown133_grant_stream_before"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause):
     import asyncio
     import copy
@@ -5812,9 +5818,9 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 assert a.run["deadline"] == 309. and a.run["native_live_at"] == 9.
                 assert a.run["recovery_episodes"] == 0 and guard.pause_recoveries == 1
                 return
-            if cause == "resume_pong_pause":
-                # Synthetic38 transition: real accepted Resume, pending native
-                # active ACK, then installed aiohttp's actual NoPONG callback.
+            if cause in {"resume_pong_pause", "resume_reporting_pause"}:
+                # Real accepted Resume and pending native active ACK, then the
+                # existing NoPONG path or actual125's owner-unavailable message.
                 pi_clock, pending_active = [10.01], [False]
                 a.clock = e.clock = lambda: pi_clock[0]
                 a._pause_live_input("input_expired")
@@ -5846,7 +5852,12 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         pending_active[0] = False
                         await asyncio.sleep(.01)
                         assert client.ws._waiting
-                        client.ws._pong_not_received()
+                        if cause == "resume_reporting_pause":
+                            peers = [peer for peer in gateway.peers if peer.device == client.device]
+                            assert len(peers) == 1
+                            peers[0].put({"kind": "unavailable"})
+                        else:
+                            client.ws._pong_not_received()
                         await client.reader
                         closes.append(copy.deepcopy(client.transport_close))
                     try:
@@ -5867,10 +5878,17 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     assert client.snapshot["evidence"]["active_acknowledged"] is True
                     assert len(resumes) == 2 and len({c["operation_id"] for c in resumes}) == 2
                     assert len(interruptions) == 1
-                    assert closes[0]["reason"] == "message-error" and closes[0]["close_code"] == 1006
-                    assert closes[0]["exception_type"] == "ServerTimeoutError"
-                    assert closes[0]["exception"] == "No PONG received after 0.5 seconds"
-                    assert closes[0]["reader_error"] is None and closes[0]["expected"] is False
+                    if cause == "resume_reporting_pause":
+                        assert closes[0]["reason"] == "reader-error" and closes[0]["close_code"] is None
+                        assert closes[0]["exception_type"] is closes[0]["exception"] is None
+                        assert closes[0]["reader_error"] == {
+                            "error_type": "RuntimeError", "message": "owner reporting unavailable"}
+                        assert closes[0]["expected"] is False
+                    else:
+                        assert closes[0]["reason"] == "message-error" and closes[0]["close_code"] == 1006
+                        assert closes[0]["exception_type"] == "ServerTimeoutError"
+                        assert closes[0]["exception"] == "No PONG received after 0.5 seconds"
+                        assert closes[0]["reader_error"] is None and closes[0]["expected"] is False
                     assert sum(op == "input" for op, _ in commands) == 1
                     assert sum(op == "claim" for op, _ in commands) == 0
                     assert guard.episodes == 0 and guard.pause_recoveries == 2
@@ -7746,7 +7764,9 @@ def test_initial_snapshot_interruption_record_is_bounded_and_keeps_first_error(m
     "later_loss", "record", "later_record", "wrong_exception", "wrong_reason", "reader_error",
     "expected_close", "unknown_ack", "resume_loss", "attach_timeout", "nonordinary", "history",
 ])
-def test_known_resume_no_pong_requires_new_ordinary_proof_and_original_clocks(monkeypatch, change):
+def test_known_resume_no_pong_requires_new_ordinary_proof_and_original_clocks(
+    monkeypatch, change, transport="no_pong"
+):
     import asyncio
     import copy
     import json
@@ -7774,6 +7794,10 @@ def test_known_resume_no_pong_requires_new_ordinary_proof_and_original_clocks(mo
         stream_error = RuntimeError(str(stream_error))
     if change == "wrong_reason":
         stream_error = ServerTimeoutError("other server timeout")
+    if transport == "owner_reporting":
+        original = (asyncio.CancelledError() if change == "cancel"
+                    else ConnectionError("owner reporting unavailable"))
+        stream_error = RuntimeError("unrelated transport failure") if change == "wrong_exception" else None
     calls, records = [], []
 
     class Client:
@@ -7784,6 +7808,20 @@ def test_known_resume_no_pong_requires_new_ordinary_proof_and_original_clocks(mo
         transport_close = {"expected": change == "expected_close", "reason": "message-error", "close_code": 1006,
                            "exception_type": type(stream_error).__name__, "exception": str(stream_error),
                            "reader_error": {"message": "reporting failed"} if change == "reader_error" else None}
+        transport_error = "owner reporting unavailable"
+        _detaching = change == "detaching"
+        if transport == "owner_reporting":
+            transport_close = {
+                "expected": change == "expected_close",
+                "reason": "stream-ended" if change == "wrong_reason" else "reader-error",
+                "close_code": 1006 if change == "wrong_close_code" else None,
+                "exception_type": "RuntimeError" if change == "wrong_exception" else None,
+                "exception": str(stream_error) if change == "wrong_exception" else None,
+                "reader_error": ({"message": "reporting failed"} if change == "reader_error" else
+                                 {"error_type": "RuntimeError", "message": "owner reporting unavailable"}),
+            }
+            if change == "wrong_transport_error":
+                transport_error = "unrelated reporting failure"
         attaches = connects = resumes = reads = 0
         saved = None
 
@@ -7811,6 +7849,11 @@ def test_known_resume_no_pong_requires_new_ordinary_proof_and_original_clocks(mo
                     fresh["events"].append(dict(fresh["events"][-1], kind="pause", at=pi_lower + .02))
                 if change == "foreign":
                     fresh["controller"]["device_id"] = "foreign"
+                if change == "stop":
+                    fresh["run"]["status"] = "stopped"
+                    fresh["events"].append(dict(fresh["events"][-1], kind="stop", at=pi_lower + .02))
+                if change == "reboot":
+                    fresh["service_incarnation"] = "new-service"
                 if change == "remaining":
                     fresh["run"]["remaining_s"] = 300.
                 if change == "history":
@@ -7898,11 +7941,12 @@ def test_known_resume_no_pong_requires_new_ordinary_proof_and_original_clocks(mo
             assert client.snapshot["evidence"]["active_acknowledged"] is True
             assert len({c["operation_id"] for c in calls if c["op"] == "resume"}) == 2
         else:
-            with pytest.raises(ConnectionError) as caught:
+            with pytest.raises(asyncio.CancelledError if change == "cancel" else ConnectionError) as caught:
                 await guard.resume(wall_deadline=deadline, renewal_check=healthy)
             assert caught.value is original
             assert client.resumes == 1
-            if change in {"wrong_exception", "wrong_reason", "reader_error", "expected_close", "unknown_ack", "resume_loss"}:
+            if change in {"wrong_exception", "wrong_reason", "reader_error", "expected_close", "unknown_ack", "resume_loss",
+                          "wrong_close_code", "wrong_transport_error", "detaching", "cancel"}:
                 assert not hasattr(original, "accepted_resume_context") and client.attaches == 0
             if change in {"active_budget", "continuation_budget"}:
                 assert isinstance(original.__cause__, TimeoutError) and pc[0] < 1006.
@@ -7917,6 +7961,19 @@ def test_known_resume_no_pong_requires_new_ordinary_proof_and_original_clocks(mo
                 assert row["operation_id"] == next(c["operation_id"] for c in calls if c["op"] == "resume")
         assert not any(row["event"] == "qualified_native_recovery" for row in records)
     asyncio.run(asyncio.wait_for(scenario(), .6))
+
+
+@pytest.mark.parametrize("change", [
+    None, "attach_retry", "active", "view", "hold", "hold_before_event", "cursor", "revision", "manual", "stop",
+    "foreign", "reboot", "remaining", "renewal", "caller_budget", "active_budget", "native_budget",
+    "continuation_budget", "later_loss", "record", "later_record", "wrong_exception", "wrong_reason", "reader_error",
+    "expected_close", "unknown_ack", "resume_loss", "attach_timeout", "nonordinary", "history",
+    "wrong_close_code", "wrong_transport_error", "detaching", "cancel",
+])
+def test_known_resume_owner_reporting_requires_same_fresh_proof_and_clocks(monkeypatch, change):
+    # Actual125's known resuming ACK then exact reader close; no private input dependency.
+    test_known_resume_no_pong_requires_new_ordinary_proof_and_original_clocks(
+        monkeypatch, change, transport="owner_reporting")
 
 
 @pytest.mark.parametrize("existing_owner", [False, True], ids=["new-owned-generation", "same-owned-generation"])
@@ -11505,3 +11562,68 @@ def test_left_entry_frontdoor_prepares_new_profile_and_retains_exact_request_met
     assert calls[0]["workspace_profile"] == m.LEFT_ENTRY_WORKSPACE_PROFILE
     assert calls[0]["workload_segment"] == "ordinary-arms" and calls[0]["left_shoulder_startup_degrees"] == 1
     assert json.loads((output/"preparation-receipt.private.json").read_text())["request"]["proportional"] == 16
+
+
+def test_virtual_input_progress_original_window_and_expiry_survive_wait_recovery_and_replacement():
+    import copy
+    from examples.alohamini.am1_teleop_workload import VirtualIntentWorkload
+
+    m, clock = adapter(), [50.]
+    native = workspace()
+    source = VirtualIntentWorkload(native, command_reference=native["reference"], clock=lambda: clock[0])
+    command = {"seq": 1, "op": "move", "intent_channel": source.intent_channel,
+               "issued_at_perf_counter_s": 50., "expires_at_perf_counter_s": 120.,
+               "transition_seconds": 8., "targets": {"arm_left_gripper.pos": 4.}}
+    assert source.submit(command)
+    source.admit(100.)
+    source.advance(100.1)
+    source.freeze()
+    before = copy.deepcopy(source.__dict__)
+    status = m.virtual_input_progress(source, window_started_at=100., window_deadline=190.,
+                                      now_monotonic=110., now_perf_counter=70.)
+    assert status["window_started_at_monotonic_s"] == 100.
+    assert status["window_deadline_monotonic_s"] == 190.
+    assert status["window_remaining_s"] == 80. and status["window_elapsed_s"] == 10.
+    assert status["intent_remaining_s"] == 50.
+    assert status["intent_expires_at_perf_counter_s"] == 120.
+    assert status["current_accepted_intent_seq"] == 1
+    assert status["ramp_progress_active_s"] == pytest.approx(.1)
+    assert status["ramp_remaining_active_s"] == pytest.approx(7.9)
+    assert status["input_state"] == "current" and status["phase"] == "intent-1-move"
+    clock[0] = 150.
+    expired = m.virtual_input_progress(source, window_started_at=100., window_deadline=190.,
+                                      now_monotonic=195., now_perf_counter=150.)
+    assert expired["window_remaining_s"] == expired["intent_remaining_s"] == 0.
+    assert expired["input_state"] == "expired"
+    assert expired["ramp_progress_active_s"] == status["ramp_progress_active_s"]
+    assert source.__dict__ == before
+    clock[0] = 155.
+    assert source.submit({"seq": 2, "op": "return", "intent_channel": source.intent_channel,
+                          "issued_at_perf_counter_s": 155., "expires_at_perf_counter_s": 225.,
+                          "transition_seconds": 8.})
+    later = m.virtual_input_progress(source, window_started_at=100., window_deadline=190.,
+                                    now_monotonic=196., now_perf_counter=156.)
+    assert later["current_accepted_intent_seq"] == 2 and later["intent_remaining_s"] == 69.
+    assert later["window_deadline_monotonic_s"] == 190. and later["window_remaining_s"] == 0.
+
+
+def test_virtual_input_progress_waiting_and_finish_do_not_change_control():
+    from examples.alohamini.am1_teleop_workload import VirtualIntentWorkload
+
+    m = adapter()
+    native = workspace()
+    source = VirtualIntentWorkload(native, command_reference=native["reference"], clock=lambda: 10.)
+    status = m.virtual_input_progress(source, window_started_at=20., window_deadline=110.,
+                                      now_monotonic=20., now_perf_counter=10.)
+    assert status["input_state"] == "waiting" and status["current_accepted_intent_seq"] is None
+    assert status["intent_remaining_s"] is None and status["ramp_remaining_active_s"] == 0.
+    assert source.submit({"seq": 1, "op": "finish", "intent_channel": source.intent_channel,
+                          "issued_at_perf_counter_s": 10., "expires_at_perf_counter_s": 11.})
+    status = m.virtual_input_progress(source, window_started_at=20., window_deadline=110.,
+                                      now_monotonic=21., now_perf_counter=10.5)
+    assert status["input_state"] == "finished" and status["current_accepted_intent_seq"] == 1
+    assert source.complete
+    source.invalidate()
+    status = m.virtual_input_progress(source, window_started_at=20., window_deadline=110.,
+                                      now_monotonic=22., now_perf_counter=12.)
+    assert status["current_accepted_intent_seq"] is None and status["window_deadline_monotonic_s"] == 110.
