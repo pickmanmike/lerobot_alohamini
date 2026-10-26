@@ -2237,3 +2237,88 @@ def test_selected_acceleration_real_cleanup_receipt_qualifies_existing_executor_
     finally:
         a.close()
         if e.worker:e.worker.join(2)
+
+
+
+def test_normal_rest_retained41ad_marker_with_representative_goal0_uses_fresh_position(
+    activation,tmp_path,monkeypatch,
+):
+    from lerobot.robots.alohamini.am1_live_teleop import STATIC
+    # Retained41ad before-home marker; no private run artifacts are needed by this test.
+    marker={"phase":"before_home","samples":[],"initial_measured_raw":3228,
+        "calibration":[2,0,515,848,3223],"operating_displacement_bound_degrees":1,
+        "settings":{"ID":2,"Model_Number":777,"Firmware_Major_Version":3,"Firmware_Minor_Version":10,
+            "Min_Position_Limit":848,"Max_Position_Limit":3223,"Homing_Offset":515,"Phase":12,
+            "P_Coefficient":16,"I_Coefficient":0,"D_Coefficient":32,"Acceleration":0,
+            "Maximum_Acceleration":254,"Protection_Current":310,"Max_Temperature_Limit":70,
+            "Min_Voltage_Limit":40,"Max_Voltage_Limit":140,"Operating_Mode":0,
+            "CW_Dead_Zone":1,"CCW_Dead_Zone":1}}
+    robot,trial=approved_startup_rest_robot(activation,tmp_path,monkeypatch,raw=marker["initial_measured_raw"],
+        workload_segment="ordinary-arms",original_acceleration=0,original_goal=0)
+    name="arm_left_shoulder_lift"
+    for register,value in marker["settings"].items():
+        robot.left_bus.registers[register,name]=value
+        if register in STATIC:robot._am1_teleop_settings["left"]["registers"][register][name]=value
+    robot.left_bus.registers["Goal_Position",name]=0  # Representative stale decoded Goal below848; exact41ad ID2Goal was not retained.
+    robot.activate_motors()
+    proof=robot._am1_teleop_rest_evidence
+    assert [row["phase"] for row in proof]==["before_home","after_home"]
+    assert all(row["qualified"] and len(row["samples"])>=9 and row["window_s"]>=.4
+        and row["operating_displacement_bound_degrees"]==1 for row in proof)
+    assert all(sample["Goal_Position"]==0 for row in proof for sample in row["samples"])
+    assert all(row["seed_raw"]==3223 and row["measured_raw"]==3228 for row in proof)
+    assert [row[4] for row in activation.events if row[0]=="write" and row[2:4]==("Goal_Position",name)]==[3223]
+    assert robot.left_bus.registers["Acceleration",name]==0
+    assert not [row for row in activation.events if row[0]=="write" and row[2:4]==("Acceleration",name)]
+    assert not robot._safe_shutdown(close_buses=True) and not trial.restore_required
+
+
+@pytest.mark.parametrize("goal",[0,3223,32767])
+def test_normal_rest_off_goal_format_does_not_replace_measured_rest_anchor(activation,monkeypatch,goal):
+    robot=resting_robot(activation,monkeypatch,raw=3225);name="arm_left_shoulder_lift"
+    robot.left_bus.registers["Goal_Position",name]=goal
+    robot.activate_motors()
+    assert robot.left_bus.registers["Goal_Position",name]==3223
+    assert all(row["qualified"] and row["seed_raw"]==3223 and row["measured_raw"]==3225
+        and len(row["samples"])>=9 and row["window_s"]>=.4 for row in robot._am1_teleop_rest_evidence)
+    assert all(sample["Goal_Position"]==goal for row in robot._am1_teleop_rest_evidence for sample in row["samples"])
+
+
+@pytest.mark.parametrize("phase",["before_home","after_home"])
+@pytest.mark.parametrize("goal",[-1,True,32768,65535])
+def test_normal_rest_off_goal_refuses_invalid_decoded_telemetry_before_seed(activation,monkeypatch,phase,goal):
+    robot=resting_robot(activation,monkeypatch,raw=3225);name="arm_left_shoulder_lift"
+    robot.left_bus.registers["Goal_Position",name]=0
+    def changed(register,motor):
+        if register=="Goal_Position" and motor==name and (phase=="after_home")==bool(activation.home_calls):
+            robot.left_bus.registers[register,name]=goal
+    robot.left_bus.on_read=changed
+    with pytest.raises(RuntimeError,match="activation failed"):robot.activate_motors()
+    assert not [row for row in activation.events if row[0]=="write" and row[2]=="Goal_Position"]
+    assert not [row for row in activation.events if row[0]=="write" and row[2]=="Torque_Enable" and row[3].startswith("arm_") and row[4]==1]
+    assert activation.home_calls==(phase=="after_home")
+
+
+@pytest.mark.parametrize("fault",["outside_allowance","torque","moving","drift","goal_changed"])
+def test_normal_rest_goal0_keeps_actual_position_off_and_quiet_guards(activation,tmp_path,monkeypatch,fault):
+    robot,trial=approved_startup_rest_robot(activation,tmp_path,monkeypatch,raw=3228,workload_segment="ordinary-arms")
+    name="arm_left_shoulder_lift";robot.left_bus.registers["Goal_Position",name]=0
+    if fault=="outside_allowance":robot.left_bus.registers["Present_Position",name]=3235
+    else:
+        counts={}
+        def changed(register,motor):
+            if motor!=name:return
+            counts[register]=counts.get(register,0)+1
+            if fault=="torque" and register=="Torque_Enable" and counts[register]>1:robot.left_bus.registers[register,name]=1
+            elif fault=="moving" and register=="Moving":robot.left_bus.registers[register,name]=1
+            elif fault=="drift" and register=="Present_Position" and counts[register]>2:robot.left_bus.registers[register,name]=3230
+            elif fault=="goal_changed" and register=="Goal_Position" and counts[register]>1:robot.left_bus.registers[register,name]=3223
+        robot.left_bus.on_read=changed
+    with pytest.raises(RuntimeError,match="activation failed"):robot.activate_motors()
+    if fault!="outside_allowance":
+        proof=robot._am1_teleop_rest_evidence[-1]
+        assert proof["samples"] and {"torque":"Torque_Enable","moving":"Moving","drift":"Present_Position","goal_changed":"Goal_Position"}[fault] in proof["first_cause"]
+    assert not [row for row in activation.events if row[0]=="write" and row[2]=="Goal_Position"]
+    assert not [row for row in activation.events if row[0]=="write" and row[2]=="Torque_Enable" and row[3].startswith("arm_") and row[4]==1]
+    robot.left_bus.on_read=None
+    robot._safe_shutdown(close_buses=True)

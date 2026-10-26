@@ -1222,9 +1222,10 @@ def qualify_rest(robot, bus, name, calibration, *, phase, present_raw):
         if robot._am1_activation_calibration(bus, name) != calibration:
             refuse("calibration changed")
         old_goal = read("Goal_Position")
-        # A stale torque-off goal is observed, not used as the new rest anchor.
-        # Historical firmware could report the adjacent unrepresentable goal.
-        seed_for(old_goal)
+        # Torque-off Goal is decoded register telemetry, never the measured rest anchor.
+        # The ordinary owner seeds from fresh qualified Present_Position after home.
+        if type(old_goal) is not int or not 0 <= old_goal <= 32767:
+            refuse("stored Goal telemetry has an invalid decoded nonnegative word format")
         positions, first_completed = [present_raw], None
         window = robot._am1_teleop_temperatures["left", bus.motors[name].id]["window"]
         while (

@@ -2406,12 +2406,12 @@ def test_left_entry_request_cannot_borrow_p32_or_another_role(tmp_path, monkeypa
 
 
 
-def test_selected_acceleration_actual963_snapshot_is_durable_before_configuration_and_restored(tmp_path,monkeypatch):
-    from pathlib import Path
+def test_selected_acceleration_retained963_fields_are_durable_before_configuration_and_restored(tmp_path,monkeypatch):
     module,r,trial,_,_,_=left_response_p_robot(tmp_path,monkeypatch,workload_segment="ordinary-arms",
         workspace_profile="ordinary-arms-left-current-rest-1051-1164",left_shoulder_startup_degrees=1)
-    original_run=json.loads((Path(__file__).resolve().parents[2]/".cache/am1-teleop-consolidation-16/physical-runs/am1-virtual-963c01dd-4824-4f6b-ae51-2266312c1c9e/cleanup.json").read_bytes())
-    actual=original_run["readback"]["left_response_p_trial"]["original_registers"]
+    # Retained963 fields on the existing closed fake owner; no private run artifact is required.
+    actual={key:r.left_bus.values[key,ELBOW] for key in module._LEFT_RESPONSE_P_REGISTERS}
+    actual.update(Acceleration=0,Goal_Position=0,Present_Position=1142)
     assert actual["Acceleration"]==actual["Goal_Position"]==0 and actual["Present_Position"]==1142
     r.left_bus.values.update({(k,ELBOW):v for k,v in actual.items()})
     from lerobot.robots.alohamini.am1_live_teleop import STATIC
