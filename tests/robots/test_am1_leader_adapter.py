@@ -1013,7 +1013,9 @@ def test_recovery_refusal_requires_original_grant_operation_and_exact_structured
 
 
 @pytest.mark.parametrize(
-    "change", [{"reason": "required selected view expired"}, {"accepted": None}, {"effect_admitted": None}]
+    "change", [{"reason": "required selected view expired"}, {"accepted": None}, {"effect_admitted": None},
+        {"accepted": None, "status": "unknown", "uncertain": True, "effect_admitted": None,
+         "reason": "owner outcome unknown; inspect state or lookup the same operation", "id": str(uuid4()), "kind": "result"}]
 )
 def test_sample_sender_preserves_all_other_refusals_without_regrant(change):
     import asyncio
@@ -1047,7 +1049,7 @@ def test_sample_sender_preserves_all_other_refusals_without_regrant(change):
                 }
             )
 
-    with pytest.raises(m.CommandRefusedError):
+    with pytest.raises(m.CommandRefusedError) as caught:
         asyncio.run(
             m.send_leader_sample(
                 Client(),
@@ -1060,6 +1062,8 @@ def test_sample_sender_preserves_all_other_refusals_without_regrant(change):
         )
     assert [row["op"] for row in calls] == ["grant", "input"]
     assert records[-1]["fresh_acquisition_allowed"] is False
+    assert caught.value.operation == "input" and not m._owner_unknown_grant(caught.value)
+    assert not hasattr(caught.value, "grant_context")  # A sent Input is never discarded as an uncaptured Grant.
 
 
 def test_sample_sender_never_sends_under_an_identity_changed_during_capture():
@@ -3729,7 +3733,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "resume_reporting_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal", "peer_start_normal", "peer_start_bench", "peer_bench_unqualified_view", "peer_bench_local_loss", "peer_normal_unqualified_view", "held_command120_view_later", "held_command120_view_never", "held_command120_local_loss", "view_refusal122_input_before", "view_refusal122_input_after", "view_refusal122_grant_before", "view_refusal122_grant_after", "view_refusal122_never", "view_refusal122_pause", "view_refusal122_stop", "view_refusal122_takeover", "view_refusal122_grant_connect_preflight_before", "view_refusal122_grant_connect_preflight_pending", "view_refusal122_grant_connect_preflight_queue", "view_refusal122_grant_connect_preflight_sent", "view_refusal122_grant_connect_preflight_pause", "view_refusal122_grant_connect_preflight_stop", "view_refusal122_grant_connect_preflight_takeover", "view_refusal122_grant_connect_preflight_reboot", "view_refusal122_grant_connect_preflight_lease", "view_refusal122_grant_connect_preflight_deadline", "view_refusal122_grant_connect_preflight_cancel", "view_refusal130_grant_input_race_before", "view_refusal130_grant_input_race_never", "view_refusal130_grant_input_race_pause", "view_refusal130_grant_input_race_stop", "view_refusal130_grant_input_race_takeover", "view_refusal130_grant_input_race_revision", "view_refusal130_grant_input_race_history", "view_refusal130_grant_input_race_time", "renewal_unknown133_grant_before", "renewal_unknown133_grant_pause", "renewal_unknown133_grant_takeover", "renewal_unknown133_grant_unchanged", "renewal_unknown133_grant_receipt_unknown", "renewal_unknown133_grant_second_read", "renewal_unknown133_grant_stream_before"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "resume_reporting_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_unknown_receipt", "grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal", "peer_start_normal", "peer_start_bench", "peer_bench_unqualified_view", "peer_bench_local_loss", "peer_normal_unqualified_view", "held_command120_view_later", "held_command120_view_never", "held_command120_local_loss", "view_refusal122_input_before", "view_refusal122_input_after", "view_refusal122_grant_before", "view_refusal122_grant_after", "view_refusal122_never", "view_refusal122_pause", "view_refusal122_stop", "view_refusal122_takeover", "view_refusal122_grant_connect_preflight_before", "view_refusal122_grant_connect_preflight_pending", "view_refusal122_grant_connect_preflight_queue", "view_refusal122_grant_connect_preflight_sent", "view_refusal122_grant_connect_preflight_pause", "view_refusal122_grant_connect_preflight_stop", "view_refusal122_grant_connect_preflight_takeover", "view_refusal122_grant_connect_preflight_reboot", "view_refusal122_grant_connect_preflight_lease", "view_refusal122_grant_connect_preflight_deadline", "view_refusal122_grant_connect_preflight_cancel", "view_refusal130_grant_input_race_before", "view_refusal130_grant_input_race_never", "view_refusal130_grant_input_race_pause", "view_refusal130_grant_input_race_stop", "view_refusal130_grant_input_race_takeover", "view_refusal130_grant_input_race_revision", "view_refusal130_grant_input_race_history", "view_refusal130_grant_input_race_time", "renewal_unknown133_grant_before", "renewal_unknown133_grant_pause", "renewal_unknown133_grant_takeover", "renewal_unknown133_grant_unchanged", "renewal_unknown133_grant_receipt_unknown", "renewal_unknown133_grant_second_read", "renewal_unknown133_grant_stream_before"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause):
     import asyncio
     import copy
@@ -5108,7 +5112,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     service.time, gateway.onboard = old_time, None
                     await proxy.close()
                 return
-            if cause in {"grant_loss_pre", "grant_loss_post", "grant_connection_loss"}:
+            if cause in {"grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_unknown_receipt"}:
                 # Synthetic47: real Core creates and qualifies an episode while
                 # a grant result is unknown, before ANY producer capture.
                 pi_clock = [10.01]
@@ -5156,8 +5160,23 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         return await asyncio.shield(task)
                     return await original_call(command, device)
 
+                if cause == "grant_unknown_receipt":
+                    # Real owner IPC response timeout -> production Gateway's canonical
+                    # unknown result; the discarded Grant may actually be accepted.
+                    import tools.am1_session_ipc as ipc
+                    original_write = ipc.write_frame
+                    async def hold_grant_result(writer, value, limit):
+                        result = value.get("result", {})
+                        if "grant_id" in result and not lost[0]:
+                            lost[0] = True
+                            old_results.append(copy.deepcopy(result))
+                            pi_clock[0] += .3
+                            a._pause_live_input("input_expired")
+                            await unblock_release.wait()
+                        return await original_write(writer, value, limit)
+                    monkeypatch.setattr(ipc, "write_frame", hold_grant_result)
                 capture(client.ws)
-                client.attach, gateway.call = attached, delay_grant
+                client.attach, gateway.call = attached, original_call if cause == "grant_unknown_receipt" else delay_grant
                 renewal = asyncio.create_task(client.renew())
                 def healthy_renewal():
                     if renewal.done():
@@ -5165,19 +5184,27 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         raise RuntimeError("original renewal ended")
                 cursor = copy.deepcopy(producer.native_cursor)
                 try:
-                    with pytest.raises((TimeoutError, ConnectionError)) as caught:
+                    with pytest.raises(m.CommandRefusedError if cause == "grant_unknown_receipt" else (TimeoutError, ConnectionError)) as caught:
                         await m.send_leader_sample(client, producer, m.ZERO_BODY, record,
                                                    phase="individual", progress_s=0)
                     original = caught.value
+                    if cause == "grant_unknown_receipt":
+                        from tools.am1_session_service import unknown_outcome
+                        assert {k: original.response[k] for k in unknown_outcome()} == unknown_outcome()
+                        assert original.response["kind"] == "result" and original.response["id"]
+                        assert producer.sequence == client.sequence == 0 and len(old_results) == 1
+                        assert hasattr(original, "grant_context")
                     assert producer.sequence == 0 and client.sequence == 0
                     assert producer.native_cursor == cursor
                     assert not any(op == "input" for op, _ in commands)
-                    assert await guard.resume(grant_error=original, renewal_check=healthy_renewal)
-                    assert a.run["status"] == "running" and guard.episodes == 1
+                    assert await guard.resume(grant_error=original, renewal_check=healthy_renewal) is (cause != "grant_unknown_receipt")
+                    assert a.run["status"] == "running" and guard.episodes == (0 if cause == "grant_unknown_receipt" else 1)
                     assert client.snapshot["evidence"]["active_acknowledged"] is True
                     assert sum(op == "connect" for op, _ in commands) == initial_connects + 1
                     holds = [v for v in a.events if v["kind"] == "required_hold"]
-                    assert len(holds) == 1 and set(holds[0]["recovery"]) == {"started", "ceiling", "revision"}
+                    assert len(holds) == (0 if cause == "grant_unknown_receipt" else 1)
+                    if holds:
+                        assert set(holds[0]["recovery"]) == {"started", "ceiling", "revision"}
                     sql_holds = [json.loads(row[0]) for row in a.db.execute("SELECT data FROM transitions")
                                  if json.loads(row[0])["kind"] == "required_hold"]
                     assert sql_holds == holds
@@ -5186,10 +5213,21 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     assert len(grants) == 1  # Unknown permission was discarded.
                     unblock_release.set()
                     await asyncio.wait_for(asyncio.gather(*delayed), .5)
-                    if cause == "grant_loss_post":
+                    if cause in {"grant_loss_post", "grant_unknown_receipt"}:
                         assert old_results[0]["accepted"] is True
                     else:
-                        assert old_results == [{"accepted": False, "status": "refused", "reason": "stale control generation", "effect_admitted": False}]
+                        assert [{k: v for k, v in result.items() if k != "diagnostic_timing"} for result in old_results] == [
+                            {"accepted": False, "status": "refused", "reason": "stale control generation", "effect_admitted": False}]
+                        from tools.am1_session_core import _INPUT_DIAGNOSTIC_MARKS
+                        import math
+                        for result in old_results:
+                            timing = result["diagnostic_timing"]
+                            assert timing["version"] == 1 and timing["clock"] == "pi-monotonic"
+                            marks = {k: v for k, v in timing.items() if k not in {"version", "clock"}}
+                            assert marks and set(marks) <= set(_INPUT_DIAGNOSTIC_MARKS)
+                            assert all(type(v) in (int, float) and math.isfinite(v) and v >= 0 for v in marks.values())
+                            ordered = [marks[k] for k in _INPUT_DIAGNOSTIC_MARKS if k in marks]
+                            assert ordered == sorted(ordered) and len(json.dumps(timing).encode()) <= 512
                     assert not any(v["command"]["op"] in {"claim", "start", "input"} for v in envelopes)
                     assert not any(op == "input" for op, _ in commands)
                     assert client.generation == ids["controller_generation"]  # Existing fenced HTTP renewal only.
@@ -5203,7 +5241,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     grants = [v for v in envelopes if v["command"]["op"] == "grant"]
                     assert len(grants) == 2 and grants[0]["id"] != grants[1]["id"]
                     assert grants[0]["command"]["connection_generation"] != grants[1]["command"]["connection_generation"]
-                    assert len([r for r in records if r["event"] == "qualified_native_recovery"]) == 1
+                    assert len([r for r in records if r["event"] == "qualified_native_recovery"]) == (0 if cause == "grant_unknown_receipt" else 1)
                 finally:
                     renewal.cancel()
                     await asyncio.gather(renewal, return_exceptions=True)
@@ -8827,13 +8865,20 @@ def test_startup_detail_uses_the_actual_core_start_pending_backend_shape(tmp_pat
     "future_source", "future_qualified", "earlier_source", "manual_pause", "closed_episode", "later_distinct_episode", "limit",
     "foreign", "service", "controller", "reference", "deadline", "live", "fault", "uncertain", "native_fault",
     "running", "view", "held", "ack", "alignment", "caller_expired", "episode_expired", "http_delay",
-    "renewal", "nested_connect", "nested_release", "nested_resume", "same_generation", "missing_tag"])
+    "renewal", "nested_connect", "nested_release", "nested_resume", "same_generation", "missing_tag",
+    "canonical:ordinary", "canonical:manual_pause", "canonical:foreign", "canonical:service", "canonical:controller",
+    "canonical:deadline", "canonical:view", "canonical:held", "canonical:ack", "canonical:alignment",
+    "canonical:caller_expired", "canonical:episode_expired", "canonical:http_delay", "canonical:missing_tag",
+    "canonical:native_fault", "canonical:nested_resume", "canonical:stop", "canonical:cancel"])
 def test_unknown_grant_requires_source_episode_fresh_hold_new_fence_and_original_budget(change, monkeypatch):
     import asyncio
     import copy
     from types import SimpleNamespace
 
     m = adapter()
+    canonical = isinstance(change, str) and change.startswith("canonical:")
+    if canonical:
+        change = change.removeprefix("canonical:")
     now, commands, records = [1000.], [], []
     monkeypatch.setattr(m, "time", SimpleNamespace(monotonic=lambda: now[0], perf_counter=m.time.perf_counter))
     before, fresh = recovery_state(), requalified_state()
@@ -8843,7 +8888,11 @@ def test_unknown_grant_requires_source_episode_fresh_hold_new_fence_and_original
     fresh["events"].insert(0, hold)
     fresh["evidence"]["active_acknowledged"] = False
     fresh["evidence"]["accepted_host_action"]["acquired_at_monotonic_s"] = 100.1
-    original = TimeoutError("original unknown permission")
+    original = (m.CommandRefusedError({"accepted": None, "status": "unknown", "uncertain": True,
+        "reason": "owner outcome unknown; inspect state or lookup the same operation", "effect_admitted": None,
+        "id": str(uuid4()), "kind": "result"}) if canonical else TimeoutError("original unknown permission"))
+    if canonical:
+        original.operation = "grant"
     connection = str(uuid4())
 
     class Client:
@@ -8968,8 +9017,8 @@ def test_unknown_grant_requires_source_episode_fresh_hold_new_fence_and_original
         fresh["run"]["uncertain"] = True
     elif change == "native_fault":
         fresh["run"]["native_first_cause"] = "device hard fault"
-    elif change == "running":
-        fresh["run"]["status"] = "running"
+    elif change in {"running", "stop"}:
+        fresh["run"]["status"] = "stopped" if change == "stop" else "running"
     elif change == "view":
         fresh["run"]["live_input"]["required_view"]["qualified"] = False
     elif change == "held":
@@ -8986,6 +9035,8 @@ def test_unknown_grant_requires_source_episode_fresh_hold_new_fence_and_original
     def healthy():
         if change == "renewal":
             raise RuntimeError("original renewal failed")
+        if change == "cancel":
+            raise asyncio.CancelledError("original caller cancelled")
 
     async def scenario():
         if change in {None, "still_recovering", "ordinary", "ordinary_then_episode"}:
@@ -9000,7 +9051,7 @@ def test_unknown_grant_requires_source_episode_fresh_hold_new_fence_and_original
                 assert not any(r["event"] == "qualified_native_recovery" for r in records)
             assert client.snapshot["evidence"]["active_acknowledged"] is True
         else:
-            with pytest.raises(TimeoutError) as caught:
+            with pytest.raises(type(original)) as caught:
                 await guard.resume(grant_error=original, wall_deadline=999.9 if change == "caller_expired" else 1000.2,
                                    renewal_check=healthy)
             assert caught.value is original
@@ -9012,11 +9063,15 @@ def test_unknown_grant_requires_source_episode_fresh_hold_new_fence_and_original
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("canonical", [False, True])
 @pytest.mark.parametrize("phase", ["individual", "terminal_zero_qualification"])
-def test_runner_routes_only_pre_capture_grant_ambiguity_and_preserves_terminal_ceiling(tmp_path, monkeypatch, phase):
+def test_runner_routes_only_pre_capture_grant_ambiguity_and_preserves_terminal_ceiling(tmp_path, monkeypatch, phase, canonical):
     m = adapter()
     actual_send, actual_resume = m.send_leader_sample, m.SameRunRecovery.resume
-    original, seen, samples = TimeoutError("unknown first permission"), [], []
+    original = (m.CommandRefusedError({"accepted": None, "status": "unknown", "uncertain": True,
+        "reason": "owner outcome unknown; inspect state or lookup the same operation", "effect_admitted": None,
+        "id": str(uuid4()), "kind": "result"}) if canonical else TimeoutError("unknown first permission"))
+    seen, samples = [], []
 
     async def send(client, producer, body, record, *, phase: str, progress_s):
         if phase == selected and not seen:
@@ -12176,3 +12231,31 @@ def test_connect_preflight_marker_requires_actual_idle_current_reporting_failure
             client.pending.clear()
             if not client.reader.done(): client.reader.cancel()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("changed", [None, "no_diagnostic", "accepted", "status", "uncertain", "reason", "effect_admitted",
+    "missing", "extra", "id", "kind", "input", "resume", "not_refusal", "diagnostic_type"])
+def test_canonical_unknown_grant_requires_exact_correlated_gateway_result(changed):
+    m = adapter()
+    from tools.am1_session_service import unknown_outcome
+    response = dict(unknown_outcome(), id=str(uuid4()), kind="result", diagnostic_timing={
+        "version": 1, "clock": "pi-monotonic", "gateway_received": 100., "reply_ready": 101.})
+    before = dict(response)
+    values = {"accepted": False, "status": "refused", "uncertain": 1, "reason": "expired grant",
+              "effect_admitted": False, "id": "not-a-uuid", "kind": "snapshot"}
+    if changed in values:
+        response[changed] = values[changed]
+    elif changed == "missing":
+        response.pop("effect_admitted")
+    elif changed == "extra":
+        response["grant_id"] = str(uuid4())
+    elif changed == "no_diagnostic":
+        response.pop("diagnostic_timing")
+    elif changed == "diagnostic_type":
+        response["diagnostic_timing"] = None
+    error = m.CommandRefusedError(response) if changed != "not_refusal" else RuntimeError("owner outcome unknown")
+    error.operation = changed if changed in {"input", "resume"} else "grant"
+    assert m._owner_unknown_grant(error) is (changed in {None, "no_diagnostic"})
+    if isinstance(error, m.CommandRefusedError):
+        assert error.response == response  # Classification must preserve the original receipt.
+    assert before["accepted"] is None and before["effect_admitted"] is None

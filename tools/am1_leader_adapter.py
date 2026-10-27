@@ -1084,6 +1084,24 @@ def _owner_unknown_renewal(error):
             and isinstance(getattr(error, "renewal_context", None), dict))
 
 
+def _owner_unknown_grant(error):
+    """Only the correlated canonical Gateway unknown result, never a refusal."""
+    expected = {"accepted": None, "status": "unknown", "uncertain": True,
+                "reason": "owner outcome unknown; inspect state or lookup the same operation", "effect_admitted": None}
+    response = getattr(error, "response", None)
+    if (type(error) is not CommandRefusedError or getattr(error, "operation", None) != "grant"
+        or not isinstance(response, dict) or set(response) not in
+            (set(expected) | {"id", "kind"}, set(expected) | {"id", "kind", "diagnostic_timing"})
+        or response.get("kind") != "result" or type(response.get("id")) is not str
+        or "diagnostic_timing" in response and type(response["diagnostic_timing"]) is not dict
+        or any(type(response[k]) is not type(value) or response[k] != value for k, value in expected.items())):
+        return False
+    try:
+        return str(UUID(response["id"])) == response["id"]
+    except ValueError:
+        return False
+
+
 def expired_input_refusal(error):
     return isinstance(error, CommandRefusedError) and all(
         error.response.get(key) == value and type(error.response.get(key)) is type(value)
@@ -2729,7 +2747,7 @@ class SameRunRecovery:
         if grant_error is not None:
             try:
                 grant_context = getattr(grant_error, "grant_context", None)
-                if (not isinstance(grant_error, (TimeoutError, ConnectionError))
+                if (not (isinstance(grant_error, (TimeoutError, ConnectionError)) or _owner_unknown_grant(grant_error))
                     or not isinstance(grant_context, dict)
                     or set(grant_context) != {"identity", "snapshot", "requested"} or renewal_check is None):
                     raise RuntimeError("original pre-capture grant ambiguity unavailable")
@@ -3901,6 +3919,8 @@ async def send_leader_sample(client, producer, body, record, *, phase, progress_
     except CommandRefusedError as error:
         error.operation = "grant"
         error.identity = dict(identity)
+        if _owner_unknown_grant(error) and grant_context is not None:
+            error.grant_context = grant_context  # Permission discarded before capture, just like a lost reply.
         record(
             {
                 "event": "leader_grant_rejected",
@@ -4914,6 +4934,9 @@ async def run(args):
                 await rejoin(grant_error=error, until=peer_baseline_until)
                 continue
             except CommandRefusedError as error:
+                if _owner_unknown_grant(error) and hasattr(error, "grant_context"):
+                    await rejoin(grant_error=error, until=peer_baseline_until)
+                    continue
                 if bench and error.reason == "stale control generation":
                     await ensure_authority(force=True, until=peer_baseline_until)
                     await rejoin(until=peer_baseline_until)
@@ -5055,6 +5078,9 @@ async def run(args):
                 await rejoin(grant_error=error, until=qualification_ceiling)
                 continue
             except CommandRefusedError as error:
+                if _owner_unknown_grant(error) and hasattr(error, "grant_context"):
+                    await rejoin(grant_error=error, until=qualification_ceiling)
+                    continue
                 mailbox = mailbox_input_refusal(error)
                 if not (recovery_grant_refusal(error) or mailbox):
                     raise
