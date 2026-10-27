@@ -455,22 +455,30 @@ class Gateway:
     async def call(self, command, device):
         marks = {"gateway_dispatch": _input_diagnostic_monotonic()} if command.get("op") in {"input", "grant"} else None
         lane = self.protective if command.get("op") in {"pause", "stop", "release"} else self.normal
-        async with asyncio.timeout(1.5):
-            async with lane:
-                if command.get("op") not in {"snapshot", "release"} and not self.auth.capable(device):
-                    return {
-                        "accepted": False,
-                        "status": "refused",
-                        "reason": "revoked control context",
-                        "effect_admitted": False,
-                    }
-                if marks is not None:
-                    marks["gateway_ipc_started"] = _input_diagnostic_monotonic()
-                result = await self.ipc.request(command, device)
-                if marks is not None:
-                    marks["gateway_ipc_completed"] = _input_diagnostic_monotonic()
-                    result = _input_diagnostic_result(result, marks)
-                return result
+        try:
+            async with asyncio.timeout(1.5):
+                async with lane:
+                    if command.get("op") not in {"snapshot", "release"} and not self.auth.capable(device):
+                        return {
+                            "accepted": False,
+                            "status": "refused",
+                            "reason": "revoked control context",
+                            "effect_admitted": False,
+                        }
+                    if marks is not None:
+                        marks["gateway_ipc_started"] = _input_diagnostic_monotonic()
+                    result = await self.ipc.request(command, device)
+                    if marks is not None:
+                        marks["gateway_ipc_completed"] = _input_diagnostic_monotonic()
+                        result = _input_diagnostic_result(result, marks)
+                    return result
+        except (OSError, TimeoutError, asyncio.IncompleteReadError) as error:
+            if marks is not None:
+                try:
+                    error._am1_gateway_partial_marks = dict(marks)
+                except Exception:
+                    pass  # Diagnostic retention must preserve the original failure.
+            raise
 
     async def current(self):
         result = await self.call({"op": "snapshot"}, "gateway-view")
@@ -739,8 +747,13 @@ class Gateway:
                 "reason": "malformed command",
                 "effect_admitted": False,
             }
-        except (OSError, TimeoutError, asyncio.IncompleteReadError):
+        except (OSError, TimeoutError, asyncio.IncompleteReadError) as error:
             result = unknown_outcome()
+            if value["command"].get("op") in {"input", "grant"}:
+                try:
+                    result = _input_diagnostic_result(result, getattr(error, "_am1_gateway_partial_marks", {}))
+                except Exception:
+                    pass  # Unknown remains unknown if diagnostic retention fails.
         finally:
             if lane:
                 peer.commands[lane] -= 1

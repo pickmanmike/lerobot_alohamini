@@ -1345,3 +1345,80 @@ def test_grant_receive_anchor_and_early_refusals_stay_server_only(monkeypatch, a
                                                      "gateway_received": 100., "reply_ready": 200.}
             assert kwargs == {"grant_reply": True} and not seen
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("op", ["input", "grant"])
+@pytest.mark.parametrize("phase", ["before-ipc", "ipc"])
+def test_partial_unknown_gateway_preserves_only_already_computed_marks(monkeypatch, op, phase):
+    from types import SimpleNamespace
+    from tools import am1_session_service as service
+    from tools import am1_session_core as core
+
+    async def scenario():
+        gateway = service.Gateway.__new__(service.Gateway)
+        gateway.auth = SimpleNamespace(resolve=lambda _: {"id":"owner", "control":True}, capable=lambda _:True)
+        original = TimeoutError("original owner timeout")
+        calls, outputs = [], []
+        class BeforeIPCFailure:
+            async def __aenter__(self):
+                raise original
+            async def __aexit__(self, *args):
+                return False
+        async def request(command, device):
+            calls.append((copy.deepcopy(command),device))
+            raise original
+        gateway.normal = BeforeIPCFailure() if phase == "before-ipc" else asyncio.Semaphore(8)
+        gateway.protective = asyncio.Semaphore(2)
+        gateway.ipc = SimpleNamespace(request=request)
+        times = iter([10.,20.,30.])
+        monkeypatch.setattr(core,"_input_diagnostic_clock",lambda:next(times))
+        peer = SimpleNamespace(token="private-test-token", ack=True, connection="same-connection",
+            commands={"normal":1}, put=lambda value, **kwargs:outputs.append(value))
+        command = {"op":op, "connection_generation":"same-connection"}
+        await gateway.execute_peer(peer,{"id":"original-request","command":command,"_diagnostic_received":5.},"normal")
+        assert peer.commands["normal"] == 0 and len(outputs) == 1
+        result = outputs[0]
+        assert {key:value for key,value in result.items() if key!="diagnostic_timing"} == dict(
+            service.unknown_outcome(),kind="result",id="original-request")
+        span = result["diagnostic_timing"]
+        expected = {"version":1,"clock":"pi-monotonic","gateway_received":5.,"gateway_dispatch":10.}
+        if phase == "ipc": expected["gateway_ipc_started"] = 20.
+        if op == "grant": expected["reply_ready"] = 20. if phase == "before-ipc" else 30.
+        assert span == expected
+        assert len(json.dumps(span)) <= 512
+        assert not any(key.startswith("core_") for key in span) and "gateway_ipc_completed" not in span
+        assert len(calls) == (phase == "ipc"), "unknown never replays the request"
+        assert command == {"op":op,"connection_generation":"same-connection"}
+    import copy
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("op", ["input", "grant", "snapshot"])
+@pytest.mark.parametrize("phase", ["before-ipc", "ipc"])
+def test_partial_unknown_call_keeps_original_exception_and_nongrant_controls(monkeypatch, op, phase):
+    from types import SimpleNamespace
+    from tools import am1_session_service as service
+    from tools import am1_session_core as core
+
+    async def scenario():
+        gateway = service.Gateway.__new__(service.Gateway)
+        gateway.auth = SimpleNamespace(capable=lambda _:True)
+        original = OSError("original IPC failure")
+        class BeforeIPCFailure:
+            async def __aenter__(self): raise original
+            async def __aexit__(self, *args): return False
+        async def request(*args): raise original
+        gateway.normal = BeforeIPCFailure() if phase == "before-ipc" else asyncio.Semaphore(8)
+        gateway.protective = asyncio.Semaphore(2)
+        gateway.ipc = SimpleNamespace(request=request)
+        times = iter([10.,20.])
+        monkeypatch.setattr(core,"_input_diagnostic_clock",lambda:next(times))
+        with pytest.raises(OSError) as caught:
+            await gateway.call({"op":op},"owner")
+        assert caught.value is original
+        marks = getattr(original,"_am1_gateway_partial_marks",None)
+        if op == "snapshot": assert marks is None
+        else:
+            assert marks == ({"gateway_dispatch":10.} if phase == "before-ipc" else {
+                "gateway_dispatch":10.,"gateway_ipc_started":20.})
+    asyncio.run(scenario())
