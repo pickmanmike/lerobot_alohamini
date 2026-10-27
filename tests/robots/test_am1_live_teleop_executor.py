@@ -2227,7 +2227,8 @@ def periodic_input_order_lane(tmp_path, monkeypatch, request):
         candidate = dict(op="input", **ids, grant_id=grant["grant_id"], seq=459,
                          source=src, target=copy.deepcopy(original["target"]), body=copy.deepcopy(original["body"]))
         now[0] = 10.118935829
-        a.last_checkpoint = now[0] - 1.01
+        # Keep these ordering/failure cases due under each profile's cadence.
+        a.last_checkpoint = now[0] - (1.01 if a._bench_continuity() else 5.01)
         evidence, first = a._evidence, [True]
         def actual_precheckpoint():
             if first[0]:
@@ -2900,3 +2901,106 @@ def test_thermal_core_postadvance_fresh_native_expired_hold_never_revives_old_in
     assert a.grant is a.applied_input is e._live_target is None and e.desired == "hold"
     assert case.control.live_snapshot()["last_input_seq"] == case.original["seq"]
     assert any(row["kind"] == "input_expired" for row in a.events)
+
+
+@pytest.mark.parametrize("age,expected_saves", [(1.1, 0), (4.999, 0), (5.0, 1)])
+def test_progress_save_normal_running_eligibility_is_five_seconds(periodic_input_order_lane, monkeypatch, age, expected_saves):
+    case = periodic_input_order_lane
+    entered = case.now[0]
+    previous = entered - age
+    case.a.last_checkpoint = previous
+    saves, save = [], case.a._save
+    def checkpoint():
+        saves.append(case.now[0])
+        return save()
+    monkeypatch.setattr(case.a, "_save", checkpoint)
+    result = case.a.handle(case.candidate, "authorized-test-device")
+    assert result["accepted"] is True and result["effect_admitted"] is True
+    assert len(saves) == expected_saves
+    assert case.a.last_checkpoint == (entered if expected_saves else previous)
+    assert ("core_deferred_checkpoint_started" in result["diagnostic_timing"]) is bool(expected_saves)
+    assert case.now[0] > entered, "eligibility retains tick-entry time, not evidence/save completion"
+    assert case.a.run["status"] == "running" and case.a.run["first_cause"] is None
+    assert case.a.run["deadline"] == 310. and case.grant["expires"] == 10.35
+    assert case.e._live_target["source"]["sample_seq"] == 772
+    assert case.e._live_target["valid_until_monotonic_s"] == 10.35
+
+
+@pytest.mark.parametrize("periodic_input_order_lane", [True], indirect=True)
+def test_progress_save_bench_running_keeps_one_second_eligibility(periodic_input_order_lane, monkeypatch):
+    case = periodic_input_order_lane
+    entered = case.now[0]
+    case.a.last_checkpoint = entered - 1.01
+    saves, save = [], case.a._save
+    def checkpoint():
+        saves.append(case.now[0])
+        return save()
+    monkeypatch.setattr(case.a, "_save", checkpoint)
+    result = case.a.handle(case.candidate, "authorized-test-device")
+    assert result["accepted"] and len(saves) == 1
+    assert "core_deferred_checkpoint_started" in result["diagnostic_timing"]
+    assert case.a.last_checkpoint == entered
+    assert case.a.run["deadline"] == 310. and case.e._live_target["valid_until_monotonic_s"] == 10.35
+
+
+@pytest.mark.parametrize("fence", ["view", "deadline", "pause", "stop", "release", "fault"])
+def test_progress_save_critical_changes_are_durable_inside_coalesced_window(periodic_input_order_lane, monkeypatch, fence):
+    import json
+    import sqlite3
+    from tests.robots.test_am1_persistent_session import command
+
+    case = periodic_input_order_lane
+    case.a._save()
+    case.a.last_checkpoint = case.now[0] - 1.1
+    saves, save = [], case.a._save
+    def checkpoint():
+        saves.append(case.a.run["status"])
+        return save()
+    monkeypatch.setattr(case.a, "_save", checkpoint)
+    if fence == "view":
+        case.a._teleop_view["qualified_until"] = case.now[0] - .001
+        case.a.tick()
+    elif fence == "deadline":
+        case.a.run["deadline"] = case.now[0] - .001
+        case.a.tick()
+    elif fence == "fault":
+        evidence = case.a._evidence
+        monkeypatch.setattr(case.a, "_evidence", lambda: dict(evidence(), fault="original pacing fixture fault"))
+        case.a.tick()
+    else:
+        request = command(fence, run_id=case.a.run["run_id"])
+        if fence == "release":
+            request["controller_generation"] = case.a.controller["generation"]
+        assert case.a.handle(request, "authorized-test-device")["accepted"] is True
+    assert saves and case.a.run["status"] != "running"
+    with sqlite3.connect(case.a.directory / "sessions.sqlite3") as observer:
+        persisted = json.loads(observer.execute("SELECT data FROM state WHERE id=1").fetchone()[0])
+    assert persisted["status"] == case.a.run["status"]
+    assert persisted["first_cause"] == case.a.run["first_cause"]
+    if fence == "fault":
+        assert persisted["first_cause"] == "original pacing fixture fault"
+    assert persisted["intent"] is None
+    refused = case.a._handle(case.candidate, "authorized-test-device")
+    assert refused["accepted"] is False and refused["effect_admitted"] is False
+    assert (case.e._live_target or {}).get("source", {}).get("sample_seq") != 772
+
+
+@pytest.mark.parametrize("status", ["paused", "recovering"])
+def test_progress_save_held_states_keep_one_second_eligibility(periodic_input_order_lane, monkeypatch, status):
+    case = periodic_input_order_lane
+    case.a._pause_live_input("input_expired")
+    entered = case.now[0]
+    if status == "recovering":
+        case.a.run.update(status=status, recovery={"started": entered, "ceiling": entered + 1., "revision": case.a.run["intent_revision"]})
+        evidence = case.a._evidence
+        monkeypatch.setattr(case.a, "_evidence", lambda: dict(evidence(), required_observation=False))
+    case.a.last_checkpoint = entered - 1.01
+    saves, save = [], case.a._save
+    def checkpoint():
+        saves.append(case.a.run["status"])
+        return save()
+    monkeypatch.setattr(case.a, "_save", checkpoint)
+    case.a.tick()
+    assert saves == [status]
+    assert case.a.last_checkpoint == entered
+    assert case.a.run["status"] == status and case.a.run["deadline"] == 310.

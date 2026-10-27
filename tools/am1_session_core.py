@@ -3193,7 +3193,15 @@ class SessionAuthority:
                 if execution["complete"]:
                     self._finish("completed")
                     return
-            if r["status"] != previous_status or checkpoint_at - self.last_checkpoint >= 1.0:
+            # Coalesce routine progress/cache saves in unchanged normal teleop.
+            # This is save eligibility, not a persistence-age bound: processing
+            # and commit may add delay. Critical saves and restart fences remain.
+            checkpoint_interval = 5.0 if (
+                previous_status == r["status"] == "running"
+                and self._physical_interactive() and r["recipe"] == TELEOP_RECIPE
+                and not self._bench_continuity() and r.get("recovery") is None
+            ) else 1.0
+            if r["status"] != previous_status or checkpoint_at - self.last_checkpoint >= checkpoint_interval:
                 if _defer_periodic_checkpoint and previous_status == r["status"] == "running":
                     return checkpoint_at
                 if _diagnostic_marks is not None:
