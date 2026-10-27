@@ -36,7 +36,7 @@ The explicit candidate correction is limited to powered AM1 live teleoperation: 
 
 ## MOTOR-03: observe the full command and measurement chain
 
-- **Apply now:** use the ordinary adapter/current-rest factory and source-bound collector. Keep original within-run endpoints and measured achieved preparation; a prepared increasing LEFT approach is supported only for its tested pose/direction, not a universal tracking correction. [Working invocation][p16] and the private current helper proof packet own the procedure. Reopen only a task-relevant new delivery/response discrepancy.
+- **Apply now:** use the ordinary adapter/current-rest factory and source-bound collector. Keep original within-run endpoints and measured achieved preparation; a prepared increasing LEFT approach is supported only for its tested pose/direction, not a universal tracking correction. The b752 preparation of1.670deg ended after measured approach room qualified; it is not a failed4deg comparison. [Working invocation][p16] and the private current helper proof packet own the procedure. Reopen only a task-relevant new delivery/response discrepancy.
 
 - **Accepted / scope:** distinguish requested target, transformed/limited target, accepted frame, stored Goal, measured position and visible motion. Keep raw feedback separate from command normalization; degrees, normalized units, counts, mA and mAh are different.
 - **Result/source:** [Packet13][p13] corrected selected-mode normalization/hidden relative-target clamp; [Packet14][p14] separately records delivered target windows, encoders and P1 qualitative movement. [Packet16][p16] distinguishes Core frame acceptance from physical writes.
@@ -127,6 +127,8 @@ The explicit candidate correction is limited to powered AM1 live teleoperation: 
 - **Reopen:** missing/stale/replayed/undecodable required input or a materially changed task sensing need. Never silently downgrade an active policy or convert strict P1 failure into a pass.
 
 ## MEDIA-02: default onboard WebRTC has bounded evidence
+
+- **Apply now / interruption evidence:** keep the selected required view visible while sampling existing diagnostics. Retain callback/presentation, specific report dispatch/settlement and original Pi qualification-floor clocks separately; latest-only receipts and isolated one-second samples cannot locate a subsecond gap. A bounded per-report history preserves the intervening event clocks; its row/drop counts define actual retained coverage. The selectedb752view hold regained qualification within48ms but lasted954ms including protective rearm. Do not equate full held time with missing-video duration or infer that fresh Pi source proves timely presentation/reporting.
 
 - **Apply now:** reuse the already successful AM1 USB-camera map and one capture owner through [the current viewing procedure](camera-viewing.md#current-ordinary-viewing-path). Camera2=Chest; Camera3=RIGHT wrist and Camera5=LEFT wrist. Camera32 and Stage85ce4 are working scoped records, not a new camera integration. Require current source plus displayed decoded evidence; optical focus may need a specific physical adjustment, while P1 and THETA remain separate.
 

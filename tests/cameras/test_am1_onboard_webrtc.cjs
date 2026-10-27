@@ -295,7 +295,8 @@ test("actual video keeps presented-frame proof across the ordinary primary scree
   const gaps=rows.slice(1).map((row,i)=>({gap:row.at-rows[i].at,before:rows[i],after:row})).sort((a,b)=>b.gap-a.gap);
   const stats={frames:rows.length,first:rows[0],last:rows.at(-1),max_ordinary_gap_ms:Math.max(0,...ordinary),
    max_screenshot_gap_ms:Math.max(0,...during),screenshot_ms:screenshotEnded-screenshotStarted,
-   health,source_ticks:sourceTicks.length,max_source_tick_gap_ms:Math.max(0,...sourceGaps),largest_frame_gap:gaps[0],
+   health,diagnostic:JSON.parse(document.querySelector("#diagnostics").textContent.split("WebRTC attempt diagnostics (observational): ")[1]),
+   source_ticks:sourceTicks.length,max_source_tick_gap_ms:Math.max(0,...sourceGaps),largest_frame_gap:gaps[0],
    first_stall:offlineFirstStall,raf:{...offlineRaf},final_stats:await offlineReadStats(),
    dom:{hidden:dom.hidden,display:style.display,visibility:style.visibility,width:rect.width,height:rect.height}};
   clearInterval(offlineMedia.timer);clearInterval(offlineStallTimer);globalThis.offlineRafActive=false;cancelAnimationFrame(offlineRafId);offlineMedia.stream.getTracks().forEach(track=>track.stop());offlinePeers.forEach(peer=>peer.close());return stats;
@@ -304,6 +305,13 @@ test("actual video keeps presented-frame proof across the ordinary primary scree
  assert.ok(result.last.presented>result.first.presented);assert.ok(result.last.media>result.first.media);
  assert.equal(result.health.video.fresh,true);assert.equal(result.dom.hidden,false);assert.notEqual(result.dom.display,"none");
  assert.ok(!requests.some(value=>/^\/api\/(start|claim|stop|command)$/.test(value)));assert.deepEqual(errors,[]);
+ const history=result.diagnostic.view_progress.delivery_history;
+ assert.ok(history.callback_count>0&&history.reports.length>0&&history.reports.length<=8);
+ assert.ok(Number.isFinite(history.latest_callback.presentation_ms)&&Number.isFinite(history.latest_callback.expected_display_ms));
+ for(const values of history.reports){const row=Object.fromEntries(history.columns.map((key,i)=>[key,values[i]]));
+  assert.ok(row.callback_ms<=row.fetch_ms);assert.equal(row.pi_core_accepted_s,null);assert.equal(row.pi_until_s,null);
+ }
+ assert.ok(Buffer.byteLength(JSON.stringify(result.diagnostic))<=8192);
  t.diagnostic(JSON.stringify({actual_video:true,width:1400,height:1000,source_fps:15,steady_seconds:20,
   frames:result.frames,first:result.first,last:result.last,max_ordinary_gap_ms:result.max_ordinary_gap_ms,
   max_screenshot_gap_ms:result.max_screenshot_gap_ms,screenshot_ms:result.screenshot_ms,dom:result.dom,
@@ -504,8 +512,16 @@ test("stopped report cannot clear a new epoch's active delivery or publish a sta
   await p.view.stop();await Promise.race([old,new Promise((_,reject)=>setTimeout(()=>reject(Error("stop did not settle old report")),200))]);await p.view.start("forward");p.source("forward");p.advance(200);
   p.callbacks.pop()(200,{presentedFrames:1,mediaTime:.1});const current=p.view.report();await new Promise(setImmediate);
   assert.equal(finish.length,2);assert.equal(p.view.reporting,true);
+  const before=p.view.diagnostics().view_progress.delivery_history;
+  assert.equal(before.attempt,p.view.epoch);assert.equal(before.reports.length,1);
+  const pendingRows=JSON.stringify(before.reports);
   finish[0]();await new Promise(setImmediate);assert.equal(p.view.reporting,true);assert.equal(p.view.progressReceipt,null);
+  assert.equal(JSON.stringify(p.view.diagnostics().view_progress.delivery_history.reports),pendingRows,
+   "retired settlement cannot append to or alter a new generation's history");
   finish[1]();await current;assert.equal(p.view.progressReceipt.view_delivery.role,"forward");assert.equal(p.view.reporting,false);
+  const after=p.view.diagnostics().view_progress.delivery_history;
+  assert.equal(after.attempt,p.view.epoch);assert.equal(after.reports.length,1);
+  assert.equal(after.reports[0][after.columns.indexOf("outcome")],"accepted");
  }finally{finish.forEach(resolve=>resolve());await p.view.stop();}
 });
 
@@ -817,4 +833,170 @@ test("view-progress panel reads do not renew source clocks or schedule delivery"
  p.context.document={get visibilityState(){throw Error("private unavailable document");}};
  assert.doesNotThrow(()=>p.view.diagnostics());assert.equal(p.view.health().fresh,false);
  await p.view.stop();
+});
+
+
+test("between-sample progress history joins actual callbacks, dispatch and out-of-order Pi receipts",async()=>{
+ const p=fixture({manualTimers:true}),pending=[],secret="PRIVATE-cookie-URL-CSRF";
+ await p.view.start("chest");p.source();
+ p.setProgressResponse(options=>{
+  const frame=JSON.parse(options.body).decoded_frames;
+  const receipt={accepted:frame!==1,status:frame===1?"refused":"view_progress",reason:secret,required_view:{required:true,qualified:frame!==1},
+   view_delivery:{owner_result:{accepted:true,required_view:{required:true,qualified:frame!==1}},decoded_frames:frame,media_time:frame/10,
+    source_sequence:123+frame,source_arrived_at_monotonic_s:99.86+frame/10,request_received_at_monotonic_s:100+frame/10,
+    status_started_at_monotonic_s:100.01+frame/10,status_completed_at_monotonic_s:100.02+frame/10,
+    original_floor_at_monotonic_s:99.9+frame/10,private:secret,
+    core:{core_started_at_monotonic_s:100.02+frame/10,core_accepted_at_monotonic_s:frame===1?null:100.03+frame/10,
+     original_floor_at_monotonic_s:99.8+frame/10,
+     qualified_until_monotonic_s:frame===1?0:100.4+frame/10}}};
+  const body=JSON.stringify(receipt);
+  return {ok:true,status:200,headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":String(body.length)},
+   text:()=>new Promise(resolve=>pending.push(()=>resolve(body)))};
+ });
+ p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1,presentationTime:0,expectedDisplayTime:16});
+ const first=p.view.report();await new Promise(setImmediate);
+ p.advance(150);p.source();p.callbacks.shift()(150,{presentedFrames:2,mediaTime:.2,presentationTime:140,expectedDisplayTime:166});
+ const second=p.view.report();await new Promise(setImmediate);
+ p.advance(180);pending[1]();await second;p.advance(300);pending[0]();await first;
+ const snapshot=p.view.diagnostics(),history=snapshot.view_progress.delivery_history;
+ assert.ok(history,"latest-only receipt loses the earlier between-sample delivery");
+ const rows=Array.from(history.reports,row=>Object.fromEntries(Array.from(history.columns,(key,i)=>[key,row[i]])));
+ assert.equal(rows.length,2);assert.equal(history.callback_count,2);
+ assert.equal(history.latest_callback.frames,2);assert.equal(history.latest_callback.presentation_ms,140);
+ assert.equal(history.latest_callback.expected_display_ms,166);
+ assert.deepEqual(rows.map(row=>[row.frames,row.callback_ms,row.fetch_ms,row.settled_ms,row.current]),
+  [[1,0,0,300,false],[2,150,150,180,true]]);
+ assert.equal(rows[0].pi_request_s,100.1);assert.equal(rows[0].pi_floor_s,100.);
+ assert.equal(rows[1].pi_core_accepted_s,100.23);assert.equal(rows[1].outcome,"accepted");
+ assert.deepEqual(rows.map(row=>[row.accepted,row.qualified,row.owner_accepted,row.owner_qualified,row.pi_until_s]),
+  [[false,false,true,false,0],[true,true,true,true,100.60000000000001]]);
+ assert.equal(rows[0].pi_core_floor_s,99.89999999999999,"late invalidating receipt keeps its original Core floor");
+ assert.equal(rows[0].source_sequence,124);assert.equal(rows[0].pi_source_arrived_s,99.96);
+ assert.equal(rows[0].pi_core_accepted_s,null);assert.equal(rows[0].pi_core_started_s,100.11999999999999,
+  "refused noncurrent report retains Core attempt even without an accepted timestamp");
+ assert.notEqual(rows[0].pi_source_arrived_s,rows[0].pi_floor_s,"source arrival and selected floor are distinct");
+ assert.equal(p.view.progressReceipt.view_delivery.decoded_frames,2,"historical receipt must not replace latest control evidence");
+ for(const forbidden of [secret,p.ids.owner_generation,p.ids.capture_generation,p.ids.encode_generation,p.ids.view_generation]){
+  assert.ok(!JSON.stringify(snapshot).includes(forbidden));assert.ok(!JSON.stringify(p.view.diagnosticView).includes(forbidden));
+ }
+ history.reports[0][0]=999;assert.notEqual(p.view.diagnostics().view_progress.delivery_history.reports[0][0],999);
+ p.advance(901);p.source();assert.equal(p.view.health().fresh,false);
+ const expired=p.view.diagnostics().view_progress.delivery_history;
+ assert.deepEqual(Array.from(expired.reports.at(-1)),Array.from(history.reports.at(-1)),
+  "sampling an expired decoder cannot invent a new invalidation receipt or renew its Pi qualification");
+ assert.equal(expired.reports.length,2);assert.equal(p.requests.filter(r=>r.url.endsWith("/progress")).length,2);
+ await p.view.stop();
+});
+
+
+test("progress history distinguishes callbacks, occupied raw slots and cancellation settlement",async()=>{
+ const p=fixture({manualTimers:true}),finish=[];await p.view.start("chest");p.source();
+ const body=JSON.stringify({accepted:true,status:"view_progress",required_view:{required:true,qualified:true}});
+ p.setProgressResponse({ok:true,status:200,headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":String(body.length)},
+  text:()=>new Promise(resolve=>finish.push(()=>resolve(body)))});
+ p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});const first=p.view.report();await new Promise(setImmediate);
+ p.advance(150);p.source();p.callbacks.shift()(150,{presentedFrames:2,mediaTime:.2});const second=p.view.report();await new Promise(setImmediate);
+ p.advance(300);p.callbacks.shift()(300,{presentedFrames:2,mediaTime:.2});void p.view.report();
+ p.advance(350);p.callbacks.shift()(350,{presentedFrames:3,mediaTime:.3});await new Promise(setImmediate);
+ p.runTimers(750);await Promise.all([first,second]);
+ let history=p.view.diagnostics().view_progress.delivery_history;
+ assert.equal(history.latest_callback.advanced,true);assert.equal(history.latest_callback.frames,3);
+ assert.ok(history.skipped.no_presentation>=1&&history.skipped.slots>=1&&history.skipped.cadence>=1);
+ assert.equal(history.slots.raw,2);assert.equal(history.slots.active,0);assert.equal(history.slots.cancelled,2);
+ assert.equal(p.requests.filter(r=>r.url.endsWith("/progress")).length,2,"diagnostics must not bypass quarantine");
+ p.advance(900);void p.view.report();history=p.view.diagnostics().view_progress.delivery_history;
+ assert.ok(history.skipped.decode>=1);assert.equal(p.view.health().fresh,false,"diagnostic clocks cannot renew decode freshness");
+ finish.forEach(resolve=>resolve());await new Promise(setImmediate);
+ history=p.view.diagnostics().view_progress.delivery_history;
+ const rows=Array.from(history.reports,row=>Object.fromEntries(Array.from(history.columns,(key,i)=>[key,row[i]])));
+ assert.deepEqual(rows.map(row=>[row.outcome,row.cancel_ms,row.settled_ms]),[["superseded",350,900],["timeout",350,900]]);
+ assert.equal(p.view.progressReceipt,null);await p.view.stop();
+});
+
+test("progress history sanitizes storage and bounds eight rows within8KiB",async t=>{
+ const p=fixture({manualTimers:true}),secret="PRIVATE-cookie-URL-CSRF",ceiling=Number.MAX_SAFE_INTEGER;
+ await p.view.start("chest");p.source();let huge=false;
+ p.setProgressResponse(()=>{
+  const n=huge?ceiling:100;
+  const receipt={accepted:true,status:"view_progress",reason:secret,required_view:{required:true,qualified:true},
+   view_delivery:{request_received_at_monotonic_s:n,status_started_at_monotonic_s:n,status_completed_at_monotonic_s:n,
+    original_floor_at_monotonic_s:n,core:{core_accepted_at_monotonic_s:n,qualified_until_monotonic_s:n},private:secret}};
+  const body=JSON.stringify(receipt);return {ok:true,status:200,
+   headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":String(body.length)},text:async()=>body};
+ });
+ for(let i=1;i<=12;i++){p.advance((i-1)*150);p.source();p.callbacks.shift()((i-1)*150,
+  {presentedFrames:i,mediaTime:i/10,presentationTime:(i-1)*150,expectedDisplayTime:(i-1)*150+16});await p.view.report();}
+ let snapshot=p.view.diagnostics(),history=snapshot.view_progress.delivery_history;
+ assert.equal(p.view.diagnosticView.progress.reports.length,8);assert.equal(history.dropped,4);
+ assert.equal(history.reports.length+history.size_dropped,8);assert.ok(Buffer.byteLength(JSON.stringify(snapshot))<=8192);
+ huge=true;
+ for(let i=1;i<=12;i++){const at=ceiling-2000+i*150;p.advance(at);p.source();p.callbacks.shift()(at,
+  {presentedFrames:ceiling-12+i,mediaTime:ceiling-12+i,presentationTime:at,expectedDisplayTime:at+16});await p.view.report();}
+ for(let i=0;i<4;i++){p.view.pc.oniceconnectionstatechange?.();p.view.pc.onconnectionstatechange?.();}
+ p.view.pc.ontrack?.({track:{kind:"video"}});p.setStatsResponse(new Map([["v",{type:"inbound-rtp",kind:"video",
+  packetsReceived:ceiling,bytesReceived:ceiling,framesReceived:ceiling,framesDecoded:ceiling,jitterBufferEmittedCount:ceiling}]]));
+ p.runTimers(3000);await new Promise(setImmediate);
+ snapshot=p.view.diagnostics();history=snapshot.view_progress.delivery_history;
+ assert.equal(p.view.diagnosticView.progress.reports.length,8);assert.equal(history.dropped,16);
+ assert.equal(history.reports.length+history.size_dropped,8,"any omitted diagnostic rows must be counted");
+ t.diagnostic(JSON.stringify({maximum_scalar_history_bytes:Buffer.byteLength(JSON.stringify(snapshot)),
+  retained:history.reports.length,size_dropped:history.size_dropped}));
+ assert.ok(Buffer.byteLength(JSON.stringify(snapshot))<=8192);
+ assert.ok(!JSON.stringify(snapshot).includes(secret)&&!JSON.stringify(p.view.diagnosticView).includes(secret));
+ p.callbacks.shift()(ceiling,{presentedFrames:ceiling,mediaTime:Infinity,presentationTime:NaN,expectedDisplayTime:secret});
+ const latest=p.view.diagnostics().view_progress.delivery_history.latest_callback;
+ assert.equal(latest.presentation_ms,null);assert.equal(latest.expected_display_ms,null);assert.equal(latest.media_time,null);
+ assert.equal(latest.advanced,false);assert.equal(p.view.mediaTime,ceiling,"invalid diagnostic metadata cannot change player progress");
+ await p.view.stop();
+});
+
+test("progress history failures cannot affect valid receipt delivery",async()=>{
+ for(const failure of ["optional-response-status","optional-presentation","diagnostic-storage"]){
+  const p=fixture({manualTimers:true});await p.view.start("chest");p.source();
+  const body=JSON.stringify({accepted:true,status:"view_progress",required_view:{required:true,qualified:true}});
+  const response={ok:true,headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":String(body.length)},text:async()=>body};
+  if(failure==="optional-response-status")Object.defineProperty(response,"status",{get(){throw Error("PRIVATE status");}});
+  if(failure==="diagnostic-storage")Object.defineProperty(p.view.diagnosticView,"progress",{get(){throw Error("PRIVATE storage");}});
+  p.setProgressResponse(response);
+  const metadata={presentedFrames:1,mediaTime:.1};
+  if(failure==="optional-presentation")Object.defineProperty(metadata,"presentationTime",{get(){throw Error("PRIVATE presentation");}});
+  p.callbacks.shift()(0,metadata);await p.view.report();
+  assert.equal(p.view.progressReceipt?.accepted,true,failure);assert.equal(p.view.error,null,failure);
+  assert.equal(p.view.health().fresh,true,failure);assert.equal(p.requests.filter(r=>r.url.endsWith("/progress")).length,1);
+  await p.view.stop();
+ }
+});
+
+for(const cadence of [150,200])test("progress history retains eight realistic full receipts at "+cadence+"ms",async t=>{
+ const p=fixture({manualTimers:true});await p.view.start("chest");p.source();
+ const pi=1011840.123456789;
+ p.setProgressResponse(options=>{
+  const body=JSON.parse(options.body),at=pi+(body.decoded_frames-1800)*cadence/1000;
+  const delivery={decoded_frames:body.decoded_frames,media_time:body.media_time,source_sequence:14600+body.decoded_frames,
+   request_received_at_monotonic_s:at,request_body_completed_at_monotonic_s:at+.0011,
+   status_started_at_monotonic_s:at+.0012,status_completed_at_monotonic_s:at+.0141,
+   source_arrived_at_monotonic_s:at-.0412,original_floor_at_monotonic_s:at-.0412,
+   owner_snapshot_started_at_monotonic_s:at+.0142,owner_snapshot_completed_at_monotonic_s:at+.0179,
+   owner_progress_started_at_monotonic_s:at+.0180,owner_progress_completed_at_monotonic_s:at+.0215,
+   owner_enqueued_at_monotonic_s:at+.0181,http_response_ready_at_monotonic_s:at+.0217,
+   core:{core_started_at_monotonic_s:at+.0184,core_completed_at_monotonic_s:at+.0213,
+    core_accepted_at_monotonic_s:at+.0186,original_floor_at_monotonic_s:at-.0412,qualified_until_monotonic_s:at+.4588},
+   owner_result:{accepted:true,status:"view_progress",required_view:{required:true,qualified:true}}};
+  const text=JSON.stringify({accepted:true,status:"view_progress",required_view:{required:true,qualified:true},view_delivery:delivery});
+  return {ok:true,status:200,headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":String(text.length)},text:async()=>text};
+ });
+ for(let i=0;i<4;i++){p.view.pc.oniceconnectionstatechange?.();p.view.pc.onconnectionstatechange?.();}
+ p.view.pc.ontrack?.({track:{kind:"video"}});p.setStatsResponse(new Map([["v",{type:"inbound-rtp",kind:"video",
+  packetsReceived:1350,bytesReceived:1234567,framesReceived:1800,framesDecoded:1800,jitterBufferEmittedCount:1797}]]));
+ p.runTimers(3000);await new Promise(setImmediate);
+ for(let i=0;i<8;i++){const at=40450.123456+i*cadence;p.advance(at);p.source();p.callbacks.shift()(at,
+  {presentedFrames:1800+i,mediaTime:120.123456789+i*cadence/1000,presentationTime:at-.211,expectedDisplayTime:at+16.667});
+  await p.view.report();}
+ const snapshot=p.view.diagnostics(),h=snapshot.view_progress.delivery_history,index=h.columns.indexOf("fetch_ms");
+ const span=h.reports.at(-1)[index]-h.reports[0][index];
+ t.diagnostic(JSON.stringify({cadence_ms:cadence,stored:8,retained:h.reports.length,size_dropped:h.size_dropped,
+  retained_span_ms:span,bytes:Buffer.byteLength(JSON.stringify(snapshot))}));
+ assert.equal(h.reports.length,8,"bounded diagnostic projection must retain the eight realistic report rows");
+ assert.ok(span>=1000,"one-second diagnostic sampling needs at least one full second of retained reports");
+ assert.equal(h.size_dropped,0);assert.ok(Buffer.byteLength(JSON.stringify(snapshot))<=8192);await p.view.stop();
 });

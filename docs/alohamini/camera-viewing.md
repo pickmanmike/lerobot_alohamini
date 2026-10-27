@@ -60,7 +60,7 @@ normal activity rather than repeating a camera-only qualification.
 The camera-plus-Local sections below are preserved historical records at their
 recorded sources. Their attendance, setup and operating restrictions do not
 supersede the current owner's explicitly authorized AM1 reliability scope;
-the current [operating checkpoint](teleop-consolidation-16.md#current-checkpoint--progress-pacing-and-useful-ordinary-reuse-2026-10-26)
+the current [operating checkpoint](teleop-consolidation-16.md#current-continuation--camera-reuse-and-recovery-composition-2026-10-27)
 and active repository instructions govern this continuation. Historical failures,
 acceptances and security boundaries remain recorded without relabeling.
 
