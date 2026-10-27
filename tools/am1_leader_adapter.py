@@ -1084,12 +1084,13 @@ def _owner_unknown_renewal(error):
             and isinstance(getattr(error, "renewal_context", None), dict))
 
 
-def _owner_unknown_grant(error):
+def _owner_unknown_result(error, operation):
     """Only the correlated canonical Gateway unknown result, never a refusal."""
     expected = {"accepted": None, "status": "unknown", "uncertain": True,
                 "reason": "owner outcome unknown; inspect state or lookup the same operation", "effect_admitted": None}
     response = getattr(error, "response", None)
-    if (type(error) is not CommandRefusedError or getattr(error, "operation", None) != "grant"
+    if (operation not in {"grant", "input"} or type(error) is not CommandRefusedError
+        or getattr(error, "operation", None) != operation
         or not isinstance(response, dict) or set(response) not in
             (set(expected) | {"id", "kind"}, set(expected) | {"id", "kind", "diagnostic_timing"})
         or response.get("kind") != "result" or type(response.get("id")) is not str
@@ -1100,6 +1101,10 @@ def _owner_unknown_grant(error):
         return str(UUID(response["id"])) == response["id"]
     except ValueError:
         return False
+
+
+def _owner_unknown_grant(error):
+    return _owner_unknown_result(error, "grant")
 
 
 def expired_input_refusal(error):
@@ -2738,16 +2743,40 @@ class SameRunRecovery:
 
     async def resume(
         self, *, wall_deadline=None, require_episode=False, refusal_identity=None, expected_pause=None,
-        renewal_check=None, grant_error=None, renewal_reconcile=None,
+        renewal_check=None, grant_error=None, renewal_reconcile=None, input_error=None,
     ):
         clock = {"ceiling": wall_deadline, "anchored": False, "before_resume": True}
-        interrupted, deferred, first_transport_error = None, [], grant_error
+        original_error = input_error if input_error is not None else grant_error
+        interrupted, deferred, first_transport_error = None, [], original_error
         grant_context, pending_recovery, resume_context = None, None, None
         consumed_resumes = set()
-        if grant_error is not None:
+        if original_error is not None:
             try:
-                grant_context = getattr(grant_error, "grant_context", None)
-                if (not (isinstance(grant_error, (TimeoutError, ConnectionError)) or _owner_unknown_grant(grant_error))
+                if input_error is not None:
+                    context = getattr(input_error, "input_context", None)
+                    if (grant_error is not None or not isinstance(context, dict)
+                        or set(context) != {"identity", "snapshot", "requested", "network_seq", "source"}
+                        or type(context["network_seq"]) is not int or not 0 < context["network_seq"] == self.client.sequence < 2**63
+                        or not (isinstance(input_error, (TimeoutError, ConnectionError))
+                                or _owner_unknown_result(input_error, "input"))):
+                        raise RuntimeError("original uncertain Input context unavailable")
+                    before = context["snapshot"]
+                    run, live = before.get("run") or {}, _live(before)
+                    if (run.get("source") != "protected-physical-provider"
+                        or before.get("evidence", {}).get("source") != run["source"]
+                        or run.get("bench_continuity") is True
+                        or live.get("workspace", {}).get("workspace_profile") != ORDINARY_ARMS_PROFILE
+                        or live.get("required_view", {}).get("required") is not True
+                        or context["source"].get("kind") != "virtual-leaders"):
+                        raise RuntimeError("ordinary physical current-rest Input authority unavailable")
+                    validate_source(context["source"], grant_id=context["source"].get("grant_id"))
+                    if context["source"]["sent_at_monotonic_s"] > time.perf_counter():
+                        raise RuntimeError("original uncertain Input acquisition is in the future")
+                    grant_context = {key: context[key] for key in ("identity", "snapshot", "requested")}
+                else:
+                    grant_context = getattr(grant_error, "grant_context", None)
+                if (not (isinstance(original_error, (TimeoutError, ConnectionError))
+                         or _owner_unknown_result(original_error, "input" if input_error is not None else "grant"))
                     or not isinstance(grant_context, dict)
                     or set(grant_context) != {"identity", "snapshot", "requested"} or renewal_check is None):
                     raise RuntimeError("original pre-capture grant ambiguity unavailable")
@@ -2778,11 +2807,12 @@ class SameRunRecovery:
                     if value <= 0:
                         raise TimeoutError("original grant rejoin ceiling exhausted")
                     return value
-                self.record({"event": "leader_grant_ambiguous", "identity": identity,
-                             "outcome": "unknown_discarded_before_capture", "remaining_s": remaining_budget()})
+                self.record({"event": "leader_input_ambiguous" if input_error is not None else "leader_grant_ambiguous", "identity": identity,
+                             "outcome": "unknown_discarded_after_capture" if input_error is not None else "unknown_discarded_before_capture",
+                             "remaining_s": remaining_budget()})
                 await self._attach_transport(before, identity, remaining_budget, renewal_check)
             except (Exception, asyncio.CancelledError) as error:
-                raise grant_error from error
+                raise original_error from error
         while True:
             try:
                 try:
@@ -4075,6 +4105,10 @@ async def send_leader_sample(client, producer, body, record, *, phase, progress_
         raise
     except CommandRefusedError as error:
         error.operation, error.identity = "input", dict(identity)
+        if _owner_unknown_result(error, "input") and grant_context is not None:
+            error.input_context = {"identity": dict(identity), "snapshot": grant_context["snapshot"],
+                                   "requested": requested, "network_seq": client.sequence,
+                                   "source": dict(frame["source"])}
         record(
             {
                 "event": "leader_frame_rejected",
@@ -4106,6 +4140,7 @@ async def run(args):
     left_entry = getattr(args, "left_entry", False)
     left_reach_cycles = _left_reach_cycles(args)
     bench = getattr(args, "bench_continuity", False)
+    ordinary_input_rearm = ordinary_arms and bool(changing_input) and not left_entry and not bench and args.source == "virtual-leaders"
     segment = getattr(args, "workload_segment", "full")
     controller_gap = getattr(args, "interrupt_controller", False)
     terminal_budget = 12. if bench else 2.
@@ -4617,13 +4652,16 @@ async def run(args):
                 ceiling = min(time.monotonic() + min(12., remaining), ceiling if ceiling is not None else float("inf"))
             if input_error is not None:
                 context = getattr(input_error, "input_context", None)
-                if (not bench or not isinstance(context, dict)
+                if (not (bench or ordinary_input_rearm) or not isinstance(context, dict)
                     or set(context) != {"identity", "snapshot", "requested", "network_seq", "source"}
                     or context["network_seq"] != client.sequence
                     or type(context["requested"]) not in (int, float)
                     or not math.isfinite(context["requested"]) or context["requested"] > time.monotonic()):
                     raise RuntimeError("original ambiguous input context unavailable") from input_error
                 recovery.check(context["snapshot"])
+                if not bench and (context["source"].get("source_id") != producer.source_id
+                    or context["source"].get("sample_seq") != producer.sequence):
+                    raise RuntimeError("original uncertain Input source acquisition changed") from input_error
                 binding = {"run_id": recovery.original["run"]["run_id"],
                            "service_incarnation": recovery.original["service"],
                            "host_incarnation": recovery.original["run"]["backend_incarnation"],
@@ -4633,7 +4671,7 @@ async def run(args):
                 ceiling = min(ceiling, context["requested"] + context["snapshot"]["run"]["remaining_s"])
                 if workload:
                     workload.freeze()
-                record({"event": "bench_input_receipt_requalification", "identity": context["identity"],
+                record({"event": "bench_input_receipt_requalification" if bench else "ordinary_input_receipt_requalification", "identity": context["identity"],
                         "network_seq": context["network_seq"], "source": context["source"],
                         "original_ceiling_monotonic_s": ceiling,
                         "meaning": "discard ambiguous input; fresh attachment, held qualification and new capture"})
@@ -4655,6 +4693,7 @@ async def run(args):
                         expected_pause=expected_pause,
                         renewal_check=renewal_healthy, grant_error=grant_error,
                         renewal_reconcile=None if bench else restart_qualified_renewal,
+                        input_error=input_error if ordinary_input_rearm else None,
                     )
                     break
                 except Exception as error:
@@ -4926,7 +4965,7 @@ async def run(args):
                 if peer_baseline_until is not None and (baseline_budget.expired() or time.monotonic() >= peer_baseline_until):
                     summary["peer_baseline_qualification_seconds"] = time.monotonic() - peer_baseline_started
                     raise TimeoutError("peer baseline original qualification ceiling exhausted") from error
-                if bench and hasattr(error, "input_context"):
+                if (bench or ordinary_input_rearm) and hasattr(error, "input_context"):
                     await rejoin(input_error=error, until=peer_baseline_until)
                     continue
                 if not hasattr(error, "grant_context"):
@@ -4934,6 +4973,9 @@ async def run(args):
                 await rejoin(grant_error=error, until=peer_baseline_until)
                 continue
             except CommandRefusedError as error:
+                if ordinary_input_rearm and _owner_unknown_result(error, "input") and hasattr(error, "input_context"):
+                    await rejoin(input_error=error, until=peer_baseline_until)
+                    continue
                 if _owner_unknown_grant(error) and hasattr(error, "grant_context"):
                     await rejoin(grant_error=error, until=peer_baseline_until)
                     continue
@@ -5058,7 +5100,7 @@ async def run(args):
                         progress_s=workload.elapsed_s if workload else None,
                     )
             except TimeoutError as error:
-                if bench and hasattr(error, "input_context") and not attempt_budget.expired():
+                if (bench or ordinary_input_rearm) and hasattr(error, "input_context") and not attempt_budget.expired():
                     await rejoin(input_error=error, until=qualification_ceiling)
                     continue
                 if hasattr(error, "grant_context") and not attempt_budget.expired():
@@ -5070,7 +5112,7 @@ async def run(args):
                     ) from error
                 raise
             except ConnectionError as error:
-                if bench and hasattr(error, "input_context"):
+                if (bench or ordinary_input_rearm) and hasattr(error, "input_context"):
                     await rejoin(input_error=error, until=qualification_ceiling)
                     continue
                 if not hasattr(error, "grant_context"):
@@ -5078,6 +5120,9 @@ async def run(args):
                 await rejoin(grant_error=error, until=qualification_ceiling)
                 continue
             except CommandRefusedError as error:
+                if ordinary_input_rearm and _owner_unknown_result(error, "input") and hasattr(error, "input_context"):
+                    await rejoin(input_error=error, until=qualification_ceiling)
+                    continue
                 if _owner_unknown_grant(error) and hasattr(error, "grant_context"):
                     await rejoin(grant_error=error, until=qualification_ceiling)
                     continue
