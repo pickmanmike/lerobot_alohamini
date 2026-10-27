@@ -5,6 +5,65 @@ milestone, see [AM1 supervised unified Local session](unified-session.md). The
 underlying camera security model, accepted evidence, and known browser-gap
 limitation documented here remain unchanged.
 
+<a id="current-ordinary-viewing-path"></a>
+
+## Current ordinary route — Stage85, 2026-10-27
+
+Use the existing AM1-attached USB cameras through the ordinary protected owner.
+[`ProtectedHostRun`](../../tools/am1_physical_executor.py) starts the maintained
+[`run_am1_camera.sh`](../../tools/run_am1_camera.sh) launcher in the retained
+`/home/pickmanmike/am1_physical_camera_trial` checkout, with its existing camera
+Python environment and one finite owned-session lease. The private
+`camera_config` pointer remains `~/.config/am1-camera/cameras.json`;
+`camera_credentials` remains `~/.config/am1-camera/viewer.json`. Retain the
+measured persistent by-path capture-index0 mapping; do not enumerate or remap
+cameras or use their shared serial as identity.
+
+| Retained USB source | Logical view | Clockwise display rotation |
+|---|---|---|
+| Camera1 | `forward` / Front | 180° |
+| Camera2 | `chest` / Chest | 180° |
+| Camera3 | `wrist_right` / Right wrist | 270° |
+| Camera4 | `backward` / Rear | 180° |
+| Camera5 | `wrist_left` / Left wrist | 90° |
+
+The corrected wrist identities are retained. One capture owner serves local
+sensing and the viewer; do not start a second standalone camera backend beside
+it. The enrolled console uses the existing
+[`/api/onboard/status` and `/api/onboard/frame/{role}` routes](../../tools/am1_session_service.py),
+which [proxy that same owner's allowlisted status/JPEG APIs](../../tools/am1_onboard_media.py).
+Select Chest in that viewer. Reopen its existing enrolled software-decoder
+profile through the [open-only launcher procedure](teleop-consolidation-16.md#verification-and-ordinary-use)
+(`run_am1_console.ps1 -SessionUrl ... -SoftwareVideoDecode`); this opens the page
+without Start/Claim or a new capture process. P1 advisory viewing and paused
+THETA/companion work are separate from these AM1 USB cameras and physical USB
+leaders.
+
+During the next purposeful normal activity, the minimum availability check is
+configured/fresh Chest at the existing owner plus actual advancing decoded
+Chest imagery and current required-view receipts in the restored visible
+viewer. Source counters or a connection label alone do not prove presentation.
+Keep the existing view-loss HOLD/recovery rules. A released source after Stop
+is expected; no separate camera-only gate, reenrollment, connection change or
+new readiness campaign is required.
+
+[Camera32](teleop-consolidation-16.md#current-status-and-source) retained a finite
+live 640×480 source/display comparison after added light, with fixed Chest and
+clean release. Stage85 reuse ce4ef37b then retained 464 qualified Chest snapshots,
+an independent Running 25.60s image and certain camera release. These support
+coarse awareness, not continuous viewing or fine gripper/approach visibility.
+On October 27 the owner identified Chest focus as a possible physical/optical
+option. It is not a proven software fault or a new prerequisite; no focus,
+remount or mapping change is included. Check source/display during useful
+normal activity rather than repeating a camera-only qualification.
+
+The camera-plus-Local sections below are preserved historical records at their
+recorded sources. Their attendance, setup and operating restrictions do not
+supersede the current owner's explicitly authorized AM1 reliability scope;
+the current [operating checkpoint](teleop-consolidation-16.md#current-checkpoint--progress-pacing-and-useful-ordinary-reuse-2026-10-26)
+and active repository instructions govern this continuation. Historical failures,
+acceptances and security boundaries remain recorded without relabeling.
+
 ## Camera workspace prepared for the control console
 
 The camera-only frontend now places Front, Rear, Chest, Left wrist and Right

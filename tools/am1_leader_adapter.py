@@ -2820,7 +2820,8 @@ class SameRunRecovery:
                         wall_deadline=clock["ceiling"], require_episode=require_episode,
                         refusal_identity=refusal_identity, expected_pause=expected_pause,
                         renewal_check=renewal_check, clock=clock, interrupted=interrupted,
-                        grant_context=grant_context, pending_recovery=pending_recovery, resume_context=resume_context)
+                        grant_context=grant_context, pending_recovery=pending_recovery, resume_context=resume_context,
+                        renewal_reconcile=renewal_reconcile)
                 except _NativeRecoveryPendingError as outcome:
                     first_transport_error = first_transport_error or outcome.original_error
                     if outcome.episode is not None:
@@ -3094,6 +3095,7 @@ class SameRunRecovery:
     async def _resume_once(
         self, *, wall_deadline, require_episode, refusal_identity, expected_pause,
         renewal_check, clock, interrupted, grant_context=None, pending_recovery=None, resume_context=None,
+        renewal_reconcile=None,
     ):
         # This is the existing authenticated owner read, not a WSS freshness
         # guess. Anchor BEFORE the read so HTTP time cannot extend the ceiling.
@@ -3637,24 +3639,42 @@ class SameRunRecovery:
                         or not 0 < accepted["native_remaining"] <= native_remaining):
                         raise RuntimeError("known accepted ordinary Resume phase unavailable")
                     clock["ceiling"] = min(clock["ceiling"], accepted["active_ceiling"])
-                    def remaining():
+                    def phase_budget():
                         value = clock["ceiling"] - time.monotonic()
                         if value <= 0:
                             raise TimeoutError("original accepted Resume observation ceiling exhausted")
+                        return value
+                    def remaining():
+                        value = phase_budget()
                         if renewal_check:
                             renewal_check()
                         return value
                     # Only fixed fields from this failed phase are emitted.
                     # Full owner snapshots and successful traffic stay unchanged.
-                    self.record({"event": "accepted_resume_transport_closed", "phase": "active_ack",
-                                 "identity": {k: (v.encode("utf-8")[:32].decode("utf-8", errors="ignore")
-                                                   if type(v) is str else v) for k, v in identity.items()},
-                                 "operation_id": accepted["operation_id"], "remaining_s": remaining(),
-                                 "transport_close": {k: accepted["transport_close"].get(k) for k in
-                                                     ("expected", "reason", "close_code", "exception_type", "reader_error")}})
-                    await self._attach_transport(state, identity, remaining, renewal_check)
-                    budget = remaining()
-                    fresh = (await asyncio.wait_for(self.client.get("state"), budget))["snapshot"]
+                    try:
+                        self.record({"event": "accepted_resume_transport_closed", "phase": "active_ack",
+                                     "identity": {k: (v.encode("utf-8")[:32].decode("utf-8", errors="ignore")
+                                                       if type(v) is str else v) for k, v in identity.items()},
+                                     "operation_id": accepted["operation_id"], "remaining_s": phase_budget(),
+                                     "transport_close": {k: accepted["transport_close"].get(k) for k in
+                                                         ("expected", "reason", "close_code", "exception_type", "reader_error")}})
+                        await self._attach_transport(state, identity, remaining, renewal_check)
+                        budget = remaining()
+                        fresh = (await asyncio.wait_for(self.client.get("state"), budget))["snapshot"]
+                    except HTTPOutcomeError as renewal_error:
+                        if (renewal_reconcile is None or not _owner_unknown_renewal(renewal_error)
+                            or clock.get("renewal_reconciled")):
+                            raise
+                        clock["renewal_reconciled"] = True
+                        # Detach may have cleared the cache. This authenticated read
+                        # grants nothing; the existing fenced renewal must prove authority.
+                        budget = phase_budget()
+                        current = (await asyncio.wait_for(self.client.get("state"), budget))["snapshot"]
+                        self.check(current)
+                        self.client.snapshot = current
+                        await self._renew_current_after_unknown(renewal_error, clock, renewal_reconcile, renewal_check)
+                        budget = remaining()
+                        fresh = (await asyncio.wait_for(self.client.get("state"), budget))["snapshot"]
                     self.client.snapshot = fresh
                     self.check(fresh)
                     run, evidence, live = fresh["run"], fresh.get("evidence", {}), _live(fresh)

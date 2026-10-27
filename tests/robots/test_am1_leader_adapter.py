@@ -3733,7 +3733,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "resume_reporting_pause", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_unknown_receipt", "ordinary_input_unknown_pre", "ordinary_input_unknown_post", "ordinary_input_unknown_transport", "grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal", "peer_start_normal", "peer_start_bench", "peer_bench_unqualified_view", "peer_bench_local_loss", "peer_normal_unqualified_view", "held_command120_view_later", "held_command120_view_never", "held_command120_local_loss", "view_refusal122_input_before", "view_refusal122_input_after", "view_refusal122_grant_before", "view_refusal122_grant_after", "view_refusal122_never", "view_refusal122_pause", "view_refusal122_stop", "view_refusal122_takeover", "view_refusal122_grant_connect_preflight_before", "view_refusal122_grant_connect_preflight_pending", "view_refusal122_grant_connect_preflight_queue", "view_refusal122_grant_connect_preflight_sent", "view_refusal122_grant_connect_preflight_pause", "view_refusal122_grant_connect_preflight_stop", "view_refusal122_grant_connect_preflight_takeover", "view_refusal122_grant_connect_preflight_reboot", "view_refusal122_grant_connect_preflight_lease", "view_refusal122_grant_connect_preflight_deadline", "view_refusal122_grant_connect_preflight_cancel", "view_refusal130_grant_input_race_before", "view_refusal130_grant_input_race_never", "view_refusal130_grant_input_race_pause", "view_refusal130_grant_input_race_stop", "view_refusal130_grant_input_race_takeover", "view_refusal130_grant_input_race_revision", "view_refusal130_grant_input_race_history", "view_refusal130_grant_input_race_time", "renewal_unknown133_grant_before", "renewal_unknown133_grant_pause", "renewal_unknown133_grant_takeover", "renewal_unknown133_grant_unchanged", "renewal_unknown133_grant_receipt_unknown", "renewal_unknown133_grant_second_read", "renewal_unknown133_grant_stream_before"])
+@pytest.mark.parametrize("cause", ["feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "resume_reporting_pause", "resume_reporting_renewal", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_unknown_receipt", "ordinary_input_unknown_pre", "ordinary_input_unknown_post", "ordinary_input_unknown_transport", "grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal", "peer_start_normal", "peer_start_bench", "peer_bench_unqualified_view", "peer_bench_local_loss", "peer_normal_unqualified_view", "held_command120_view_later", "held_command120_view_never", "held_command120_local_loss", "view_refusal122_input_before", "view_refusal122_input_after", "view_refusal122_grant_before", "view_refusal122_grant_after", "view_refusal122_never", "view_refusal122_pause", "view_refusal122_stop", "view_refusal122_takeover", "view_refusal122_grant_connect_preflight_before", "view_refusal122_grant_connect_preflight_pending", "view_refusal122_grant_connect_preflight_queue", "view_refusal122_grant_connect_preflight_sent", "view_refusal122_grant_connect_preflight_pause", "view_refusal122_grant_connect_preflight_stop", "view_refusal122_grant_connect_preflight_takeover", "view_refusal122_grant_connect_preflight_reboot", "view_refusal122_grant_connect_preflight_lease", "view_refusal122_grant_connect_preflight_deadline", "view_refusal122_grant_connect_preflight_cancel", "view_refusal130_grant_input_race_before", "view_refusal130_grant_input_race_never", "view_refusal130_grant_input_race_pause", "view_refusal130_grant_input_race_stop", "view_refusal130_grant_input_race_takeover", "view_refusal130_grant_input_race_revision", "view_refusal130_grant_input_race_history", "view_refusal130_grant_input_race_time", "renewal_unknown133_grant_before", "renewal_unknown133_grant_pause", "renewal_unknown133_grant_takeover", "renewal_unknown133_grant_unchanged", "renewal_unknown133_grant_receipt_unknown", "renewal_unknown133_grant_second_read", "renewal_unknown133_grant_stream_before"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause):
     import asyncio
     import copy
@@ -6092,7 +6092,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 assert a.run["deadline"] == 309. and a.run["native_live_at"] == 9.
                 assert a.run["recovery_episodes"] == 0 and guard.pause_recoveries == 1
                 return
-            if cause in {"resume_pong_pause", "resume_reporting_pause"}:
+            if cause in {"resume_pong_pause", "resume_reporting_pause", "resume_reporting_renewal"}:
                 # Real accepted Resume and pending native active ACK, then the
                 # existing NoPONG path or actual125's owner-unavailable message.
                 pi_clock, pending_active = [10.01], [False]
@@ -6101,6 +6101,26 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 a._teleop_view["qualified_until"] = pi_clock[0] + .5
                 original_call, original_wait, original_evidence = gateway.call, client.wait, e.evidence
                 resumes, closes, interruptions = [], [], []
+                coupled = cause == "resume_reporting_renewal"
+                held_renewal, renewal_contexts, renewal_posts, restarts = [], [], [], []
+                original_post = client.post
+                async def current_post(op, body):
+                    if op == "claim":
+                        renewal_posts.append(copy.deepcopy(body))
+                        assert body == {"controller_generation": ids["controller_generation"]}
+                    return await original_post(op, body)
+                if coupled:
+                    import tools.am1_session_ipc as ipc
+                    original_write = ipc.write_frame
+                    async def delay_known_renewal(writer, value, limit):
+                        result = value.get("result", {})
+                        if result.get("status") == "claimed" and len(resumes) == 1 and not held_renewal:
+                            held_renewal.append(copy.deepcopy(result))
+                            pi_clock[0] += .01  # Fresh snapshot is after the pause/renewal readbacks.
+                            await unblock_release.wait()  # Real owner IPC timeout -> canonical HTTP503.
+                        return await original_write(writer, value, limit)
+                    monkeypatch.setattr(ipc, "write_frame", delay_known_renewal)
+                    client.post = current_post
 
                 def pending_ack():
                     value = original_evidence()
@@ -6109,6 +6129,8 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     return value
 
                 async def accepted_resume(command, device):
+                    if coupled and command.get("op") == "claim":
+                        pi_clock[0] += .01  # Actual separate owner requests occur after the prior snapshot.
                     if command.get("op") == "resume":
                         resumes.append(copy.deepcopy(command))
                         if len(resumes) == 1:
@@ -6121,12 +6143,15 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 async def no_pong_during_active(predicate, timeout):
                     if timeout == 5 and len(resumes) == 1 and not closes:
                         assert sum(op == "input" for op, _ in commands) == 1
+                        if coupled:
+                            await original_wait(lambda: client.snapshot["run"]["intent_revision"] == a.run["intent_revision"], .3)
+                            assert client.snapshot["run"]["intent_revision"] == resumes[0]["intent_revision"]+1
                         pi_clock[0] += .02
                         a._pause_live_input("input_expired")
                         pending_active[0] = False
                         await asyncio.sleep(.01)
                         assert client.ws._waiting
-                        if cause == "resume_reporting_pause":
+                        if cause.startswith("resume_reporting"):
                             peers = [peer for peer in gateway.peers if peer.device == client.device]
                             assert len(peers) == 1
                             peers[0].put({"kind": "unavailable"})
@@ -6134,6 +6159,14 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                             client.ws._pong_not_received()
                         await client.reader
                         closes.append(copy.deepcopy(client.transport_close))
+                        if coupled:
+                            # Let the actual normal renewal's IPC timeout surface while
+                            # observing the already accepted Resume, not before dispatch.
+                            while not renewal.done():
+                                await asyncio.sleep(.01)
+                            error = renewal.exception()
+                            assert m._owner_unknown_renewal(error)
+                            renewal_contexts.append(copy.deepcopy(error.renewal_context))
                     try:
                         return await original_wait(predicate, timeout)
                     except ConnectionError as error:
@@ -6142,17 +6175,29 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
 
                 e.evidence, gateway.call, client.wait = pending_ack, accepted_resume, no_pong_during_active
                 renewal = asyncio.create_task(client.renew())
+                if coupled:
+                    while getattr(client, "_renewal_ack", None) is None:
+                        assert not renewal.done(), "the unknown renewal must have an actual prior qualified receipt"
+                        await asyncio.sleep(.01)
                 def renewal_healthy():
+                    if coupled and renewal.done():
+                        renewal.result()
                     assert not renewal.done()
+                async def restart_renewal(error):
+                    nonlocal renewal
+                    assert renewal.done() and renewal.exception() is error
+                    restarts.append(error)
+                    renewal = asyncio.create_task(client.renew())
                 try:
-                    ceiling = m.time.monotonic() + 1.5
+                    ceiling = m.time.monotonic() + (4.5 if coupled else 1.5)
                     assert not await guard.resume(expected_pause="input_expired", wall_deadline=ceiling,
-                                                  renewal_check=renewal_healthy)
+                                                  renewal_check=renewal_healthy,
+                                                  renewal_reconcile=restart_renewal if coupled else None)
                     assert client.snapshot["run"]["status"] == "running"
                     assert client.snapshot["evidence"]["active_acknowledged"] is True
                     assert len(resumes) == 2 and len({c["operation_id"] for c in resumes}) == 2
                     assert len(interruptions) == 1
-                    if cause == "resume_reporting_pause":
+                    if cause.startswith("resume_reporting"):
                         assert closes[0]["reason"] == "reader-error" and closes[0]["close_code"] is None
                         assert closes[0]["exception_type"] is closes[0]["exception"] is None
                         assert closes[0]["reader_error"] == {
@@ -6164,7 +6209,15 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         assert closes[0]["exception"] == "No PONG received after 0.5 seconds"
                         assert closes[0]["reader_error"] is None and closes[0]["expected"] is False
                     assert sum(op == "input" for op, _ in commands) == 1
-                    assert sum(op == "claim" for op, _ in commands) == 0
+                    if coupled:
+                        assert len(held_renewal) == len(renewal_contexts) == len(restarts) == 1
+                        context = renewal_contexts[0]
+                        assert context["identity"]["intent_revision"] in {resumes[0]["intent_revision"]+1, resumes[0]["intent_revision"]+2}
+                        assert held_renewal[0]["presence_expires"] > context["previous_expiry"]
+                        assert sum(row["event"] == "controller_renewal_requalified" for row in records) == 1
+                        assert renewal_posts and all(body == {"controller_generation": ids["controller_generation"]} for body in renewal_posts)
+                    else:
+                        assert sum(op == "claim" for op, _ in commands) == 0
                     assert guard.episodes == 0 and guard.pause_recoveries == 2
                     assert sum(r["event"] == "accepted_resume_superseded" for r in records) == 1
                     assert a.run["deadline"] == 309. and a.run["native_live_at"] == 9.
@@ -6175,6 +6228,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     assert fresh[2]["accepted"] is True and producer.sequence == 2
                     assert fresh[0]["grant_id"] != first[0]["grant_id"]
                 finally:
+                    unblock_release.set()
                     renewal.cancel()
                     await asyncio.gather(renewal, return_exceptions=True)
                 return
@@ -8061,12 +8115,17 @@ def test_known_resume_no_pong_requires_new_ordinary_proof_and_original_clocks(
     from aiohttp import ServerTimeoutError
 
     m = adapter()
+    canonical_renewal = isinstance(change, str) and change.startswith("canonical_renewal")
+    if canonical_renewal and ":" in change:
+        change = change.partition(":")[2]
     pc = [1000.]
     monkeypatch.setattr(m, "time", SimpleNamespace(monotonic=lambda: pc[0], perf_counter=time.perf_counter))
     state = recovery_state()
     state["run"].update(status="paused", operation_id=str(uuid4()),
                         remaining_s=.2 if change == "native_budget" else 299.)
     state["evidence"]["active_acknowledged"] = False
+    if canonical_renewal:
+        state["controller"]["presence_expires"] = 102.5
     pi_lower = state["run"]["deadline"] - state["run"]["remaining_s"]
     state["events"] = [{"kind": "pause" if change == "nonordinary" else "input_expired", "at": pi_lower - .01,
                         "run_id": "owned", "service_incarnation": "service"}]
@@ -8107,7 +8166,8 @@ def test_known_resume_no_pong_requires_new_ordinary_proof_and_original_clocks(
             }
             if change == "wrong_transport_error":
                 transport_error = "unrelated reporting failure"
-        attaches = connects = resumes = reads = 0
+        attaches = connects = resumes = reads = detaches = 0
+        renewal_failed = False
         saved = None
 
         async def get(self, path):
@@ -8115,6 +8175,10 @@ def test_known_resume_no_pong_requires_new_ordinary_proof_and_original_clocks(
             self.reads += 1
             pc[0] += .01
             if self.reads > 1:
+                if canonical_renewal and change == "fresh_deadline":
+                    pc[0] += 3.
+                if canonical_renewal and change == "cancel_read":
+                    raise asyncio.CancelledError("cancelled current authority read")
                 if change == "continuation_budget" and self.reads > 2:
                     pc[0] += 5.1
                 fresh = copy.deepcopy(self.saved)
@@ -8149,6 +8213,9 @@ def test_known_resume_no_pong_requires_new_ordinary_proof_and_original_clocks(
         async def detach(self):
             assert not any(c["op"] in {"input", "grant"} for c in calls)
             self.snapshot = None
+            self.detaches += 1
+            if canonical_renewal and change != "pending_before_record" and self.detaches == 1:
+                self.renewal_failed = True  # Unknown renewal arrives after quarantine, before fresh attachment.
             pc[0] += .01
 
         async def attach(self):
@@ -8163,6 +8230,21 @@ def test_known_resume_no_pong_requires_new_ordinary_proof_and_original_clocks(
             if change == "attach_timeout":
                 raise TimeoutError("original three-second attachment timed out")
             self.snapshot = copy.deepcopy(self.saved)
+            if canonical_renewal:
+                self.transport_error = self.transport_close = None
+
+        async def post(self, path, body):
+            assert canonical_renewal and path == "claim" and body == {"controller_generation": self.generation}
+            renewals.append(copy.deepcopy(body))
+            if change == "second_unknown":
+                raise m.HTTPOutcomeError(503, {"accepted": None, "status": "unknown", "uncertain": True,
+                    "reason": "owner outcome unknown; inspect state or lookup the same operation", "effect_admitted": None})
+            self.saved["controller"]["presence_expires"] = 104.5
+            self.saved["run"]["remaining_s"] = 298.5
+            self.saved["evidence"]["accepted_host_action"]["acquired_at_monotonic_s"] = 101.5
+            return {"accepted": True, "status": "claimed", "controller_generation": self.generation,
+                    "presence_expires": 104.5, "lease_seconds": 3.,
+                    "timing": {"service_received_at": 101.5, "service_completed_at": 101.5}}
 
         async def command(self, command):
             calls.append(copy.deepcopy(command))
@@ -8196,6 +8278,22 @@ def test_known_resume_no_pong_requires_new_ordinary_proof_and_original_clocks(
                 self.saved["evidence"]["accepted_host_action"].update(intent_revision=revision, state="paused",
                                                                       acquired_at_monotonic_s=pi_lower + .01)
                 self.snapshot["run"].update(status="resuming", intent_revision=command["intent_revision"] + 1)
+                if canonical_renewal:
+                    self.saved["run"]["remaining_s"] -= .01  # Snapshot follows the pause/held ACK by 10ms.
+                    self.saved["controller"]["presence_expires"] = 103.5  # Original unknown renewal actually advanced it.
+                    self.renewal_error.renewal_context = {"identity": self.identities(), "device": self.device,
+                        "run": copy.deepcopy(self.original_run), "previous_expiry": 102.5, "dispatched": pc[0]}
+                    if change == "unchanged_lease":
+                        self.saved["controller"]["presence_expires"] = 102.5
+                    elif change == "expired_lease":
+                        self.saved["controller"]["presence_expires"] = 100.9
+                        self.renewal_error.renewal_context["previous_expiry"] = 100.5
+                    elif change == "bad_context":
+                        self.renewal_error.renewal_context["run"]["deadline"] += 1
+                    elif change == "old_revision":
+                        self.renewal_error.renewal_context["identity"]["intent_revision"] -= 1
+                    elif change == "future_revision":
+                        self.renewal_error.renewal_context["identity"]["intent_revision"] += 2
             else:
                 self.snapshot["run"].update(status="running", intent_revision=command["intent_revision"] + 1)
                 self.snapshot["evidence"]["active_acknowledged"] = True
@@ -8203,11 +8301,16 @@ def test_known_resume_no_pong_requires_new_ordinary_proof_and_original_clocks(
 
         async def wait(self, predicate, timeout):
             if timeout == 5 and self.resumes == 1:
+                if canonical_renewal and change == "pending_before_record":
+                    self.renewal_failed = True
                 raise original
             assert predicate(), "fresh proof or actual active ACK required"
 
+    renewals, restarted = [], []
     async def scenario():
         client = Client()
+        client.renewal_error = m.HTTPOutcomeError(200 if change == "wrong_http" else 503, {"accepted": None, "status": "unknown", "uncertain": True,
+            "reason": "owner outcome unknown; inspect state or lookup the same operation", "effect_admitted": None})
         def record(row):
             records.append(copy.deepcopy(row))
             if change == "record" and row["event"] == "accepted_resume_transport_closed" or (
@@ -8216,18 +8319,42 @@ def test_known_resume_no_pong_requires_new_ordinary_proof_and_original_clocks(
         def healthy():
             if change == "renewal" and client.resumes:
                 raise RuntimeError("original renewal failed")
+            if canonical_renewal and client.renewal_failed:
+                raise client.renewal_error
+        async def restart(error):
+            assert error is client.renewal_error
+            restarted.append(error)
+            client.renewal_failed = False
         guard = m.SameRunRecovery(client, record)
+        client.original_run = copy.deepcopy(guard.original["run"])
+        if canonical_renewal and change == "already_reconciled":
+            resume_once = guard._resume_once
+            async def prior_reconciliation(**kwargs):
+                kwargs["clock"]["renewal_reconciled"] = True
+                return await resume_once(**kwargs)
+            monkeypatch.setattr(guard, "_resume_once", prior_reconciliation)
         deadline = None if change in {"active_budget", "continuation_budget"} else 1002.
-        if change in {None, "attach_retry", "unicode"}:
-            assert await guard.resume(wall_deadline=deadline, renewal_check=healthy) is False
+        if change in {None, "attach_retry", "unicode", "canonical_renewal", "pending_before_record"}:
+            assert await guard.resume(wall_deadline=deadline, renewal_check=healthy,
+                renewal_reconcile=restart if canonical_renewal else None) is False
             assert client.connects == client.resumes == 2
             assert client.attaches == (2 if change == "attach_retry" else 1)
             assert client.snapshot["run"]["status"] == "running"
             assert client.snapshot["evidence"]["active_acknowledged"] is True
             assert len({c["operation_id"] for c in calls if c["op"] == "resume"}) == 2
+            if canonical_renewal:
+                assert renewals == [{"controller_generation": "control"}] and restarted == [client.renewal_error]
+                assert client.generation == "control" and pc[0] < deadline
+                if change == "pending_before_record":
+                    primary = [row for row in records if row["event"] == "accepted_resume_transport_closed"]
+                    assert len(primary) == 1, "successful reconciliation must retain the original accepted Resume reader-close"
+                    assert primary[0]["operation_id"] == next(c["operation_id"] for c in calls if c["op"] == "resume")
+                    assert primary[0]["transport_close"] == {key: original.accepted_resume_context["transport_close"].get(key)
+                        for key in ("expected", "reason", "close_code", "exception_type", "reader_error")}
         else:
             with pytest.raises(asyncio.CancelledError if change == "cancel" else ConnectionError) as caught:
-                await guard.resume(wall_deadline=deadline, renewal_check=healthy)
+                await guard.resume(wall_deadline=deadline, renewal_check=healthy,
+                    renewal_reconcile=restart if canonical_renewal else None)
             assert caught.value is original
             assert client.resumes == 1
             if change in {"wrong_exception", "wrong_reason", "reader_error", "expected_close", "unknown_ack", "resume_loss",
@@ -8237,6 +8364,13 @@ def test_known_resume_no_pong_requires_new_ordinary_proof_and_original_clocks(
                 assert isinstance(original.__cause__, TimeoutError) and pc[0] < 1006.
             if change == "later_loss":
                 assert client.connects == 2 and isinstance(original.__cause__, ConnectionError)
+            if canonical_renewal:
+                assert client.resumes == 1 and all(v == {"controller_generation": "control"} for v in renewals)
+                if change == "second_unknown":
+                    assert len(renewals) == 1 and not restarted
+                if change in {"unchanged_lease", "expired_lease", "bad_context", "wrong_http", "already_reconciled", "old_revision", "future_revision",
+                              "fresh_deadline", "cancel_read", "manual", "stop", "foreign", "reboot", "history", "remaining", "nonordinary"}:
+                    assert renewals == [] and restarted == []
         assert not any(c["op"] in {"input", "grant", "claim", "start"} for c in calls)
         assert guard.original["run"]["deadline"] == 400. and guard.episodes == 0
         for row in records:
@@ -8253,7 +8387,13 @@ def test_known_resume_no_pong_requires_new_ordinary_proof_and_original_clocks(
     "foreign", "reboot", "remaining", "renewal", "caller_budget", "active_budget", "native_budget",
     "continuation_budget", "later_loss", "record", "later_record", "wrong_exception", "wrong_reason", "reader_error",
     "expected_close", "unknown_ack", "resume_loss", "attach_timeout", "nonordinary", "history",
-    "wrong_close_code", "wrong_transport_error", "detaching", "cancel",
+    "wrong_close_code", "wrong_transport_error", "detaching", "cancel", "canonical_renewal",
+    "canonical_renewal:view", "canonical_renewal:hold", "canonical_renewal:manual", "canonical_renewal:stop",
+    "canonical_renewal:foreign", "canonical_renewal:reboot", "canonical_renewal:history", "canonical_renewal:remaining",
+    "canonical_renewal:nonordinary", "canonical_renewal:unchanged_lease", "canonical_renewal:expired_lease",
+    "canonical_renewal:bad_context", "canonical_renewal:wrong_http", "canonical_renewal:already_reconciled",
+    "canonical_renewal:old_revision", "canonical_renewal:future_revision", "canonical_renewal:pending_before_record",
+    "canonical_renewal:second_unknown", "canonical_renewal:fresh_deadline", "canonical_renewal:cancel_read",
 ])
 def test_known_resume_owner_reporting_requires_same_fresh_proof_and_clocks(monkeypatch, change):
     # Actual125's known resuming ACK then exact reader close; no private input dependency.
