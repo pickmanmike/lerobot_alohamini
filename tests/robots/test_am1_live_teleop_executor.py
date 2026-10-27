@@ -509,6 +509,7 @@ def test_real_core_executor_native_frame_expiry_and_fresh_rejoin_preserve_run(tm
 
     try:
         assert start(a, "physical-live-teleop")["accepted"]
+        assert a.db.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == 0
         until(lambda: bool(step()) and a.run.get("native_live_at") is not None)
         frozen_deadline = a.run["deadline"]
         frozen_workspace = copy.deepcopy(e.evidence()["live_input"]["workspace"])
@@ -2360,11 +2361,23 @@ def test_due_periodic_checkpoint_still_saves_refused_input_without_admitting_or_
     monkeypatch.setattr(case.a, "_save", checkpoint)
     result = case.a.handle(candidate, "authorized-test-device")
     assert result["accepted"] is False and result["effect_admitted"] is False
-    assert len(snapshots) == 1 and snapshots[0] == case.original
-    assert case.e._live_target == case.original
+    if fault == "expired-during-evidence":
+        # Expiry while tick consumed evidence is now observed before admission.
+        # Its required HOLD commit is not a deferred periodic checkpoint.
+        assert snapshots == [None, None]
+        assert case.e._live_target is case.a.grant is case.a.applied_input is None
+        assert case.a.run["status"] == "paused" and case.a.run["intent"] is None
+        assert case.e.desired == "hold" and case.a.run["first_cause"] is None
+        assert any(row["kind"] == "input_expired" for row in case.a.events)
+        assert "core_checkpoint_started" in result["diagnostic_timing"]
+        assert "core_deferred_checkpoint_started" not in result["diagnostic_timing"]
+        assert case.grant["expires"] == 10.35
+    else:
+        assert len(snapshots) == 1 and snapshots[0] == case.original
+        assert case.e._live_target == case.original
+        assert "core_deferred_checkpoint_started" in result["diagnostic_timing"]
+        assert "core_checkpoint_started" not in result["diagnostic_timing"]
     assert case.a.connection["seq"] == 1 and case.a.run["input_source"] == case.original["source"]
-    assert "core_deferred_checkpoint_started" in result["diagnostic_timing"]
-    assert "core_checkpoint_started" not in result["diagnostic_timing"]
     assert case.a.last_checkpoint == 10.118935829
 
 
@@ -2523,3 +2536,367 @@ def test_deferred_checkpoint_invalid_diagnostic_clock_never_changes_admitted_out
     assert case.e._live_target["source"] == case.candidate["source"]
     assert case.e._live_target["valid_until_monotonic_s"] == 10.35
     assert case.a.last_checkpoint == 10.118935829
+
+
+@pytest.fixture
+def active_wal_lane(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from tools.am1_session_core import SessionAuthority
+
+    e, _ = admitted_executor()
+    now, begun, selected = [10.], [], []
+    a = SessionAuthority(tmp_path, clock=lambda: now[0], executor=e)
+    original = a.db.execute("PRAGMA wal_autocheckpoint").fetchone()[0]
+    monkeypatch.setattr(e, "begin", lambda recipe: begun.append(recipe.name) or True)
+    monkeypatch.setattr(e, "set_selected_experiment", lambda value: selected.append(value))
+    claimed = a.handle({"op": "claim"}, "pc")
+    request = dict(op="start", operation_id=str(uuid4()), recipe="physical-live-teleop",
+                   controller_generation=claimed["controller_generation"])
+    try:
+        yield SimpleNamespace(a=a, e=e, now=now, begun=begun, selected=selected,
+                              request=request, original=original)
+    finally:
+        a.run = None
+        a.close()
+
+
+def test_active_wal_policy_is_scoped_through_cleanup_and_restored_after_durable_terminal(active_wal_lane, monkeypatch):
+    import json
+    import sqlite3
+
+    c = active_wal_lane
+    a, sql = c.a, []
+    a.db.execute("PRAGMA busy_timeout=47")
+    a.db.set_trace_callback(sql.append)
+    result = a.handle(c.request, "pc")
+    assert result["accepted"] and c.begun == ["physical-live-teleop"]
+    assert a.db.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == 0
+    assert a.db.execute("PRAGMA synchronous").fetchone()[0] == 2  # FULL is unchanged.
+    assert a.db.execute("PRAGMA busy_timeout").fetchone()[0] == 47
+    assert sum("wal_checkpoint(TRUNCATE)" in row for row in sql) == 1
+    first_insert = next(i for i, row in enumerate(sql) if row.startswith("INSERT INTO operations"))
+    assert next(i for i, row in enumerate(sql) if "wal_autocheckpoint=0" in row) < first_insert
+    sql.clear()
+    for status in ("paused", "running", "recovering", "resuming", "finishing"):
+        a.run["status"] = status
+        a._save()
+        assert a.db.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == 0
+    assert not any("wal_checkpoint(" in row for row in sql)
+    a.run["status"] = "paused"
+    monkeypatch.setattr(c.e, "finish", lambda status: dict(cleanup="physical_readback_verified", uncertain=False))
+    stop = dict(op="stop", run_id=a.run["run_id"], operation_id=str(uuid4()))
+    assert a.handle(stop, "pc")["accepted"]
+    assert a.run["status"] == "stopped" and a.run["uncertain"] is False
+    assert a.db.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == c.original
+    with sqlite3.connect(a.directory / "sessions.sqlite3") as observer:
+        assert json.loads(observer.execute("SELECT data FROM state WHERE id=1").fetchone()[0])["status"] == "stopped"
+        assert json.loads(observer.execute("SELECT result FROM mutations WHERE id=?", (stop["operation_id"],)).fetchone()[0])["accepted"]
+    assert sum("wal_checkpoint(" in row for row in sql) == 0, "terminal restoration only restores the threshold"
+    assert a.handle(dict(c.request, operation_id=str(uuid4())), "pc")["accepted"]
+    assert sum("wal_checkpoint(TRUNCATE)" in row for row in sql) == 1, "each fresh Start drains the prior run"
+
+
+def test_active_wal_busy_reader_refuses_before_run_operation_or_executor_change(active_wal_lane):
+    import sqlite3
+
+    c, a = active_wal_lane, active_wal_lane.a
+    a.db.execute("PRAGMA busy_timeout=31")
+    reader = sqlite3.connect(a.directory / "sessions.sqlite3")
+    try:
+        reader.execute("BEGIN")
+        reader.execute("SELECT * FROM transitions").fetchall()
+        a.db.execute("INSERT INTO transitions(data) VALUES ('{}')")
+        a.db.commit()
+        result = a.handle(c.request, "pc")
+        assert result["accepted"] is False and result["effect_admitted"] is False
+        assert "checkpoint" in result["reason"]
+        assert a.run is None and c.begun == c.selected == []
+        assert a.db.execute("SELECT COUNT(*) FROM operations").fetchone()[0] == 0
+        assert a.db.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == c.original
+        assert a.db.execute("PRAGMA busy_timeout").fetchone()[0] == 31
+    finally:
+        reader.close()
+
+
+@pytest.mark.parametrize("failure", ["error", "incomplete", "lease", "setter"])
+def test_active_wal_prestart_maintenance_refusals_restore_timeout_and_never_latch_policy(active_wal_lane, monkeypatch, failure):
+    import sqlite3
+    from types import SimpleNamespace
+
+    c, a = active_wal_lane, active_wal_lane.a
+    db = a.db
+    db.execute("PRAGMA busy_timeout=29")
+    checkpoints = []
+    class ObserveCheckpoint:
+        def __getattr__(self, name):
+            return getattr(db, name)
+        def execute(self, sql, *args):
+            if sql == "PRAGMA wal_checkpoint(TRUNCATE)":
+                checkpoints.append(db.execute("PRAGMA busy_timeout").fetchone()[0])
+                if failure == "error":
+                    raise sqlite3.OperationalError("injected idle checkpoint failure")
+                if failure == "incomplete":
+                    return SimpleNamespace(fetchone=lambda: (0, 1, 1))
+                result = db.execute(sql, *args)
+                if failure == "lease":
+                    c.now[0] = 11.5  # Exact original idle lease; maintenance cannot renew it.
+                return result
+            return db.execute(sql, *args)
+    a.db = ObserveCheckpoint()
+    if failure == "setter":
+        def refused(value):
+            raise ValueError("selected setting refused")
+        monkeypatch.setattr(c.e, "set_selected_experiment", refused)
+    result = a.handle(c.request, "pc")
+    assert not result["accepted"] and result["effect_admitted"] is False
+    assert checkpoints == [0]
+    assert a.run is None and c.begun == c.selected == []
+    assert db.execute("SELECT COUNT(*) FROM operations").fetchone()[0] == 0
+    assert db.execute("PRAGMA busy_timeout").fetchone()[0] == 29
+    assert db.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == c.original
+
+
+@pytest.mark.parametrize("previous", ["active", "uncertain", "duplicate"])
+def test_active_wal_old_run_and_duplicate_start_never_consolidate(active_wal_lane, previous):
+    c, a = active_wal_lane, active_wal_lane.a
+    first = a.handle(c.request, "pc")
+    assert first["accepted"]
+    if previous == "uncertain":
+        a.run.update(status="faulted", uncertain=True, cleanup="physical_cleanup_unknown")
+        a._save()
+    statements = []
+    a.db.set_trace_callback(statements.append)
+    request = c.request if previous == "duplicate" else dict(c.request, operation_id=str(uuid4()))
+    result = a.handle(request, "pc")
+    assert result["accepted"] is (previous == "duplicate")
+    assert not any("wal_checkpoint(" in row for row in statements)
+    assert len(c.begun) == 1
+    assert a.db.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("recipe", ["fake-interactive", "physical-live-left-elbow"])
+def test_active_wal_fake_and_other_physical_modes_keep_connection_defaults(tmp_path, monkeypatch, recipe):
+    from tools.am1_session_core import SessionAuthority
+    from tools.am1_fake_executor import FakeExecutor
+    from tests.robots.test_am1_persistent_session import start
+
+    e = FakeExecutor(clock=lambda: 10.) if recipe.startswith("fake") else admitted_executor()[0]
+    monkeypatch.setattr(e, "begin", lambda value: True)
+    a = SessionAuthority(tmp_path, clock=lambda: 10., executor=e)
+    try:
+        original = a.db.execute("PRAGMA wal_autocheckpoint").fetchone()[0]
+        statements = []
+        a.db.set_trace_callback(statements.append)
+        assert start(a, recipe)["accepted"]
+        assert a.db.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == original
+        assert not any("wal_checkpoint(" in row for row in statements)
+    finally:
+        a.run = None
+        a.close()
+
+
+@pytest.mark.parametrize("saved_status", ["running", "faulted"])
+def test_active_wal_uncertain_reopen_defers_before_restart_commit_and_existing_reconcile_restores(active_wal_lane, monkeypatch, saved_status):
+    import sqlite3
+    from tools.am1_session_core import SessionAuthority
+    from tools.am1_physical_reconciliation import terminal_run_hash
+
+    c, a = active_wal_lane, active_wal_lane.a
+    assert a.handle(c.request, "pc")["accepted"]
+    a.run.update(status=saved_status, uncertain=saved_status == "faulted", cleanup="physical_cleanup_unknown",
+                 physical_result={"backend_incarnation": c.e.host_incarnation}, intent=dict.fromkeys(KEYS, 1.))
+    a._save()
+    a.close()
+    statements, real_connect = [], sqlite3.connect
+    def recorded_connect(*args, **kwargs):
+        db = real_connect(*args, **kwargs)
+        db.set_trace_callback(statements.append)
+        return db
+    monkeypatch.setattr(sqlite3, "connect", recorded_connect)
+    replacement = executor(ControlledHost())
+    restored = SessionAuthority(a.directory, clock=lambda: 10., executor=replacement)
+    try:
+        assert restored.db.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == 0
+        assert restored.run["uncertain"] is True
+        assert restored.controller is restored.connection is restored.grant is restored.applied_input is None
+        assert restored.run["intent"] is None or saved_status == "faulted"
+        assert replacement.worker is None and replacement._live_target is None
+        assert not any("wal_checkpoint(" in row for row in statements)
+        if saved_status == "running":
+            disabled = next(i for i, row in enumerate(statements) if "wal_autocheckpoint=0" in row)
+            restarted = next(i for i, row in enumerate(statements) if row.startswith("INSERT INTO transitions"))
+            assert disabled < restarted
+            assert restored.run["status"] == "interrupted"
+        # A terminal status alone cannot restore the automatic policy. The existing
+        # receipt validator must accept this synthetic stopped-proof/ACK fixture.
+        def reconciled(run, *, operation_id):
+            return dict(version=1, kind="am1-actual-stopped-reconciliation", run_id=run["run_id"],
+                        host_incarnation=c.e.host_incarnation, cleanup="physical_readback_verified", uncertain=False,
+                        original_terminal_run_sha256=terminal_run_hash(run), acknowledgment=dict(
+                            version=1, run_id=run["run_id"], host_incarnation=c.e.host_incarnation,
+                            consumed_operation_id=operation_id, validated=True, markers_archived=True,
+                            proof_sha256="a" * 64))
+        monkeypatch.setattr(replacement, "reconcile", reconciled)
+        retained_cleanup = restored.run["cleanup"]
+        assert restored.handle({"op": "claim"}, "pc")["accepted"]
+        result = restored.handle(dict(op="reconcile", operation_id=str(uuid4()), run_id=restored.run["run_id"]), "pc")
+        assert result == {"accepted": True, "status": "reconciled"}
+        assert restored.run["uncertain"] is False and restored.run["cleanup"] == retained_cleanup
+        assert restored.db.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == c.original
+        with real_connect(a.directory / "sessions.sqlite3") as observer:
+            import json
+            assert json.loads(observer.execute("SELECT data FROM state WHERE id=1").fetchone()[0])["uncertain"] is False
+        assert replacement.worker is None and replacement._live_target is None
+    finally:
+        restored.close()
+
+
+@pytest.mark.parametrize("latest", ["fresh", "stale", "future", "invalid", "hard_fault"])
+def test_thermal_core_advance_consumes_latest_owned_held_cache_not_aged_local_copy(tmp_path, monkeypatch, latest):
+    # c4-like initial native HOLD, no admitted input: this isolates RAW evidence
+    # age from the independent250ms motion expiry and never invents an active ACK.
+    a, e, _ = authority_lane(tmp_path)
+    now = [10.]
+    a.clock = e.clock = lambda: now[0]
+    a.run.update(status="paused", recovery_episodes=0, resume_ceiling=18.)
+    e._execution = dict(progress_s=0., complete=False, fault=None)
+    e._epoch, e._epoch_mode, e.desired = 0, "pause", "hold"
+    e._aligned.extend([9.7, 9.8, 10.])
+    e.sample["ack"].update(state="paused", epoch=0)
+    e.sample["ack"]["live_input"].update(state="held", reference=e.sample["ack"]["live_input"]["workspace"]["reference"])
+    proof = dict(version=1, raw_sample_at_monotonic_s=9.99, peaks_ready=True,
+                 deficit_started_at_monotonic_s=None, deficit_ceiling_monotonic_s=None,
+                 hold_sample_at_monotonic_s=None, zero_read_started_at_monotonic_s=None,
+                 zero_read_completed_at_monotonic_s=None)
+    e.sample["ack"]["thermal_history"] = copy.deepcopy(proof)
+    original_advance, advances = e.advance, []
+    def delayed_advance(at, dt):
+        advances.append((at, dt))
+        now[0] = 10.6
+        # Explicit new SAME-owner receipt in the actual executor cache, with its
+        # own acquisition/RAW times. The old Core dictionary remains unchanged.
+        with e.mutex:
+            e.sample["at"], e.sample["sequence"] = now[0], 2
+            raw = now[0] - .01
+            if latest == "stale": raw = now[0] - .501
+            elif latest == "future": raw = now[0] + .001
+            elif latest == "invalid": raw = float("nan")
+            e.sample["ack"]["thermal_history"] = dict(proof, raw_sample_at_monotonic_s=raw)
+            if latest == "hard_fault": e._fault = "retained native hardware fault"
+        return original_advance(at, dt)
+    monkeypatch.setattr(e, "advance", delayed_advance)
+    try:
+        initial = e.evidence()
+        assert initial["feedback"] and initial["native_ack"] and initial["hold_acknowledged"]
+        assert initial["thermal_history"] == proof
+        a.tick()
+        current = e.evidence()
+        assert advances == [(10., 0.)]
+        assert initial["thermal_history"] == proof, "never retimestamp the original copied proof"
+        assert a.run["deadline"] == 309. and a.applied_input is a.grant is None
+        assert e._live_target is None and e.desired == "hold"
+        if latest == "fresh":
+            assert current["feedback"] and current["native_ack"] and current["hold_acknowledged"]
+            assert current["thermal_history"]["raw_sample_at_monotonic_s"] == 10.59
+            assert a.run["status"] == "paused" and a.run["first_cause"] is None
+        else:
+            assert a.run["requested_terminal"] == "faulted"
+            assert a.run["first_cause"] == ("retained native hardware fault" if latest == "hard_fault"
+                                             else "native thermal original RAW feedback expired/invalid")
+    finally:
+        a.run = None
+        a.close()
+
+
+@pytest.mark.parametrize("invalid", ["stale", "future", "nan", "hardware"])
+def test_thermal_core_initial_invalid_proof_is_not_discarded_for_a_newer_cache(tmp_path, monkeypatch, invalid):
+    a, e, _ = authority_lane(tmp_path)
+    now = [10.]
+    a.clock = e.clock = lambda: now[0]
+    a.run.update(status="paused", recovery_episodes=0)
+    raw = {"stale": 9.499, "future": 10.001, "nan": float("nan"), "hardware": 9.99}[invalid]
+    e.sample["ack"]["thermal_history"] = dict(version=1, raw_sample_at_monotonic_s=raw, peaks_ready=True,
+        deficit_started_at_monotonic_s=None, deficit_ceiling_monotonic_s=None, hold_sample_at_monotonic_s=None,
+        zero_read_started_at_monotonic_s=None, zero_read_completed_at_monotonic_s=None)
+    if invalid == "hardware": e._fault = "initial native hardware fault"
+    advances = []
+    def would_replace(at, dt):
+        advances.append(True)
+        e.sample["ack"]["thermal_history"]["raw_sample_at_monotonic_s"] = 9.99
+        e._fault = None
+        return dict(progress_s=0., complete=False, fault=None)
+    monkeypatch.setattr(e, "advance", would_replace)
+    try:
+        a.tick()
+        assert advances == [], "a genuine initial invalid proof/fault must win before cache replacement"
+        assert a.run["requested_terminal"] == "faulted"
+        assert a.run["first_cause"] == ("initial native hardware fault" if invalid == "hardware"
+                                         else "native thermal original RAW feedback expired/invalid")
+        assert a.run["deadline"] == 309. and e._live_target is None
+    finally:
+        a.run = None
+        a.close()
+
+
+@pytest.mark.parametrize("expired", ["lease", "deadline"])
+def test_thermal_core_postadvance_clock_keeps_original_expiry_guards(tmp_path, monkeypatch, expired):
+    a, e, _ = authority_lane(tmp_path)
+    now = [10.]
+    a.clock = e.clock = lambda: now[0]
+    a.run.update(status="paused", recovery_episodes=0)
+    a.run["deadline"] = 10.5 if expired == "deadline" else 309.
+    original_deadline = a.run["deadline"]
+    e._execution = dict(progress_s=0., complete=False, fault=None)
+    e._epoch, e._epoch_mode, e.desired = 0, "pause", "hold"
+    e.sample["ack"].update(state="paused", epoch=0)
+    e.sample["ack"]["live_input"].update(state="held", reference=e.sample["ack"]["live_input"]["workspace"]["reference"])
+    proof = dict(version=1, raw_sample_at_monotonic_s=9.99, peaks_ready=True,
+        deficit_started_at_monotonic_s=None, deficit_ceiling_monotonic_s=None, hold_sample_at_monotonic_s=None,
+        zero_read_started_at_monotonic_s=None, zero_read_completed_at_monotonic_s=None)
+    e.sample["ack"]["thermal_history"] = proof
+    advance = e.advance
+    def delayed(at, dt):
+        now[0] = 12. if expired == "lease" else 10.6
+        e.sample["at"] = now[0]
+        e.sample["ack"]["thermal_history"] = dict(proof, raw_sample_at_monotonic_s=now[0]-.01)
+        return advance(at, dt)
+    monkeypatch.setattr(e, "advance", delayed)
+    try:
+        a.tick()
+        assert a.run["deadline"] == original_deadline
+        assert a.grant is a.applied_input is e._live_target is None
+        assert e.desired == "hold"
+        if expired == "lease":
+            assert a.controller is a.connection is None
+            assert a.run["status"] == "paused" and a.run["first_cause"] is None
+            assert any(row["kind"] == "presence_expired" for row in a.events)
+        else:
+            assert a.run["requested_terminal"] == "stopped" and a.run["first_cause"] == "live_deadline"
+    finally:
+        a.run = None
+        a.close()
+
+
+def test_thermal_core_postadvance_fresh_native_expired_hold_never_revives_old_input(periodic_input_order_lane, monkeypatch):
+    case = periodic_input_order_lane
+    a, e = case.a, case.e
+    original_deadline, original_expiry = a.run["deadline"], a.applied_input["expires"]
+    advance = e.advance
+    def delayed(at, dt):
+        case.now[0] += .6
+        case.step()  # Existing real native control detects the original250ms expiry.
+        assert case.control.live_snapshot()["state"] == "expired"
+        with e.mutex:
+            e.sample["ack"]["thermal_history"] = dict(version=1, raw_sample_at_monotonic_s=case.now[0]-.01,
+                peaks_ready=True, deficit_started_at_monotonic_s=None, deficit_ceiling_monotonic_s=None,
+                hold_sample_at_monotonic_s=None, zero_read_started_at_monotonic_s=None,
+                zero_read_completed_at_monotonic_s=None)
+        return advance(at, dt)
+    monkeypatch.setattr(e, "advance", delayed)
+    a.tick()
+    assert case.now[0] > original_expiry
+    assert a.run["deadline"] == original_deadline and a.run["first_cause"] is None
+    assert a.run["status"] == "paused" and a.run["intent"] is None
+    assert a.grant is a.applied_input is e._live_target is None and e.desired == "hold"
+    assert case.control.live_snapshot()["last_input_seq"] == case.original["seq"]
+    assert any(row["kind"] == "input_expired" for row in a.events)

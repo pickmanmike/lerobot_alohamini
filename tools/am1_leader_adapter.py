@@ -1084,6 +1084,29 @@ def _owner_unknown_renewal(error):
             and isinstance(getattr(error, "renewal_context", None), dict))
 
 
+def _owner_unknown_result(error, operation):
+    """Only the correlated canonical Gateway unknown result, never a refusal."""
+    expected = {"accepted": None, "status": "unknown", "uncertain": True,
+                "reason": "owner outcome unknown; inspect state or lookup the same operation", "effect_admitted": None}
+    response = getattr(error, "response", None)
+    if (operation not in {"grant", "input"} or type(error) is not CommandRefusedError
+        or getattr(error, "operation", None) != operation
+        or not isinstance(response, dict) or set(response) not in
+            (set(expected) | {"id", "kind"}, set(expected) | {"id", "kind", "diagnostic_timing"})
+        or response.get("kind") != "result" or type(response.get("id")) is not str
+        or "diagnostic_timing" in response and type(response["diagnostic_timing"]) is not dict
+        or any(type(response[k]) is not type(value) or response[k] != value for k, value in expected.items())):
+        return False
+    try:
+        return str(UUID(response["id"])) == response["id"]
+    except ValueError:
+        return False
+
+
+def _owner_unknown_grant(error):
+    return _owner_unknown_result(error, "grant")
+
+
 def expired_input_refusal(error):
     return isinstance(error, CommandRefusedError) and all(
         error.response.get(key) == value and type(error.response.get(key)) is type(value)
@@ -1551,6 +1574,10 @@ class SessionClient:
             reason = "reader-error"
             reader_error = {"error_type": type(error).__name__, "message": str(error)}
             if self.ws is ws:
+                # Capture BEFORE pending futures are failed/cleared below. A later
+                # empty map cannot prove that no unknown command was in flight.
+                self._idle_reporting_ws = (ws if type(error) is RuntimeError
+                    and str(error) == "owner reporting unavailable" and not self.pending and not self._detaching else None)
                 self.transport_error = self.transport_error or str(error)
         finally:
             if self.ws is ws:
@@ -1656,6 +1683,14 @@ class SessionClient:
             or len(self.pending) >= 4
         ):
             original = ConnectionError("bounded current WSS connection required")
+            close = getattr(self, "transport_close", None) or {}
+            if (command.get("op") == "connect" and self.ws is not None
+                and getattr(self, "_idle_reporting_ws", None) is self.ws
+                and self.reader is not None and self.reader.done() and not self.pending
+                and self.transport_error == "owner reporting unavailable" and not self._detaching
+                and close.get("expected") is False and close.get("reason") == "reader-error"
+                and close.get("reader_error") == {"error_type": "RuntimeError", "message": "owner reporting unavailable"}):
+                original._connect_unsent_ws = self.ws  # Before UUID/future/send creation; never a wire receipt.
             if record:
                 try:
                     _record_controller_command_timing(record, recorded_command, None,
@@ -1709,10 +1744,10 @@ class SessionClient:
             timing["send_completed_at_monotonic_s"] = time.perf_counter()
             phase = "receipt"
             try:
-                # A connect fence can take effect before its receipt arrives.
-                # Allow its bounded gateway call (1.5 s) to return; callers keep
-                # their original phase ceilings and input/grant waits stay 1 s.
-                result = await asyncio.wait_for(future, 2.0 if command.get("op") == "connect" else 1.0)
+                # Allow the bounded gateway call (1.5 s) plus receipt margin for
+                # Connect/Input/Grant. Original source/grant expiries and outer
+                # phase ceilings are unchanged; this never retries a command.
+                result = await asyncio.wait_for(future, 2.0 if command.get("op") in {"connect", "input", "grant"} else 1.0)
             except TimeoutError as error:
                 if command.get("op") == "resume":
                     # Only the actual reply future's timeout is unknown admission;
@@ -2708,16 +2743,40 @@ class SameRunRecovery:
 
     async def resume(
         self, *, wall_deadline=None, require_episode=False, refusal_identity=None, expected_pause=None,
-        renewal_check=None, grant_error=None, renewal_reconcile=None,
+        renewal_check=None, grant_error=None, renewal_reconcile=None, input_error=None,
     ):
         clock = {"ceiling": wall_deadline, "anchored": False, "before_resume": True}
-        interrupted, deferred, first_transport_error = None, [], grant_error
+        original_error = input_error if input_error is not None else grant_error
+        interrupted, deferred, first_transport_error = None, [], original_error
         grant_context, pending_recovery, resume_context = None, None, None
         consumed_resumes = set()
-        if grant_error is not None:
+        if original_error is not None:
             try:
-                grant_context = getattr(grant_error, "grant_context", None)
-                if (not isinstance(grant_error, (TimeoutError, ConnectionError))
+                if input_error is not None:
+                    context = getattr(input_error, "input_context", None)
+                    if (grant_error is not None or not isinstance(context, dict)
+                        or set(context) != {"identity", "snapshot", "requested", "network_seq", "source"}
+                        or type(context["network_seq"]) is not int or not 0 < context["network_seq"] == self.client.sequence < 2**63
+                        or not (isinstance(input_error, (TimeoutError, ConnectionError))
+                                or _owner_unknown_result(input_error, "input"))):
+                        raise RuntimeError("original uncertain Input context unavailable")
+                    before = context["snapshot"]
+                    run, live = before.get("run") or {}, _live(before)
+                    if (run.get("source") != "protected-physical-provider"
+                        or before.get("evidence", {}).get("source") != run["source"]
+                        or run.get("bench_continuity") is True
+                        or live.get("workspace", {}).get("workspace_profile") != ORDINARY_ARMS_PROFILE
+                        or live.get("required_view", {}).get("required") is not True
+                        or context["source"].get("kind") != "virtual-leaders"):
+                        raise RuntimeError("ordinary physical current-rest Input authority unavailable")
+                    validate_source(context["source"], grant_id=context["source"].get("grant_id"))
+                    if context["source"]["sent_at_monotonic_s"] > time.perf_counter():
+                        raise RuntimeError("original uncertain Input acquisition is in the future")
+                    grant_context = {key: context[key] for key in ("identity", "snapshot", "requested")}
+                else:
+                    grant_context = getattr(grant_error, "grant_context", None)
+                if (not (isinstance(original_error, (TimeoutError, ConnectionError))
+                         or _owner_unknown_result(original_error, "input" if input_error is not None else "grant"))
                     or not isinstance(grant_context, dict)
                     or set(grant_context) != {"identity", "snapshot", "requested"} or renewal_check is None):
                     raise RuntimeError("original pre-capture grant ambiguity unavailable")
@@ -2748,11 +2807,12 @@ class SameRunRecovery:
                     if value <= 0:
                         raise TimeoutError("original grant rejoin ceiling exhausted")
                     return value
-                self.record({"event": "leader_grant_ambiguous", "identity": identity,
-                             "outcome": "unknown_discarded_before_capture", "remaining_s": remaining_budget()})
+                self.record({"event": "leader_input_ambiguous" if input_error is not None else "leader_grant_ambiguous", "identity": identity,
+                             "outcome": "unknown_discarded_after_capture" if input_error is not None else "unknown_discarded_before_capture",
+                             "remaining_s": remaining_budget()})
                 await self._attach_transport(before, identity, remaining_budget, renewal_check)
             except (Exception, asyncio.CancelledError) as error:
-                raise grant_error from error
+                raise original_error from error
         while True:
             try:
                 try:
@@ -3537,7 +3597,18 @@ class SameRunRecovery:
                 original.resume_pending_episode = ({"recovery": episode, "count": self.episodes, "cause": self.cause}
                                                    if recovered and self.completed_episodes < self.episodes else None)
                 raise
-            if "held_view_ceiling" in clock:
+            close = dict(getattr(self.client, "transport_close", None) or {})
+            ws = getattr(self.client, "ws", None)
+            unsent_connect = (type(original) is ConnectionError and ws is not None
+                and getattr(original, "_connect_unsent_ws", None) is ws
+                and getattr(self.client, "_idle_reporting_ws", None) is ws
+                and getattr(self.client, "pending", None) == {}
+                and getattr(self.client, "_detaching", True) is False
+                and getattr(self.client, "reader", None) is not None and self.client.reader.done()
+                and getattr(self.client, "transport_error", None) == "owner reporting unavailable"
+                and close.get("expected") is False and close.get("reason") == "reader-error"
+                and close.get("reader_error") == {"error_type": "RuntimeError", "message": "owner reporting unavailable"})
+            if "held_view_ceiling" in clock and not unsent_connect:
                 raise  # A nested ambiguous phase never starts another replacement.
             accepted = getattr(original, "accepted_resume_context", None)
             if accepted is not None:
@@ -3622,7 +3693,6 @@ class SameRunRecovery:
                     raise original from qualification_error
             release = getattr(original, "empty_release_context", None)
             release_loss = isinstance(release, dict) and set(release) == {"identity", "connect_identity", "snapshot"}
-            close = dict(getattr(self.client, "transport_close", None) or {})
             identity = release["identity"] if release_loss else getattr(original, "connect_identity", None)
             expected = dict(
                 run_id=self.original["run"]["run_id"], service_incarnation=self.original["service"],
@@ -3633,9 +3703,9 @@ class SameRunRecovery:
             )
             if (
                 recovered
-                or close.get("reader_error") is not None
-                or not release_loss and (close.get("expected") is not False or close.get("reason") != "stream-ended"
-                                         or close.get("close_code") != 1006)
+                or not unsent_connect and close.get("reader_error") is not None
+                or not release_loss and not unsent_connect and (close.get("expected") is not False or close.get("reason") != "stream-ended"
+                                                                or close.get("close_code") != 1006)
                 or not isinstance(identity, dict) or set(identity) != set(expected)
                 or any(type(identity[k]) is not type(v) or identity[k] != v for k, v in expected.items())
                 or type(identity["intent_revision"]) is not int
@@ -3695,9 +3765,10 @@ class SameRunRecovery:
                     return value
                 if renewal_check:
                     renewal_check()
-                self.record({"event": "ordinary_empty_release_ambiguous" if release_loss else "ordinary_connect_transport_closed", "transport_close": close,
-                             "identity": identity, "pause_event": original_event,
-                             "remaining_s": remaining(), "outcome": "ambiguous"})
+                self.record({"event": "ordinary_empty_release_ambiguous" if release_loss else
+                                     "ordinary_connect_not_dispatched" if unsent_connect else "ordinary_connect_transport_closed",
+                             "transport_close": close, "identity": identity, "pause_event": original_event,
+                             "remaining_s": remaining(), "outcome": "not_dispatched" if unsent_connect else "ambiguous"})
                 await self._attach_transport(state, identity, remaining, renewal_check)
                 budget = remaining()
                 fresh_requested = time.monotonic()
@@ -3727,7 +3798,7 @@ class SameRunRecovery:
                     if (
                         run.get("status") != "paused" or run.get("recovery") is not None
                         or pause_event(snapshot) != original_event
-                        or type(revision) is not int or revision not in ((identity["intent_revision"],) if release_loss else
+                        or type(revision) is not int or revision not in ((identity["intent_revision"],) if release_loss or unsent_connect else
                                                                       (identity["intent_revision"], identity["intent_revision"] + 1))
                         or previous_revision is not None and revision != previous_revision
                         or self.client.connection != identity["connection_generation"]
@@ -3878,6 +3949,8 @@ async def send_leader_sample(client, producer, body, record, *, phase, progress_
     except CommandRefusedError as error:
         error.operation = "grant"
         error.identity = dict(identity)
+        if _owner_unknown_grant(error) and grant_context is not None:
+            error.grant_context = grant_context  # Permission discarded before capture, just like a lost reply.
         record(
             {
                 "event": "leader_grant_rejected",
@@ -4032,6 +4105,10 @@ async def send_leader_sample(client, producer, body, record, *, phase, progress_
         raise
     except CommandRefusedError as error:
         error.operation, error.identity = "input", dict(identity)
+        if _owner_unknown_result(error, "input") and grant_context is not None:
+            error.input_context = {"identity": dict(identity), "snapshot": grant_context["snapshot"],
+                                   "requested": requested, "network_seq": client.sequence,
+                                   "source": dict(frame["source"])}
         record(
             {
                 "event": "leader_frame_rejected",
@@ -4063,6 +4140,7 @@ async def run(args):
     left_entry = getattr(args, "left_entry", False)
     left_reach_cycles = _left_reach_cycles(args)
     bench = getattr(args, "bench_continuity", False)
+    ordinary_input_rearm = ordinary_arms and bool(changing_input) and not left_entry and not bench and args.source == "virtual-leaders"
     segment = getattr(args, "workload_segment", "full")
     controller_gap = getattr(args, "interrupt_controller", False)
     terminal_budget = 12. if bench else 2.
@@ -4574,13 +4652,16 @@ async def run(args):
                 ceiling = min(time.monotonic() + min(12., remaining), ceiling if ceiling is not None else float("inf"))
             if input_error is not None:
                 context = getattr(input_error, "input_context", None)
-                if (not bench or not isinstance(context, dict)
+                if (not (bench or ordinary_input_rearm) or not isinstance(context, dict)
                     or set(context) != {"identity", "snapshot", "requested", "network_seq", "source"}
                     or context["network_seq"] != client.sequence
                     or type(context["requested"]) not in (int, float)
                     or not math.isfinite(context["requested"]) or context["requested"] > time.monotonic()):
                     raise RuntimeError("original ambiguous input context unavailable") from input_error
                 recovery.check(context["snapshot"])
+                if not bench and (context["source"].get("source_id") != producer.source_id
+                    or context["source"].get("sample_seq") != producer.sequence):
+                    raise RuntimeError("original uncertain Input source acquisition changed") from input_error
                 binding = {"run_id": recovery.original["run"]["run_id"],
                            "service_incarnation": recovery.original["service"],
                            "host_incarnation": recovery.original["run"]["backend_incarnation"],
@@ -4590,7 +4671,7 @@ async def run(args):
                 ceiling = min(ceiling, context["requested"] + context["snapshot"]["run"]["remaining_s"])
                 if workload:
                     workload.freeze()
-                record({"event": "bench_input_receipt_requalification", "identity": context["identity"],
+                record({"event": "bench_input_receipt_requalification" if bench else "ordinary_input_receipt_requalification", "identity": context["identity"],
                         "network_seq": context["network_seq"], "source": context["source"],
                         "original_ceiling_monotonic_s": ceiling,
                         "meaning": "discard ambiguous input; fresh attachment, held qualification and new capture"})
@@ -4612,6 +4693,7 @@ async def run(args):
                         expected_pause=expected_pause,
                         renewal_check=renewal_healthy, grant_error=grant_error,
                         renewal_reconcile=None if bench else restart_qualified_renewal,
+                        input_error=input_error if ordinary_input_rearm else None,
                     )
                     break
                 except Exception as error:
@@ -4883,7 +4965,7 @@ async def run(args):
                 if peer_baseline_until is not None and (baseline_budget.expired() or time.monotonic() >= peer_baseline_until):
                     summary["peer_baseline_qualification_seconds"] = time.monotonic() - peer_baseline_started
                     raise TimeoutError("peer baseline original qualification ceiling exhausted") from error
-                if bench and hasattr(error, "input_context"):
+                if (bench or ordinary_input_rearm) and hasattr(error, "input_context"):
                     await rejoin(input_error=error, until=peer_baseline_until)
                     continue
                 if not hasattr(error, "grant_context"):
@@ -4891,6 +4973,12 @@ async def run(args):
                 await rejoin(grant_error=error, until=peer_baseline_until)
                 continue
             except CommandRefusedError as error:
+                if ordinary_input_rearm and _owner_unknown_result(error, "input") and hasattr(error, "input_context"):
+                    await rejoin(input_error=error, until=peer_baseline_until)
+                    continue
+                if _owner_unknown_grant(error) and hasattr(error, "grant_context"):
+                    await rejoin(grant_error=error, until=peer_baseline_until)
+                    continue
                 if bench and error.reason == "stale control generation":
                     await ensure_authority(force=True, until=peer_baseline_until)
                     await rejoin(until=peer_baseline_until)
@@ -5012,7 +5100,7 @@ async def run(args):
                         progress_s=workload.elapsed_s if workload else None,
                     )
             except TimeoutError as error:
-                if bench and hasattr(error, "input_context") and not attempt_budget.expired():
+                if (bench or ordinary_input_rearm) and hasattr(error, "input_context") and not attempt_budget.expired():
                     await rejoin(input_error=error, until=qualification_ceiling)
                     continue
                 if hasattr(error, "grant_context") and not attempt_budget.expired():
@@ -5024,7 +5112,7 @@ async def run(args):
                     ) from error
                 raise
             except ConnectionError as error:
-                if bench and hasattr(error, "input_context"):
+                if (bench or ordinary_input_rearm) and hasattr(error, "input_context"):
                     await rejoin(input_error=error, until=qualification_ceiling)
                     continue
                 if not hasattr(error, "grant_context"):
@@ -5032,6 +5120,12 @@ async def run(args):
                 await rejoin(grant_error=error, until=qualification_ceiling)
                 continue
             except CommandRefusedError as error:
+                if ordinary_input_rearm and _owner_unknown_result(error, "input") and hasattr(error, "input_context"):
+                    await rejoin(input_error=error, until=qualification_ceiling)
+                    continue
+                if _owner_unknown_grant(error) and hasattr(error, "grant_context"):
+                    await rejoin(grant_error=error, until=qualification_ceiling)
+                    continue
                 mailbox = mailbox_input_refusal(error)
                 if not (recovery_grant_refusal(error) or mailbox):
                     raise
