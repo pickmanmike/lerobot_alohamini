@@ -36,6 +36,8 @@ The explicit candidate correction is limited to powered AM1 live teleoperation: 
 
 ## MOTOR-03: observe the full command and measurement chain
 
+- **Apply now:** use the ordinary adapter/current-rest factory and source-bound collector. Keep original within-run endpoints and measured achieved preparation; a prepared increasing LEFT approach is supported only for its tested pose/direction, not a universal tracking correction. [Working invocation][p16] and the private current helper proof packet own the procedure. Reopen only a task-relevant new delivery/response discrepancy.
+
 - **Accepted / scope:** distinguish requested target, transformed/limited target, accepted frame, stored Goal, measured position and visible motion. Keep raw feedback separate from command normalization; degrees, normalized units, counts, mA and mAh are different.
 - **Result/source:** [Packet13][p13] corrected selected-mode normalization/hidden relative-target clamp; [Packet14][p14] separately records delivered target windows, encoders and P1 qualitative movement. [Packet16][p16] distinguishes Core frame acceptance from physical writes.
 - **Implementation/tests/status:** [live mapping][live], [scripted amplitudes](../../tests/robots/test_am1_scripted_amplitudes.py), [selected feedback](../../tests/robots/test_am1_selected_joint_feedback.py). Existing fixes retained; later full-workload response remains to qualify.
@@ -84,6 +86,10 @@ The explicit candidate correction is limited to powered AM1 live teleoperation: 
 
 ## COMM-02: ordinary pause and ambiguous Start have distinct meanings
 
+- **Reopened now / concrete new fact:**5358 entered known accepted-Resume recovery, then concurrent canonical unknown renewal aborted qualification despite a still-live last acknowledged lease. The PC-only repair composes their existing fenced paths with original contexts and one-shot reconciliation;202 affected motor-free checks pass. Record primary reporting-close context even if renewal is already unknown before the event is emitted. Existing renewal and final motion-proof guards stay unchanged; no native fault, actual5358 counterfactual recovery or physical exercise of the new branch is claimed. Reopen for a distinct retained context/failure, not another unexplained timeout.
+
+- **Apply now:** preserve Start-specific identical-operation handling separately from unknown Grant/Input recovery. Consume an uncertain Grant/Input context, qualify current same-owner HOLD/view/feedback and obtain a fresh binding/grant/sample; do not replay that motion packet or restart the task. Current source-specific clauses and failed outcomes are retained in [Packet16][p16].
+
 - **Accepted / scope:** ordinary input/view-expiry holds are not automatically recovery episodes. Qualified rejoin requires current feedback, cause-specific proof and executor ACK; retain the original run/reference/deadline and native recovery budget. Ambiguous HTTP outcomes keep the identical operation/body and uncertainty through the supported retry.
 - **Result/source:** [Packet16][p16] Combined13 exposed a fourth-ordinary-pause PC cap with Core recovery count 0; `0a458a900aae2600be4099465920addda92aecf6` removes that extra cap. Published `2647b77c` corrects HTTP 503 unknown Start classification; a later refusal cannot erase earlier ambiguity, and matching accepted Core identity establishes ownership separately from native effect/cleanup.
 - **Implementation/tests/status:** [one leader adapter](../../tools/am1_leader_adapter.py), [real-Core/HTTP/pause tests](../../tests/robots/test_am1_leader_adapter.py). PC fixes have recorded offline checks, no Pi restaging for these changes; full combined qualification pending. Combined18 exposed a distinct pre-Live entrypoint gap: WSS close exits admission into ordinary Stop instead of reattaching to the same accepted operation. Its initiating close cause is unproved. The independently reviewed correction permits one classified pre-Live reattachment, retaining original ownership/admission times through the actual Live handoff and the original ceiling, with no new Start/input or deadline reset. It passed 113 adapter checks and 33 exact-source boundary checks; the existing Live timing path remains unchanged.
@@ -122,6 +128,8 @@ The explicit candidate correction is limited to powered AM1 live teleoperation: 
 
 ## MEDIA-02: default onboard WebRTC has bounded evidence
 
+- **Apply now:** reuse the already successful AM1 USB-camera map and one capture owner through [the current viewing procedure](camera-viewing.md#current-ordinary-viewing-path). Camera2=Chest; Camera3=RIGHT wrist and Camera5=LEFT wrist. Camera32 and Stage85ce4 are working scoped records, not a new camera integration. Require current source plus displayed decoded evidence; optical focus may need a specific physical adjustment, while P1 and THETA remain separate.
+
 - **Accepted / scope:** selected onboard WebRTC is primary, explicit MJPEG is rollback. One exclusive capture owner feeds one selected shared encoder; retain rotation/aspect ratio, local JPEG evidence, source/sequence/age and capture/encode generations.
 - **Result/source:** [Packet16][p16] installed go2rtc 1.9.14/ffmpeg 7.1.5/libx264; Combined15 sampled 246 decoded frames/51 fresh points. This does not erase two Core view-lease expiries; planned wrist switch remains unqualified.
 - **Implementation/tests/status:** [onboard proxy/encoder](../../tools/am1_onboard_media.py), [media tests](../../tests/robots/test_am1_onboard_media.py). Implemented/staged and partial physical playback observed; full combined view-switch/reconnect remains pending.
@@ -149,6 +157,8 @@ Virtual changing input remains at the existing acquisition/mapping/transport/exe
 - **Reopen:** concrete task evidence changing product priorities or proving a shared-path gap. Do not substitute more per-joint menus or precision scores for the representative combined workload.
 
 ## PROCESS-02: one lean runner, focused informative checks
+
+- **Apply now:** start from the one current-state/private Next row and pass its selected binding explicitly. Existing live-phase-coordinator6c35 uses accepted intentions/active progress, fresh gripper bounds and qualified approach cancellation. Its final source is retained with matching private permissions beside the existing current-proof-freeze02/preimage/review02 packet; per-run launch-metadata seals the adapter preparation/binding, not the coordinator version. Keep detailed history in its existing records instead of copying it into AGENTS or each summary.
 
 - **Resume known transfer work without repeating exclusive setup:** preserve the original failed SCP receipt; require the exact closed identity/argv/timeout and acknowledged prefix, freshly verify the full matched rollback plus acknowledged files, retry only the unfinished pinned copies, and retain the original final full-file verification before phase success. A connection timeout does not identify a robot or network defect. Stage85 uses the existing common upload entrypoint;21focused checks and review passed. Unknown/missing/duplicate/later-phase histories refuse.
 
