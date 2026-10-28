@@ -7,7 +7,7 @@ limitation documented here remain unchanged.
 
 <a id="current-ordinary-viewing-path"></a>
 
-## Current ordinary route — Stage85, 2026-10-27
+## Current ordinary route — Stage86, 2026-10-27
 
 Use the existing AM1-attached USB cameras through the ordinary protected owner.
 [`ProtectedHostRun`](../../tools/am1_physical_executor.py) starts the maintained
@@ -39,6 +39,21 @@ without Start/Claim or a new capture process. P1 advisory viewing and paused
 THETA/companion work are separate from these AM1 USB cameras and physical USB
 leaders.
 
+After a delivered viewer-script change, hard-reload the same enrolled profile,
+reselect Chest and verify the current page's `delivery_history` format. A trusted
+HTTP asset fetch matched the deployed script while an already-open page still
+lacked that field; the finite 30 s camera-only check verified the eight-report
+format after the browser hard reload and reselection. This establishes the
+loaded page format, without identifying a cache root cause.
+
+One finite 90 s visible→offviewport→visible check retained advancing frames in
+all three intervals. It does not identify required-view HOLD causes or establish
+universal offviewport behavior. Earlier diagnostic comparisons invalidated by
+tool setup or retired-tab closures remain separate tool outcomes, without a
+hardware-cause attribution. Keep the primary view visible while observing, use
+the current tab handle and observation file explicitly. Rebind a stale tab
+rather than reusing a helper closure that captured a retired handle. See the [current operating checkpoint](teleop-consolidation-16.md#current-continuation--camera-reuse-and-recovery-composition-2026-10-27).
+
 During the next purposeful normal activity, the minimum availability check is
 configured/fresh Chest at the existing owner plus actual advancing decoded
 Chest imagery and current required-view receipts in the restored visible
@@ -60,7 +75,7 @@ normal activity rather than repeating a camera-only qualification.
 The camera-plus-Local sections below are preserved historical records at their
 recorded sources. Their attendance, setup and operating restrictions do not
 supersede the current owner's explicitly authorized AM1 reliability scope;
-the current [operating checkpoint](teleop-consolidation-16.md#current-checkpoint--progress-pacing-and-useful-ordinary-reuse-2026-10-26)
+the current [operating checkpoint](teleop-consolidation-16.md#current-continuation--camera-reuse-and-recovery-composition-2026-10-27)
 and active repository instructions govern this continuation. Historical failures,
 acceptances and security boundaries remain recorded without relabeling.
 

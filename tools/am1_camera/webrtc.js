@@ -1,4 +1,9 @@
 "use strict";
+const AM1_VIEW_PROGRESS_COLUMNS=Object.freeze(["serial","frames","media_time","callback_ms","presentation_ms",
+  "expected_display_ms","fetch_ms","settled_ms","cancel_ms","outcome","http_status","pi_request_s",
+  "pi_status_start_s","pi_status_done_s","pi_floor_s","pi_core_accepted_s","pi_until_s","current",
+  "accepted","qualified","owner_accepted","owner_qualified","pi_core_floor_s",
+  "source_sequence","pi_source_arrived_s","pi_core_started_s"]);
 // Native go2rtc SDP exchange. Connected transport is never a decoded-frame clock.
 globalThis.AM1OnboardView=class {
   constructor(video,options) {
@@ -46,10 +51,89 @@ globalThis.AM1OnboardView=class {
             ["core_started_at_monotonic_s","core_completed_at_monotonic_s","core_accepted_at_monotonic_s",
              "original_floor_at_monotonic_s","qualified_until_monotonic_s"]):null,
           owner_result:result(delivery.owner_result)}:null}:null};
+      const history=this.progressDiagnostics();
+      if(history){
+        snapshot.view_progress.delivery_history=history;
+        // This closed projection contains ASCII labels/scalars only. Drop only
+        // diagnostic rows; transport slots, receipts and their clocks are untouched.
+        const byteLimit=history.reports.length?8192:4096;
+        while(JSON.stringify(snapshot).length>byteLimit&&history.reports.length){history.reports.shift();history.size_dropped++;}
+      }
     } catch {} // Observing cached diagnostics must not affect playback or control.
     return snapshot;
   }
   diagnosticCurrent(attempt) {return this.diagnostic===attempt&&attempt.epoch===this.epoch&&attempt.pc===this.pc;}
+  progressDiagnostic(event,slot=null,value=null) {
+    try {
+      const view=this.diagnosticView,p=view?.progress;
+      const stopping=event==="cancel"&&value==="stop"&&view?.state==="stopped"&&slot?.epoch===view.attempt;
+      if(!p||(!stopping&&(!this.diagnostic||!this.diagnosticCurrent(this.diagnostic)))||
+         slot&&slot.epoch!==view.attempt)return;
+      const number=v=>typeof v==="number"&&Number.isFinite(v)&&v>=0&&v<=Number.MAX_SAFE_INTEGER?v:null;
+      const count=v=>Number.isSafeInteger(v)&&v>=0?v:null;
+      const increment=v=>count(v)===null?null:Math.min(Number.MAX_SAFE_INTEGER,v+1),now=number(this.clock());
+      if(event==="callback") {
+        const metadata=value.metadata;
+        const row={at_ms:now,presentation_ms:number(metadata.presentationTime),expected_display_ms:number(metadata.expectedDisplayTime),
+          frames:count(metadata.presentedFrames),media_time:number(metadata.mediaTime),advanced:value.advanced===true};
+        p.callback_count=increment(p.callback_count);p.latest_callback=row;
+        if(row.advanced)p.presented={...row};
+        return;
+      }
+      if(event==="skip") {
+        const index=["decode","cadence","no_presentation","slots"].indexOf(value);
+        if(index>=0)p.skipped[index]=increment(p.skipped[index]);
+        return;
+      }
+      if(event==="report") {
+        const body=value,shown=p.presented;
+        const same=shown&&shown.frames===body.decoded_frames&&shown.media_time===body.media_time;
+        const row=[count(slot.id),count(body.decoded_frames),number(body.media_time),number(this.decodedAt),
+          same?shown.presentation_ms:null,same?shown.expected_display_ms:null,null,null,null,"pending",null,
+          null,null,null,null,null,null,null,null,null,null,null,null,null,null,null];
+        if(p.reports.length>=8){p.reports.shift();p.dropped=increment(p.dropped);}
+        p.reports.push(row);return;
+      }
+      const row=p.reports.find(item=>item[0]===slot?.id);if(!row)return;
+      if(event==="fetch")row[6]=now;
+      else if(event==="headers") {const status=value?.status;row[10]=Number.isInteger(status)&&status>=100&&status<=599?status:null;}
+      else if(event==="receipt") {
+        const receipt=value.receipt,delivery=receipt?.view_delivery;
+        if(!slot.cancelled)row[9]=receipt?.accepted===true?"accepted":receipt?.accepted===false?"refused":"invalid";
+        for(const [index,key]of [[11,"request_received_at_monotonic_s"],[12,"status_started_at_monotonic_s"],
+          [13,"status_completed_at_monotonic_s"],[14,"original_floor_at_monotonic_s"]])row[index]=number(delivery?.[key]);
+        row[15]=number(delivery?.core?.core_accepted_at_monotonic_s);row[16]=number(delivery?.core?.qualified_until_monotonic_s);
+        row[17]=typeof value.current==="boolean"?value.current:null;
+        for(const [index,flag]of [[18,receipt?.accepted],[19,receipt?.required_view?.qualified],
+          [20,delivery?.owner_result?.accepted],[21,delivery?.owner_result?.required_view?.qualified]])
+          row[index]=typeof flag==="boolean"?flag:null;
+        row[22]=number(delivery?.core?.original_floor_at_monotonic_s);
+        row[23]=count(delivery?.source_sequence);row[24]=number(delivery?.source_arrived_at_monotonic_s);
+        row[25]=number(delivery?.core?.core_started_at_monotonic_s);
+      } else if(event==="cancel") {
+        row[8]=now;row[9]=({timeout:"timeout",superseded:"superseded",stop:"stopped"})[value]||"cancelled";
+      } else if(event==="error") {if(row[9]==="pending")row[9]="error";}
+      else if(event==="settled") {row[7]=now;if(row[9]==="pending")row[9]="ignored";}
+    } catch {} // Diagnostic failure cannot enter the delivery state machine.
+  }
+  progressDiagnostics() {
+    try {
+      const view=this.diagnosticView,p=view?.progress;if(!p)return null;
+      const number=v=>typeof v==="number"&&Number.isFinite(v)&&v>=0&&v<=Number.MAX_SAFE_INTEGER?v:null;
+      const count=v=>Number.isSafeInteger(v)&&v>=0?v:null,callback=p.latest_callback,slots=[...this.reports.values()];
+      const outcomes=["pending","accepted","refused","invalid","timeout","superseded","stopped","cancelled","error","ignored"];
+      return {attempt:count(view.attempt),clock:"browser_performance_ms",pi_clock:"pi_monotonic_s",capacity:8,
+        callback_count:count(p.callback_count),latest_callback:callback?{at_ms:number(callback.at_ms),
+          presentation_ms:number(callback.presentation_ms),expected_display_ms:number(callback.expected_display_ms),
+          frames:count(callback.frames),media_time:number(callback.media_time),advanced:callback.advanced===true}:null,
+        skipped:Object.fromEntries(["decode","cadence","no_presentation","slots"].map((key,i)=>[key,count(p.skipped[i])])),
+        slots:{raw:count(slots.length),active:count(slots.filter(item=>item.epoch===view.attempt&&!item.cancelled).length),
+          cancelled:count(slots.filter(item=>item.cancelled).length)},
+        dropped:count(p.dropped),size_dropped:0,columns:[...AM1_VIEW_PROGRESS_COLUMNS],
+        reports:p.reports.slice(-8).map(row=>AM1_VIEW_PROGRESS_COLUMNS.map((_,i)=>i===9?(outcomes.includes(row[i])?row[i]:null):
+          i>=17&&i<=21?(typeof row[i]==="boolean"?row[i]:null):[0,1,10,23].includes(i)?count(row[i]):number(row[i])))};
+    } catch {return null;}
+  }
   diagnose(attempt,phase,fields) {
     try {
       const limits={offer:1,"remote-description":1,ice:2,connection:2,track:1,stats:1};
@@ -80,7 +164,8 @@ globalThis.AM1OnboardView=class {
   beginDiagnostics(epoch,pc) {
     const attempt={epoch,pc,counts:{offer:0,"remote-description":0,ice:0,connection:0,track:0,stats:0},timer:null};
     this.diagnostic=attempt;
-    this.diagnosticView={attempt:epoch,state:"current",records:[]};
+    this.diagnosticView={attempt:epoch,state:"current",records:[],progress:{callback_count:0,latest_callback:null,
+      presented:null,skipped:[0,0,0,0],reports:[],dropped:0}};
     try {attempt.timer=setTimeout(()=>this.sampleDiagnosticStats(attempt),3000);}catch{}
     return attempt;
   }
@@ -192,8 +277,9 @@ globalThis.AM1OnboardView=class {
         if(Number.isSafeInteger(metadata.presentedFrames)&&metadata.presentedFrames>this.frames&&
            Number.isFinite(metadata.mediaTime)&&metadata.mediaTime>this.mediaTime) {
           this.frames=metadata.presentedFrames;this.mediaTime=metadata.mediaTime;this.decodedAt=this.clock();
+          this.progressDiagnostic("callback",null,{metadata,advanced:true});
           void this.report(); // Fresh decoded progress may take an already-due opportunity immediately.
-        }
+        } else this.progressDiagnostic("callback",null,{metadata,advanced:false});
         this.callback=this.video.requestVideoFrameCallback(decoded);
       };
       this.callback=this.video.requestVideoFrameCallback(decoded);
@@ -212,10 +298,13 @@ globalThis.AM1OnboardView=class {
     const now=this.clock(),decodedAge=this.decodedAt===null?Infinity:now-this.decodedAt;
     // Cached browser source status can lag; Gateway independently qualifies
     // current Pi source identity/arrival. Publish only genuinely current decode.
-    if(!this.options.progress||!this.binding||this.frames<1||!Number.isFinite(decodedAge)||decodedAge<0||decodedAge>=500)return idle();
-    if(now-this.lastReportAt<150||this.frames<=this.lastReportedFrames||this.mediaTime<=this.lastReportedMedia)
-      return latest?.epoch===this.epoch&&!latest.cancelled?latest.promise:idle();
+    if(!this.options.progress||!this.binding||this.frames<1||!Number.isFinite(decodedAge)||decodedAge<0||decodedAge>=500){
+      this.progressDiagnostic("skip",null,"decode");return idle();}
+    if(now-this.lastReportAt<150||this.frames<=this.lastReportedFrames||this.mediaTime<=this.lastReportedMedia){
+      this.progressDiagnostic("skip",null,now-this.lastReportAt<150?"cadence":"no_presentation");
+      return latest?.epoch===this.epoch&&!latest.cancelled?latest.promise:idle();}
     if(this.reports.size>=2) {
+      this.progressDiagnostic("skip",null,"slots");
       // Cancel oldest delivery, then let its raw operation settle before using
       // that slot. A transport ignoring abort stays quarantined against this cap.
       [...this.reports.values()].find(slot=>!slot.cancelled)?.cancel("superseded");
@@ -236,17 +325,20 @@ globalThis.AM1OnboardView=class {
     slot.cancel=reason=>{
       if(slot.cancelled||slot.done)return;
       const active=current();slot.cancelled=true;controller.abort();release();this.updateReporting();
+      this.progressDiagnostic("cancel",slot,reason);
       if(active&&reason==="timeout")this.error="View progress delivery unavailable";
     };
     slot.timer=setTimeout(()=>slot.cancel("timeout"),750);
     this.reports.set(id,slot);this.latestReport=id;
     this.lastReportAt=now;this.lastReportedFrames=body.decoded_frames;this.lastReportedMedia=body.media_time;
-    this.updateReporting();
+    this.updateReporting();this.progressDiagnostic("report",slot,body);
     const work=(async()=>{
       try {
+        this.progressDiagnostic("fetch",slot);
         const response=await fetch(this.options.progress,{method:"POST",credentials:"same-origin",redirect:"error",
           headers:{"Content-Type":"application/json","X-AM1-CSRF":this.options.csrf?.()||""},
           body:JSON.stringify(body),signal:controller.signal});
+        this.progressDiagnostic("headers",slot,response);
         if(slot.cancelled)return;
         const length=response.headers.get("Content-Length"),mime=response.headers.get("Content-Type");
         if(!response.ok||!/^\d{1,5}$/.test(length||"")||Number(length)>8192||
@@ -258,9 +350,10 @@ globalThis.AM1OnboardView=class {
            Object.keys(receipt).some(key=>!allowed.includes(key)))throw Error("Invalid logical view receipt");
         // Receipt delivery cannot renew original source/decoder clocks, and an
         // older request or source cannot replace the latest current observation.
-        if(current())this.progressReceipt=receipt;
-      } catch {if(current())this.error="View progress delivery unavailable";}
-      finally {slot.done=true;clearTimeout(slot.timer);this.reports.delete(id);this.updateReporting();}
+        const active=current();if(active)this.progressReceipt=receipt;
+        this.progressDiagnostic("receipt",slot,{receipt,current:active});
+      } catch {if(current())this.error="View progress delivery unavailable";this.progressDiagnostic("error",slot);}
+      finally {slot.done=true;clearTimeout(slot.timer);this.reports.delete(id);this.updateReporting();this.progressDiagnostic("settled",slot);}
     })();
     slot.promise=Promise.race([work,cancelled]);
     return slot.promise;
