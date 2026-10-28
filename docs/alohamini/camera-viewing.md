@@ -13,9 +13,11 @@ Stage88 changes only the runtime viewer diagnostics (WebRTC JSa97118fe).
 The maintained camera bytes, enrolled software-decoder profile, source mapping
 and ordinary procedure below remain unchanged. A completed receiver baseline/stall
 pair retains its own attempt identity across replacement; current_attachment=false
-is historical evidence, never current viewing qualification. Restore the actual
-viewer window after launching the PC producer; DOM focus/visibility alone did not
-establish that its native window was onscreen.
+is historical evidence, never current viewing qualification. Verify the actual
+claimed tab/window after launching the PC producer. Native AX later repeated a
+retired session/clock and is excluded; DOM focus alone is not scene evidence.
+8849 has one correctly bound Live Chest screenshot with coarse-awareness scope;
+fine tips and final-window observation remain limited.
 
 Use the existing AM1-attached USB cameras through the ordinary protected owner.
 [`ProtectedHostRun`](../../tools/am1_physical_executor.py) starts the maintained
