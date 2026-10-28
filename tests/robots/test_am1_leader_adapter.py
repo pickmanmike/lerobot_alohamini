@@ -3343,7 +3343,7 @@ def recovery_state():
 
 
 @pytest.mark.parametrize("changed", ["service", "device", "generation", "deadline", "reference", "unchanged",
-                                     "expired", "expired_pc_budget", "reply_after_lease", "reply_after_budget", "claim_expired", "second_read"])
+                                     "expired", "expired_pc_budget", "reply_after_lease", "reply_after_budget", "claim_expired", "second_read", "ordinary_pause"])
 def test_unknown_renewal_requires_current_original_authority_and_bounded_fresh_receipts(monkeypatch, changed):
     import asyncio
     import copy
@@ -3387,7 +3387,9 @@ def test_unknown_renewal_requires_current_original_authority_and_bounded_fresh_r
         "reason": "owner outcome unknown; inspect state or lookup the same operation", "effect_admitted": None})
     original.renewal_context = {"identity": client.identities(), "device": "device", "run": copy.deepcopy(guard.original["run"]),
                                 "previous_expiry": 102.5, "dispatched": 999.9}
-    if changed == "service":
+    if changed == "ordinary_pause":
+        state["events"][0]["kind"] = "pause"  # No finishing receipt/context may enter ordinary recovery.
+    elif changed == "service":
         state["service_incarnation"] = "foreign"
     elif changed in {"device", "generation"}:
         state["controller"]["device_id" if changed == "device" else "controller_generation"] = "foreign"
@@ -5592,6 +5594,122 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                             value["fault"] = "actual hard native fault"
                     return value
                 e.evidence = final_evidence
+                if cause.startswith("bench_finish_renewal_"):
+                    # Production Core/IPC/TLS/HTTP claim loss during own Pause:
+                    # fake Native sensing is the existing fixture's only device seam.
+                    pi, lost, renewal_errors, restarts = [10.], [False], [], []
+                    mode, own_receipt_returned, fenced = cause.removeprefix("bench_finish_renewal_"), [False], []
+                    a.clock = e.clock = lambda: pi[0]
+                    client.record = record
+                    client._renewal_ack = await original_post("claim", {"controller_generation": client.generation})
+                    async def renewal_loss(command, device):
+                        if command.get("op") == "claim" and not lost[0]:
+                            pi[0] = 10.125
+                            result = await original_call(command, device)
+                            assert result["accepted"] is True
+                            lost[0] = True
+                            raise TimeoutError("renewal receipt lost after current owner effect")
+                        if command.get("op") == "claim":
+                            pi[0] = 10.25  # Exact binary Pi samples avoid artificial deadline-subtraction drift.
+                            fenced.append(copy.deepcopy(command))
+                            result = await original_call(command, device)
+                            if mode == "badreceipt":
+                                result["lease_seconds"] = 6.
+                            return result
+                        if command.get("op") == "pause":
+                            gateway_pauses.append(copy.deepcopy(command))
+                            result = await original_call(command, device)
+                            if cause.endswith("unknown") and len(gateway_pauses) == 1:
+                                raise TimeoutError("own Pause receipt lost after durable effect")
+                            return result
+                        return await original_call(command, device)
+                    gateway.call = renewal_loss
+                    renewal = asyncio.create_task(client.renew())
+                    async def finish_post(path, body):
+                        if path == "pause":
+                            pauses.append(copy.deepcopy(body))
+                        result = await original_post(path, body)
+                        if path == "pause":
+                            error = (await asyncio.gather(renewal, return_exceptions=True))[0]
+                            assert m._owner_unknown_renewal(error)
+                            renewal_errors.append(error)
+                            if mode == "pause":
+                                assert a.handle({"op": "pause", "run_id": e.run_id,
+                                                 "operation_id": str(uuid4())}, enrolled["device_id"])["accepted"]
+                            elif mode == "stop":
+                                assert a.handle({"op": "stop", "run_id": e.run_id,
+                                                 "operation_id": str(uuid4())}, enrolled["device_id"])["accepted"]
+                            elif mode == "takeover":
+                                a.controller["expires"] = 9.9
+                                a._expire_controls(pi[0])
+                                assert a.handle({"op": "claim"}, "competitor")["accepted"]
+                            elif mode == "reboot":
+                                a.service_incarnation = str(uuid4())
+                            elif mode == "expired":
+                                a.controller["expires"] = 10.
+                            elif mode == "unadvanced":
+                                a.controller["expires"] = client._renewal_ack["presence_expires"]
+                            own_receipt_returned[0] = True
+                        return result
+                    client.post = finish_post
+                    original_get = client.get
+                    async def finish_get(path):
+                        if own_receipt_returned[0]:
+                            if mode == "cancel":
+                                raise asyncio.CancelledError("cancelled during finishing-only presence qualification")
+                            if mode == "deadline":
+                                await asyncio.sleep(2.1)  # The ORIGINAL2s scope cancels this real pending read.
+                            if mode == "second_read" and fenced:
+                                a.controller["expires"] += .25
+                        return await original_get(path)
+                    client.get = finish_get
+                    def healthy_renewal():
+                        if renewal.done():
+                            renewal.result()
+                            raise RuntimeError("original renewal ended")
+                    async def restart(error):
+                        nonlocal renewal
+                        assert renewal.done() and renewal.exception() is error
+                        restarts.append(error)
+                        renewal = asyncio.create_task(client.renew())
+                    entered = m.time.monotonic()
+                    try:
+                        if mode not in {"hold", "unknown"}:
+                            expected = asyncio.CancelledError if mode == "cancel" else m.HTTPOutcomeError
+                            with pytest.raises(expected) as failed:
+                                await guard.finish_owned(bench=False, wall_deadline=entered + 2,
+                                                         renewal_check=healthy_renewal, renewal_reconcile=restart)
+                            assert len(renewal_errors) == 1 and not restarts
+                            if mode != "cancel":
+                                assert failed.value is renewal_errors[0] and failed.value.__cause__ is not None
+                            assert len(fenced) == int(mode in {"badreceipt", "second_read"})
+                            assert not any(row["event"] == "normal_finish_hold_qualified" for row in records)
+                            assert not any(op in {"input", "grant"} for op, _ in commands)
+                            assert sum(op == "connect" for op, _ in commands) == 1
+                            assert sum(op == "resume" for op, _ in commands) == 1
+                            assert a.run["native_live_at"] == 9. and a.run["deadline"] == 309.
+                            return
+                        proof = await guard.finish_owned(bench=False, wall_deadline=entered + 2,
+                                                         renewal_check=healthy_renewal, renewal_reconcile=restart)
+                        assert proof["native_held_qualified"] is True
+                        assert restarts == renewal_errors and len(restarts) == 1
+                        assert len(pauses) == (2 if cause.endswith("unknown") else 1)
+                        assert all(value == pauses[0] for value in pauses)
+                        assert len([row for row in a.events if row["kind"] == "pause"]) == 1
+                        assert a.db.execute("SELECT result FROM mutations WHERE id=?", (pauses[0]["operation_id"],)).fetchone()
+                        failed = [row for row in records if row["event"] == "controller_renewal" and row["outcome"] == "failed"]
+                        qualified = [row for row in records if row["event"] == "controller_renewal_requalified"]
+                        assert len(failed) == len(qualified) == 1
+                        assert qualified[0]["original_outcome"] == "unknown"
+                        assert qualified[0]["original_ceiling_monotonic_s"] <= entered + 2
+                        assert not any(op in {"input", "grant"} for op, _ in commands)
+                        assert sum(op == "connect" for op, _ in commands) == 1
+                        assert sum(op == "resume" for op, _ in commands) == 1
+                        assert a.run["native_live_at"] == 9. and a.run["deadline"] == 309.
+                    finally:
+                        renewal.cancel()
+                        await asyncio.gather(renewal, return_exceptions=True)
+                    return
                 async def post(path, body):
                     if path != "pause":
                         return await original_post(path, body)
@@ -12858,3 +12976,10 @@ def test_ordinary_changing_runner_routes_consumed_input_without_replaying_it(tmp
     assert dispatched[0]["source"]["sample_seq"] == 1 and dispatched[1]["source"]["sample_seq"] == 2
     assert dispatched[0]["grant_id"] != dispatched[1]["grant_id"]
     assert not hasattr(original, "grant_context"), "Input uncertainty must retain its own consumed acquisition context"
+
+
+@pytest.mark.parametrize("cause", ["normal_finish_renewal_" + mode for mode in
+    ("hold", "unknown", "pause", "stop", "takeover", "reboot", "cancel", "expired", "unadvanced",
+     "badreceipt", "second_read", "deadline")])
+def test_normal_finish_requalifies_unknown_renewal_after_own_pause(tmp_path, monkeypatch, cause):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause)

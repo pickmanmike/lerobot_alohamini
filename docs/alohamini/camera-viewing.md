@@ -7,10 +7,15 @@ limitation documented here remain unchanged.
 
 <a id="current-ordinary-viewing-path"></a>
 
-## Current ordinary route — Stage87, 2026-10-27
+## Current ordinary route — Stage88, 2026-10-28
 
-Stage87 changed only the runtime Core. The Stage86 viewer/camera bytes, enrolled
-profile, source mapping and ordinary procedure below remain unchanged.
+Stage88 changes only the runtime viewer diagnostics (WebRTC JSa97118fe).
+The maintained camera bytes, enrolled software-decoder profile, source mapping
+and ordinary procedure below remain unchanged. A completed receiver baseline/stall
+pair retains its own attempt identity across replacement; current_attachment=false
+is historical evidence, never current viewing qualification. Restore the actual
+viewer window after launching the PC producer; DOM focus/visibility alone did not
+establish that its native window was onscreen.
 
 Use the existing AM1-attached USB cameras through the ordinary protected owner.
 [`ProtectedHostRun`](../../tools/am1_physical_executor.py) starts the maintained
