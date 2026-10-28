@@ -597,6 +597,10 @@ def test_real_core_executor_native_frame_expiry_and_fresh_rejoin_preserve_run(tm
                 assert row["epoch"] == marker["epoch"] and row["intent_revision"] == marker["intent_revision"]
                 assert row["outcome"] == "returned" and row["error_type"] is None
                 assert row["send_started_at_monotonic_s"] <= row["send_completed_at_monotonic_s"]
+                assert row["poll_started_at_monotonic_s"] <= row["poll_returned_at_monotonic_s"] <= row["send_started_at_monotonic_s"]
+                assert -1 <= row["poll_previous_feedback_sequence"] <= row["poll_feedback_sequence"]
+                assert row["poll_outcome"] == "returned"
+                assert "poll_" not in repr(marker)  # Diagnostic extension never enters the native wire marker.
                 if marker.get("live_input"):
                     assert row["input"]["seq"] == marker["live_input"]["seq"]
         if queued_expiry is True:
@@ -1938,6 +1942,8 @@ def test_bench_expired_authority_reacquires_new_generation_without_replaying_old
         assert e.sample["ack"]["live_input"]["workspace"] == reference
         assert not a._handle(dict(op="connect", **ids), "pc")["accepted"]
         newids = dict(ids, controller_generation=new_generation)
+        assert not a._handle(dict(op="connect", **newids), "pc")["accepted"]  # New owner still needs CURRENT revision.
+        newids["intent_revision"] = a.run["intent_revision"]
         connected = a._handle(dict(op="connect", **newids), "pc")
         assert connected["accepted"]
         assert not a._handle(dict(op="grant", **newids), "pc")["accepted"]
@@ -3004,3 +3010,175 @@ def test_progress_save_held_states_keep_one_second_eligibility(periodic_input_or
     assert saves == [status]
     assert case.a.last_checkpoint == entered
     assert case.a.run["status"] == status and case.a.run["deadline"] == 310.
+
+
+@pytest.mark.parametrize("poll_mode", ["advanced", "pending", "feedback_unavailable", "os_error"])
+def test_worker_send_retains_exact_preceding_poll_without_wire_fields(monkeypatch, poll_mode):
+    import json
+    from tools.am1_physical_executor import PendingSample
+
+    e, _ = admitted_executor()
+    io, now, calls = e.io_factory(), [10.], []
+    e.clock = lambda: now[0]
+    original = copy.deepcopy(e.sample)
+    primary = RuntimeError("original send failure after observed poll")
+
+    def poll(previous):
+        calls.append(previous)
+        result = copy.deepcopy(original)
+        now[0] = 10.03125
+        if poll_mode == "pending":
+            return PendingSample(result)
+        if poll_mode == "feedback_unavailable":
+            from tools.am1_physical_executor import FeedbackUnavailable
+            raise FeedbackUnavailable("original bounded observation unavailable")
+        if poll_mode == "os_error":
+            raise OSError("original bounded observation OS error")
+        result["sequence"] = previous + 1
+        return result
+
+    def send(action):
+        io.actions.append(copy.deepcopy(action))
+        raise primary  # Stop after exactly one real worker iteration.
+
+    monkeypatch.setattr(io, "poll", poll)
+    monkeypatch.setattr(io, "send", send)
+    assert e.begin(e.recipe)
+    e.worker.join(2)
+    assert not e.worker.is_alive() and calls == [1]
+    assert e._fault == "RuntimeError: original send failure after observed poll" and io.finished == 1
+    trace = e.advance(now[0], 0.)["input_transport_trace"]
+    sent = [r for r in trace["recent"] if r["event"] == "worker_send"]
+    assert len(sent) == 1
+    row = sent[0]
+    assert row["poll_started_at_monotonic_s"] == 10.
+    assert row["poll_returned_at_monotonic_s"] == 10.03125
+    assert row["poll_previous_feedback_sequence"] == 1
+    assert row["poll_feedback_sequence"] == ({"pending": 1, "advanced": 2}.get(poll_mode))
+    assert row["poll_outcome"] == ("returned" if poll_mode in {"advanced", "pending"} else poll_mode)
+    if poll_mode in {"feedback_unavailable", "os_error"}:
+        assert io.actions[0]["_am1_local_control"]["mode"] == "pause"
+        assert e._transient.startswith("original bounded observation")
+    assert row["poll_returned_at_monotonic_s"] <= row["send_started_at_monotonic_s"]
+    assert row["outcome"] == "raised" and row["error_type"] == "RuntimeError"
+    assert row["action_sequence"] == io.actions[0]["_am1_local_control"]["action_sequence"]
+    assert "poll_" not in json.dumps(io.actions)
+    assert "positions" not in json.dumps(row) and "target" not in json.dumps(row)
+
+
+@pytest.mark.parametrize("probe", ["start_raise", "return_raise", "start_nan", "return_bool"])
+@pytest.mark.parametrize("fatal_poll", [False, True])
+def test_poll_diagnostic_probe_cannot_replace_original_io_result_or_fault(monkeypatch, probe, fatal_poll):
+    e, _ = admitted_executor()
+    io, now, reads = e.io_factory(), [10.], [0]
+    original = copy.deepcopy(e.sample)
+    primary = RuntimeError("original poll failure" if fatal_poll else "original send failure")
+
+    def clock():
+        reads[0] += 1
+        # First clock is the existing native deadline check. Only the two
+        # immediately adjacent observational probes are disturbed.
+        if reads[0] == (2 if probe.startswith("start") else 3):
+            if probe.endswith("raise"):
+                raise ValueError("diagnostic clock unavailable")
+            return float("nan") if probe.endswith("nan") else True
+        return now[0]
+
+    def poll(previous):
+        now[0] = 10.03125
+        if fatal_poll:
+            raise primary
+        result = copy.deepcopy(original)
+        result["sequence"] = previous + 1
+        return result
+
+    def send(action):
+        io.actions.append(copy.deepcopy(action))
+        raise primary
+
+    e.clock = clock
+    monkeypatch.setattr(io, "poll", poll)
+    monkeypatch.setattr(io, "send", send)
+    assert e.begin(e.recipe)
+    e.worker.join(2)
+    assert not e.worker.is_alive() and io.finished == 1
+    assert e._fault == "RuntimeError: " + str(primary)
+    trace = e.advance(now[0], 0.)["input_transport_trace"]
+    sent = [r for r in trace["recent"] if r["event"] == "worker_send"]
+    if fatal_poll:
+        assert not sent and not io.actions
+    else:
+        assert len(sent) == 1 and sent[0]["outcome"] == "raised"
+        key = "poll_started_at_monotonic_s" if probe.startswith("start") else "poll_returned_at_monotonic_s"
+        assert sent[0][key] is None
+        assert sent[0]["poll_feedback_sequence"] == 2 and sent[0]["poll_outcome"] == "returned"
+
+
+@pytest.mark.parametrize("bad", ["reverse", "future", "sequence_bool", "sequence_huge", "sequence_negative", "nonprimitive", "shape"])
+def test_poll_trace_optional_values_are_closed_unknown_and_private(bad):
+    import json
+    e, _ = admitted_executor()
+    marker = {"run_id": e.run_id, "host_incarnation": e.host_incarnation,
+              "live_binding": dict(e._live_binding), "intent_revision": 0, "epoch": 1,
+              "mode": "active", "action_sequence": 7, "live_input": None}
+    before = copy.deepcopy(marker)
+    values = [9., 9.5, 1, 2, "returned"]
+    unknown = []
+    if bad == "reverse":
+        values[:2] = [9.5, 9.]
+        unknown = ["poll_started_at_monotonic_s", "poll_returned_at_monotonic_s"]
+    elif bad == "future":
+        values[1] = 10.5
+        unknown = ["poll_returned_at_monotonic_s"]
+    elif bad.startswith("sequence"):
+        values[3] = {"sequence_bool": True, "sequence_huge": 2**63, "sequence_negative": -1}[bad]
+        unknown = ["poll_feedback_sequence"]
+    elif bad == "nonprimitive":
+        values[0] = {"target": "SHOULD_NOT_LOG"}
+        values[4] = "SHOULD_NOT_LOG"
+        unknown = ["poll_started_at_monotonic_s", "poll_outcome"]
+    else:
+        values.append({"image": "SHOULD_NOT_LOG"})
+        unknown = ["poll_started_at_monotonic_s", "poll_returned_at_monotonic_s", "poll_previous_feedback_sequence",
+                   "poll_feedback_sequence", "poll_outcome"]
+    row = e._input_transport_row("worker_send", marker, poll=tuple(values))
+    e._append_input_transport(row, outcome="returned")
+    assert row is not None and all(row[key] is None for key in unknown)
+    assert marker == before and e._fault is None and e.desired == "active"
+    assert "SHOULD_NOT_LOG" not in json.dumps(row, allow_nan=False)
+
+
+def test_poll_observation_keeps_original_rings_and_frozen_first_expiry_size(capsys):
+    import json
+    e, _ = admitted_executor()
+    marker = {"run_id": e.run_id, "host_incarnation": e.host_incarnation,
+              "live_binding": dict(e._live_binding), "intent_revision": 0, "epoch": 1,
+              "mode": "active", "action_sequence": 0,
+              "live_input": {"source": source(999), "grant_id": str(uuid4()), "seq": 999,
+                             "valid_until_monotonic_s": 10.25, "target": {"private": "SHOULD_NOT_LOG"}}}
+    for i in range(32):
+        marker["action_sequence"] = i
+        row = e._input_transport_row("worker_send", marker, poll=(9.96875, 10., i, i + 1, "returned"))
+        e._append_input_transport(row, outcome="returned")
+    sample = copy.deepcopy(e.sample)
+    sample["ack"].update(epoch=1, live_input={"last_input_seq": 999, "valid_until_monotonic_s": 9.99,
+                                           "expiry_detected_at_monotonic_s": 10.})
+    e._freeze_input_transport_expiry(sample)
+    frozen = copy.deepcopy(e.advance(10., 0.)["input_transport_trace"]["first_native_expiry"])
+    for i in range(32, 96):
+        marker["action_sequence"] = i
+        row = e._input_transport_row("worker_send", marker, poll=(9.96875, 10., i, i + 1, "returned"))
+        e._append_input_transport(row, outcome="returned")
+    trace = e.advance(10., 0.)["input_transport_trace"]
+    assert len(trace["recent"]) == len(trace["first_native_expiry"]["rows"]) == trace["recent_limit"] == 32
+    assert trace["first_native_expiry"] == frozen and trace["dropped_rows"] == 64
+    raw = json.dumps(trace, allow_nan=False, separators=(",", ":")).encode()
+    assert "SHOULD_NOT_LOG" not in raw.decode() and len(raw) < 65536
+    without_poll = copy.deepcopy(trace)
+    for row in without_poll["recent"] + without_poll["first_native_expiry"]["rows"]:
+        for key in tuple(row):
+            if key.startswith("poll_"):
+                row.pop(key)
+    before_bytes = len(json.dumps(without_poll, allow_nan=False, separators=(",", ":")).encode())
+    print("WORKER_POLL_TRACE_BYTES", len(raw), "PRIOR_FIELDS_BYTES", before_bytes,
+          "ADDED_BYTES", len(raw) - before_bytes, "ROWS", 32, 32)
