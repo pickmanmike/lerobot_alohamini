@@ -2579,7 +2579,24 @@ class SameRunRecovery:
             self.record({"event": f"{label}_finish_pause_requested", "operation_id": request["operation_id"],
                          "identity": self.client.identities(), "expected_intent_revision": revision,
                          "original_ceiling_monotonic_s": ceiling})
-            receipt = await asyncio.wait_for(self.client.post("pause", request), budget())
+            try:
+                receipt = await asyncio.wait_for(self.client.post("pause", request), budget())
+            except HTTPOutcomeError as original:
+                unknown = {"accepted": None, "status": "unknown", "uncertain": True,
+                           "reason": "owner outcome unknown; inspect state or lookup the same operation",
+                           "effect_admitted": None}
+                if (type(original) is not HTTPOutcomeError or type(original.http_status) is not int
+                    or original.http_status != 503 or not isinstance(original.response, dict)
+                    or set(original.response) != set(unknown)
+                    or any(type(original.response[k]) is not type(v) or original.response[k] != v
+                           for k, v in unknown.items())):
+                    raise
+                self.record({"event": f"{label}_finish_pause_receipt_unknown", "operation_id": request["operation_id"],
+                             "http_status": original.http_status, "response": original.response,
+                             "original_ceiling_monotonic_s": ceiling})
+                # Pause is a durable mutation: the IDENTICAL body/operation
+                # returns its recorded result, never a new Pause or fresh budget.
+                receipt = await asyncio.wait_for(self.client.post("pause", request), budget())
             if (receipt.get("accepted") is not True or receipt.get("status") != "paused"
                 or receipt.get("uncertain", False) is not False or receipt.get("effect_admitted") is not False):
                 raise RuntimeError(f"own {label} Pause did not receive a definite paused acknowledgement")

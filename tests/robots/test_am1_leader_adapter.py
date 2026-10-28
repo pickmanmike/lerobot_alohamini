@@ -3733,7 +3733,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["initial_connect_loss_pre", "initial_connect_loss_post", "initial_connect_loss_late", "initial_connect_loss_late_pause", "initial_connect_loss_contract", "initial_connect_loss_qualified_pause", "initial_connect_loss_bound_pause", "feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "resume_reporting_pause", "resume_reporting_renewal", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_unknown_receipt", "ordinary_input_unknown_pre", "ordinary_input_unknown_post", "ordinary_input_unknown_transport", "grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal", "peer_start_normal", "peer_start_bench", "peer_bench_unqualified_view", "peer_bench_local_loss", "peer_normal_unqualified_view", "held_command120_view_later", "held_command120_view_never", "held_command120_local_loss", "view_refusal122_input_before", "view_refusal122_input_after", "view_refusal122_grant_before", "view_refusal122_grant_after", "view_refusal122_never", "view_refusal122_pause", "view_refusal122_stop", "view_refusal122_takeover", "view_refusal122_grant_connect_preflight_before", "view_refusal122_grant_connect_preflight_pending", "view_refusal122_grant_connect_preflight_queue", "view_refusal122_grant_connect_preflight_sent", "view_refusal122_grant_connect_preflight_pause", "view_refusal122_grant_connect_preflight_stop", "view_refusal122_grant_connect_preflight_takeover", "view_refusal122_grant_connect_preflight_reboot", "view_refusal122_grant_connect_preflight_lease", "view_refusal122_grant_connect_preflight_deadline", "view_refusal122_grant_connect_preflight_cancel", "view_refusal130_grant_input_race_before", "view_refusal130_grant_input_race_never", "view_refusal130_grant_input_race_pause", "view_refusal130_grant_input_race_stop", "view_refusal130_grant_input_race_takeover", "view_refusal130_grant_input_race_revision", "view_refusal130_grant_input_race_history", "view_refusal130_grant_input_race_time", "renewal_unknown133_grant_before", "renewal_unknown133_grant_pause", "renewal_unknown133_grant_takeover", "renewal_unknown133_grant_unchanged", "renewal_unknown133_grant_receipt_unknown", "renewal_unknown133_grant_second_read", "renewal_unknown133_grant_stream_before"])
+@pytest.mark.parametrize("cause", ["initial_connect_loss_pre", "initial_connect_loss_post", "initial_connect_loss_late", "initial_connect_loss_late_pause", "initial_connect_loss_contract", "initial_connect_loss_qualified_pause", "initial_connect_loss_bound_pause", "feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "resume_reporting_pause", "resume_reporting_renewal", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_unknown_receipt", "ordinary_input_unknown_pre", "ordinary_input_unknown_post", "ordinary_input_unknown_transport", "grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_unknown_pre", "normal_finish_unknown_post", "normal_finish_unknown_twice", "normal_finish_unknown_wrong_status", "normal_finish_unknown_wrong_shape", "normal_finish_unknown_wrong_type", "normal_finish_unknown_refused", "normal_finish_unknown_new_pause", "normal_finish_unknown_new_stop", "normal_finish_unknown_new_owner", "normal_finish_unknown_new_service", "normal_finish_unknown_cancel", "normal_finish_unknown_view_lost", "normal_finish_unknown_ceiling", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal", "peer_start_normal", "peer_start_bench", "peer_bench_unqualified_view", "peer_bench_local_loss", "peer_normal_unqualified_view", "held_command120_view_later", "held_command120_view_never", "held_command120_local_loss", "view_refusal122_input_before", "view_refusal122_input_after", "view_refusal122_grant_before", "view_refusal122_grant_after", "view_refusal122_never", "view_refusal122_pause", "view_refusal122_stop", "view_refusal122_takeover", "view_refusal122_grant_connect_preflight_before", "view_refusal122_grant_connect_preflight_pending", "view_refusal122_grant_connect_preflight_queue", "view_refusal122_grant_connect_preflight_sent", "view_refusal122_grant_connect_preflight_pause", "view_refusal122_grant_connect_preflight_stop", "view_refusal122_grant_connect_preflight_takeover", "view_refusal122_grant_connect_preflight_reboot", "view_refusal122_grant_connect_preflight_lease", "view_refusal122_grant_connect_preflight_deadline", "view_refusal122_grant_connect_preflight_cancel", "view_refusal130_grant_input_race_before", "view_refusal130_grant_input_race_never", "view_refusal130_grant_input_race_pause", "view_refusal130_grant_input_race_stop", "view_refusal130_grant_input_race_takeover", "view_refusal130_grant_input_race_revision", "view_refusal130_grant_input_race_history", "view_refusal130_grant_input_race_time", "renewal_unknown133_grant_before", "renewal_unknown133_grant_pause", "renewal_unknown133_grant_takeover", "renewal_unknown133_grant_unchanged", "renewal_unknown133_grant_receipt_unknown", "renewal_unknown133_grant_second_read", "renewal_unknown133_grant_stream_before"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause):
     import asyncio
     import copy
@@ -5534,6 +5534,41 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 normal_finish = cause.startswith("normal_")
                 cause = cause.replace("normal_finish_", "bench_finish_", 1)
                 original_evidence, original_post, original_hold = e.evidence, client.post, e.hold
+                original_call, gateway_pauses = gateway.call, []
+                unknown_case = cause.startswith("bench_finish_unknown_")
+                retry_expected = unknown_case and cause not in {
+                    "bench_finish_unknown_wrong_status", "bench_finish_unknown_wrong_shape",
+                    "bench_finish_unknown_wrong_type", "bench_finish_unknown_refused"}
+                async def pause_receipt(command, device):
+                    if command.get("op") != "pause":
+                        return await original_call(command, device)
+                    gateway_pauses.append(copy.deepcopy(command))
+                    if len(gateway_pauses) == 1 and cause == "bench_finish_unknown_pre":
+                        raise TimeoutError("Pause owner outcome unavailable before dispatch")
+                    result = await original_call(command, device)
+                    if len(gateway_pauses) == 1 and unknown_case:
+                        if cause == "bench_finish_unknown_new_pause":
+                            assert a.handle({"op": "pause", "run_id": e.run_id,
+                                             "operation_id": str(uuid4())}, enrolled["device_id"])["accepted"]
+                        elif cause == "bench_finish_unknown_new_stop":
+                            assert a.handle({"op": "stop", "run_id": e.run_id,
+                                             "operation_id": str(uuid4())}, enrolled["device_id"])["accepted"]
+                        elif cause == "bench_finish_unknown_new_owner":
+                            a.controller["expires"] = 9.9
+                            a._expire_controls(10.)
+                            assert a.handle({"op": "claim"}, "competitor")["accepted"]
+                        elif cause == "bench_finish_unknown_new_service":
+                            a.service_incarnation = str(uuid4())
+                        elif cause == "bench_finish_unknown_view_lost":
+                            a._teleop_view["qualified_until"] = 9.9
+                        if cause == "bench_finish_unknown_refused":
+                            return {"accepted": False, "status": "refused", "effect_admitted": False,
+                                    "reason": "actual owner refusal"}
+                        raise TimeoutError("Pause receipt unavailable after durable owner effect")
+                    if cause == "bench_finish_unknown_twice":
+                        raise TimeoutError("second Pause receipt still unavailable")
+                    return result
+                gateway.call = pause_receipt
                 pauses = []
                 def held():
                     epoch[0] += 1  # Explicit fake Native acceptance of a NEW hold action epoch.
@@ -5561,9 +5596,22 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     if path != "pause":
                         return await original_post(path, body)
                     pauses.append(copy.deepcopy(body))
+                    if len(pauses) == 2 and cause == "bench_finish_unknown_cancel":
+                        raise asyncio.CancelledError("cancelled before exact mutation retry")
+                    if len(pauses) == 2 and cause == "bench_finish_unknown_ceiling":
+                        await asyncio.sleep(.3)
                     if cause in {"bench_finish_budget", "bench_finish_native_ceiling"}:
                         await asyncio.sleep(.3)
-                    result = await original_post(path, body)
+                    try:
+                        result = await original_post(path, body)
+                    except m.HTTPOutcomeError as error:
+                        if cause == "bench_finish_unknown_wrong_status":
+                            error.http_status = 502
+                        elif cause == "bench_finish_unknown_wrong_shape":
+                            error.response["unexpected"] = True
+                        elif cause == "bench_finish_unknown_wrong_type":
+                            error.response["uncertain"] = 1
+                        raise
                     if cause == "bench_finish_pause_unknown":
                         raise TimeoutError("own Pause accepted; receipt unavailable")
                     if cause == "bench_finish_cancel":
@@ -5600,11 +5648,19 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         raise RuntimeError("original renewal ended")
                 entered = m.time.monotonic()
                 try:
-                    if cause == "bench_finish_hold":
+                    if cause in {"bench_finish_hold", "bench_finish_unknown_pre", "bench_finish_unknown_post"}:
                         proof = await guard.finish_owned(bench=not normal_finish, wall_deadline=entered + 12, renewal_check=healthy_renewal)
                         assert proof["native_held_qualified"] is True and proof["zero_body_command"] is True
                         assert proof["measured_body_exact_zero"] is False
                         assert proof["pause_operation_id"] == pauses[0]["operation_id"]
+                        if "unknown_" in cause:
+                            assert len(pauses) == len(gateway_pauses) == 2
+                            assert pauses[0] == pauses[1] and gateway_pauses[0] == gateway_pauses[1]
+                            assert len([v for v in a.events if v["kind"] == "pause"]) == 1
+                            assert a.db.execute("SELECT result FROM mutations WHERE id=?", (pauses[0]["operation_id"],)).fetchone()
+                            unknown = [r for r in records if r["event"] == "normal_finish_pause_receipt_unknown"]
+                            assert len(unknown) == 1 and unknown[0]["operation_id"] == pauses[0]["operation_id"]
+                            assert unknown[0]["http_status"] == 503 and unknown[0]["response"]["status"] == "unknown"
                         assert a.run["status"] == "paused" and e.desired == "hold"
                         assert proof["snapshot"]["evidence"]["accepted_host_action"]["intent_revision"] == a.run["intent_revision"]
                         if normal_finish:
@@ -5616,18 +5672,30 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         else:
                             assert len([row for row in records if row["event"] == "bench_finish_hold_qualified"]) == 1
                     else:
-                        expected = (asyncio.CancelledError if cause.endswith("cancel") else
-                                    TimeoutError if cause in {"bench_finish_no_ack", "bench_finish_stale_revision",
+                        expected = (m.HTTPOutcomeError if unknown_case and cause in {
+                                        "bench_finish_unknown_twice", "bench_finish_unknown_wrong_status",
+                                        "bench_finish_unknown_wrong_shape", "bench_finish_unknown_wrong_type",
+                                        "bench_finish_unknown_refused"} else
+                                    asyncio.CancelledError if cause.endswith("cancel") else
+                                    TimeoutError if cause in {"bench_finish_unknown_view_lost", "bench_finish_unknown_ceiling","bench_finish_no_ack", "bench_finish_stale_revision",
                                         "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_pause_unknown", "bench_finish_view_after"} else RuntimeError)
                         with pytest.raises(expected):
                             await guard.finish_owned(bench=not normal_finish, wall_deadline=entered + (.1 if cause in {
-                                "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_budget", "bench_finish_view_after"} else (2 if normal_finish else 12)),
+                                "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_budget", "bench_finish_view_after",
+                                "bench_finish_unknown_view_lost", "bench_finish_unknown_ceiling"} else (2 if normal_finish else 12)),
                                                      renewal_check=healthy_renewal)
                         assert not any(row["event"] == "bench_finish_hold_qualified" for row in records)
                     if normal_finish:
-                        if cause != "bench_finish_hold":
+                        if cause not in {"bench_finish_hold", "bench_finish_unknown_pre", "bench_finish_unknown_post"}:
                             assert not any(row["event"] == "normal_finish_hold_qualified" for row in records)
-                        assert len(pauses) == (0 if cause == "bench_finish_view_before" else 1)
+                        assert len(pauses) == (0 if cause == "bench_finish_view_before" else 2 if retry_expected else 1)
+                        if unknown_case:
+                            assert pauses[-1] == pauses[0]
+                            assert len(gateway_pauses) == (1 if cause in {"bench_finish_unknown_cancel", "bench_finish_unknown_ceiling"}
+                                                          or not retry_expected else 2)
+                            unknown = [r for r in records if r["event"] == "normal_finish_pause_receipt_unknown"]
+                            assert len(unknown) == int(retry_expected)
+                            assert len([v for v in a.events if v["kind"] == "pause"]) == (2 if cause == "bench_finish_unknown_new_pause" else 1)
                     else:
                         assert len(pauses) == (0 if cause == "bench_finish_strict" else 1)
                     assert not any(op in {"grant", "input"} for op, _ in commands)
