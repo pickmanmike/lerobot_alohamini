@@ -802,6 +802,7 @@ test("view-progress panel bounds hostile values and unavailable document fields"
  p.view.progressReceipt={accepted:true,status:"view_progress",reason:secret,view_delivery:delivery};
  p.view.frames=p.view.mediaTime=ceiling;p.view.decodedAt=0;p.advance(ceiling);
  p.context.document={visibilityState:secret,hasFocus:()=>true};
+ await p.view.report();await new Promise(setImmediate); // Include the full before/stall receiver pair in the original4KiB bound.
  const snapshot=p.view.diagnostics(),bytes=Buffer.byteLength(JSON.stringify(snapshot));
  assert.equal(snapshot.records.length,8,"size check includes the full existing diagnostic record bound");
  assert.ok(bytes<=4096,"fixed scalar projection must stay below4KiB even at largest admitted numbers");
@@ -999,4 +1000,114 @@ for(const cadence of [150,200])test("progress history retains eight realistic fu
  assert.equal(h.reports.length,8,"bounded diagnostic projection must retain the eight realistic report rows");
  assert.ok(span>=1000,"one-second diagnostic sampling needs at least one full second of retained reports");
  assert.equal(h.size_dropped,0);assert.ok(Buffer.byteLength(JSON.stringify(snapshot))<=8192);await p.view.stop();
+});
+
+
+for(const decodeAdvances of [false,true])test("receiver stats retain baseline and stalled presentation: decode advances="+decodeAdvances,async()=>{
+ const p=fixture({manualTimers:true});
+ const sample=(packets,received,decoded)=>new Map([["v",{type:"inbound-rtp",kind:"video",codecId:"c",
+  packetsReceived:packets,bytesReceived:packets*100,framesReceived:received,framesDecoded:decoded,
+  framesDropped:0,jitterBufferEmittedCount:received}],["c",{mimeType:"video/H264"}]]);
+ p.setStatsResponse(sample(100,20,20));await p.view.start("chest");p.advance(3000);p.source();
+ p.callbacks.shift()(3000,{presentedFrames:20,mediaTime:2});p.runTimers(3000);await new Promise(setImmediate);
+ p.setStatsResponse(sample(200,30,30));p.advance(4000);p.source();
+ p.callbacks.shift()(4000,{presentedFrames:30,mediaTime:3});await p.view.report();await new Promise(setImmediate);
+ p.setStatsResponse(sample(250,35,decodeAdvances?35:30));p.advance(4501);p.source();await p.view.report();await new Promise(setImmediate);
+ const diagnostic=p.view.diagnostics(),stats=diagnostic.receiver_stats;
+ assert.ok(stats,"current/stalled receiver evidence is missing");assert.equal(stats.clock,"browser_performance_ms");
+ assert.equal(stats.state,"stalled");assert.equal(stats.samples.length,2);assert.equal(p.statsCalls(),3);
+ const rows=stats.samples.map(row=>Object.fromEntries(stats.columns.map((key,i)=>[key,row[i]])));
+ assert.equal(rows[0].trigger,"baseline");assert.equal(rows[1].trigger,"stall");
+ assert.equal(rows[0].packetsReceived,200);assert.equal(rows[1].packetsReceived,250);
+ assert.equal(rows[0].framesReceived,30);assert.equal(rows[1].framesReceived,35);
+ assert.equal(rows[0].framesDecoded,30);assert.equal(rows[1].framesDecoded,decodeAdvances?35:30);
+ assert.equal(rows[1].presented_frames,30);assert.equal(rows[1].callback_ms,4000);assert.equal(rows[1].requested_ms,4501);
+ assert.equal(rows[1].settled_ms,4501);assert.equal(rows[1].codec,"H264");
+ assert.equal(p.view.health().fresh,false,"stats cannot refresh decoded presentation");
+ const stable=JSON.stringify(stats);stats.samples[0][0]="PRIVATE mutation";
+ assert.equal(JSON.stringify(p.view.diagnostics().receiver_stats),stable,"stats projection must not alias its cache");
+ p.advance(4900);await p.view.report();assert.equal(p.statsCalls(),3,"one transition sample per stalled episode");
+ await p.view.stop();assert.equal(JSON.stringify(p.view.diagnostics().receiver_stats),stable,"stop retains the actual pair");
+ assert.equal(p.logs.filter(row=>row.phase==="stats").length,1,"periodic/stall samples must not emit per-frame console records");
+});
+
+for(const mode of ["unchanged","missing","malformed"])test("receiver stats distinguish unchanged and unknown counters: "+mode,async()=>{
+ const p=fixture({manualTimers:true}),value=mode==="missing"?{}:mode==="malformed"?{packetsReceived:NaN,bytesReceived:Infinity,framesReceived:-1,framesDecoded:1.5,jitterBufferEmittedCount:"0"}:{packetsReceived:1,bytesReceived:100,
+  framesReceived:2,framesDecoded:2,jitterBufferEmittedCount:0};
+ p.setStatsResponse(new Map([["v",{type:"inbound-rtp",kind:"video",...value}]]));
+ await p.view.start("chest");p.advance(3000);p.source();p.callbacks.shift()(3000,{presentedFrames:2,mediaTime:.2});
+ p.runTimers(3000);await new Promise(setImmediate);p.advance(3501);p.source();await p.view.report();await new Promise(setImmediate);
+ const stats=p.view.diagnostics().receiver_stats;assert.ok(stats,"receiver transition missing");
+ const rows=stats.samples.map(row=>Object.fromEntries(stats.columns.map((key,i)=>[key,row[i]])));
+ assert.equal(rows.length,2);
+ for(const key of ["packetsReceived","bytesReceived","framesReceived","framesDecoded","jitterBufferEmittedCount"])
+  assert.equal(rows[1][key],mode!=="unchanged"?null:value[key],"missing is UNKNOWN, not zero");
+ assert.equal(rows[1].framesDropped,null);assert.equal(p.view.health().fresh,false);await p.view.stop();
+});
+
+test("receiver stall sampling preserves a hung getStats slot and excludes late retired results",async()=>{
+ const p=fixture({manualTimers:true});let finish;
+ p.setStatsResponse(()=>new Promise(resolve=>{finish=resolve;}));await p.view.start("chest");p.advance(3000);p.source();
+ p.callbacks.shift()(3000,{presentedFrames:1,mediaTime:.1});p.runTimers(3000);await new Promise(setImmediate);
+ p.advance(3501);p.source();await p.view.report();await new Promise(setImmediate);
+ assert.equal(p.statsCalls(),1,"stall cannot overlap the underlying stats request");
+ const stats=p.view.diagnostics().receiver_stats;assert.ok(stats,"busy transition must remain explicit");
+ const row=Object.fromEntries(stats.columns.map((key,i)=>[key,stats.samples.at(-1)[i]]));
+ assert.equal(row.outcome,"busy");assert.equal(row.packetsReceived,null);
+ await p.view.stop();await p.view.start("forward");p.source("forward");
+ const before=JSON.stringify(p.view.diagnostics());finish(new Map([["late",{type:"inbound-rtp",kind:"video",framesDecoded:999}]]));
+ await new Promise(setImmediate);assert.equal(JSON.stringify(p.view.diagnostics()),before,"retired stats cannot alter current evidence");
+ await p.view.stop();assert.equal(p.timers.size,0);
+});
+
+
+test("receiver sampling resumes baseline opportunities without losing the cached transition",async()=>{
+ const p=fixture({manualTimers:true});p.setStatsResponse(new Map([["v",{type:"inbound-rtp",kind:"video",framesDecoded:3}]]));
+ await p.view.start("chest");p.advance(3000);p.source();p.callbacks.shift()(3000,{presentedFrames:3,mediaTime:.3});
+ p.runTimers(3000);await new Promise(setImmediate);p.advance(3501);p.source();await p.view.report();await new Promise(setImmediate);
+ const original=JSON.stringify(p.view.diagnostics().receiver_stats.samples);assert.equal(p.statsCalls(),2);
+ p.advance(4000);p.source();p.callbacks.shift()(4000,{presentedFrames:4,mediaTime:.4});await p.view.report();
+ assert.equal(p.view.diagnostics().receiver_stats.state,"presenting");assert.equal(p.statsCalls(),2);
+ p.advance(5000);p.source();p.callbacks.shift()(5000,{presentedFrames:5,mediaTime:.5});await p.view.report();await new Promise(setImmediate);
+ assert.equal(p.statsCalls(),3);assert.equal(JSON.stringify(p.view.diagnostics().receiver_stats.samples),original);
+ p.advance(5501);p.source();await p.view.report();await new Promise(setImmediate);
+ const stats=p.view.diagnostics().receiver_stats,index=stats.columns.indexOf("requested_ms");
+ assert.equal(stats.samples.length,2);assert.equal(stats.samples[0][index],5000);assert.equal(stats.samples[1][index],5501);
+ assert.equal(p.statsCalls(),4);assert.equal(p.view.health().fresh,false);await p.view.stop();
+});
+
+test("receiver diagnostic failures cannot throw into presentation or progress",async()=>{
+ const p=fixture({manualTimers:true});await p.view.start("chest");p.source();
+ Object.defineProperty(p.view.diagnosticView,"receiver",{get(){throw Error("PRIVATE diagnostic cache");}});
+ p.setStatsResponse(()=>{throw Error("PRIVATE stats");});p.runTimers(3000);await new Promise(setImmediate);
+ p.callbacks.shift()(0,{presentedFrames:1,mediaTime:.1});await p.view.report();
+ assert.equal(p.view.health().fresh,true);assert.equal(p.view.frames,1);
+ assert.equal(p.requests.filter(x=>x.url.endsWith("/progress")).length,1);
+ p.advance(501);p.source();await p.view.report();assert.equal(p.view.health().fresh,false);
+ assert.doesNotThrow(()=>p.view.diagnostics());assert.ok(!JSON.stringify(p.view.diagnostics()).includes("PRIVATE"));await p.view.stop();
+});
+
+
+test("receiver replacement retains only the completed pair under its original attempt",async()=>{
+ const p=fixture({manualTimers:true});p.setStatsResponse(new Map([["v",{type:"inbound-rtp",kind:"video",framesDecoded:3}]]));
+ await p.view.start("chest");p.advance(3000);p.source();p.callbacks.shift()(3000,{presentedFrames:3,mediaTime:.3});
+ p.runTimers(3000);await new Promise(setImmediate);p.advance(3501);p.source();await p.view.report();await new Promise(setImmediate);
+ const old=p.view.epoch,pair=JSON.stringify(p.view.diagnostics().receiver_stats.samples);
+ await p.view.stop();await p.view.start("forward");p.source("forward");
+ const retained=p.view.diagnostics().receiver_stats;
+ assert.equal(JSON.stringify(retained.samples),pair,"replacement must not erase the completed pair before a DOM observation");
+ assert.equal(retained.attempt,old,"replacement must keep the completed transition's OWN attempt");
+ assert.equal(retained.current_attachment,false);
+ p.advance(6501);p.source("forward");p.callbacks.pop()(6501,{presentedFrames:1,mediaTime:.1});
+ p.runTimers(3000);await new Promise(setImmediate);
+ assert.equal(p.view.diagnostics().receiver_stats.attempt,old,"a startup baseline cannot erase the retained transition");
+ let finish;p.setStatsResponse(()=>new Promise(resolve=>{finish=resolve;}));
+ p.advance(7002);p.source("forward");await p.view.report();await new Promise(setImmediate);
+ assert.equal(p.view.diagnostics().receiver_stats.attempt,old,"a pending new measurement is not a completed transition");
+ finish(new Map([["v",{type:"inbound-rtp",kind:"video",framesDecoded:1}]]));await new Promise(setImmediate);
+ const current=p.view.diagnostics().receiver_stats;
+ assert.equal(current.attempt,p.view.epoch);assert.equal(current.current_attachment,true);
+ const index=current.columns.indexOf("requested_ms");assert.equal(current.samples.length,2);
+ assert.equal(current.samples[0][index],6501);assert.equal(current.samples[1][index],7002);
+ await p.view.stop();
 });

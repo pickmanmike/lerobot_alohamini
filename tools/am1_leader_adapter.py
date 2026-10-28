@@ -2580,7 +2580,8 @@ class SameRunRecovery:
                          "identity": self.client.identities(), "expected_intent_revision": revision,
                          "original_ceiling_monotonic_s": ceiling})
             try:
-                receipt = await asyncio.wait_for(self.client.post("pause", request), budget())
+                wait_seconds = budget()
+                receipt = await asyncio.wait_for(self.client.post("pause", request), wait_seconds)
             except HTTPOutcomeError as original:
                 unknown = {"accepted": None, "status": "unknown", "uncertain": True,
                            "reason": "owner outcome unknown; inspect state or lookup the same operation",
@@ -2596,14 +2597,16 @@ class SameRunRecovery:
                              "original_ceiling_monotonic_s": ceiling})
                 # Pause is a durable mutation: the IDENTICAL body/operation
                 # returns its recorded result, never a new Pause or fresh budget.
-                receipt = await asyncio.wait_for(self.client.post("pause", request), budget())
+                wait_seconds = budget()
+                receipt = await asyncio.wait_for(self.client.post("pause", request), wait_seconds)
             if (receipt.get("accepted") is not True or receipt.get("status") != "paused"
                 or receipt.get("uncertain", False) is not False or receipt.get("effect_admitted") is not False):
                 raise RuntimeError(f"own {label} Pause did not receive a definite paused acknowledgement")
             self.record({"event": f"{label}_finish_pause_acknowledged", "operation_id": request["operation_id"],
                          "receipt": receipt, "expected_intent_revision": revision})
             while True:
-                state = (await asyncio.wait_for(self.client.get("state"), budget()))["snapshot"]
+                wait_seconds = budget()
+                state = (await asyncio.wait_for(self.client.get("state"), wait_seconds))["snapshot"]
                 self.client.snapshot = state
                 self.check(state)
                 current, evidence, live = state["run"], state.get("evidence", {}), _live(state)

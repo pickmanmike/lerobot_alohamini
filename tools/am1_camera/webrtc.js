@@ -4,6 +4,9 @@ const AM1_VIEW_PROGRESS_COLUMNS=Object.freeze(["serial","frames","media_time","c
   "pi_status_start_s","pi_status_done_s","pi_floor_s","pi_core_accepted_s","pi_until_s","current",
   "accepted","qualified","owner_accepted","owner_qualified","pi_core_floor_s",
   "source_sequence","pi_source_arrived_s","pi_core_started_s"]);
+const AM1_RECEIVER_STATS_COLUMNS=Object.freeze(["trigger","outcome","requested_ms","settled_ms","callback_ms",
+  "presented_frames","media_time","packetsReceived","bytesReceived","framesReceived","framesDecoded",
+  "framesDropped","jitterBufferEmittedCount","codec","ice_state","connection_state"]);
 // Native go2rtc SDP exchange. Connected transport is never a decoded-frame clock.
 globalThis.AM1OnboardView=class {
   constructor(video,options) {
@@ -13,7 +16,7 @@ globalThis.AM1OnboardView=class {
     this.reporting=false;this.timer=null;this.connecting=false;this.error=null;this.progressReceipt=null;
     this.reports=new Map();this.reportSerial=0;this.latestReport=0;
     this.lastReportAt=-Infinity;this.lastReportedFrames=0;this.lastReportedMedia=-1;
-    this.diagnostic=null;this.statsPending=null;this.diagnosticView=null;
+    this.diagnostic=null;this.statsPending=null;this.diagnosticView=null;this.receiverTransition=null;
   }
   diagnostics() {
     const view=this.diagnosticView;
@@ -27,6 +30,16 @@ globalThis.AM1OnboardView=class {
       const result=value=>value&&typeof value==="object"&&!Array.isArray(value)?{
         accepted:boolean(value.accepted),status:["view_progress","refused","unknown","reporting_error"].includes(value.status)?value.status:null,
         required_view:{required:boolean(value.required_view?.required),qualified:boolean(value.required_view?.qualified)}}:null;
+      const receiver=this.receiverTransition&&this.receiverTransition.attempt!==view.attempt?this.receiverTransition:view.receiver;
+      if(receiver)snapshot.receiver_stats={attempt:count(receiver.attempt),current_attachment:receiver.attempt===view.attempt,clock:"browser_performance_ms",
+        state:["waiting","baseline","stalled","presenting"].includes(receiver.state)?receiver.state:null,
+        columns:[...AM1_RECEIVER_STATS_COLUMNS],samples:receiver.samples.slice(-2).map(row=>AM1_RECEIVER_STATS_COLUMNS.map((_,i)=>
+          i===0?(["startup","baseline","stall"].includes(row[i])?row[i]:null):
+          i===1?(["available","no-inbound","busy","unsupported","timeout","failed"].includes(row[i])?row[i]:null):
+          i===13?(["H264","VP8","VP9","AV1"].includes(row[i])?row[i]:null):
+          i===14?(["new","checking","connected","completed","disconnected","failed","closed","unknown"].includes(row[i])?row[i]:null):
+          i===15?(["new","connecting","connected","disconnected","failed","closed","unknown"].includes(row[i])?row[i]:null):
+          [5,7,8,9,10,11,12].includes(i)?count(row[i]):number(row[i])))};
       const now=number(this.clock()),source=this.source?.cameras?.[this.binding?.role],receipt=this.progressReceipt;
       let visibility=null,focus=null;
       if(typeof document==="object"&&document!==null) {
@@ -162,27 +175,52 @@ globalThis.AM1OnboardView=class {
       headers_valid:valid===true,error_category:error});}catch{}
   }
   beginDiagnostics(epoch,pc) {
-    const attempt={epoch,pc,counts:{offer:0,"remote-description":0,ice:0,connection:0,track:0,stats:0},timer:null};
+    const attempt={epoch,pc,counts:{offer:0,"remote-description":0,ice:0,connection:0,track:0,stats:0},timer:null,
+      statsStarted:false,statsNextAt:Infinity,statsStalled:false,statsFrozen:false,statsBaseline:null,statsBefore:null};
     this.diagnostic=attempt;
-    this.diagnosticView={attempt:epoch,state:"current",records:[],progress:{callback_count:0,latest_callback:null,
+    this.diagnosticView={attempt:epoch,state:"current",records:[],receiver:{attempt:epoch,state:"waiting",samples:[]},progress:{callback_count:0,latest_callback:null,
       presented:null,skipped:[0,0,0,0],reports:[],dropped:0}};
-    try {attempt.timer=setTimeout(()=>this.sampleDiagnosticStats(attempt),3000);}catch{}
+    try {const now=this.clock();attempt.statsNextAt=Number.isFinite(now)?now+3000:Infinity;
+      attempt.timer=setTimeout(()=>this.sampleDiagnosticStats(attempt),3000);}catch{}
     return attempt;
   }
-  sampleDiagnosticStats(attempt) {
-    let ticket;
+  sampleDiagnosticStats(attempt,trigger="startup") {
+    let ticket,requested=null,callback=null,frames=null,media=null;
+    const number=v=>typeof v==="number"&&Number.isFinite(v)&&v>=0&&v<=Number.MAX_SAFE_INTEGER?v:null;
     const record=(outcome,row=null,codec=null)=>{
       try {
+        if(!this.diagnosticCurrent(attempt))return;
         const count=key=>{const value=row?.[key];return Number.isSafeInteger(value)&&value>=0?value:null;};
-        this.diagnose(attempt,"stats",{outcome,ice_state:this.diagnosticState(attempt.pc,true),
-          connection_state:this.diagnosticState(attempt.pc),packetsReceived:count("packetsReceived"),
+        const ice=this.diagnosticState(attempt.pc,true),connection=this.diagnosticState(attempt.pc);
+        const sample=[trigger,outcome,requested,number(this.clock()),callback,frames,media,
+          ...["packetsReceived","bytesReceived","framesReceived","framesDecoded","framesDropped","jitterBufferEmittedCount"].map(count),
+          codec,ice,connection],receiver=this.diagnosticView.receiver;
+        if(trigger==="stall"){
+          receiver.samples=[attempt.statsBefore,sample].filter(Boolean).map(value=>value.slice());
+          // A replacement can precede the next DOM observation. Carry only the
+          // completed pair, under its own attempt, until a new pair completes.
+          if(receiver.samples.length===2)this.receiverTransition={attempt:attempt.epoch,state:receiver.state,
+            samples:receiver.samples.map(value=>value.slice())};
+        }
+        else if(!attempt.statsStalled&&outcome!=="busy"){
+          attempt.statsBaseline=sample.slice();
+          if(!attempt.statsFrozen){receiver.state="baseline";receiver.samples=[sample.slice()];}
+        }
+        if(trigger==="startup")this.diagnose(attempt,"stats",{outcome,ice_state:ice,
+          connection_state:connection,packetsReceived:count("packetsReceived"),
           bytesReceived:count("bytesReceived"),framesReceived:count("framesReceived"),framesDecoded:count("framesDecoded"),
           jitterBufferEmittedCount:count("jitterBufferEmittedCount"),codec});
       }catch{}
     };
     try {
       if(!this.diagnosticCurrent(attempt))return;
-      attempt.timer=null;
+      if(trigger==="startup"){
+        if(attempt.statsStarted)return;
+        attempt.statsStarted=true;clearTimeout(attempt.timer);attempt.timer=null;
+      }
+      requested=number(this.clock());callback=number(this.decodedAt);
+      frames=Number.isSafeInteger(this.frames)&&this.frames>=0?this.frames:null;media=number(this.mediaTime);
+      attempt.statsNextAt=requested===null?Infinity:requested+1000;
       if(this.statsPending){record("busy");return;}
       if(typeof attempt.pc.getStats!=="function"){record("unsupported");return;}
       ticket={attempt,timedOut:false,timer:null};this.statsPending=ticket;
@@ -296,6 +334,22 @@ globalThis.AM1OnboardView=class {
   report() {
     const latest=this.reports.get(this.latestReport),idle=()=>Promise.resolve();
     const now=this.clock(),decodedAge=this.decodedAt===null?Infinity:now-this.decodedAt;
+    // Receiver sampling observes existing report opportunities only. It cannot
+    // refresh presentation, qualify view progress or add a second getStats slot.
+    try {
+      const attempt=this.diagnostic;
+      if(attempt&&this.diagnosticCurrent(attempt)&&Number.isFinite(now)&&this.frames>0&&Number.isFinite(decodedAge)){
+        if(decodedAge>=500&&!attempt.statsStalled){
+          attempt.statsStalled=true;attempt.statsFrozen=true;attempt.statsBefore=attempt.statsBaseline?.slice()||null;
+          this.diagnosticView.receiver.state="stalled";
+          this.diagnosticView.receiver.samples=attempt.statsBefore?[attempt.statsBefore.slice()]:[];
+          this.sampleDiagnosticStats(attempt,"stall");
+        }else if(decodedAge>=0&&decodedAge<500){
+          if(attempt.statsStalled){attempt.statsStalled=false;this.diagnosticView.receiver.state="presenting";}
+          if(now>=attempt.statsNextAt)this.sampleDiagnosticStats(attempt,attempt.statsStarted?"baseline":"startup");
+        }
+      }
+    }catch{} // Diagnostic scheduling cannot enter the report state machine.
     // Cached browser source status can lag; Gateway independently qualifies
     // current Pi source identity/arrival. Publish only genuinely current decode.
     if(!this.options.progress||!this.binding||this.frames<1||!Number.isFinite(decodedAge)||decodedAge<0||decodedAge>=500){
