@@ -2538,7 +2538,7 @@ class SameRunRecovery:
                      "previous_generation": old, "elapsed_seconds": time.monotonic() - entered,
                      "snapshot": fresh})
 
-    async def finish_owned(self, *, bench, wall_deadline, renewal_check):
+    async def finish_owned(self, *, bench, wall_deadline, renewal_check, renewal_reconcile=None):
         """End finite owned input; a Pause receipt alone never proves Native HOLD."""
         label = "bench" if bench else "normal"
         entered = time.monotonic()
@@ -2580,7 +2580,8 @@ class SameRunRecovery:
                          "identity": self.client.identities(), "expected_intent_revision": revision,
                          "original_ceiling_monotonic_s": ceiling})
             try:
-                receipt = await asyncio.wait_for(self.client.post("pause", request), budget())
+                wait_seconds = budget()
+                receipt = await asyncio.wait_for(self.client.post("pause", request), wait_seconds)
             except HTTPOutcomeError as original:
                 unknown = {"accepted": None, "status": "unknown", "uncertain": True,
                            "reason": "owner outcome unknown; inspect state or lookup the same operation",
@@ -2596,27 +2597,57 @@ class SameRunRecovery:
                              "original_ceiling_monotonic_s": ceiling})
                 # Pause is a durable mutation: the IDENTICAL body/operation
                 # returns its recorded result, never a new Pause or fresh budget.
-                receipt = await asyncio.wait_for(self.client.post("pause", request), budget())
+                wait_seconds = budget()
+                receipt = await asyncio.wait_for(self.client.post("pause", request), wait_seconds)
             if (receipt.get("accepted") is not True or receipt.get("status") != "paused"
                 or receipt.get("uncertain", False) is not False or receipt.get("effect_admitted") is not False):
                 raise RuntimeError(f"own {label} Pause did not receive a definite paused acknowledgement")
             self.record({"event": f"{label}_finish_pause_acknowledged", "operation_id": request["operation_id"],
                          "receipt": receipt, "expected_intent_revision": revision})
+            # This closure exists only after THIS request has a definite Pause
+            # receipt. It is not an ordinary-recovery permission to adopt Pause.
+            def own_pause(state, pi_now):
+                current = state["run"]
+                event = _latest_run_event(state, self.client.identities())
+                return (current.get("status") == "paused" and current.get("recovery") is None
+                        and type(current.get("intent_revision")) is int and current["intent_revision"] == revision
+                        and current.get("control_intent") == expected_intent
+                        and set(event) == {"kind", "at", "run_id", "service_incarnation"}
+                        and event.get("kind") == "pause"
+                        and type(event.get("at")) in (int, float) and math.isfinite(event["at"])
+                        and lower <= event["at"] <= pi_now < run["deadline"])
+
+            requalified = False
+            async def held_budget():
+                nonlocal ceiling, remaining, requalified
+                try:
+                    return budget()
+                except HTTPOutcomeError as original:
+                    if bench or requalified or renewal_reconcile is None or not _owner_unknown_renewal(original):
+                        raise
+                    clock = {"ceiling": ceiling, "remaining": remaining}
+                    try:
+                        await self._renew_current_after_unknown(
+                            original, clock, renewal_reconcile, renewal_check, finishing_pause=own_pause)
+                        ceiling, remaining = min(ceiling, clock["ceiling"]), min(remaining, clock["remaining"])
+                        requalified = True
+                        return budget()
+                    except (Exception, asyncio.CancelledError) as refusal:
+                        if isinstance(refusal, asyncio.CancelledError) and time.monotonic() < ceiling:
+                            raise
+                        raise original from refusal
+
             while True:
-                state = (await asyncio.wait_for(self.client.get("state"), budget()))["snapshot"]
+                wait_seconds = await held_budget()
+                state = (await asyncio.wait_for(self.client.get("state"), wait_seconds))["snapshot"]
                 self.client.snapshot = state
                 self.check(state)
                 current, evidence, live = state["run"], state.get("evidence", {}), _live(state)
                 event, ack = _latest_run_event(state, self.client.identities()), evidence.get("accepted_host_action") or {}
                 native_remaining = current.get("remaining_s")
-                if (current.get("status") != "paused" or current.get("recovery") is not None
-                    or type(current.get("intent_revision")) is not int or current["intent_revision"] != revision
-                    or current.get("control_intent") != expected_intent
-                    or set(event) != {"kind", "at", "run_id", "service_incarnation"} or event.get("kind") != "pause"
-                    or type(event.get("at")) not in (int, float) or not math.isfinite(event["at"])
-                    or not lower <= event["at"] < run["deadline"]
-                    or type(native_remaining) not in (int, float) or not math.isfinite(native_remaining)
-                    or not 0 < native_remaining <= remaining):
+                if (type(native_remaining) not in (int, float) or not math.isfinite(native_remaining)
+                    or not 0 < native_remaining <= remaining
+                    or not own_pause(state, current["deadline"] - native_remaining)):
                     raise RuntimeError(f"own {label} Pause authority/revision was superseded")
                 remaining = native_remaining
                 current_ack = (ack.get("run_id") == run["run_id"] and ack.get("host_incarnation") == run["backend_incarnation"]
@@ -2647,7 +2678,7 @@ class SameRunRecovery:
                         self.record({"event": f"{label}_finish_hold_qualified", **proof,
                                      "original_ceiling_monotonic_s": ceiling})
                         return proof
-                await asyncio.sleep(min(.03, budget()))
+                await asyncio.sleep(min(.03, await held_budget()))
 
     def history_qualified(self, state):
         run = state.get("run") or {}
@@ -2947,7 +2978,7 @@ class SameRunRecovery:
                     raise first_transport_error from error
                 raise
 
-    async def _renew_current_after_unknown(self, original, clock, restart, renewal_check):
+    async def _renew_current_after_unknown(self, original, clock, restart, renewal_check, *, finishing_pause=None):
         """A fresh fenced presence receipt never qualifies motion or resolves the old RPC."""
         context = original.renewal_context
         identity = context.get("identity") or {}
@@ -2992,9 +3023,10 @@ class SameRunRecovery:
             if (run.get("status") != "paused" or run.get("recovery") is not None
                 or type(run.get("intent_revision")) is not int
                 or run["intent_revision"] not in (identity.get("intent_revision"), identity.get("intent_revision", -2) + 1)
-                or event.get("kind") not in {"input_expired", "native_input_expired", "required_view_expired", "live_sensing_requalified"}
-                or type(event.get("at")) not in (int, float) or not math.isfinite(event["at"])
-                or not run["native_live_at"] <= event["at"] <= pi_now < run["deadline"]
+                or (not finishing_pause(state, pi_now) if finishing_pause is not None else (
+                    event.get("kind") not in {"input_expired", "native_input_expired", "required_view_expired", "live_sensing_requalified"}
+                    or type(event.get("at")) not in (int, float) or not math.isfinite(event["at"])
+                    or not run["native_live_at"] <= event["at"] <= pi_now < run["deadline"]))
                 or type(expiry) not in (int, float) or not math.isfinite(expiry)
                 or not expiry > max(pi_now, context["previous_expiry"])):
                 raise RuntimeError("current advanced unknown renewal authority/ordinary HOLD unavailable")
@@ -5142,7 +5174,8 @@ async def run(args):
             # No new motion is needed after the declared program has completed.
             # Own Pause cancels that intent; only current Native HOLD proof can
             # qualify finishing. Ordinary Stop/readback remains separate below.
-            proof = await recovery.finish_owned(bench=bench, wall_deadline=qualification_ceiling, renewal_check=renewal_healthy)
+            proof = await recovery.finish_owned(bench=bench, wall_deadline=qualification_ceiling,
+                                                renewal_check=renewal_healthy, renewal_reconcile=restart_qualified_renewal)
             final = proof["snapshot"]
             summary.update({key: proof[key] for key in
                             ("pause_operation_id", "pause_receipt", "native_held_qualified",
