@@ -2579,7 +2579,24 @@ class SameRunRecovery:
             self.record({"event": f"{label}_finish_pause_requested", "operation_id": request["operation_id"],
                          "identity": self.client.identities(), "expected_intent_revision": revision,
                          "original_ceiling_monotonic_s": ceiling})
-            receipt = await asyncio.wait_for(self.client.post("pause", request), budget())
+            try:
+                receipt = await asyncio.wait_for(self.client.post("pause", request), budget())
+            except HTTPOutcomeError as original:
+                unknown = {"accepted": None, "status": "unknown", "uncertain": True,
+                           "reason": "owner outcome unknown; inspect state or lookup the same operation",
+                           "effect_admitted": None}
+                if (type(original) is not HTTPOutcomeError or type(original.http_status) is not int
+                    or original.http_status != 503 or not isinstance(original.response, dict)
+                    or set(original.response) != set(unknown)
+                    or any(type(original.response[k]) is not type(v) or original.response[k] != v
+                           for k, v in unknown.items())):
+                    raise
+                self.record({"event": f"{label}_finish_pause_receipt_unknown", "operation_id": request["operation_id"],
+                             "http_status": original.http_status, "response": original.response,
+                             "original_ceiling_monotonic_s": ceiling})
+                # Pause is a durable mutation: the IDENTICAL body/operation
+                # returns its recorded result, never a new Pause or fresh budget.
+                receipt = await asyncio.wait_for(self.client.post("pause", request), budget())
             if (receipt.get("accepted") is not True or receipt.get("status") != "paused"
                 or receipt.get("uncertain", False) is not False or receipt.get("effect_admitted") is not False):
                 raise RuntimeError(f"own {label} Pause did not receive a definite paused acknowledgement")
@@ -3731,12 +3748,18 @@ class SameRunRecovery:
                 or type(identity["intent_revision"]) is not int
             ):
                 raise
+            initial_connect = (not release_loss and not unsent_connect and not require_episode
+                and expected_pause is None and grant_context is None and resume_context is None
+                and self.connect_rebindings == 0 and self.client.connection is None
+                and getattr(self.client, "sequence", None) == 0 and type(getattr(self.client, "sequence", None)) is int
+                and identity["connection_generation"] is None and identity["intent_revision"] == 0)
             self.connect_rebindings += 1
             try:
                 if (
                     type(self.original["run"].get("operation_id")) is not str
                     or not self.original["run"]["operation_id"]
-                    or any(type(identity[k]) is not str or not identity[k] for k in identity if k != "intent_revision")
+                    or any(type(identity[k]) is not str or not identity[k] for k in identity
+                           if k != "intent_revision" and not (initial_connect and k == "connection_generation"))
                     or type(native_remaining) not in (int, float) or not math.isfinite(native_remaining)
                     or not 0 < native_remaining <= self.original["run"]["deadline"] - self.original["run"]["native_live_at"]
                 ):
@@ -3746,6 +3769,28 @@ class SameRunRecovery:
                                  if event.get("run_id") == self.original["run"]["run_id"]
                                  and event.get("service_incarnation") == self.original["service"]), {})
                 original_event = pause_event(state)
+                def initial_phase(snapshot):
+                    run, live = snapshot["run"], _live(snapshot)
+                    own = [event for event in snapshot.get("events", []) if event.get("run_id") == run["run_id"]
+                           and event.get("service_incarnation") == self.original["service"]]
+                    times = [event.get("at") for event in own]
+                    expiry, remaining = (snapshot.get("controller") or {}).get("presence_expires"), run.get("remaining_s")
+                    return (run.get("recipe") == TELEOP_RECIPE and run.get("source") == "protected-physical-provider"
+                        and run.get("bench_continuity") is False and self.original["workspace"].get("workspace_profile") == ORDINARY_ARMS_PROFILE
+                        and run.get("first_cause") is None and run.get("native_first_cause") is None
+                        and run.get("recovery_episodes") == 0 and type(run.get("intent_revision")) is int
+                        and run["intent_revision"] in (0, 1) and type(live.get("last_input_seq")) is int
+                        and live["last_input_seq"] == -1 and live.get("source") is None and live.get("valid_until_monotonic_s") is None
+                        and live.get("body") == ZERO_BODY and all(type(v) in (int, float) for v in live["body"].values())
+                        and live.get("cursor") == live.get("accepted_target")
+                        and (snapshot.get("evidence", {}).get("accepted_host_action") or {}).get("accepted_action")
+                            == {"mode": "raw_goal_hold", "body_velocity": 0.}
+                        and [event.get("kind") for event in own] == ["start", "native_live_admitted", "observation_qualified"]
+                        and all(set(event) == {"kind", "at", "run_id", "service_incarnation"} for event in own)
+                        and all(type(v) in (int, float) and math.isfinite(v) for v in (*times, expiry, remaining))
+                        and times[0] <= run["native_live_at"] <= times[1] <= times[2] < run["deadline"]
+                        and times[2] + remaining <= run["deadline"] < expiry + remaining
+                        and str(UUID(run["operation_id"])) == run["operation_id"])
                 if release_loss:
                     before = release["connect_identity"]
                     if not isinstance(before, dict):
@@ -3766,7 +3811,9 @@ class SameRunRecovery:
                 if (
                     state["run"].get("status") != "paused" or state["run"].get("recovery") is not None
                     or set(original_event) != {"kind", "at", "run_id", "service_incarnation"}
-                    or original_event.get("kind") not in {"input_expired", "native_input_expired", "required_view_expired"}
+                    or original_event.get("kind") not in ({"observation_qualified"} if initial_connect else
+                                                         {"input_expired", "native_input_expired", "required_view_expired"})
+                    or initial_connect and not initial_phase(state)
                     or expected_pause is not None and original_event["kind"] != expected_pause
                     or type(original_event.get("at")) not in (int, float) or not math.isfinite(original_event["at"])
                     or not self.original["run"]["native_live_at"] <= original_event["at"] < self.original["run"]["deadline"]
@@ -3817,6 +3864,7 @@ class SameRunRecovery:
                     stamp, current_remaining = ack.get("acquired_at_monotonic_s"), run.get("remaining_s")
                     if (
                         run.get("status") != "paused" or run.get("recovery") is not None
+                        or initial_connect and not initial_phase(snapshot)
                         or pause_event(snapshot) != original_event
                         or type(revision) is not int or revision not in ((identity["intent_revision"],) if release_loss or unsent_connect else
                                                                       (identity["intent_revision"], identity["intent_revision"] + 1))
@@ -3853,11 +3901,13 @@ class SameRunRecovery:
                 # One deliberate NEW binding, after current held qualification.
                 # The old command/result and every acquired input stay discarded.
                 budget = remaining()
-                if release_loss:
-                    # A NEW acknowledged generation fences an old release that
-                    # may still be queued in Gateway/IPC. Never replay its ID.
+                if release_loss or initial_connect:
+                    # Freeze the qualified initial revision before the coroutine
+                    # can observe a newer Pause. Core's Connect CAS fences old work.
+                    connect_identity = (dict(identity, intent_revision=revision) if initial_connect
+                                        else self.client.identities())
                     connected = await asyncio.wait_for(
-                        self.client.command(dict(op="connect", **self.client.identities())), budget)
+                        self.client.command(dict(op="connect", **connect_identity)), budget)
                     generation = connected.get("connection_generation")
                     replacement = connected.get("snapshot")
                     self.check(replacement)
@@ -3868,7 +3918,8 @@ class SameRunRecovery:
                         or pause_event(replacement) != original_event):
                         raise RuntimeError("replacement connect generation/revision ACK unavailable")
                     self.client.connection, self.client.snapshot, self.client.sequence = generation, replacement, 0
-                    self.record({"event": "ordinary_empty_release_fenced", "connection_generation": generation,
+                    self.record({"event": "ordinary_initial_connect_fenced" if initial_connect else "ordinary_empty_release_fenced",
+                                 "connection_generation": generation,
                                  "previous_connection_generation": identity["connection_generation"],
                                  "intent_revision": revision + 1, "remaining_s": remaining()})
                     held_stamp = stamp

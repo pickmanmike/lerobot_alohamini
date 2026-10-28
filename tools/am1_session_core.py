@@ -2701,6 +2701,13 @@ class SessionAuthority:
                 or c.get("host_incarnation") != self.executor.host_incarnation
             ):
                 return self._refuse("stale physical control identity")
+            if self._physical_interactive() and (
+                type(c.get("intent_revision")) is not int
+                or c["intent_revision"] != self.run["intent_revision"]
+            ):
+                # A disconnected RPC can still reach this owner thread later.
+                # It must not replace a newer binding or Pause/Stop revision.
+                return self._refuse("stale physical Connect revision")
             automatic = "rearm_of_intent_revision" in c
             if automatic and not self._rearm_matches(c, d, "released"):
                 return self._refuse("ordinary rearm release fence changed; explicit Resume required")

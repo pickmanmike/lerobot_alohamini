@@ -7,7 +7,10 @@ limitation documented here remain unchanged.
 
 <a id="current-ordinary-viewing-path"></a>
 
-## Current ordinary route — Stage86, 2026-10-27
+## Current ordinary route — Stage87, 2026-10-27
+
+Stage87 changed only the runtime Core. The Stage86 viewer/camera bytes, enrolled
+profile, source mapping and ordinary procedure below remain unchanged.
 
 Use the existing AM1-attached USB cameras through the ordinary protected owner.
 [`ProtectedHostRun`](../../tools/am1_physical_executor.py) starts the maintained
