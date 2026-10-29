@@ -2226,7 +2226,7 @@ class SessionClient:
                         or run.get("recovery") is not None or run.get("native_first_cause")
                         or self.snapshot.get("evidence", {}).get("fault")
                         or set(prior_event) != {"kind", "at", "run_id", "service_incarnation"}
-                        or prior_event.get("kind") not in {"input_expired", "native_input_expired", "required_view_expired"}
+                        or prior_event.get("kind") not in _ordinary_pause_kinds(self)
                         or any(type(v) not in (int, float) or not math.isfinite(v)
                                for v in (prior_event.get("at"), pi_lower_bound))
                         or not run["native_live_at"] <= prior_event["at"] < run["deadline"]
@@ -2317,7 +2317,7 @@ class SessionClient:
                         for key, value in dict(identity, intent_revision=identity["intent_revision"] + 2).items())
                 and type(run.get("intent_revision")) is int
                 and set(event) == {"kind", "at", "run_id", "service_incarnation"}
-                and event.get("kind") in {"required_view_expired", "input_expired", "native_input_expired"}
+                and event.get("kind") in _ordinary_pause_kinds(self)
                 and all(type(value) in (int, float) and math.isfinite(value)
                         for value in (at, prior_at, pi_lower_bound))
                 and prior_at < at and pi_lower_bound <= at < run["deadline"]):
@@ -2377,6 +2377,18 @@ def _live(snapshot):
     return (
         (snapshot.get("run") or {}).get("live_input") or snapshot.get("evidence", {}).get("live_input") or {}
     )
+
+
+def _ordinary_pause_kinds(client):
+    kinds = {"input_expired", "native_input_expired", "required_view_expired"}
+    state = getattr(client, "snapshot", None) or {}
+    live = _live(state)
+    if (getattr(client, "_ordinary_transport_recovery", False) is True
+        and (state.get("run") or {}).get("bench_continuity") is False
+        and (live.get("workspace") or {}).get("workspace_profile") == ORDINARY_ARMS_PROFILE
+        and (live.get("required_view") or {}).get("required") is True):
+        kinds.add("transport_connection_lost")
+    return kinds
 
 
 def _view_admitted(snapshot):
@@ -2767,7 +2779,7 @@ class SameRunRecovery:
         if (not continuing and (episode["started"] + prior["remaining_s"] < prior["deadline"]
             or not resume_unknown and episode["revision"] == identity["intent_revision"] + 1
             and (index == 0 or own[index - 1].get("kind") not in
-                 {"required_view_expired", "input_expired", "native_input_expired"}
+                 _ordinary_pause_kinds(self.client)
                  or type(own[index - 1].get("at")) not in (int, float)
                  or own[index - 1]["at"] + prior["remaining_s"] < prior["deadline"]
                  or own[index - 1]["at"] > hold["at"]))):
@@ -2942,7 +2954,7 @@ class SameRunRecovery:
                         or phase_key in consumed_resumes
                         or before["run"].get("status") != "paused" or before["run"].get("recovery") is not None
                         or _latest_run_event(before, identity) != event
-                        or event.get("kind") not in {"input_expired", "native_input_expired", "required_view_expired", "live_sensing_requalified"}
+                        or event.get("kind") not in _ordinary_pause_kinds(self.client) | {"live_sensing_requalified"}
                         or any(type(v) not in (int, float) or not math.isfinite(v)
                                for v in (remaining, ceiling, context["requested"], context["pi_lower_bound"], event.get("at")))
                         or not 0 < remaining <= clock["remaining"]
@@ -3027,7 +3039,7 @@ class SameRunRecovery:
                 or type(run.get("intent_revision")) is not int
                 or run["intent_revision"] not in (identity.get("intent_revision"), identity.get("intent_revision", -2) + 1)
                 or (not finishing_pause(state, pi_now) if finishing_pause is not None else (
-                    event.get("kind") not in {"input_expired", "native_input_expired", "required_view_expired", "live_sensing_requalified"}
+                    event.get("kind") not in _ordinary_pause_kinds(self.client) | {"live_sensing_requalified"}
                     or type(event.get("at")) not in (int, float) or not math.isfinite(event["at"])
                     or not run["native_live_at"] <= event["at"] <= pi_now < run["deadline"]))
                 or type(expiry) not in (int, float) or not math.isfinite(expiry)
@@ -3281,7 +3293,7 @@ class SameRunRecovery:
                 new_pause = (resume_context.get("phase") != "held_qualification"
                              and type(run.get("intent_revision")) is int and run["intent_revision"] == identity["intent_revision"] + 2
                              and set(event) == {"kind", "at", "run_id", "service_incarnation"}
-                             and event.get("kind") in {"input_expired", "native_input_expired", "required_view_expired"}
+                             and event.get("kind") in _ordinary_pause_kinds(self.client)
                              and type(event.get("at")) in (int, float) and math.isfinite(event["at"])
                              and resume_context["prior_event"]["at"] < event["at"]
                              and resume_context["pi_lower_bound"] <= event["at"] < run["deadline"])
@@ -3303,7 +3315,7 @@ class SameRunRecovery:
                 ),
                 {},
             )
-            allowed = {"required_view_expired", "input_expired", "native_input_expired"}
+            allowed = _ordinary_pause_kinds(self.client)
             ack = (state.get("evidence") or {}).get("accepted_host_action") or {}
             if (view_refusal and require_episode and event.get("kind") == "input_expired"
                 and set(event) == {"kind", "at", "run_id", "service_incarnation"}
@@ -3682,7 +3694,7 @@ class SameRunRecovery:
                         or str(UUID(accepted["operation_id"])) != accepted["operation_id"]
                         or set(prior) != {"kind", "at", "run_id", "service_incarnation"}
                         or prior != _latest_run_event(state, identity)
-                        or prior.get("kind") not in {"input_expired", "native_input_expired", "required_view_expired"}
+                        or prior.get("kind") not in _ordinary_pause_kinds(self.client)
                         or any(type(v) not in (int, float) or not math.isfinite(v)
                                for v in (prior.get("at"), lower, accepted["native_remaining"], accepted["active_ceiling"]))
                         or not self.original["run"]["native_live_at"] <= prior["at"] < self.original["run"]["deadline"]
@@ -3847,7 +3859,7 @@ class SameRunRecovery:
                     state["run"].get("status") != "paused" or state["run"].get("recovery") is not None
                     or set(original_event) != {"kind", "at", "run_id", "service_incarnation"}
                     or original_event.get("kind") not in ({"observation_qualified"} if initial_connect else
-                                                         {"input_expired", "native_input_expired", "required_view_expired"})
+                                                         _ordinary_pause_kinds(self.client))
                     or initial_connect and not initial_phase(state)
                     or expected_pause is not None and original_event["kind"] != expected_pause
                     or type(original_event.get("at")) not in (int, float) or not math.isfinite(original_event["at"])
@@ -4165,7 +4177,7 @@ async def send_leader_sample(client, producer, body, record, *, phase, progress_
             and isinstance(old_live.get("reference"), dict) and isinstance(old_live.get("workspace"), dict)
             and old_live.get("live_admitted_at_monotonic_s") == before.get("native_live_at")
             and old_live.get("live_deadline_monotonic_s") == before.get("deadline")
-            and pause.get("kind") in {"input_expired", "native_input_expired", "required_view_expired"}
+            and pause.get("kind") in _ordinary_pause_kinds(client)
             and all(type(value) in (int, float) and math.isfinite(value) for value in clocks)
             and 0 < remaining[1] <= remaining[0]
             and before["native_live_at"] < before["deadline"]
@@ -4492,9 +4504,11 @@ async def run(args):
             native_admission_terminal(state)
             return run.get("native_live_at") is not None
 
-        # One current transport loss may reattach to the already accepted Start.
-        # All attachment work consumes this original admission ceiling.
+        # Each qualified current stream may replace one lost transport while
+        # preserving the same accepted Start and original admission ceiling.
         reattached = False
+        admission_stream = getattr(client, "ws", None)
+        lost_admission_streams = []
 
         def admission_remaining():
             # Before a fresh Live clock is mapped, Start precedes every possible
@@ -4581,7 +4595,8 @@ async def run(args):
                         and close.get("reason") == "message-error"
                     )
                     if (
-                        reattached
+                        ws is None or ws is not admission_stream
+                        or any(ws is previous for previous in lost_admission_streams)
                         or close.get("expected") is not False
                         or close.get("reason") != "stream-ended" and not (no_pong or closing_transport)
                         or close.get("close_code") != 1006
@@ -4604,6 +4619,7 @@ async def run(args):
                             "remaining_s": remaining,
                         }
                     )
+                    lost_admission_streams.append(ws)
                     reattached = True
                     async with asyncio.timeout(admission_remaining()):
                         await client.detach()
@@ -4614,7 +4630,15 @@ async def run(args):
                         if await authenticated_startup_times() != startup_anchor:
                             raise RuntimeError("original native admission startup timestamps changed") from None
                         check_admission_attachment()
+                    current_stream = getattr(client, "ws", None)
+                    reader = getattr(client, "reader", None)
+                    if (current_stream is None or any(current_stream is previous for previous in lost_admission_streams)
+                        or getattr(current_stream, "closed", True) or getattr(client, "transport_error", None)
+                        or reader is not None and reader.done()):
+                        raise original
+                    admission_stream = current_stream
                     record({"event": "native_admission_reattached", "remaining_s": remaining})
+                    admission_first_error = None  # This episode qualified; later failures remain their own.
         except (Exception, asyncio.CancelledError) as qualification_error:
             if admission_first_error is not None and qualification_error is not admission_first_error:
                 raise admission_first_error from qualification_error
@@ -4676,6 +4700,7 @@ async def run(args):
                 workload = source = TeleopWorkload(workspace) if segment == "full" else TeleopWorkload(workspace, segment=segment)
         producer = FrameProducer(source, source_id=intent_channel) if changing_input else FrameProducer(source)
         producer.workspace = workspace
+        client._ordinary_transport_recovery = ordinary_input_rearm
         recovery = SameRunRecovery(client, record)
         applied_intent_revision = None
 
@@ -4875,18 +4900,10 @@ async def run(args):
             if state["run"]["status"] == "recovering":
                 await rejoin(require_episode=True, until=until)
                 return False
-            cause = next(
-                (
-                    v.get("kind")
-                    for v in reversed(state.get("events", []))
-                    if v.get("kind")
-                    in {"required_view_expired", "input_expired", "native_input_expired", "pause", "stop"}
-                ),
-                None,
-            )
+            cause = _latest_run_event(state, client.identities()).get("kind")
             if (
                 state["run"]["status"] != "paused"
-                or cause not in {"required_view_expired", "input_expired", "native_input_expired"}
+                or cause not in _ordinary_pause_kinds(client)
                 or not recovery.history_qualified(state)
                 or state["run"].get("uncertain")
             ):
