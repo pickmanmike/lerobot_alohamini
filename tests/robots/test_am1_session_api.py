@@ -1422,3 +1422,205 @@ def test_partial_unknown_call_keeps_original_exception_and_nongrant_controls(mon
             assert marks == ({"gateway_dispatch":10.} if phase == "before-ipc" else {
                 "gateway_dispatch":10.,"gateway_ipc_started":20.})
     asyncio.run(scenario())
+
+
+# Compact wire lengths reproduce retained 74ef/b2bf sizes without publishing private histories.
+def _peer_queue_snapshot(wire_bytes, *, revision=None):
+    from tools.am1_session_ipc import encode
+    value = {"kind": "snapshot", "snapshot": {"retained_size_fixture": ""}}
+    if revision is not None:
+        value["revision"] = revision
+    value["snapshot"]["retained_size_fixture"] = "x" * (wire_bytes - len(encode(value)))
+    assert len(encode(value)) == wire_bytes
+    return value
+
+
+class _PeerQueueSocket:
+    def __init__(self):
+        from types import SimpleNamespace
+        self.entered, self.release, self.closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        self.sent, self.close_codes = [], []
+        self.aborted = False
+        self._writer = SimpleNamespace(transport=SimpleNamespace(abort=self.abort))
+
+    def abort(self):
+        self.aborted = True
+
+    async def send_str(self, value):
+        self.entered.set()
+        await self.release.wait()
+        if self.closed.is_set():
+            raise ConnectionError("fake socket already closed")
+        self.sent.append(json.loads(value))
+
+    async def close(self, *, code):
+        self.close_codes.append(code)
+        self.closed.set()
+
+    async def delivered(self, count):
+        async with asyncio.timeout(.4):
+            while len(self.sent) < count:
+                await asyncio.sleep(.001)
+
+
+def test_peer_queue_control_reply_evicts_only_queued_snapshot_and_keeps_stop_fifo():
+    from tools import am1_session_service as service
+    async def scenario():
+        ws = _PeerQueueSocket()
+        peer = service.Peer(ws, "owner", "private-test-token")
+        gateway = service.Gateway.__new__(service.Gateway)
+        observation = _peer_queue_snapshot(31326)
+        connect = dict(accepted=True, status="connected", connection_generation=oid(),
+                       snapshot=observation["snapshot"])
+        try:
+            assert peer.put(observation, True)
+            await asyncio.wait_for(ws.entered.wait(), .2)
+            gateway.command_reply(peer, {"id": "protective-stop", "command": {"op": "stop"}},
+                                  {"accepted": True, "status": "finishing", "effect_admitted": False})
+            assert peer.put(observation, True)
+            gateway.command_reply(peer, {"id": "connect", "command": {"op": "connect"}}, connect)
+            assert not peer.closed, "queued optional status must yield space to the command result"
+            assert peer.bytes + peer.inflight <= 65536
+            assert [json.loads(row[0])["id"] for row in peer.queue] == ["protective-stop", "connect"]
+            assert all(row[1] is False for row in peer.queue)
+            await asyncio.sleep(.05)
+            ws.release.set()
+            await ws.delivered(3)
+            assert [row.get("id") for row in ws.sent] == [None, "protective-stop", "connect"]
+            assert ws.sent[-1]["snapshot"] == observation["snapshot"]
+            assert not ws.close_codes
+        finally:
+            await peer.close()
+    asyncio.run(scenario())
+
+
+def test_peer_queue_optional_terminal_snapshot_pressure_preserves_initial_ack_fence():
+    from tools import am1_session_service as service
+    async def scenario():
+        ws = _PeerQueueSocket()
+        peer = service.Peer(ws, "owner", "private-test-token")
+        gateway = service.Gateway.__new__(service.Gateway)
+        peer.revision = "initial-revision"
+        initial = _peer_queue_snapshot(36870, revision=peer.revision)
+        optional = _peer_queue_snapshot(36870)
+        try:
+            assert peer.put(initial, True)
+            await asyncio.wait_for(ws.entered.wait(), .2)
+            assert peer.put(optional, True) is False
+            assert not peer.closed, "optional status pressure is not proof of a slow reader"
+            assert peer.ack is False and peer.connection is None
+            gateway.enqueue(peer, {"id": "claim-before-ack", "command": {"op": "claim"}})
+            assert peer.commands == {"normal": 0, "protective": 0}
+            assert peer.ack is False and peer.connection is None
+            await asyncio.sleep(.05)
+            ws.release.set()
+            await ws.delivered(2)
+            assert ws.sent[0] == initial
+            assert ws.sent[1]["id"] == "claim-before-ack" and ws.sent[1]["accepted"] is False
+            assert peer.ack is False and not ws.close_codes
+            assert peer.put(optional, True)
+            await ws.delivered(3)
+            assert ws.sent[-1] == optional and peer.ack is False
+        finally:
+            await peer.close()
+    asyncio.run(scenario())
+
+
+def test_peer_queue_snapshot_pressure_preserves_grant_reserved_bytes_and_reply_bound():
+    from tools import am1_session_service as service
+    from tools.am1_session_ipc import encode
+    async def scenario():
+        ws = _PeerQueueSocket()
+        peer = service.Peer(ws, "owner", "private-test-token")
+        observation = _peer_queue_snapshot(31326)
+        grant = {"kind": "result", "id": "grant", "accepted": True, "status": "granted", "padding": ""}
+        grant["padding"] = "x" * (65536 - 31326 - 80 - len(encode(grant)))
+        try:
+            assert peer.put(observation, True)
+            await asyncio.wait_for(ws.entered.wait(), .2)
+            assert peer.put(grant, grant_reply=True)
+            assert peer.queue[0][2] == 80 and peer.bytes + peer.inflight == 65536
+            assert peer.put(observation, True) is False
+            assert not peer.closed and peer.bytes + peer.inflight == 65536
+            assert json.loads(peer.queue[0][0]) == grant and peer.queue[0][2] == 80
+            assert peer.put({"kind": "result", "id": "excess-reply"}) is False
+            assert peer.closed, "command replies cannot evict an earlier Grant or its reservation"
+            await asyncio.wait_for(ws.closed.wait(), .2)
+            assert 1013 in ws.close_codes
+        finally:
+            await peer.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("first_size,queued_reply", [(31326, True), (36870, False)])
+def test_peer_queue_reply_only_or_inflight_pressure_still_closes(first_size, queued_reply):
+    from tools import am1_session_service as service
+    async def scenario():
+        ws = _PeerQueueSocket()
+        peer = service.Peer(ws, "owner", "private-test-token")
+        reply = dict(kind="result", id="connect", accepted=True, status="connected",
+                     connection_generation=oid(), snapshot=_peer_queue_snapshot(31326)["snapshot"])
+        try:
+            assert peer.put(_peer_queue_snapshot(first_size), True)
+            await asyncio.wait_for(ws.entered.wait(), .2)
+            if queued_reply:
+                assert peer.put(dict(reply, id="first-connect"))
+            assert peer.put(reply) is False
+            assert peer.closed
+            await asyncio.wait_for(ws.closed.wait(), .2)
+            assert 1013 in ws.close_codes
+        finally:
+            await peer.close()
+    asyncio.run(scenario())
+
+
+def test_peer_queue_blocked_send_keeps_half_second_close():
+    from tools import am1_session_service as service
+    async def scenario():
+        ws = _PeerQueueSocket()
+        peer = service.Peer(ws, "owner", "private-test-token")
+        try:
+            assert peer.put(_peer_queue_snapshot(36870), True)
+            await asyncio.wait_for(ws.entered.wait(), .2)
+            await asyncio.wait_for(ws.closed.wait(), .8)
+            assert peer.closed and 1013 in ws.close_codes and ws.sent == []
+        finally:
+            await peer.close()
+    asyncio.run(scenario())
+
+
+def test_peer_queue_intrinsically_oversized_initial_snapshot_rejects_and_closes(monkeypatch):
+    from types import SimpleNamespace
+    from tools import am1_session_service as service
+    async def scenario():
+        class Socket(_PeerQueueSocket):
+            async def prepare(self, request):
+                return None
+            async def receive(self):
+                return SimpleNamespace(type=WSMsgType.TEXT, data=json.dumps({"ticket": "once"}))
+        ws = Socket()
+        gateway = service.Gateway.__new__(service.Gateway)
+        gateway.pending_ws, gateway.peers, gateway.revision = 0, set(), 0
+        gateway.incarnation = "test-gateway"
+        gateway.tickets = {service.digest("once"): ("owner", time.monotonic() + 10)}
+        gateway.auth = SimpleNamespace(resolve=lambda _: {"id": "owner", "control": True})
+        async def current():
+            return {"oversized": "x" * 65536}
+        gateway.current = current
+        original_peer, created = service.Peer, []
+        def create_peer(*args):
+            peer = original_peer(*args)
+            created.append(peer)
+            return peer
+        monkeypatch.setattr(service, "Peer", create_peer)
+        monkeypatch.setattr(service.web, "WebSocketResponse", lambda **_: ws)
+        class Request(dict):
+            pass
+        request = Request(token="private-test-token", device={"id": "owner"})
+        request.transport = SimpleNamespace(set_write_buffer_limits=lambda **_: None,
+            get_extra_info=lambda _: SimpleNamespace(setsockopt=lambda *args: None))
+        await gateway.websocket(request)
+        assert ws.close_codes[0] == 1008 and ws.sent == []
+        assert len(created) == 1 and created[0].ack is False and created[0].connection is None
+        assert gateway.pending_ws == 0 and gateway.peers == set()
+    asyncio.run(scenario())

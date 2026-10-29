@@ -187,10 +187,13 @@ class Peer:
         # Grant only: reserve the bounded final diagnostic mark within the same cap.
         reservation = 80 if grant_reply else 0
         size = len(data) + reservation
-        if snapshot:
+        if snapshot or self.bytes + self.inflight + size > 65536:
+            # Queued optional status yields to replies; in-flight data and replies stay exact.
             self.queue = deque(item for item in self.queue if not item[1])
             self.bytes = sum(len(item[0]) + item[2] for item in self.queue)
         if self.bytes + self.inflight + size > 65536:
+            if snapshot:
+                return False
             self.closed = True
             asyncio.create_task(close_socket(self.ws, self.ws._writer.transport, 1013))
             return False
