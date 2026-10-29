@@ -1515,7 +1515,7 @@ class SessionClient:
         self.ws = await self.http.ws_connect(
             self.origin.replace("https:", "wss:") + "/api/ws",
             ssl=self.tls,
-            heartbeat=2,
+            heartbeat=6,
             max_msg_size=65536,
             compress=0,
         )

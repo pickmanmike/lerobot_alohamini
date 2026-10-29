@@ -1678,3 +1678,135 @@ def test_transport_detach_revoked_gateway_capability_never_reaches_private_owner
         assert result == {"accepted": False, "status": "refused", "reason": "revoked control context",
                           "effect_admitted": False}
     asyncio.run(scenario())
+
+
+
+def test_bootstrap_grace_real_tls_accepts_delayed_valid_ticket_without_ack_credit(cluster):
+    async def scenario():
+        session=await enrolled(cluster);ws=None
+        try:
+            attached=(await post(session,cluster,"/api/attach",{}))[1]
+            ws=await session.ws_connect(cluster.url.replace("https:","wss:")+"/api/ws",
+                ssl=session._test_tls,headers={"Origin":cluster.url})
+            await asyncio.sleep(1.25)  # Valid original five-second ticket; no server output before verification.
+            await ws.send_json({"ticket":attached["ticket"]})
+            initial=await ws.receive_json(timeout=2)
+            assert initial["kind"]=="snapshot" and isinstance(initial["revision"],str)
+            denied=await ws_command(ws,{"op":"claim"})
+            assert denied["accepted"] is False and denied["effect_admitted"] is False
+            await ws.send_json({"ack":initial["revision"]})
+            assert (await ws_command(ws,{"op":"claim"}))["accepted"] is True
+        finally:
+            if ws:await ws.close()
+            await session.close()
+    asyncio.run(scenario())
+
+
+def test_bootstrap_grace_real_tls_delayed_pong_keeps_verified_stream_usable(cluster):
+    async def scenario():
+        session=await enrolled(cluster);ws=None
+        try:
+            attached=(await post(session,cluster,"/api/attach",{}))[1]
+            ws=await session.ws_connect(cluster.url.replace("https:","wss:")+"/api/ws",
+                ssl=session._test_tls,headers={"Origin":cluster.url},autoping=False)
+            await ws.send_json({"ticket":attached["ticket"]})
+            initial=await ws.receive_json(timeout=2)
+            await ws.send_json({"ack":initial["revision"]})
+            async with asyncio.timeout(7):
+                while True:
+                    message=await ws.receive()
+                    if message.type==WSMsgType.PING:break
+                    assert message.type==WSMsgType.TEXT
+            pong_at=time.monotonic()+2.1
+            while time.monotonic()<pong_at:
+                try:row=await ws.receive(timeout=pong_at-time.monotonic())
+                except asyncio.TimeoutError:break
+                assert row.type==WSMsgType.TEXT, "a bounded application PONG delay must not retire this verified stream"
+            await ws.pong(message.data)
+            assert (await ws_command(ws,{"op":"claim"}))["accepted"] is True
+        finally:
+            if ws:await ws.close()
+            await session.close()
+    asyncio.run(scenario())
+
+
+def test_bootstrap_grace_real_session_client_uses_same_three_second_pong_allowance(cluster,tmp_path):
+    from tools.am1_leader_adapter import SessionClient
+    async def scenario():
+        session=await enrolled(cluster);client=None
+        try:
+            cookie=next(row.value for row in session.cookie_jar if row.key=="__Host-am1-device")
+            state=tmp_path/"existing-enrolled-state.json"
+            state.write_text(json.dumps({"cookies":[{"name":"__Host-am1-device","value":cookie,
+                "domain":"127.0.0.1","path":"/","secure":True}]}),encoding="utf-8")
+            client=SessionClient(cluster.url,cluster.cert,state)
+            await client.attach()
+            assert client.ws._heartbeat==6 and client.ws._pong_heartbeat==3
+            assert client.snapshot is not None
+        finally:
+            if client:await client.close()
+            await session.close()
+    asyncio.run(scenario())
+
+
+def test_bootstrap_grace_real_tls_stale_ack_still_closes_policy_boundary(cluster):
+    async def scenario():
+        session=await enrolled(cluster);ws=None
+        try:
+            ws,_=await ws_attached(session,cluster)
+            await ws.send_json({"ack":"not-a-current-revision"})
+            async with asyncio.timeout(2):
+                while True:
+                    message=await ws.receive()
+                    if message.type in {WSMsgType.CLOSE,WSMsgType.CLOSED}:break
+            assert ws.close_code==1008
+            assert (await snapshot(session,cluster))["controller"] is None
+        finally:
+            if ws:await ws.close()
+            await session.close()
+    asyncio.run(scenario())
+
+
+def test_bootstrap_grace_real_tls_first_ticket_wait_is_still_finite(cluster):
+    async def scenario():
+        session=await enrolled(cluster);ws=None
+        try:
+            ws=await session.ws_connect(cluster.url.replace("https:","wss:")+"/api/ws",
+                ssl=session._test_tls,headers={"Origin":cluster.url})
+            started=time.monotonic()
+            message=await ws.receive(timeout=3.8)
+            assert message.type in {WSMsgType.CLOSE,WSMsgType.CLOSED} and ws.close_code==1008
+            assert 2.7<=time.monotonic()-started<3.8
+        finally:
+            if ws:await ws.close()
+            await session.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("logger_fails",[False,True])
+def test_bootstrap_grace_bounded_existing_journal_tags_never_change_close(monkeypatch,logger_fails):
+    from types import SimpleNamespace
+    from tools import am1_session_service as service
+    async def scenario():
+        class Socket(_PeerQueueSocket):
+            async def prepare(self,request):return None
+            async def receive(self):
+                return SimpleNamespace(type=WSMsgType.TEXT,
+                    data='{"ticket":"PRIVATE-TICKET-SENTINEL","ticket":"duplicate"}')
+        ws=Socket();calls=[]
+        def warning(template,*args):
+            calls.append((template,args))
+            if logger_fails:raise RuntimeError("journal unavailable")
+        gateway=service.Gateway.__new__(service.Gateway)
+        gateway.pending_ws,gateway.peers=0,set()
+        monkeypatch.setattr(service.web,"WebSocketResponse",lambda **_:ws)
+        class Request(dict):pass
+        request=Request();request.app=SimpleNamespace(logger=SimpleNamespace(warning=warning))
+        request.transport=SimpleNamespace(set_write_buffer_limits=lambda **_:None,
+            get_extra_info=lambda _:SimpleNamespace(setsockopt=lambda *args:None),abort=ws.abort)
+        await gateway.websocket(request)
+        assert ws.close_codes[0]==1008 and gateway.pending_ws==0 and gateway.peers==set()
+        assert len(calls)==1 and calls[0][1]==("ticket_decode","ValueError")
+        rendered=calls[0][0] % calls[0][1]
+        assert len(rendered)<=160 and "PRIVATE-TICKET-SENTINEL" not in rendered
+    asyncio.run(scenario())

@@ -3941,10 +3941,11 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         value = {k: v for k, v in value.items() if k != "revision"}
                     return original_put(peer, value, snapshot)
                 monkeypatch.setattr(Peer, "put", initial_revision_gate)
-            if cause in {"transport_blackout_hb1", "resume_pong_pause"}:
+            if cause in {"transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "resume_pong_pause"}:
                 original_ws_connect = client.http.ws_connect
                 def fixture_heartbeat(*args, **kwargs):
-                    kwargs["heartbeat"] = 1  # Retained baseline; other cases exercise common production heartbeat=2.
+                    # Explicit historical controls; the bootstrap fixture tests the new normal6/3s policy.
+                    kwargs["heartbeat"] = 1 if cause in {"transport_blackout_hb1", "resume_pong_pause"} else 2
                     return original_ws_connect(*args, **kwargs)
                 monkeypatch.setattr(client.http, "ws_connect", fixture_heartbeat)
             await client.attach()
