@@ -528,7 +528,7 @@ class PhysicalExecutor:
             "recent": [], "first_native_expiry": None, "first_native_expiry_seen": False,
         }
 
-    def _input_transport_row(self, event, marker):
+    def _input_transport_row(self, event, marker, *, poll=None):
         """Copy only bounded diagnostic primitives, never targets or PC clocks."""
         if self.live_spec is not TELEOP_SPEC:
             return None
@@ -574,6 +574,18 @@ class PhysicalExecutor:
                 raise ValueError("invalid diagnostic Pi clock")
             row["event"] = event
             row["send_started_at_monotonic_s" if event == "worker_send" else "admitted_at_monotonic_s"] = at
+            if event == "worker_send" and poll is not None:
+                values = poll if type(poll) is tuple and len(poll) == 5 else (None,) * 5
+                for key, value in zip(("poll_started_at_monotonic_s", "poll_returned_at_monotonic_s"), values):
+                    row[key] = (value if type(value) in (int, float) and math.isfinite(value) and 0 <= value <= at else None)
+                started, returned = row["poll_started_at_monotonic_s"], row["poll_returned_at_monotonic_s"]
+                if started is not None and returned is not None and returned < started:
+                    row["poll_started_at_monotonic_s"] = row["poll_returned_at_monotonic_s"] = None
+                for key, value, minimum in (("poll_previous_feedback_sequence", values[2], -1),
+                                            ("poll_feedback_sequence", values[3], 0)):
+                    row[key] = value if type(value) is int and minimum <= value < 2**63 else None
+                row["poll_outcome"] = values[4] if type(values[4]) is str and values[4] in (
+                    "returned", "feedback_unavailable", "os_error") else None
             return row
         except Exception:
             self._input_transport_trace["invalid_rows"] = min(2**63 - 1, self._input_transport_trace["invalid_rows"] + 1)
@@ -1316,13 +1328,37 @@ class PhysicalExecutor:
                     ):
                         self.finish_status = "stopped"
                         break
+                observe_poll = self.live_spec is TELEOP_SPEC
+                poll_started = poll_returned = None
+                poll_outcome = "returned"
                 try:
                     previous = self.sample["sequence"] if self.sample else -1
-                    sample = io.poll(previous)
+                    if observe_poll:
+                        try:
+                            poll_started = self.clock()
+                        except Exception:
+                            pass  # An observational clock must not prevent the real poll.
+                    try:
+                        sample = io.poll(previous)
+                    finally:
+                        if observe_poll:
+                            try:
+                                poll_returned = self.clock()
+                            except Exception:
+                                pass  # Preserve the poll's original result or exception.
                     transient = None
                 except (FeedbackUnavailable, OSError) as exc:
                     sample = None
                     transient = str(exc)
+                    poll_outcome = "feedback_unavailable" if isinstance(exc, FeedbackUnavailable) else "os_error"
+                poll_trace = None
+                if observe_poll:
+                    try:
+                        polled = sample.sample if isinstance(sample, PendingSample) else sample
+                        returned_sequence = polled.get("sequence") if type(polled) is dict else None
+                    except Exception:
+                        returned_sequence = None
+                    poll_trace = (poll_started, poll_returned, previous, returned_sequence, poll_outcome)
                 with self.mutex:
                     if self.finish_status:
                         break
@@ -1575,7 +1611,7 @@ class PhysicalExecutor:
                             live_admitted=self._live_admission_requested,
                             live_input=copy.deepcopy(self._live_target) if desired == "active" else None)
                     # Bound send is outside authority; the worker mutex fences concurrent Pause/Stop.
-                    send_trace = self._input_transport_row("worker_send", action["_am1_local_control"])
+                    send_trace = self._input_transport_row("worker_send", action["_am1_local_control"], poll=poll_trace)
                     try:
                         try:
                             io.send(action)

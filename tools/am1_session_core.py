@@ -2280,14 +2280,14 @@ class SessionAuthority:
         if op == "view_progress":
             return self._view_progress(c, d)
         if (self._bench_continuity()
-                and op in {"connect", "release_input", "resume", "grant", "input"}):
+                and op in {"connect", "release_input", "transport_detach", "resume", "grant", "input"}):
             intent = self.run.get("control_intent") or {}
             if (intent.get("eligible") is not True or intent.get("device_id") != d
                     or intent.get("controller_generation") != c.get("controller_generation")
                     or intent.get("service_incarnation") != self.service_incarnation):
                 return self._refuse("same-operation control intent cancelled")
         if (self._physical_interactive() and self.run["status"] == "finishing"
-                and op in {"connect", "release", "handoff", "release_input", "resume", "grant", "input"}):
+                and op in {"connect", "release", "handoff", "release_input", "transport_detach", "resume", "grant", "input"}):
             return self._refuse("physical finishing already in progress")
         if op == "snapshot":
             return {"accepted": True, "status": "snapshot", "snapshot": self.snapshot()}
@@ -2732,7 +2732,17 @@ class SessionAuthority:
             }
         if not self._connection_valid(c, d):
             return self._refuse("stale control generation")
-        if op == "release_input":
+        if op in {"release_input", "transport_detach"}:
+            transport_detach = op == "transport_detach"
+            if transport_detach and (
+                not self._physical_interactive()
+                or set(c) != {"op", "run_id", "service_incarnation", "controller_generation",
+                              "connection_generation", "host_incarnation", "intent_revision"}
+                or self.run["status"] not in {"running", "resuming"}
+                or type(c.get("intent_revision")) is not int
+                or c["intent_revision"] != self.run["intent_revision"]
+            ):
+                return self._refuse("stale transport detach context")
             if self._physical_interactive() and set(c) - {
                 "op", "run_id", "service_incarnation", "controller_generation", "connection_generation",
                 "host_incarnation", "intent_revision", "release_kind", "rearm_of_intent_revision",
@@ -2747,7 +2757,12 @@ class SessionAuthority:
                     return self._refuse("unknown physical release kind")
                 if automatic and ("release_kind" in c or not self._rearm_matches(c, d, "connected")):
                     return self._refuse("ordinary rearm release fence changed; explicit Resume required")
-                if not automatic:
+                if transport_detach:
+                    # Only authenticated gateway cleanup can name this cause. No evidence IO
+                    # intervenes after the current connection/revision/lease checks above.
+                    self._pause_live_input("transport_connection_lost")
+                    self.connection["transport_detached_revision"] = self.run["intent_revision"]
+                elif not automatic:
                     e = self._evidence()
                     # Feedback acquisition can cross the original grant expiry.
                     released_at = self.clock()
@@ -2764,6 +2779,14 @@ class SessionAuthority:
                         and all(e.get(key) is True for key in ("feedback", "required_observation", "native_ack"))
                         and e.get("acknowledged_intent_revision") == self.run["intent_revision"]
                     )
+                    if (self.run["status"] == "paused" and self.connection
+                            and self.connection.get("transport_detached_revision") == self.run["intent_revision"]):
+                        # A deliberate release on the still-detached connection supersedes
+                        # transport recovery. Connect replaces this private marker entirely.
+                        self.connection.pop("transport_detached_revision")
+                        self.run["intent_revision"] += 1
+                        self._event("input_released")
+                        self._save()
                     self._pause_live_input("input_released")
             self._clear_input(preserve_rearm=automatic)
             self.released = True

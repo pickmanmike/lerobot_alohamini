@@ -3317,3 +3317,159 @@ def test_response_baseline_volatile_stopped_denies_other_states_and_incomplete_p
     with pytest.raises((ValueError, KeyError, TypeError)):
         m.load_qualified_proof(config, run)
     assert run == before and not m._ack_path(state, run["run_id"]).exists()
+
+
+# Offline original-origin contrast: fresh proof remains separately acquired.
+def follower_baseline_expired_fixture(tmp_path, monkeypatch):
+    m, config, run, proof, state = response_baseline_refused_fixture(
+        tmp_path, monkeypatch, ordinary_current_rest=True, volatile_stopped=True
+    )
+    old = run["physical_result"]["readback"]
+    trial = old["readback"]["left_response_p_trial"]
+    cause = "RuntimeError: AM1 teleop original follower baseline acquisition expired"
+    old.update(first_cause=cause, first_error_chain=[{"cause": cause, "notes": []}])
+    run["native_first_cause"] = proof["original_first_cause"] = cause
+    proof["original_cleanup_origin"] = "preconfigure-follower-baseline-expired-lift-unqualified"
+    registers = trial["original_registers"]
+    registers.update(Present_Position=1094, Goal_Position=1094, Present_Temperature=29)
+    trial["original_settings_sha256"] = hashlib.sha256(canonical({
+        "registers": registers, "individual_bytes": trial["original_bytes"]
+    })).hexdigest()
+    trial.update(state="restored", status="restored", restore_required=False,
+                 configured_p_readback=32, configured_acceleration_readback=254,
+                 restored_p_readback=16, restored_acceleration_readback=0,
+                 prepared_at_monotonic_s=525862.0, configured_at_monotonic_s=525863.0,
+                 restored_at_monotonic_s=525864.0,
+                 selected_acceleration_profile={"version": 1, "original_raw": 0,
+                                                "active_raw": 254, "maximum_raw": 254})
+    preserved = set(registers) - {"P_Coefficient", "Torque_Enable", "Lock", "Present_Position",
+                                 "Goal_Position", "Present_Current", "Present_Voltage",
+                                 "Present_Temperature", "Status"}
+    events = [("restored", key, registers[key]) for key in sorted(preserved | {"P_Coefficient"})]
+    events += [("restored_acceleration", "Acceleration", 0),
+               ("restore_original_lock_verify", "Lock", 0)]
+    trial["events"] = [dict(operation="read", phase=phase, register=register, value=value,
+                           started_at_monotonic_s=525863.5 + n * .001,
+                           completed_at_monotonic_s=525863.5005 + n * .001)
+                       for n, (phase, register, value) in enumerate(events)]
+    for n, (address, value) in enumerate(trial["original_bytes"].items()):
+        trial["events"].append(dict(operation="read", phase="restored", address=int(address),
+                                    width=1, value=value, started_at_monotonic_s=525863.9 + n * .001,
+                                    completed_at_monotonic_s=525863.9005 + n * .001))
+    trial["events"].sort(key=lambda row: row["started_at_monotonic_s"])
+    return m, config, run, proof, state
+
+
+def test_follower_baseline_expired_origin_still_requires_fresh_stopped_proof_and_distinct_ack(tmp_path, monkeypatch):
+    m, config, run, proof, state = follower_baseline_expired_fixture(tmp_path, monkeypatch)
+    original = copy.deepcopy(run)
+    raw = publish_incomplete_fixture(config, run, proof, state)
+    actual, received, inventory = m.load_qualified_proof(config, run)
+    assert actual == proof and received == raw and inventory == dict.fromkeys(m.MARKERS)
+    operation = str(uuid.uuid4())
+    assert not m.acknowledged_receipt(actual, run, operation)
+    ack = m.archive_and_ack(config, actual, received, inventory, operation)
+    receipt = {**actual, "acknowledgment": {**ack, "consumed_operation_id": operation}}
+    assert m.acknowledged_receipt(receipt, run, operation)
+    assert run == original and run["uncertain"] is True and run["status"] == "faulted"
+    assert run["physical_result"]["readback"]["readback"]["lift_readback"] == "unavailable-or-failed"
+    assert m.load_qualified_proof(config, run)[2] == inventory
+
+
+@pytest.mark.parametrize("broken", [
+    "cause", "extra_chain", "fault_note", "live", "progress", "recipe", "old_nonzero",
+    "old_row_missing", "cleanup_error", "restore_pending", "trial_pending", "trial_failure",
+    "trial_host", "trial_run", "request", "request_hash", "source", "restored_p",
+    "restored_acceleration", "original_status", "original_current", "original_temperature",
+    "original_hash", "restore_read", "restore_byte", "restore_lock", "restore_late",
+    "event_error", "powered_event", "fresh_lift", "fresh_thermal", "fresh_nonzero", "age", "boot",
+])
+def test_follower_baseline_expired_origin_denies_drift_or_unqualified_fresh_proof(tmp_path, monkeypatch, broken):
+    m, config, run, proof, state = follower_baseline_expired_fixture(tmp_path, monkeypatch)
+    old = run["physical_result"]["readback"]
+    rb = old["readback"]
+    trial = rb["left_response_p_trial"]
+    if broken == "cause":
+        cause = "RuntimeError: unrelated powered feedback fault"
+        old["first_cause"] = run["native_first_cause"] = proof["original_first_cause"] = cause
+        old["first_error_chain"][0]["cause"] = cause
+    elif broken == "extra_chain": old["first_error_chain"].append({"cause": "hard fault", "notes": []})
+    elif broken == "fault_note": old["first_error_chain"][0]["notes"] = ["hard fault"]
+    elif broken == "live": run["native_live_at"] = 525863.0
+    elif broken == "progress": run["progress_s"] = .01
+    elif broken == "recipe": run["recipe"] = "physical-short-sweep"
+    elif broken == "old_nonzero": rb["readbacks"][0]["value"] = 1
+    elif broken == "old_row_missing": rb["readbacks"].pop()
+    elif broken == "cleanup_error": rb["cleanup_errors"] = ["failed"]
+    elif broken == "restore_pending": rb["selected_gain_restore_required"] = True
+    elif broken == "trial_pending": trial["restore_required"] = True
+    elif broken == "trial_failure": trial["first_failure"] = {"message": "hard fault"}
+    elif broken in {"trial_host", "trial_run"}: trial["binding"]["host_incarnation" if broken == "trial_host" else "run_id"] = str(uuid.uuid4())
+    elif broken == "request": trial["binding"]["request"]["workload_segment"] = "left-reach"
+    elif broken == "request_hash": trial["binding"]["request_sha256"] = "0" * 64
+    elif broken == "source": proof["source"]["motor_head"] = "0" * 40
+    elif broken == "restored_p": trial["restored_p_readback"] = 32
+    elif broken == "restored_acceleration": trial["restored_acceleration_readback"] = 254
+    elif broken == "original_status": trial["original_registers"]["Status"] = 32
+    elif broken == "original_current": trial["original_registers"]["Present_Current"] = 400
+    elif broken == "original_temperature": trial["original_registers"]["Present_Temperature"] = 70
+    elif broken == "original_hash": trial["original_settings_sha256"] = "0" * 64
+    elif broken == "restore_read": trial["events"][0]["value"] += 1
+    elif broken == "restore_byte": trial["events"][-1]["value"] += 1
+    elif broken == "restore_lock": trial["events"] = [row for row in trial["events"] if row["phase"] != "restore_original_lock_verify"]
+    elif broken == "restore_late": trial["restored_at_monotonic_s"] = rb["completed_at_monotonic_s"] + 1
+    elif broken == "event_error": trial["events"][0]["error"] = "read failed"
+    elif broken == "powered_event":
+        trial["events"].insert(0, {**trial["events"][0], "operation": "write", "register": "Torque_Enable", "value": 1})
+    elif broken == "fresh_lift": proof["readback"].pop("lift_stationary")
+    elif broken == "fresh_thermal": proof["readback"]["lift_stationary"]["temperature_ready"] = False
+    elif broken == "fresh_nonzero": proof["readback"]["readbacks"][0]["value"] = 1
+    elif broken == "age": proof["completed_at_monotonic_s"] -= 181
+    elif broken == "boot": proof["boot_id"] = str(uuid.uuid4())
+    publish_incomplete_fixture(config, run, proof, state)
+    with pytest.raises((ValueError, RuntimeError)):
+        m.load_qualified_proof(config, run)
+
+
+def test_follower_baseline_expired_new_marker_after_validation_prevents_ack(tmp_path, monkeypatch):
+    m, config, run, proof, state = follower_baseline_expired_fixture(tmp_path, monkeypatch)
+    publish_incomplete_fixture(config, run, proof, state)
+    actual, raw, inventory = m.load_qualified_proof(config, run)
+    (state / m.MARKERS[1]).write_bytes(b"new owner")
+    with pytest.raises((ValueError, RuntimeError)):
+        m.archive_and_ack(config, actual, raw, inventory, str(uuid.uuid4()))
+
+
+@pytest.mark.parametrize("broken", [
+    "register:Homing_Offset", "register:Min_Position_Limit", "register:Max_Position_Limit",
+    "register:Firmware_Minor_Version", "frozen_missing", "frozen_value", "frozen_bool",
+    "frozen_extra", "request_version_missing", "request_version_bool", "request_id_missing",
+    "request_id_invalid", "request_extra", "binding_version_missing", "binding_extra", "schema_missing",
+])
+def test_follower_baseline_expired_origin_rejects_rehashed_incomplete_original(tmp_path, monkeypatch, broken):
+    m, config, run, proof, state = follower_baseline_expired_fixture(tmp_path, monkeypatch)
+    trial = run["physical_result"]["readback"]["readback"]["left_response_p_trial"]
+    if broken.startswith("register:"):
+        key = broken.split(":", 1)[1]
+        trial["original_registers"].pop(key)
+        trial["frozen_teleop_registers"].pop(key, None)
+        trial["events"] = [row for row in trial["events"] if row.get("register") != key]
+    elif broken == "frozen_missing": trial["frozen_teleop_registers"].pop("Homing_Offset")
+    elif broken == "frozen_value": trial["frozen_teleop_registers"]["Homing_Offset"] += 1
+    elif broken == "frozen_bool": trial["frozen_teleop_registers"]["Operating_Mode"] = False
+    elif broken == "frozen_extra": trial["frozen_teleop_registers"]["unexpected"] = 0
+    elif broken == "request_version_missing": trial["binding"]["request"].pop("version")
+    elif broken == "request_version_bool": trial["binding"]["request"]["version"] = True
+    elif broken == "request_id_missing": trial["binding"]["request"].pop("request_id")
+    elif broken == "request_id_invalid": trial["binding"]["request"]["request_id"] = "not-an-operation-id"
+    elif broken == "request_extra": trial["binding"]["request"]["unexpected"] = 0
+    elif broken == "binding_version_missing": trial["binding"].pop("version")
+    elif broken == "binding_extra": trial["binding"]["unexpected"] = 0
+    elif broken == "schema_missing": trial.pop("schema_version")
+    trial["original_settings_sha256"] = hashlib.sha256(canonical({
+        "registers": trial["original_registers"], "individual_bytes": trial["original_bytes"],
+    })).hexdigest()
+    trial["binding"]["request_sha256"] = hashlib.sha256(canonical(trial["binding"]["request"])).hexdigest()
+    publish_incomplete_fixture(config, run, proof, state)
+    with pytest.raises((ValueError, RuntimeError)):
+        m.load_qualified_proof(config, run)

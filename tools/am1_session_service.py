@@ -187,10 +187,13 @@ class Peer:
         # Grant only: reserve the bounded final diagnostic mark within the same cap.
         reservation = 80 if grant_reply else 0
         size = len(data) + reservation
-        if snapshot:
+        if snapshot or self.bytes + self.inflight + size > 65536:
+            # Queued optional status yields to replies; in-flight data and replies stay exact.
             self.queue = deque(item for item in self.queue if not item[1])
             self.bytes = sum(len(item[0]) + item[2] for item in self.queue)
         if self.bytes + self.inflight + size > 65536:
+            if snapshot:
+                return False
             self.closed = True
             asyncio.create_task(close_socket(self.ws, self.ws._writer.transport, 1013))
             return False
@@ -765,15 +768,18 @@ class Gateway:
         self.pending_ws += 1
         pending = True
         ws = web.WebSocketResponse(
-            timeout=0.5, max_msg_size=CONTROL_LIMIT, heartbeat=2, compress=False, writer_limit=4096
+            timeout=0.5, max_msg_size=CONTROL_LIMIT, heartbeat=6, compress=False, writer_limit=4096
         )
         peer = None
+        stage = "transport_setup"
         try:
             # Bound transport buffering as well as serialized application output.
             request.transport.set_write_buffer_limits(high=4096, low=1024)
             request.transport.get_extra_info("socket").setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
             await ws.prepare(request)
-            first = await asyncio.wait_for(ws.receive(), 1)
+            stage = "ticket_wait"
+            first = await asyncio.wait_for(ws.receive(), 3)
+            stage = "ticket_decode"
             if first.type != WSMsgType.TEXT:
                 raise ValueError("ticket required")
             payload = strict_json(first.data)
@@ -784,6 +790,7 @@ class Gateway:
                 or len(payload["ticket"]) > 128
             ):
                 raise ValueError("ticket")
+            stage = "ticket_verify"
             key = digest(payload["ticket"])
             record = self.tickets.get(key)
             device = self.auth.resolve(request["token"])
@@ -800,26 +807,34 @@ class Gateway:
             self.pending_ws -= 1
             pending = False
             peer.revision = self.next_revision()
+            stage = "initial_snapshot"
             peer.put({"kind": "snapshot", "revision": peer.revision, "snapshot": await self.current()}, True)
             count, since = 0, time.monotonic()
+            stage = "stream_receive"
             async for message in ws:
                 if message.type != WSMsgType.TEXT:
                     break
+                stage = "rate_limit"
                 now = time.monotonic()
                 if now - since >= 1:
                     count, since = 0, now
                 count += 1
                 if count > 40:
                     break
+                stage = "device_auth"
                 device = self.auth.resolve(peer.token)
                 if not device:
                     break
+                stage = "command_decode"
                 value = strict_json(message.data)
                 if isinstance(value, dict) and set(value) == {"ack"}:
+                    stage = "snapshot_ack"
                     if value["ack"] != peer.revision:
                         raise ValueError("snapshot acknowledgement")
                     peer.ack = True
+                    stage = "stream_receive"
                     continue
+                stage = "command_envelope"
                 if (
                     not isinstance(value, dict)
                     or set(value) != {"id", "command"}
@@ -828,8 +843,12 @@ class Gateway:
                     or not isinstance(value["command"], dict)
                 ):
                     raise ValueError("command envelope")
+                stage = "command_enqueue"
                 self.enqueue(peer, value, received_at=now)
+                stage = "stream_receive"
         except ReportingError as exc:
+            with contextlib.suppress(Exception):
+                request.app.logger.warning("AM1 WSS close stage=%s exception=%s", stage, type(exc).__name__[:48])
             with contextlib.suppress(TimeoutError, ConnectionError):
                 await asyncio.wait_for(
                     ws.send_str(encode(dict(exc.result, kind="unavailable")).decode()), 0.5
@@ -843,8 +862,15 @@ class Gateway:
             ConnectionError,
             OSError,
             asyncio.IncompleteReadError,
-        ):
+        ) as exc:
+            with contextlib.suppress(Exception):
+                request.app.logger.warning("AM1 WSS close stage=%s exception=%s", stage, type(exc).__name__[:48])
             await close_socket(ws, request.transport, 1008)
+        else:
+            with contextlib.suppress(Exception):
+                error = ws.exception()
+                request.app.logger.warning("AM1 WSS close stage=%s exception=%s", stage,
+                                           "None" if error is None else type(error).__name__[:48])
         finally:
             if pending:
                 self.pending_ws -= 1
@@ -862,12 +888,14 @@ class Gateway:
                         ):
                             await self.call(
                                 {
-                                    "op": "release_input",
+                                    "op": ("transport_detach" if state["run"]["recipe"] in {*LIVE_ELBOW_SPECS, TELEOP_RECIPE}
+                                           else "release_input"),
                                     "run_id": state["run"]["run_id"],
                                     "service_incarnation": state["service_incarnation"],
                                     "controller_generation": controller["controller_generation"],
                                     "connection_generation": peer.connection,
-                                    **({"host_incarnation": state.get("evidence", {}).get("host_incarnation")}
+                                    **({"host_incarnation": state.get("evidence", {}).get("host_incarnation"),
+                                        "intent_revision": state["run"].get("intent_revision")}
                                        if state["run"]["recipe"] in {*LIVE_ELBOW_SPECS, TELEOP_RECIPE} else {}),
                                 },
                                 peer.device,

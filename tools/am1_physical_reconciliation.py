@@ -20,6 +20,7 @@ CACHE_S = 5.0
 INCOMPLETE_PREACTIVATION_ORIGIN = "preactivation-lift-unqualified"
 PREHOME_COOL_STALE_ORIGIN = "prehome-cool-thermal-stale-lift-unqualified"
 PRECONFIGURE_COOL_STALE_ORIGIN = "preconfigure-cool-thermal-stale-lift-unqualified"
+FOLLOWER_BASELINE_EXPIRED_ORIGIN = "preconfigure-follower-baseline-expired-lift-unqualified"
 PREIMPORT_STOP_ORIGIN = "preimport-stop-missing-host-receipt"
 RESPONSE_BASELINE_REFUSED_ORIGIN = "preconfigure-left-response-baseline-refused-lift-unqualified"
 RESPONSE_GOAL_RESTORE_ORIGIN = "preconfigure-left-response-goal-restore-incomplete-lift-unqualified"
@@ -280,6 +281,29 @@ def _validate_prehome_cool_stale_origin(run, receipt, chain, *, configure=False)
         )
 
 
+def _response_origin_settings():
+    expected = {
+            "Model_Number": 777, "Firmware_Major_Version": 3, "Firmware_Minor_Version": 10,
+            "Operating_Mode": 0, "Torque_Enable": 0, "Lock": 0, "P_Coefficient": 16,
+            "I_Coefficient": 0, "D_Coefficient": 32, "Min_Position_Limit": 864,
+            "Max_Position_Limit": 3073, "ID": 3, "Homing_Offset": 1845, "Phase": 12,
+            "Max_Torque_Limit": 1000, "Torque_Limit": 1000, "CW_Dead_Zone": 1,
+            "CCW_Dead_Zone": 1, "Acceleration": 254, "Maximum_Acceleration": 254,
+            "Goal_Time": 0, "Goal_Velocity": 0, "Protection_Current": 310,
+            "Max_Temperature_Limit": 70, "Min_Voltage_Limit": 40, "Max_Voltage_Limit": 140,
+            "Protective_Torque": 20, "Protection_Time": 200, "Overload_Torque": 80,
+            "Over_Current_Protection_Time": 200, "Velocity_closed_loop_P_proportional_coefficient": 10,
+            "Velocity_closed_loop_I_integral_coefficient": 200, "Present_Current": 0, "Status": 0,
+        }
+    frozen_keys = {
+            "ID", "Model_Number", "Firmware_Major_Version", "Firmware_Minor_Version",
+            "Min_Position_Limit", "Max_Position_Limit", "Homing_Offset", "Phase", "P_Coefficient",
+            "I_Coefficient", "D_Coefficient", "Acceleration", "Maximum_Acceleration", "Protection_Current",
+            "Max_Temperature_Limit", "Min_Voltage_Limit", "Max_Voltage_Limit", "Operating_Mode",
+        }
+    return expected, frozen_keys
+
+
 def _validate_response_baseline_refused_origin(run, proof, receipt, chain):
     """This old refusal grants no readiness; the independent fresh stopped proof does."""
     cause = "RuntimeError: Selected elbow response P actual stopped baseline differs from its reviewed original"
@@ -343,19 +367,7 @@ def _validate_response_baseline_refused_origin(run, proof, receipt, chain):
     )
     for value in (request["request_id"], request["boot_id"]):
         require(type(value) is str and str(uuid.UUID(value)) == value, "canonical original request identity required")
-    expected = {
-        "Model_Number": 777, "Firmware_Major_Version": 3, "Firmware_Minor_Version": 10,
-        "Operating_Mode": 0, "Torque_Enable": 0, "Lock": 0, "P_Coefficient": 16,
-        "I_Coefficient": 0, "D_Coefficient": 32, "Min_Position_Limit": 864,
-        "Max_Position_Limit": 3073, "ID": 3, "Homing_Offset": 1845, "Phase": 12,
-        "Max_Torque_Limit": 1000, "Torque_Limit": 1000, "CW_Dead_Zone": 1,
-        "CCW_Dead_Zone": 1, "Acceleration": 254, "Maximum_Acceleration": 254,
-        "Goal_Time": 0, "Goal_Velocity": 0, "Protection_Current": 310,
-        "Max_Temperature_Limit": 70, "Min_Voltage_Limit": 40, "Max_Voltage_Limit": 140,
-        "Protective_Torque": 20, "Protection_Time": 200, "Overload_Torque": 80,
-        "Over_Current_Protection_Time": 200, "Velocity_closed_loop_P_proportional_coefficient": 10,
-        "Velocity_closed_loop_I_integral_coefficient": 200, "Present_Current": 0, "Status": 0,
-    }
+    expected, frozen_keys = _response_origin_settings()
     registers, individual = trial["original_registers"], trial["original_bytes"]
     # This exact OFF/no-write state is an origin only, never powered readiness.
     volatile_stopped = (current_rest and isinstance(registers, dict)
@@ -379,12 +391,7 @@ def _validate_response_baseline_refused_origin(run, proof, receipt, chain):
         and trial["original_settings_sha256"] == sha(canonical({"registers": registers, "individual_bytes": individual})),
         "only reviewed out-of-corridor or volatile OFF baseline with unchanged safe stopped settings required",
     )
-    frozen_keys = {
-        "ID", "Model_Number", "Firmware_Major_Version", "Firmware_Minor_Version",
-        "Min_Position_Limit", "Max_Position_Limit", "Homing_Offset", "Phase", "P_Coefficient",
-        "I_Coefficient", "D_Coefficient", "Acceleration", "Maximum_Acceleration", "Protection_Current",
-        "Max_Temperature_Limit", "Min_Voltage_Limit", "Max_Voltage_Limit", "Operating_Mode",
-    }
+
     frozen = trial["frozen_teleop_registers"]
     require(
         isinstance(frozen, dict) and set(frozen) == frozen_keys
@@ -422,6 +429,113 @@ def _validate_response_baseline_refused_origin(run, proof, receipt, chain):
         observed.add(key)
         previous = completed
     require(observed == set(registers) | {24, 25}, "complete original baseline register/byte reads required")
+
+
+def _validate_follower_baseline_expired_origin(run, proof, receipt, chain):
+    """An original OFF configure deadline grants no powered or lift readiness."""
+    cause = "RuntimeError: AM1 teleop original follower baseline acquisition expired"
+    rb = receipt["readback"]
+    trial = rb.get("left_response_p_trial") or {}
+    require(isinstance(trial, dict) and type(trial.get("schema_version")) is int
+            and trial["schema_version"] == 1, "versioned original restored trial required")
+    binding = trial.get("binding") or {}
+    require(isinstance(binding, dict)
+        and set(binding) == {"version", "kind", "run_id", "host_incarnation", "request_sha256", "request"}
+        and type(binding.get("version")) is int and binding["version"] == 1,
+        "closed original restored trial binding required")
+    request = binding.get("request") or {}
+    require(isinstance(request, dict)
+        and set(request) == {"version", "kind", "request_id", "source_head", "proportional",
+                            "workload_segment", "boot_id", "expires_at_monotonic_s",
+                            "workspace_profile", "left_shoulder_startup_degrees"}
+        and type(request.get("version")) is int and request["version"] == 1,
+        "closed original ordinary response request required")
+    for value in (request["request_id"], request["boot_id"]):
+        require(type(value) is str and str(uuid.UUID(value)) == value,
+                "canonical original request identity required")
+    source = proof.get("source") or {}
+    require(
+        run.get("recipe") == "physical-live-teleop"
+        and receipt["first_cause"] == cause and chain == [{"cause": cause, "notes": []}]
+        and trial.get("kind") == "left-response-p" and trial.get("motor") == "arm_left_elbow_flex"
+        and type(trial.get("motor_id")) is int and trial["motor_id"] == 3
+        and trial.get("state") == trial.get("status") == "restored"
+        and trial.get("restore_required") is False and "first_failure" not in trial
+        and "active_verified" not in trial and "active_registers" not in trial
+        and binding.get("run_id") == run["run_id"]
+        and binding.get("host_incarnation") == proof["host_incarnation"]
+        and request.get("source_head") == source.get("motor_head")
+        == (source.get("backend_contract") or {}).get("host_head")
+        and request.get("boot_id") == proof.get("boot_id")
+        and request.get("kind") == binding.get("kind") == "left-response-p"
+        and type(request.get("proportional")) is int and request["proportional"] == 32
+        and request.get("workload_segment") == "ordinary-arms"
+        and request.get("workspace_profile") == "ordinary-arms-left-current-rest-1051-1164"
+        and type(request.get("left_shoulder_startup_degrees")) is int
+        and request["left_shoulder_startup_degrees"] == 1
+        and binding.get("request_sha256") == sha(canonical(request)),
+        "exact direct pre-Live follower expiry with restored same-owner ordinary trial required",
+    )
+    registers, individual = trial.get("original_registers"), trial.get("original_bytes")
+    expected, frozen_keys = _response_origin_settings()
+    expected["Acceleration"] = 0
+    expected.pop("Present_Current")  # A healthy stopped current is bounded below, not invented as zero.
+    require(
+        isinstance(registers, dict)
+        and set(registers) == set(expected) | {"Present_Position", "Goal_Position", "Present_Current",
+                                              "Present_Voltage", "Present_Temperature"}
+        and all(type(v) is int for v in registers.values())
+        and all(registers.get(key) == value for key, value in expected.items())
+        and 1051 <= registers.get("Present_Position", -1) <= 1164
+        and registers.get("Goal_Position") == registers["Present_Position"]
+        and abs(registers.get("Present_Current", math.inf)) < registers.get("Protection_Current", 0)
+        and 0 <= registers.get("Present_Temperature", -1) < registers.get("Max_Temperature_Limit", 0) <= 100
+        and 0 < registers.get("Min_Voltage_Limit", 0) <= registers.get("Present_Voltage", -1)
+        <= registers.get("Max_Voltage_Limit", 0) <= 255
+        and individual == {"24": 16, "25": 0} and all(type(v) is int for v in individual.values())
+        and trial.get("original_settings_sha256") == sha(canonical({"registers": registers, "individual_bytes": individual}))
+        and trial.get("selected_acceleration_profile") == {"version": 1, "original_raw": 0, "active_raw": 254, "maximum_raw": 254}
+        and type(trial.get("restored_p_readback")) is int and trial["restored_p_readback"] == 16
+        and type(trial.get("restored_acceleration_readback")) is int and trial["restored_acceleration_readback"] == 0,
+        "original healthy OFF settings and complete P16/Acceleration0 restoration required",
+    )
+    frozen = trial.get("frozen_teleop_registers")
+    require(isinstance(frozen, dict) and set(frozen) == frozen_keys
+        and all(type(value) is int and value == registers[key] for key, value in frozen.items()),
+        "complete unchanged original frozen teleop settings required")
+    prepared, configured, restored = (trial.get(key) for key in (
+        "prepared_at_monotonic_s", "configured_at_monotonic_s", "restored_at_monotonic_s"))
+    expiry = request.get("expires_at_monotonic_s")
+    require(all(number(v) for v in (prepared, configured, restored, expiry))
+        and 0 <= prepared <= configured < expiry and configured <= restored <= rb["started_at_monotonic_s"],
+        "original ordered selected preparation/configuration/restoration required")
+    events = trial.get("events")
+    require(isinstance(events, list) and events, "actual restored settings reads required")
+    reads, previous = {}, 0.0
+    for row in events:
+        require(isinstance(row, dict) and not {"error", "error_type", "reconciled"}.intersection(row),
+                "original selected event errors cannot qualify")
+        start, end = row.get("started_at_monotonic_s"), row.get("completed_at_monotonic_s")
+        require(number(start) and number(end) and previous <= start <= end <= restored
+                and type(row.get("value")) is int, "ordered bounded original selected events required")
+        previous = end
+        key = row.get("register") if "register" in row else row.get("address")
+        if row.get("operation") == "write":
+            require(row.get("register") in {"Torque_Enable", "Lock", "P_Coefficient", "Acceleration"}
+                and row["value"] in {"Torque_Enable": (0,), "Lock": (0, 1), "P_Coefficient": (16, 32),
+                                      "Acceleration": (0, 254)}[row["register"]],
+                "pre-Live selected transaction cannot contain powered or other writes")
+        else:
+            require(row.get("operation") == "read" and (key != "Status" or row["value"] == 0),
+                    "original selected hard-status fault cannot qualify")
+            reads[(row.get("phase"), key)] = row["value"]
+    preserved = set(registers) - {"P_Coefficient", "Torque_Enable", "Lock", "Present_Position", "Goal_Position",
+                                  "Present_Current", "Present_Voltage", "Present_Temperature", "Status"}
+    require(all(reads.get(("restored", key)) == registers[key] for key in preserved | {"P_Coefficient"})
+        and all(reads.get(("restored", int(key))) == value for key, value in individual.items())
+        and reads.get(("restored_acceleration", "Acceleration")) == 0
+        and reads.get(("restore_original_lock_verify", "Lock")) == 0,
+        "actual unchanged preserved settings/bytes/P16/Acceleration0/Lock0 readbacks required")
 
 
 def _validate_stopped_response_completion(run, proof):
@@ -783,7 +897,7 @@ def validate_cleanup_origin(run, proof, receipt):
         return False
     require(
         origin in (INCOMPLETE_PREACTIVATION_ORIGIN, PREHOME_COOL_STALE_ORIGIN,
-                   PRECONFIGURE_COOL_STALE_ORIGIN, RESPONSE_BASELINE_REFUSED_ORIGIN),
+                   PRECONFIGURE_COOL_STALE_ORIGIN, RESPONSE_BASELINE_REFUSED_ORIGIN, FOLLOWER_BASELINE_EXPIRED_ORIGIN),
         "unsupported original cleanup origin",
     )
     lifecycle, rb = run.get("physical_result") or {}, receipt.get("readback") or {}
@@ -825,7 +939,9 @@ def validate_cleanup_origin(run, proof, receipt):
         "only incomplete lift proof with otherwise actual known off cleanup may use this origin",
     )
     chain = receipt.get("first_error_chain")
-    if origin == RESPONSE_BASELINE_REFUSED_ORIGIN:
+    if origin == FOLLOWER_BASELINE_EXPIRED_ORIGIN:
+        _validate_follower_baseline_expired_origin(run, proof, receipt, chain)
+    elif origin == RESPONSE_BASELINE_REFUSED_ORIGIN:
         _validate_response_baseline_refused_origin(run, proof, receipt, chain)
     elif origin in (PREHOME_COOL_STALE_ORIGIN, PRECONFIGURE_COOL_STALE_ORIGIN):
         _validate_prehome_cool_stale_origin(run, receipt, chain, configure=origin == PRECONFIGURE_COOL_STALE_ORIGIN)
