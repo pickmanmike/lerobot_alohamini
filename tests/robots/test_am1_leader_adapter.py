@@ -8887,7 +8887,9 @@ def test_initial_claim_lost_result_reuses_live_authority_without_replaying_claim
     "renew_generation", "renew_expiry", "attach_loss", "final_generation", "final_run", "final_lease",
     "initial_generation", "initial_connection", "reader_error", "timeout", "expected_close", "wrong_close",
     "wrong_reason", "old_close", "command_precheck", "budget_spent", "spent_09", "attach_budget",
-    "missing_original_run", "missing_fresh_run", "missing_attached_run", "missing_final_run"])
+    "missing_original_run", "missing_fresh_run", "missing_attached_run", "missing_final_run",
+    "compact_terminal", "accepted_changed", "accepted_type", "accepted_missing", "accepted_added",
+    "accepted_bool", "accepted_nan"])
 def test_initial_claim_requalification_preserves_original_error_authority_and_one_second_budget(tmp_path, monkeypatch, change):
     import asyncio
     import copy
@@ -8907,7 +8909,11 @@ def test_initial_claim_requalification_preserves_original_error_authority_and_on
         "backend_incarnation": str(uuid4()), "status": "faulted", "uncertain": False, "cleanup": "physical_readback_verified",
         "first_cause": "feedback_loss", "native_first_cause": "retained actual first cause", "native_live_at": None,
         "deadline": None, "accepted_at": 90., "startup_deadline": 270., "intent_revision": 2, "execution": {"complete": False}}
-    terminal_case = change in {"terminal", "unsafe", "cause", "clock", "missing_identity", "missing_clock", "complete"}
+    compact = change in {"compact_terminal", "accepted_added"}
+    terminal_case = compact or change in {"terminal", "unsafe", "cause", "clock", "missing_identity", "missing_clock", "complete",
+                                         "accepted_changed", "accepted_type", "accepted_missing", "accepted_bool", "accepted_nan"}
+    if change in {"accepted_bool", "accepted_nan"}:
+        terminal["accepted_at"] = True if change == "accepted_bool" else float("nan")
     if change == "unsafe":
         terminal["uncertain"] = True
     if change == "missing_identity":
@@ -8921,6 +8927,15 @@ def test_initial_claim_requalification_preserves_original_error_authority_and_on
         value = authority.handle({"op": "snapshot"}, device)["snapshot"]
         if terminal_case:
             value["run"] = copy.deepcopy(terminal)  # Explicit synthetic known-cleanup last-run fields.
+        if compact:
+            # Same real Core compact projection as production /api/state;
+            # never hand-author a dictionary with the field removed.
+            value = authority._essential_status(value, value["evidence"])
+            expected = {"run_id", "operation_id", "recipe", "backend_incarnation", "status", "uncertain",
+                        "cleanup", "first_cause", "native_first_cause", "native_live_at", "deadline",
+                        "accepted_at", "startup_deadline", "intent_revision", "execution"}
+            assert expected - set(value["run"]) == {"accepted_at"}
+            assert "accepted_at" in terminal
         return value
 
     client = m.SessionClient.__new__(m.SessionClient)
@@ -8996,6 +9011,14 @@ def test_initial_claim_requalification_preserves_original_error_authority_and_on
             value["run"]["startup_deadline"] += 1
         if change == "complete":
             value["run"]["execution"]["complete"] = True
+        if change == "accepted_changed":
+            value["run"]["accepted_at"] = 91.
+        elif change == "accepted_type":
+            value["run"]["accepted_at"] = 90  # Numeric equality cannot hide a type change.
+        elif change == "accepted_missing":
+            value["run"].pop("accepted_at")
+        elif change == "accepted_added":
+            value["run"]["accepted_at"] = 90.
         if change == "missing_fresh_run" or change == "missing_final_run" and get_count[0] == 2:
             value.pop("run")
         return {"snapshot": value}
@@ -9035,7 +9058,7 @@ def test_initial_claim_requalification_preserves_original_error_authority_and_on
     client.command, client.detach, client.get, client.post, client.attach = command, detach, get, post, attach
 
     async def scenario():
-        if change in {None, "terminal", "accepted"}:
+        if change in {None, "terminal", "accepted", "compact_terminal"}:
             await client.claim()
             assert client.generation == generation[0] and pc[0] < 1001.
             assert [v[0] for v in calls] == (["command"] if change == "accepted" else

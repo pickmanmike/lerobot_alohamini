@@ -1824,8 +1824,11 @@ class SessionClient:
         old_run, old_controller = before.get("run"), before.get("controller")
         run_keys = ("run_id", "operation_id", "recipe", "backend_incarnation", "status", "uncertain",
                     "cleanup", "first_cause", "native_first_cause", "native_live_at", "deadline",
-                    "accepted_at", "startup_deadline", "intent_revision", "execution")
-        run_anchor = {key: old_run[key] for key in run_keys if key in old_run} if isinstance(old_run, dict) else None
+                    "startup_deadline", "intent_revision", "execution")
+        # Compact owner status omits accepted_at. When supplied, its presence,
+        # exact value and type remain anchored across every authenticated read.
+        anchor_keys = (*run_keys, "accepted_at")
+        run_anchor = {key: old_run[key] for key in anchor_keys if key in old_run} if isinstance(old_run, dict) else None
         initial = (self.generation is None and self.connection is None and self.transport_error is None
                    and self.transport_close is None and self.ws is not None and not self.ws.closed
                    and (self.reader is None or not self.reader.done()))
@@ -1859,7 +1862,7 @@ class SessionClient:
                   or run_anchor.get("status") not in {"stopped", "faulted", "interrupted"}
                   or run_anchor.get("cleanup") != "physical_readback_verified"
                   or run_anchor.get("uncertain") is not False or not isinstance(run, dict)
-                  or {key: run[key] for key in run_keys if key in run} != run_anchor
+                  or {key: run[key] for key in anchor_keys if key in run} != run_anchor
                   or any(type(run[key]) is not type(value) for key, value in run_anchor.items())
                   or type(run["execution"].get("complete")) is not bool):
                 raise RuntimeError("initial known-cleanup terminal run changed")
