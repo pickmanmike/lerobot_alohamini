@@ -2008,6 +2008,61 @@ class SessionClient:
                 error.empty_release_context = release_context
             raise
 
+        def initial_connected_phase(snapshot):
+            # Only the acknowledged first Connect + empty release may carry
+            # initial HOLD through a definitely nonadmitted view refusal.
+            try:
+                current, old = snapshot["run"], release_context["snapshot"]["run"]
+                live, before = _live(snapshot), _live(release_context["snapshot"])
+                actual = self.identities()
+                own = [row for row in snapshot.get("events", []) if row.get("run_id") == current["run_id"]
+                       and row.get("service_incarnation") == snapshot["service_incarnation"]]
+                stamps = [row.get("at") for row in own]
+                remaining, expiry = current.get("remaining_s"), (snapshot.get("controller") or {}).get("presence_expires")
+                return (getattr(self, "_ordinary_transport_recovery", False) is True
+                    and isinstance(connect_identity, dict) and set(connect_identity) == set(identity) == set(actual)
+                    and connect_identity.get("connection_generation") is None
+                    and type(connect_identity.get("intent_revision")) is int and connect_identity["intent_revision"] == 0
+                    and type(identity.get("intent_revision")) is int and identity["intent_revision"] == 1
+                    and all(type(v) is str and v for k, v in identity.items() if k != "intent_revision")
+                    and all(type(actual[k]) is type(v) and actual[k] == v for k, v in identity.items())
+                    and all(type(connect_identity[k]) is type(v) and connect_identity[k] == v for k, v in identity.items()
+                            if k not in {"intent_revision", "connection_generation"})
+                    and type(getattr(self, "sequence", None)) is int and self.sequence == 0
+                    and isinstance(released, dict) and all(type(released.get(k)) is type(v) and released[k] == v
+                        for k, v in {"accepted": True, "status": "released", "effect_admitted": False}.items())
+                    and current.get("recipe") == TELEOP_RECIPE and current.get("source") == "protected-physical-provider"
+                    and snapshot.get("evidence", {}).get("source") == current["source"]
+                    and current.get("bench_continuity") is False and current.get("status") == old.get("status") == "paused"
+                    and current.get("uncertain") is old.get("uncertain") is False and current.get("recovery") is None
+                    and current.get("first_cause") is current.get("native_first_cause") is None
+                    and type(current.get("recovery_episodes")) is int and current["recovery_episodes"] == 0
+                    and all(type(current.get(k)) is type(old.get(k)) and current.get(k) == old.get(k) for k in
+                        ("run_id", "recipe", "source", "operation_id", "backend_incarnation", "native_live_at", "deadline", "intent_revision"))
+                    and str(UUID(current["operation_id"])) == current["operation_id"]
+                    and live.get("workspace") == before.get("workspace") and live.get("reference") == before.get("reference")
+                    and live.get("workspace", {}).get("workspace_profile") == ORDINARY_ARMS_PROFILE
+                    and live.get("required_view", {}).get("required") is True
+                    and all(live.get("required_view", {}).get(k) == before.get("required_view", {}).get(k) for k in ("required", "role"))
+                    and type(live.get("last_input_seq")) is int and live["last_input_seq"] == -1
+                    and live.get("source") is None and live.get("valid_until_monotonic_s") is None
+                    and live.get("cursor") == live.get("accepted_target") and set(live.get("body") or {}) == set(ZERO_BODY)
+                    and all(type(v) in (int, float) and v == 0 for v in live["body"].values())
+                    and snapshot.get("evidence", {}).get("active_acknowledged") is False
+                    and [row.get("kind") for row in own] == ["start", "native_live_admitted", "observation_qualified"]
+                    and all(set(row) == {"kind", "at", "run_id", "service_incarnation"} for row in own)
+                    and all(type(v) in (int, float) and math.isfinite(v) for v in
+                        (*stamps, current.get("native_live_at"), current.get("deadline"), remaining, old.get("remaining_s"), expiry))
+                    and stamps[0] <= current["native_live_at"] <= stamps[1] <= stamps[2] < current["deadline"]
+                    and 0 < remaining <= old["remaining_s"] <= current["deadline"] - current["native_live_at"] <= 300.
+                    and stamps[2] + remaining <= current["deadline"] < expiry + remaining
+                    and all(type((snapshot.get("controller") or {}).get(k)) is type(v)
+                            and (snapshot.get("controller") or {}).get(k) == v
+                            for k, v in (release_context["snapshot"].get("controller") or {}).items()
+                            if k in {"device_id", "controller_generation"}))
+            except (KeyError, TypeError, ValueError):
+                return False
+
         def qualified():
             if check:
                 check(self.snapshot)
@@ -2032,6 +2087,7 @@ class SessionClient:
         if phase_ceiling is None:
             phase_ceiling = time.monotonic() + 8
         first_refusal, refused_identity, refused_event, refused_state, refused_context = None, None, None, None, None
+        initial_refusal = False
 
         def record_qualification(phase, current):
             if refusal_record is None:
@@ -2155,6 +2211,7 @@ class SessionClient:
                         or run.get("status") != "paused" or run.get("uncertain") is not False
                         or run.get("recovery") is not None or run.get("native_first_cause") or evidence.get("fault")
                         or _latest_run_event(self.snapshot, refused_identity) != refused_event
+                        or initial_refusal and not initial_connected_phase(self.snapshot)
                         or live.get("reference") != _live(refused_state).get("reference")
                         or live.get("workspace") != _live(refused_state).get("workspace")
                         or type(current_remaining) not in (int, float) or not math.isfinite(current_remaining)
@@ -2219,6 +2276,10 @@ class SessionClient:
                     first = first_refusal is None
                     if first:
                         first_refusal = refusal
+                    initial = (reason == "current required selected view must advance before Resume"
+                               and initial_connected_phase(sent_state))
+                    if first:
+                        initial_refusal = initial
                     if (
                         type(identity["intent_revision"]) is not int or identity["intent_revision"] < 0
                         or any(type(v) is not str or not v for k, v in identity.items() if k != "intent_revision")
@@ -2226,7 +2287,7 @@ class SessionClient:
                         or run.get("recovery") is not None or run.get("native_first_cause")
                         or self.snapshot.get("evidence", {}).get("fault")
                         or set(prior_event) != {"kind", "at", "run_id", "service_incarnation"}
-                        or prior_event.get("kind") not in _ordinary_pause_kinds(self)
+                        or prior_event.get("kind") not in _ordinary_pause_kinds(self) and not initial
                         or any(type(v) not in (int, float) or not math.isfinite(v)
                                for v in (prior_event.get("at"), pi_lower_bound))
                         or not run["native_live_at"] <= prior_event["at"] < run["deadline"]
