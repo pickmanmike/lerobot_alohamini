@@ -3182,3 +3182,177 @@ def test_poll_observation_keeps_original_rings_and_frozen_first_expiry_size(caps
     before_bytes = len(json.dumps(without_poll, allow_nan=False, separators=(",", ":")).encode())
     print("WORKER_POLL_TRACE_BYTES", len(raw), "PRIOR_FIELDS_BYTES", before_bytes,
           "ADDED_BYTES", len(raw) - before_bytes, "ROWS", 32, 32)
+
+
+@pytest.mark.parametrize("status", ["running", "resuming"])
+def test_transport_detach_exact_current_core_context_pauses_without_replaying_input(tmp_path, status):
+    a, e, ids = authority_lane(tmp_path)
+    try:
+        a._teleop_view = {"run_id": e.run_id, "qualified_until": 10.4}
+        grant = a._handle(dict(op="grant", **ids), "pc")
+        packet = dict(op="input", **ids, grant_id=grant["grant_id"], seq=1,
+                      source=source(grant=grant["grant_id"]), target=dict.fromkeys(KEYS, 5.),
+                      body={"x.vel": 0., "y.vel": 0., "theta.vel": 0., "lift_axis.vel": 0.})
+        assert a._handle(packet, "pc")["accepted"]
+        a.run["status"] = status
+        before = copy.deepcopy(a.run)
+        workspace_before = copy.deepcopy(e.sample["ack"]["live_input"]["workspace"])
+        detached = a._handle(dict(op="transport_detach", **ids), "pc")
+        assert detached["accepted"], detached
+        assert a.run["status"] == "paused" and a.run["intent_revision"] == ids["intent_revision"] + 1
+        assert a.events[-1]["kind"] == "transport_connection_lost"
+        assert a.connection["transport_detached_revision"] == a.run["intent_revision"]
+        assert a.run["intent"] is None and a.grant is a.applied_input is None and e._live_target is None
+        assert a.run["input_source"] == before["input_source"]
+        assert a.run["deadline"] == before["deadline"] and a.run["native_live_at"] == before["native_live_at"]
+        assert e.sample["ack"]["live_input"]["workspace"] == workspace_before
+        assert not a._handle(dict(op="grant", **ids), "pc")["accepted"]
+    finally:
+        a.run = None
+        a.close()
+
+
+@pytest.mark.parametrize("fault", ["run_id", "service_incarnation", "controller_generation",
+    "connection_generation", "host_incarnation", "intent_revision", "revision_bool", "extra", "lease", "device", "intent_cancelled"])
+def test_transport_detach_refuses_stale_or_foreign_context_before_mutation(tmp_path, fault):
+    a, e, ids = authority_lane(tmp_path)
+    try:
+        _bench_intent(a)
+        command = dict(op="transport_detach", **ids)
+        device = "pc"
+        if fault in ids:
+            command[fault] = ids[fault] + 1 if fault == "intent_revision" else str(uuid4())
+        elif fault == "revision_bool":
+            command["intent_revision"] = False
+        elif fault == "extra":
+            command["origin"] = "server"
+        elif fault == "lease":
+            a.controller["expires"] = 10.
+        elif fault == "device":
+            device = "other"
+        else:
+            a.run["control_intent"].update(eligible=False, invalidated_by="release")
+        before = copy.deepcopy((a.run, a.connection, a.controller, a.events, a.released))
+        assert not a._handle(command, device)["accepted"]
+        assert (a.run, a.connection, a.controller, a.events, a.released) == before
+    finally:
+        a.run = None
+        a.close()
+
+
+@pytest.mark.parametrize("newer", ["pause", "stop", "release_input", "release", "handoff", "input_expired"])
+def test_transport_detach_never_relabels_a_newer_manual_or_expiry_pause(tmp_path, newer):
+    a, e, ids = authority_lane(tmp_path)
+    try:
+        if newer == "input_expired":
+            a._pause_live_input("input_expired")
+        else:
+            command = dict(op=newer, run_id=a.run["run_id"], operation_id=str(uuid4()))
+            if newer == "release_input":
+                command = dict(op=newer, **ids)
+            elif newer == "handoff":
+                command["target_device_id"] = "other"
+            assert a._handle(command, "pc")["accepted"]
+        before = copy.deepcopy((a.run, a.connection, a.controller, a.events, a.released))
+        assert not a._handle(dict(op="transport_detach", **ids), "pc")["accepted"]
+        assert (a.run, a.connection, a.controller, a.events, a.released) == before
+        if newer == "input_expired":
+            current = dict(ids, intent_revision=a.run["intent_revision"])
+            connected = a._handle(dict(op="connect", **current), "pc")
+            assert connected["accepted"] and connected["connection_generation"] != ids["connection_generation"]
+            assert a.events[-1]["kind"] == "input_expired"
+            assert not a._handle(dict(op="transport_detach", **ids), "pc")["accepted"]
+    finally:
+        a.run = None
+        a.close()
+
+
+@pytest.mark.parametrize("fresh_connect", [False, True])
+def test_transport_detach_newer_explicit_release_wins_but_fresh_connect_rearm_is_unchanged(tmp_path, fresh_connect):
+    a, e, ids = authority_lane(tmp_path)
+    try:
+        assert a._handle(dict(op="transport_detach", **ids), "pc")["accepted"]
+        paused_revision = a.run["intent_revision"]
+        current = dict(ids, intent_revision=paused_revision)
+        if fresh_connect:
+            connected = a._handle(dict(op="connect", **current), "pc")
+            assert connected["accepted"]
+            current.update(connection_generation=connected["connection_generation"], intent_revision=a.run["intent_revision"])
+            assert "transport_detached_revision" not in a.connection
+        before = a.run["intent_revision"]
+        assert a._handle(dict(op="release_input", **current), "pc")["accepted"]
+        assert a.events[-1]["kind"] == ("transport_connection_lost" if fresh_connect else "input_released")
+        assert a.run["intent_revision"] == before + (0 if fresh_connect else 1)
+        assert "transport_detached_revision" not in a.connection
+        assert not a._handle(dict(op="transport_detach", **ids), "pc")["accepted"]
+    finally:
+        a.run = None
+        a.close()
+
+
+
+def test_transport_detached_connection_public_release_is_newer_manual_intent(tmp_path):
+    a, e, ids = authority_lane(tmp_path)
+    try:
+        # Arrange the real Core's paused state at the new private connection boundary.
+        a._pause_live_input("transport_connection_lost")
+        a.connection["transport_detached_revision"] = a.run["intent_revision"]
+        before = a.run["intent_revision"]
+        assert a._handle(dict(op="release_input", **dict(ids, intent_revision=before)), "pc")["accepted"]
+        assert a.events[-1]["kind"] == "input_released"
+        assert a.run["intent_revision"] == before + 1
+        assert "transport_detached_revision" not in a.connection
+    finally:
+        a.run = None
+        a.close()
+
+
+
+def test_transport_detach_core_leading_tick_preserves_actual_input_expiry(tmp_path):
+    a, e, ids = authority_lane(tmp_path)
+    now = [10.]
+    a.clock = e.clock = lambda: now[0]
+    try:
+        a._teleop_view = {"run_id": e.run_id, "qualified_until": 11.}
+        grant = a._handle(dict(op="grant", **ids), "pc")
+        packet = dict(op="input", **ids, grant_id=grant["grant_id"], seq=1,
+                      source=source(grant=grant["grant_id"]), target=dict.fromkeys(KEYS, 5.),
+                      body={"x.vel": 0., "y.vel": 0., "theta.vel": 0., "lift_axis.vel": 0.})
+        assert a._handle(packet, "pc")["accepted"]
+        now[0] = 10.251
+        result = a.handle(dict(op="transport_detach", **ids), "pc")
+        assert result["accepted"] is False and a.run["status"] == "paused"
+        assert any(event["kind"] == "input_expired" for event in a.events)
+        assert all(event["kind"] != "transport_connection_lost" for event in a.events)
+        assert "transport_detached_revision" not in a.connection
+    finally:
+        a.run = None
+        a.close()
+
+
+@pytest.mark.parametrize("newer", ["pause", "stop"])
+def test_transport_detached_marker_cannot_override_newer_manual_revision(tmp_path, newer):
+    a, e, ids = authority_lane(tmp_path)
+    try:
+        assert a._handle(dict(op="transport_detach", **ids), "pc")["accepted"]
+        assert a._handle(dict(op=newer, run_id=a.run["run_id"], operation_id=str(uuid4())), "pc")["accepted"]
+        revision, events = a.run["intent_revision"], copy.deepcopy(a.events)
+        result = a._handle(dict(op="release_input", **dict(ids, intent_revision=revision)), "pc")
+        assert result["accepted"] is (newer == "pause")
+        assert a.run["intent_revision"] == revision and a.events == events
+        assert a.events[-1]["kind"] != "input_released"
+    finally:
+        a.run = None
+        a.close()
+
+
+@pytest.mark.parametrize("forged", [{"origin": "transport"}, {"release_kind": "transport_detach"}])
+def test_transport_detach_public_release_cannot_supply_private_provenance(tmp_path, forged):
+    a, e, ids = authority_lane(tmp_path)
+    try:
+        before = copy.deepcopy((a.run, a.connection, a.events))
+        assert not a._handle(dict(op="release_input", **ids, **forged), "pc")["accepted"]
+        assert (a.run, a.connection, a.events) == before
+    finally:
+        a.run = None
+        a.close()

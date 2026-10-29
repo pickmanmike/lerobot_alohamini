@@ -865,12 +865,14 @@ class Gateway:
                         ):
                             await self.call(
                                 {
-                                    "op": "release_input",
+                                    "op": ("transport_detach" if state["run"]["recipe"] in {*LIVE_ELBOW_SPECS, TELEOP_RECIPE}
+                                           else "release_input"),
                                     "run_id": state["run"]["run_id"],
                                     "service_incarnation": state["service_incarnation"],
                                     "controller_generation": controller["controller_generation"],
                                     "connection_generation": peer.connection,
-                                    **({"host_incarnation": state.get("evidence", {}).get("host_incarnation")}
+                                    **({"host_incarnation": state.get("evidence", {}).get("host_incarnation"),
+                                        "intent_revision": state["run"].get("intent_revision")}
                                        if state["run"]["recipe"] in {*LIVE_ELBOW_SPECS, TELEOP_RECIPE} else {}),
                                 },
                                 peer.device,

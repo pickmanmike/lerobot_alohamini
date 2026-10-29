@@ -286,25 +286,17 @@ def test_physical_live_wss_close_releases_selected_run_before_sample_expiry(clus
 
     from tests.robots.test_am1_live_native import ExecutorNativeHost
     from tests.robots.test_am1_physical_executor import executor
-    from tools.am1_session_core import SessionAuthority
+    from tools.am1_session_ipc import OwnerServer
     from tools.am1_session_service import Gateway
 
     host = ExecutorNativeHost()
     e = executor(host)
-    authority = SessionAuthority(tmp_path / "physical-authority", executor=e)
+    owner = OwnerServer(tmp_path / "physical-authority", executor=e)
+    authority = owner.authority
 
     async def scenario():
-        gateway = Gateway(cluster.owner_dir, tmp_path / "physical-gateway-auth")
-
-        async def local_owner_request(command, device):
-            # Preserve the actual gateway/TLS/WSS/auth and real authority/worker;
-            # replace only transport to the owner with this local test boundary.
-            authority.tick()
-            if command["op"] == "snapshot":
-                return {"snapshot": authority.snapshot()}
-            return authority.handle(command, device)
-
-        gateway.ipc.request = local_owner_request
+        await owner.start()
+        gateway = Gateway(owner.directory, tmp_path / "physical-gateway-auth")
         runner = web.AppRunner(gateway.app)
         server_tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         server_tls.load_cert_chain(cluster.cert, cluster.key)
@@ -336,7 +328,8 @@ def test_physical_live_wss_close_releases_selected_run_before_sample_expiry(clus
             ws, current = await ws_attached(session, local)
             base = dict(run_id=started["run_id"], service_incarnation=current["service_incarnation"],
                         controller_generation=claim["controller_generation"],
-                        host_incarnation=current["evidence"]["host_incarnation"])
+                        host_incarnation=current["evidence"]["host_incarnation"],
+                        intent_revision=current["run"]["intent_revision"])
             connected = await ws_command(ws, dict(op="connect", **base))
             assert connected["accepted"]
             base["connection_generation"] = connected["connection_generation"]
@@ -358,17 +351,19 @@ def test_physical_live_wss_close_releases_selected_run_before_sample_expiry(clus
                 await asyncio.sleep(.005)
             assert time.monotonic() < grant["expires"]
             assert authority.run["status"] == "paused" and authority.run["intent"] is None
-            assert authority.events[-1]["kind"] == "input_released"
+            assert authority.events[-1]["kind"] == "transport_connection_lost"
         finally:
             if ws:
                 await ws.close()
             await session.close()
             await runner.cleanup()
+            await owner.close()
 
     try:
         asyncio.run(scenario())
     finally:
-        authority.close()
+        if not authority.closed:
+            authority.close()
         if e.worker:
             e.worker.join(2)
 
@@ -1623,4 +1618,63 @@ def test_peer_queue_intrinsically_oversized_initial_snapshot_rejects_and_closes(
         assert ws.close_codes[0] == 1008 and ws.sent == []
         assert len(created) == 1 and created[0].ack is False and created[0].connection is None
         assert gateway.pending_ws == 0 and gateway.peers == set()
+    asyncio.run(scenario())
+
+
+
+def test_transport_detach_cannot_enter_through_gateway_dispatch_or_enqueue():
+    from types import SimpleNamespace
+    from tools import am1_session_service as service
+    async def scenario():
+        gateway = service.Gateway.__new__(service.Gateway)
+        gateway.auth = SimpleNamespace(resolve=lambda _: {"id": "owner", "control": True}, capable=lambda _: True)
+        async def forbidden(*args):
+            pytest.fail("public transport_detach reached private owner IPC")
+        gateway.call = forbidden
+        replies = []
+        peer = SimpleNamespace(ack=True, connection="current", token="private-test-token",
+            commands={"normal": 0, "protective": 0}, tasks=set(), put=lambda value, **_: replies.append(value))
+        command = {"op": "transport_detach"}
+        with pytest.raises(ValueError, match="operation"):
+            await gateway.dispatch(command, {"id": "owner", "control": True}, peer)
+        gateway.enqueue(peer, {"id": "forged-detach", "command": command})
+        await asyncio.gather(*tuple(peer.tasks))
+        assert len(replies) == 1 and replies[0]["accepted"] is False and replies[0]["effect_admitted"] is False
+        assert peer.commands == {"normal": 0, "protective": 0}
+    asyncio.run(scenario())
+
+
+def test_transport_detach_has_no_public_http_route_or_wss_operation(cluster):
+    async def scenario():
+        session = await enrolled(cluster)
+        ws = None
+        try:
+            async with session.post(cluster.url + "/api/transport_detach", json={}, ssl=session._test_tls,
+                    headers={"Origin": cluster.url, "X-AM1-CSRF": session._test_csrf}) as response:
+                assert response.status == 404
+            ws, _ = await ws_attached(session, cluster)
+            denied = await ws_command(ws, {"op": "transport_detach", "origin": "server"})
+            assert denied["accepted"] is False and denied["effect_admitted"] is False
+            assert (await snapshot(session, cluster))["controller"] is None
+        finally:
+            if ws:
+                await ws.close()
+            await session.close()
+    asyncio.run(scenario())
+
+
+
+def test_transport_detach_revoked_gateway_capability_never_reaches_private_owner():
+    from types import SimpleNamespace
+    from tools import am1_session_service as service
+    async def scenario():
+        gateway = service.Gateway.__new__(service.Gateway)
+        gateway.normal, gateway.protective = asyncio.Semaphore(8), asyncio.Semaphore(2)
+        gateway.auth = SimpleNamespace(capable=lambda _: False)
+        async def forbidden(*args):
+            pytest.fail("revoked transport detach reached private owner")
+        gateway.ipc = SimpleNamespace(request=forbidden)
+        result = await gateway.call({"op": "transport_detach"}, "revoked-owner")
+        assert result == {"accepted": False, "status": "refused", "reason": "revoked control context",
+                          "effect_admitted": False}
     asyncio.run(scenario())
