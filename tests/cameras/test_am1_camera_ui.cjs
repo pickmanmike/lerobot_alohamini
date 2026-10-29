@@ -613,3 +613,111 @@ test("bounded per-role reconnection leaves other views running and rejects old g
   assert.equal(vm.runInContext('AM1CameraReconnect("chest")',page.context).accepted,false,'Reconnection attempts stay bounded for this page lifetime');
   vm.runInContext('stopPrimary()',page.context);
 });
+
+
+async function webPrimaryPageFixture() {
+  const page = pageFixture(); await flush();
+  // Exercise the real app render/start/stop path with controlled receiver progress.
+  vm.runInContext(`
+    stopPrimary("test-webrtc-selection");
+    webView = {
+      starts:[], pending:[], active:false, frames:0, presentedAt:null,
+      pc:{connectionState:"connected"},
+      start(role) {
+        if(this.active)throw Error("duplicate active primary");
+        this.active=true;this.role=role;this.frames=0;this.presentedAt=null;
+        this.starts.push({role,at:performance.now()});
+        return new Promise((resolve,reject)=>this.pending.push({resolve,reject}));
+      },
+      stop() { this.active=false;this.frames=0;this.presentedAt=null; },
+      health() {
+        const age=this.presentedAt===null?null:performance.now()-this.presentedAt;
+        const source=AM1SourceState(latest?.cameras[this.role],reportAt,performance.now());
+        return {fresh:this.active&&statusAvailable()&&source.state==="fresh"&&age!==null&&age<500,
+          decoded_frames:this.frames,decoded_age_ms:age,error:null};
+      }
+    };
+    latest.video={enabled:true};render();
+  `,page.context);
+  return page;
+}
+function webPrimarySourceAt(page,time,render=true) {
+  page.advance(time,Math.floor(time));
+  vm.runInContext(`reportAt=performance.now();statusReceivedAt=performance.now();
+    latest.cameras.forward.sequence++;latest.cameras.chest.sequence++;${render?"render();":""}`,page.context);
+}
+function presentWebPrimary(page) {
+  vm.runInContext('webView.frames++;webView.presentedAt=performance.now();render()',page.context);
+}
+function exhaustWebPrimaryStalls(page) {
+  for(const at of [1000,2000,3000]) {
+    webPrimarySourceAt(page,at);presentWebPrimary(page);
+    webPrimarySourceAt(page,at+501);
+    assert.equal(vm.runInContext('stream',page.context),null,"A stale presentation must stop the primary");
+    assert.equal(page.roots.querySelector('#primary').flags.has('fresh'),false);
+  }
+  assert.equal(vm.runInContext('webView.starts.length',page.context),3);
+}
+
+test("WebRTC primary retries three same-generation stalls after a five-second cooldown", async () => {
+  const page=await webPrimaryPageFixture();exhaustWebPrimaryStalls(page);
+  assert.equal(vm.runInContext('roleGenerations.get("forward")',page.context),1);
+  webPrimarySourceAt(page,7999);
+  assert.equal(vm.runInContext('webView.starts.length',page.context),3,"Cooldown is measured from the last attempt, not refreshed by status");
+  webPrimarySourceAt(page,8000);
+  assert.equal(vm.runInContext('webView.starts.length',page.context),4,"Healthy source must not remain permanently disabled");
+  assert.equal(vm.runInContext('stream.role',page.context),'forward');
+  assert.equal(page.roots.querySelector('#primary').flags.has('fresh'),false,"A retry is not decoded-frame evidence");
+  vm.runInContext('render();render()',page.context);
+  assert.equal(vm.runInContext('webView.starts.length',page.context),4,"One active primary must not duplicate transport starts");
+  assert.equal(page.streams.length,1,"WebRTC retries cannot acquire another MJPEG/capture owner");
+  assert.equal(page.streams[0].signal.aborted,true);
+  presentWebPrimary(page);
+  assert.equal(page.roots.querySelector('#primary').flags.has('fresh'),true);
+  webPrimarySourceAt(page,8500);
+  assert.equal(page.roots.querySelector('#primary').flags.has('fresh'),false,"The unchanged500ms presentation freshness still expires");
+  webPrimarySourceAt(page,8501);
+  assert.equal(vm.runInContext('stream',page.context),null);
+  webPrimarySourceAt(page,12999);
+  assert.equal(vm.runInContext('webView.starts.length',page.context),4);
+  webPrimarySourceAt(page,13000);
+  assert.equal(vm.runInContext('webView.starts.length',page.context),5,"Later retries remain paced at five seconds");
+  vm.runInContext('stopPrimary()',page.context);
+});
+
+test("WebRTC retry cooldown keeps ordinary spacing, current source and stop boundaries", async () => {
+  const page=await webPrimaryPageFixture();presentWebPrimary(page);
+  webPrimarySourceAt(page,1501);webPrimarySourceAt(page,1999);
+  assert.equal(vm.runInContext('webView.starts.length',page.context),1);
+  webPrimarySourceAt(page,2000);presentWebPrimary(page);webPrimarySourceAt(page,2501);
+  webPrimarySourceAt(page,3000);presentWebPrimary(page);webPrimarySourceAt(page,3501);
+  webPrimarySourceAt(page,8000,false);
+  vm.runInContext('latest.cameras.forward.state="stale";render()',page.context);
+  assert.equal(vm.runInContext('webView.starts.length',page.context),3,"Cooldown cannot override source qualification");
+  assert.equal(page.roots.querySelector('#primary').flags.has('fresh'),false);
+  vm.runInContext('latest.cameras.forward.state="fresh";latest.cameras.forward.configured=false;render()',page.context);
+  assert.equal(vm.runInContext('webView.starts.length',page.context),3);
+  vm.runInContext('latest.cameras.forward.configured=true;render()',page.context);
+  assert.equal(vm.runInContext('webView.starts.length',page.context),4);
+  vm.runInContext('stopPrimary("page-detached")',page.context);
+  webPrimarySourceAt(page,14000,false);await flush();
+  assert.equal(vm.runInContext('webView.starts.length',page.context),4,"No retry timer may restart a stopped primary");
+  assert.equal(vm.runInContext('stream',page.context),null);
+});
+
+test("WebRTC retry cooldown remains role-generation scoped and ignores retired start failures", async () => {
+  const page=await webPrimaryPageFixture();exhaustWebPrimaryStalls(page);
+  webPrimarySourceAt(page,3600,false);
+  vm.runInContext('AM1CameraSelect("chest")',page.context);
+  assert.equal(vm.runInContext('webView.starts.length',page.context),4,"Another role keeps its own retry budget");
+  presentWebPrimary(page);
+  vm.runInContext('webView.pending[0].reject(Error("retired attempt"))',page.context);await flush();
+  assert.equal(vm.runInContext('stream.role',page.context),'chest',"An old start failure must not cancel the replacement");
+  assert.equal(vm.runInContext('webView.active',page.context),true);
+  webPrimarySourceAt(page,3700,false);
+  vm.runInContext('bumpGeneration("forward");AM1CameraSelect("forward")',page.context);
+  assert.equal(vm.runInContext('webView.starts.length',page.context),5,"A new source generation keeps its independent initial attempts");
+  assert.equal(vm.runInContext('roleGenerations.get("forward")',page.context),2);
+  assert.equal(page.roots.querySelector('#primary').flags.has('fresh'),false,"Old-role progress must not qualify this attachment");
+  vm.runInContext('stopPrimary()',page.context);
+});

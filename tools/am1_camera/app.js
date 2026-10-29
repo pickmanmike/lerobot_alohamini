@@ -206,7 +206,8 @@ function stopPrimary(reason = "stopped") {
 function startPrimary() {
   if (webPrimary()) {
     const key=selected+":"+roleGenerations.get(selected), prior=videoAttempts.get(key)||{count:0,at:-Infinity};
-    if (!webView || prior.count>=3 || performance.now()-prior.at<1000) return;
+    // After three attempts, pace further retries at 5s rather than disabling a healthy source.
+    if (!webView || performance.now()-prior.at<(prior.count>=3?5000:1000)) return;
     videoAttempts.set(key,{count:prior.count+1,at:performance.now()});
     const current={role:selected,kind:"webrtc",controller:new AbortController(),progressed:performance.now(),
       deadline:performance.now()+6000,decoded:false}; stream=current;
