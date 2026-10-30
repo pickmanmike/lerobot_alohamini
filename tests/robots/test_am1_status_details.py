@@ -258,3 +258,88 @@ def test_existing_http_state_detail_read_retains_auth_route_and_typed_bytes():
     assert reply["status"] == "detail" and response.headers["Cache-Control"] == "no-store"
     assert len(response.body) < ipc.RESPONSE_LIMIT
     assert commands[0][0]["op"] == "snapshot"
+
+def raw_source_control_ack():
+    """Representative thirteen-source owner diagnostic, never a hardware read."""
+    from tests.robots.test_am1_leader_adapter import held_command119_client
+
+    client, workspace = held_command119_client()
+    evidence = client.snapshot["evidence"]
+    ack = evidence["accepted_host_action"]
+    ack.update(
+        version=1, observation_id=31, accepted_action_sequence=2,
+        read_started_at_monotonic_s=100.20012345678912, write_acknowledged=False,
+        arm_feedback={"version": 1, "positions": {
+            key: {"raw": 2000 + index, "normalized": (index + 1) / 7,
+                  "read_started_at_monotonic_s": 100.20012345678912,
+                  "read_completed_at_monotonic_s": 100.20112345678912}
+            for index, key in enumerate(workspace["reference"])
+        }},
+        lift_feedback={"version": 1, "height_mm": 10.4384765625, "present_velocity_raw": 0,
+                       "request_duration_s": .0017561180065968074,
+                       "sample_monotonic_s": 100.20012345678912},
+        thermal_history={"version": 1, "raw_sample_at_monotonic_s": 100.20012345678912,
+                         "peaks_ready": True, "deficit_started_at_monotonic_s": None,
+                         "deficit_ceiling_monotonic_s": None, "hold_sample_at_monotonic_s": None,
+                         "zero_read_started_at_monotonic_s": None,
+                         "zero_read_completed_at_monotonic_s": None},
+        thermal_raw_sources={
+            "version": 1, "assembled_at_monotonic_s": 100.20112345678912,
+            "published_at_monotonic_s": 100.20212345678912,
+            "sources": [
+                {"bus": side, "motor_id": motor, "role": f"arm_{side}_{joint}",
+                 "raw_sample_at_monotonic_s": 100.20012345678912}
+                for side in ("left", "right")
+                for motor, joint in enumerate(
+                    ("shoulder_pan", "shoulder_lift", "elbow_flex",
+                     "wrist_flex", "wrist_roll", "gripper"), 1)
+            ] + [{"bus": "left", "motor_id": 11, "role": "lift_axis",
+                  "raw_sample_at_monotonic_s": 100.20012345678912}],
+        },
+        live_input=copy.deepcopy(client.snapshot["run"]["live_input"]),
+    )
+    evidence["live_input"] = copy.deepcopy(ack["live_input"])
+    return client, workspace
+
+
+@pytest.mark.parametrize("teleop", [True, False])
+def test_raw_source_diagnostics_preserve_essential_control_ack_and_full_detail(teleop):
+    from tools.am1_leader_adapter import _qualified_command_reference
+
+    client, workspace = raw_source_control_ack()
+    state = client.snapshot
+    state["run"]["operation_id"] = str(uuid.uuid4())
+    state["run"]["execution"] = {"complete": False}
+    state["run"]["progress_s"] = 0.0
+    a = reporting_authority(state["run"], state["evidence"])
+    a.service_incarnation = state["service_incarnation"]
+    a.executor.host_incarnation = state["run"]["backend_incarnation"]
+    a.clock = lambda: 100.25
+    a._teleop_view = {"run_id": a.run["run_id"], "qualified_until": 100.75, "role": "chest"}
+    if not teleop:
+        # Other physical recipes retain their own meaningful live-input field.
+        a.run["recipe"] = selected_native_record()["recipe"]
+        state["run"]["recipe"] = a.run["recipe"]
+        state["evidence"]["accepted_host_action"]["live_input"] = {"state": "held", "joint": "left"}
+    original = copy.deepcopy(state)
+    evidence = state["evidence"]
+    ack = evidence["accepted_host_action"]
+    ordinary_ack = {key: value for key, value in ack.items()
+                    if not (teleop and key == "live_input")}
+    def canonical(value):
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    assert len(canonical(ordinary_ack)) > 4096
+    expected = {key: value for key, value in ordinary_ack.items() if key != "thermal_raw_sources"}
+    assert len(canonical(expected)) <= 4096
+
+    view = a._essential_status(copy.deepcopy(state), evidence)
+    if teleop:
+        client.snapshot = view
+        assert _qualified_command_reference(client, workspace) == original["run"]["live_input"]["cursor"]
+    assert view["evidence"]["accepted_host_action"] == expected
+    assert "thermal_history" in view["evidence"]["accepted_host_action"]
+    if not teleop:
+        assert view["evidence"]["accepted_host_action"]["live_input"] == {"state": "held", "joint": "left"}
+    assert resolve(a, view["evidence"]["details_reference"]) == evidence
+    assert evidence["accepted_host_action"]["thermal_raw_sources"] == ack["thermal_raw_sources"]
+    assert state == original and a.run == original["run"]

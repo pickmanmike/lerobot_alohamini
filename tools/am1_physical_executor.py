@@ -837,6 +837,7 @@ class PhysicalExecutor:
             self._dispatch_ack = False
             self._execution = {"progress_s": 0.0, "complete": False, "fault": None}
             self._reset_input_transport_trace()
+            self._thermal_poll_trace = None
             self._finite_completion = None
             self._completion_returns = []
             self._lifecycle = {
@@ -985,6 +986,62 @@ class PhysicalExecutor:
         self._wake.set()
         return True
 
+    def _retain_thermal_rejection(self, ack, now, error, boundary):
+        """Freeze the first actual rejection; diagnostics never replace its guard."""
+        if ("thermal_rejection" in self._lifecycle or self._fault is not None
+                or self._lifecycle.get("phase") not in {"startup", "live"}
+                or self._lifecycle.get("cleanup") is not None
+                or self._lifecycle.get("terminal_status") is not None):
+            return
+        try:
+            def scalar(value):
+                if value is None or type(value) is bool:
+                    return value
+                if type(value) is int and -(1 << 63) <= value < (1 << 63):
+                    return value
+                if type(value) is float:
+                    return value if math.isfinite(value) else {"nonfinite": str(value)}
+                if type(value) is str:
+                    return value if len(value) <= 64 else {"prefix": value[:64], "length": len(value)}
+                return {"type": type(value).__name__[:32]}
+
+            def fields(value, names):
+                return ({key: scalar(value[key]) for key in names if key in value}
+                        if type(value) is dict else scalar(value))
+
+            proof = ack.get("thermal_history")
+            sources = ack.get("thermal_raw_sources")
+            rows = sources.get("sources") if type(sources) is dict else None
+            source_snapshot = fields(sources, ("version", "assembled_at_monotonic_s", "published_at_monotonic_s"))
+            if type(sources) is dict:
+                source_snapshot["sources"] = [fields(row, ("bus", "motor_id", "role", "raw_sample_at_monotonic_s"))
+                                              for row in rows[:13]] if type(rows) is list else scalar(rows)
+                source_snapshot["source_count"] = len(rows) if type(rows) is list else None
+            trace = getattr(self, "_thermal_poll_trace", None)
+            sample = self.sample or {}
+            record = {
+                "version": 1, "boundary": boundary, "fault": str(error)[:192],
+                "checked_at_monotonic_s": scalar(now),
+                "feedback_sequence": scalar(sample.get("sequence")), "sample_at_monotonic_s": scalar(sample.get("at")),
+                "proof": fields(proof, ("version", "raw_sample_at_monotonic_s", "peaks_ready",
+                    "deficit_started_at_monotonic_s", "deficit_ceiling_monotonic_s", "hold_sample_at_monotonic_s",
+                    "zero_read_started_at_monotonic_s", "zero_read_completed_at_monotonic_s")),
+                "proof_fields": [scalar(key) for _, key in zip(range(16), proof)] if type(proof) is dict else None,
+                "proof_field_count": len(proof) if type(proof) is dict else None,
+                "source_snapshot": source_snapshot,
+                "ack": fields(ack, ("run_id", "host_incarnation", "observation_id", "intent_revision", "epoch",
+                    "accepted_action_sequence", "read_started_at_monotonic_s", "acquired_at_monotonic_s")),
+                "feedback_timing": fields(sample.get("timing"), ("read_started_at_monotonic_s", "acquired_at_monotonic_s",
+                    "original_request_sent_at_monotonic_s", "reply_received_at_monotonic_s", "original_request_roundtrip_age_s")),
+                "poll": dict(zip(("started_at_monotonic_s", "returned_at_monotonic_s", "previous_sequence",
+                    "returned_sequence", "outcome"), (scalar(v) for v in trace)))
+                    if type(trace) is tuple and len(trace) == 5 else None,
+            }
+            if len(json.dumps(record, allow_nan=False, separators=(",", ":")).encode()) <= 8192:
+                self._lifecycle["thermal_rejection"] = record
+        except Exception:
+            pass  # Preserve the original rejection even if optional evidence cannot be frozen.
+
     def _thermal_qualification(self, ack, now):
         identity = (self.run_id, self.host_incarnation)
         if "thermal_history" in ack:
@@ -1035,7 +1092,12 @@ class PhysicalExecutor:
         advanced = not pending and polled is not None
         thermal_ready = True
         if self.sample is not None and self.live_spec is TELEOP_SPEC:
-            _thermal, thermal_ready = self._thermal_qualification(self.sample["ack"], self.clock())
+            checked_at = self.clock()
+            try:
+                _thermal, thermal_ready = self._thermal_qualification(self.sample["ack"], checked_at)
+            except ValueError as error:
+                self._retain_thermal_rejection(self.sample["ack"], checked_at, error, "worker_poll")
+                raise
             if not thermal_ready:
                 self._live_target = None  # A later qualified Resume must never replay this target.
         usable = bool(
@@ -1134,6 +1196,7 @@ class PhysicalExecutor:
                         thermal, thermal_ready = self._thermal_qualification(ack, now)
                         fresh = fresh and thermal_ready
                     except ValueError as error:
+                        self._retain_thermal_rejection(ack, now, error, "evidence")
                         fresh, thermal_fault = False, str(error)
             matched = (
                 fresh
@@ -1362,6 +1425,7 @@ class PhysicalExecutor:
                 with self.mutex:
                     if self.finish_status:
                         break
+                    self._thermal_poll_trace = poll_trace
                     advanced, usable = self._update_polled_sample(sample, transient)
                     observed = self.observation.evidence()["qualified"]
                     if not usable or not observed:

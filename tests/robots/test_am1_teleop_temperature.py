@@ -2289,3 +2289,31 @@ def test_history_permission_collection_rejects_recursive_drain_before_nested_bus
         teleop.thermal_history_status(state.robot, collect_due=True)
     assert not state.command_reads
     assert state.robot._am1_thermal_history_collecting is False
+
+
+def test_thermal_raw_sources_share_the_actual_owner_snapshot_without_extra_io(command_cadence_boundary):
+    import json
+
+    state = command_cadence_boundary
+    control, _identity, _owner, _base = _live_cadence_owner(state)
+    robot = state.robot
+    observation = robot.get_observation()
+    before = [len(bus.port_handler.writes) for bus in (robot.left_bus, robot.right_bus)]
+    control.annotate(observation, acquired_at=state.clock.now)
+    ack = observation["_am1_local_feedback"]
+    proof, sources = ack["thermal_history"], ack["thermal_raw_sources"]
+    assert set(proof) == {"version", "raw_sample_at_monotonic_s", "peaks_ready",
+        "deficit_started_at_monotonic_s", "deficit_ceiling_monotonic_s",
+        "hold_sample_at_monotonic_s", "zero_read_started_at_monotonic_s", "zero_read_completed_at_monotonic_s"}
+    assert set(sources) == {"version", "assembled_at_monotonic_s", "published_at_monotonic_s", "sources"}
+    assert sources["version"] == 1 and len(sources["sources"]) == 13
+    assert sources["assembled_at_monotonic_s"] <= sources["published_at_monotonic_s"] == state.clock.now
+    expected = {("left", robot.left_bus.motors["lift_axis"].id, "lift_axis"): state.operation.temperature._last_sample_at}
+    expected.update({(side, motor_id, value["identity"][1]): value["window"]._last_sample_at
+                     for (side, motor_id), value in robot._am1_teleop_temperatures.items()})
+    actual = {(row["bus"], row["motor_id"], row["role"]): row["raw_sample_at_monotonic_s"]
+              for row in sources["sources"]}
+    assert actual == expected and len(actual) == 13
+    assert min(actual.values()) == proof["raw_sample_at_monotonic_s"]
+    assert before == [len(bus.port_handler.writes) for bus in (robot.left_bus, robot.right_bus)]
+    assert len(json.dumps(ack, allow_nan=False).encode()) < 32768

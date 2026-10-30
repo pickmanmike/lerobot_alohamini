@@ -19,7 +19,14 @@ retired session/clock and is excluded; DOM focus alone is not scene evidence.
 8849 has one correctly bound Live Chest screenshot with coarse-awareness scope;
 fine tips and final-window observation remain limited.
 
-Keep the actual enrolled native window restored and the camera content pane on screen. DOM visibility/focus and a browser viewport screenshot do not prove the OS window is restored. Required presentation receipts also do not prove the camera pane is in the visible viewport or the scene is useful. After an optional P1 action or diagnostic inspection scrolls the pane away, return it to the top and verify an actual camera-panel image before the next activity. Do not change decoder/network settings from dark scene content alone.
+Use the reviewed working-view routine below; [current state](current-state.md) records installation and actual operating qualification separately.
+
+1. Open the existing enrolled software-video profile through the [open-only launcher](teleop-consolidation-16.md#verification-and-ordinary-use), then restore/maximize the actual AM1 window with its normal window controls or the existing CUA routine; DOM visibility/focus and a browser viewport screenshot do not prove the native window is restored.
+2. In the reviewed UI, a new active PC-owned teleop run or fresh attachment returns to the camera once, and optional P1 Connect/Close returns there without Claim, Start or motion; same-run updates preserve deliberate diagnostic inspection, so use **Working camera** before continuing after that inspection.
+3. Verify actual current pixels showing the coarse gripper and approach area; advancing counters, qualified presentation receipts and advisory P1 recording are separate evidence, and darkness alone does not identify a decoder fault or a special low-light mode.
+4. A one-time reload to load a delivered viewer update is a development handoff; repeated manual refreshes or reconnects during ordinary use remain an operability limitation, not the working-view routine.
+
+Stage96's97a4 retained current coarse Chest pixels in a finishing browser screenshot. Its native capture returned black/wallpaper and nativeAX repeated an older run, so those observations do not qualify the actual onscreen window. A fresh regular tab in the same enrolled/software-decoder profile attached without pairing; desktop activation/capture remained unavailable. Preserve this tool/access limitation and the specific pending desktop check; do not infer a camera/decoder defect or count a viewport image as native-window proof.
 
 The2026-10-30 P1 recordings provide useful coarse external context during5344 and71AE, with verified overlap/release; optional live P1 viewing was separately unavailable. Onboard5344 imagery was dark and71AE running screenshots were diagnostics-only. Neither result qualifies a dependable human working view. P1 remains advisory, and no special low-light mode was changed or qualified.
 
