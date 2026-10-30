@@ -350,7 +350,7 @@ def enable_thermal_history(control, robot):
         window.allow_history_hold = True
 
 
-def thermal_history_status(robot, *, collect_due=False):
+def thermal_history_status(robot, *, collect_due=False, diagnostics=None):
     """Original-clock safety proof; history loss is distinct from lost/invalid RAW."""
     context = getattr(robot, "_am1_thermal_history_context", None)
     if context is None:
@@ -398,6 +398,14 @@ def thermal_history_status(robot, *, collect_due=False):
         }
     if episode is not None and now >= episode["ceiling"]:
         raise RuntimeError("AM1 thermal history original recovery deadline expired")
+    if diagnostics is not None:
+        # Cached actual sources only: no extra read, vote or safety permission.
+        diagnostics.update(version=1, assembled_at_monotonic_s=now, sources=[{
+            "bus": "left", "motor_id": robot.left_bus.motors["lift_axis"].id,
+            "role": "lift_axis", "raw_sample_at_monotonic_s": operation.temperature._last_sample_at,
+        }, *({"bus": side, "motor_id": motor_id, "role": state["identity"][1],
+              "raw_sample_at_monotonic_s": state["window"]._last_sample_at}
+             for (side, motor_id), state in sorted(robot._am1_teleop_temperatures.items()))])
     return {
         "version": 1, "raw_sample_at_monotonic_s": min(window._last_sample_at for window in windows),
         "peaks_ready": all(window.ready for window in windows),

@@ -785,3 +785,83 @@ test("workspace metadata policy identity accepts only retained v1 and reviewed v
     assert.equal(transport.supportedWorkspace(spec),null,"unknown policy must not become supported metadata");
   }
 });
+
+
+test("ordinary working camera restores after new runs and optional actions without task commands",async t=>{
+ const browser=await chromium.launch({headless:true,channel:process.env.AM1_TEST_BROWSER_CHANNEL||"msedge"});t.after(()=>browser.close());
+ const page=await browser.newPage({viewport:{width:768,height:780}});
+ const fs=require("node:fs"),path=require("node:path"),root=path.join(__dirname,"../.."),assets=path.join(root,"tools/am1_console_ui");
+ const errors=[];page.on("pageerror",error=>errors.push(error.message));
+ await page.setContent(fs.readFileSync(path.join(assets,"index.html"),"utf8").replace(/<script[^>]*>[\s\S]*?<\/script>/g,""));
+ await page.addStyleTag({path:path.join(root,"tools/am1_camera/style.css")});
+ await page.addStyleTag({path:path.join(assets,"style.css")});
+ await page.addScriptTag({path:path.join(assets,"p1_view.js")});
+ await page.addScriptTag({path:path.join(assets,"session_transport.js")});
+ await page.evaluate(()=>{
+  document.querySelector("#am1-camera-root").dataset.onboard="true";
+  globalThis.mediaRequests=[];globalThis.mediaAvailable=false;
+  globalThis.fetch=async(url,options={})=>{mediaRequests.push({url,method:options.method});return {ok:mediaAvailable,status:mediaAvailable?201:503,
+   headers:{get:name=>name==="Location"?"/api/media/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa":'"fixture"'},text:async()=>"v=0\r\n"};};
+  globalThis.RTCPeerConnection=class {addTransceiver(){}close(){}async createOffer(){return {sdp:"v=0\r\n"};}async setLocalDescription(){}async setRemoteDescription(){}};
+  AM1SessionTransport.prototype.initialize=async()=>null;
+  AM1RemoteInitialize();
+  am1Remote.optionalVideo=true;am1Remote.csrf="fixture-csrf";
+  am1Remote.snapshot={recipes:["physical-live-teleop"],presets:[],evidence:{required_observation:true},run:null};
+  am1Remote.render(am1Remote);
+ });
+ const cameraBounds=()=>page.evaluate(()=>{
+  const image=document.querySelector("#primary .image-wrap").getBoundingClientRect(),header=document.querySelector(".console-top").getBoundingClientRect();
+  return {top:image.top,bottom:image.bottom,headerBottom:header.bottom,height:innerHeight,scrollY};
+ });
+ const assertWorking=async label=>{
+  const box=await cameraBounds();
+  assert.ok(box.top>=box.headerBottom&&box.bottom<=box.height,`${label}: ${JSON.stringify(box)}`);
+ };
+ await page.evaluate(()=>{
+  const diagnostic=document.querySelector("#diagnostics");diagnostic.textContent="fixture diagnostics\n".repeat(150);diagnostic.closest("details").open=true;
+  document.querySelector(".more-actions").open=true;document.querySelector(".session-details").open=true;
+  document.querySelector("#control-help").hidden=false;
+  window.scrollTo(0,document.documentElement.scrollHeight);
+ });
+ assert.ok((await cameraBounds()).scrollY>100,"fixture must begin with camera scrolled away");
+ await page.evaluate(()=>{
+  am1Remote.snapshot.run={run_id:"fixture-run-A",source:"protected-physical-provider",recipe:"physical-live-teleop",status:"running",progress_s:0,native_live_at:10,deadline:310};
+  am1Remote.render(am1Remote);
+ });
+ await assertWorking("first snapshot of existing PC-owned task restores camera");
+ const working=page.getByRole("button",{name:"Working camera",exact:true});
+ assert.equal(await working.count(),1);
+ assert.equal(await working.evaluate(element=>element===document.activeElement),true,"focus cannot remain on an offscreen optional button");
+ // Same-run evidence refresh must not snap a deliberate diagnostic inspection away.
+ await page.evaluate(()=>{document.querySelector("#diagnostics").closest("details").open=true;window.scrollTo(0,document.documentElement.scrollHeight);});
+ const inspected=(await cameraBounds()).scrollY;assert.ok(inspected>100);
+ await page.evaluate(()=>{am1Remote.snapshot.run.status="running";am1Remote.render(am1Remote);});
+ assert.equal((await cameraBounds()).scrollY,inspected,"ordinary same-run render preserves diagnostic inspection");
+ const original=await page.evaluate(()=>JSON.stringify(am1Remote.snapshot.run));
+ await working.click();await assertWorking("explicit return from diagnostics");
+ assert.equal(await page.evaluate(()=>JSON.stringify(am1Remote.snapshot.run)),original);
+ assert.deepEqual(await page.evaluate(()=>mediaRequests),[],"working-camera action has no task or media request");
+ // Clicking optional media below the main panel must restore it even after a503.
+ await page.getByRole("button",{name:"Connect P1 view",exact:true}).click();
+ await page.waitForFunction(()=>document.querySelector("#p1-advisory-root").textContent.includes("Optional P1 video unavailable"));
+ await assertWorking("failed optional P1 Connect");
+ assert.equal(await working.evaluate(element=>element===document.activeElement),true);
+ await page.getByRole("button",{name:"Close view",exact:true}).click();
+ await assertWorking("optional P1 Close");
+ assert.equal(await working.evaluate(element=>element===document.activeElement),true);
+ assert.deepEqual(await page.evaluate(()=>mediaRequests),[{url:"/api/media",method:"POST"}],"optional UI never calls task APIs");
+ assert.equal(await page.evaluate(()=>JSON.stringify(am1Remote.snapshot.run)),original,"view actions preserve run identity/deadline/state");
+ await page.evaluate(()=>{mediaAvailable=true;});
+ await page.getByRole("button",{name:"Connect P1 view",exact:true}).click();
+ await page.waitForFunction(()=>am1Remote.videoView.handle!==null);
+ await assertWorking("successful optional P1 Connect");
+ assert.equal(await working.evaluate(element=>element===document.activeElement),true);
+ await page.getByRole("button",{name:"Close view",exact:true}).click();
+ await page.waitForFunction(()=>am1Remote.videoView.handle===null);
+ await assertWorking("successful optional P1 Close");
+ assert.deepEqual(await page.evaluate(()=>mediaRequests),[{url:"/api/media",method:"POST"},{url:"/api/media",method:"POST"},{url:"/api/media/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",method:"DELETE"}]);
+ assert.equal(await page.evaluate(()=>JSON.stringify(am1Remote.snapshot.run)),original);
+ await page.evaluate(()=>{document.querySelector("#diagnostics").closest("details").open=true;window.scrollTo(0,document.documentElement.scrollHeight);am1Remote.snapshot.run.run_id="fixture-run-B";am1Remote.snapshot.run.status="starting";am1Remote.render(am1Remote);});
+ await assertWorking("later fresh task restores camera again");
+ assert.deepEqual(errors,[]);
+});

@@ -576,6 +576,23 @@ class AM1SessionTransport {
 globalThis.AM1SessionTransport=AM1SessionTransport;
 globalThis.AM1RemoteInitialize=function() {
   const state=document.querySelector("#session-state"),notice=document.querySelector("#control-notice");
+  const workingCameraRoot=document.querySelector("#am1-camera-root");
+  const workingCameraButton=document.createElement("button");
+  workingCameraButton.type="button";workingCameraButton.textContent="Working camera";
+  workingCameraButton.hidden=workingCameraRoot.dataset.onboard!=="true";
+  document.querySelector('[data-help="touch"]').after(workingCameraButton);
+  const showWorkingView=()=> {
+    if(workingCameraRoot.dataset.onboard!=="true")return;
+    for(const details of document.querySelectorAll(".more-actions, .session-details"))details.open=false;
+    const diagnostics=document.querySelector("#diagnostics").closest("details");
+    if(diagnostics)diagnostics.open=false;
+    document.querySelector("#control-help").hidden=true;
+    document.querySelector('[data-help="touch"]').setAttribute("aria-expanded","false");
+    workingCameraButton.focus({preventScroll:true});
+    window.scrollTo({top:0,left:0,behavior:"instant"});
+  };
+  workingCameraButton.onclick=showWorkingView;
+  let workingRunId=null;
   const defaultControlHelp="Explicitly claim input before Start. Finite authorization survives browser closure. Interactive work needs a fresh connected snapshot, empty release and qualified Resume. Disconnect, blur and handoff clear held keys. Pause and Stop remain available to enrolled control-capable spectators. Motor feedback and commands remain simulated. When configured, real P1 images qualify observation on Pi; optional browser video has no control authority.";
   const render=(transport,message)=> {
     const run=transport.snapshot?.run;
@@ -628,7 +645,8 @@ globalThis.AM1RemoteInitialize=function() {
       const open=document.createElement("button");open.type="button";open.textContent="Connect P1 view";
       const close=document.createElement("button");close.type="button";close.textContent="Close view";
       const view=transport.videoView=new AM1P1View(video,()=>transport.csrf,message=>status.textContent=message);
-      open.onclick=()=>view.start();close.onclick=()=>{view.stop();status.textContent="View closed · task observation continues independently";};
+      open.onclick=()=>{const pending=view.start();showWorkingView();return pending;};
+      close.onclick=()=>{const pending=view.stop();status.textContent="View closed · task observation continues independently";showWorkingView();return pending;};
       window.addEventListener("pagehide",()=>view.stop());root.append(label,video,status,open,close);
     }
     document.querySelector("#gate-state").textContent=viewerRole || (transport.controllerGeneration ? physical ? "Explicit controller; physical Start activates the protected host. Request acceptance is separate from protected-host ACK and measured motion." : "Explicit controller; accepted requests require actual fake acknowledgement." : "Spectator; viewing does not claim input.");
@@ -675,6 +693,11 @@ globalThis.AM1RemoteInitialize=function() {
     document.querySelector("#pairing-panel").hidden=Boolean(transport.device);
     for(const button of document.querySelectorAll("[data-operation]"))button.disabled=!transport.control || !transport.connected ||
       teleop && ["Start","ClaimInput","Resume","Handoff"].includes(button.dataset.operation) || button.dataset.operation==="Start" && selectionFrozen;
+    // Restore the working pane once on Start or a newly attached active run,
+    // without pulling same-run diagnostic inspection back on every render.
+    if(teleop && physicalRun && !terminal && typeof run?.run_id==="string" && run.run_id!==workingRunId) {
+      workingRunId=run.run_id;showWorkingView();
+    }
   };
   document.querySelector("#view-heading").textContent="Fake persistent session";
   const panel=document.createElement("section");panel.id="pairing-panel";

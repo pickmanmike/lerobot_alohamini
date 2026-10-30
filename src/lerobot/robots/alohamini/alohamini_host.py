@@ -543,9 +543,13 @@ class AM1LocalControl:
             if self.teleop:
                 from .am1_live_teleop import thermal_history_status
 
-                history = thermal_history_status(self._thermal_robot) if hasattr(self, "_thermal_robot") else None
+                sources = {}
+                history = (thermal_history_status(self._thermal_robot, diagnostics=sources)
+                           if hasattr(self, "_thermal_robot") else None)
                 if history is not None:
                     observation[AM1_LOCAL_FEEDBACK_KEY]["thermal_history"] = history
+                    sources["published_at_monotonic_s"] = time.monotonic()
+                    observation[AM1_LOCAL_FEEDBACK_KEY]["thermal_raw_sources"] = sources
             if self.teleop and "_am1_arm_feedback" in observation:
                 observation[AM1_LOCAL_FEEDBACK_KEY]["arm_feedback"] = copy.deepcopy(observation["_am1_arm_feedback"])
             if self.teleop and "_am1_lift_feedback" in observation:

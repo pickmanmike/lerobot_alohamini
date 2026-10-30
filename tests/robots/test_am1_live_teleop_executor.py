@@ -3356,3 +3356,134 @@ def test_transport_detach_public_release_cannot_supply_private_provenance(tmp_pa
     finally:
         a.run = None
         a.close()
+
+
+@pytest.mark.parametrize("boundary", ["evidence", "worker_poll"])
+@pytest.mark.parametrize("invalid", ["stale", "future", "nonfinite"])
+def test_thermal_rejection_keeps_first_actual_proof_clock_sources_and_poll_context(boundary, invalid):
+    import json
+
+    e, _identity = admitted_executor()
+    raw = {"stale": 9.499, "future": 10.001, "nonfinite": float("nan")}[invalid]
+    proof = dict(version=1, raw_sample_at_monotonic_s=raw, peaks_ready=True,
+        deficit_started_at_monotonic_s=None, deficit_ceiling_monotonic_s=None,
+        hold_sample_at_monotonic_s=None, zero_read_started_at_monotonic_s=None,
+        zero_read_completed_at_monotonic_s=None)
+    source_rows = [dict(bus=side, motor_id=motor, role=f"arm_{side}_{motor}", raw_sample_at_monotonic_s=9.99)
+                   for side in ("left", "right") for motor in range(1, 7)]
+    source_rows.append(dict(bus="left", motor_id=11, role="lift_axis", raw_sample_at_monotonic_s=9.99))
+    source_rows[2]["raw_sample_at_monotonic_s"] = raw
+    published = dict(version=1, assembled_at_monotonic_s=9.999, published_at_monotonic_s=10., sources=source_rows)
+    e.sample["ack"].update(thermal_history=proof, thermal_raw_sources=published, observation_id=31,
+        read_started_at_monotonic_s=9.98, acquired_at_monotonic_s=9.99)
+    e.sample["timing"] = {"acquired_at_monotonic_s": 9.99, "reply_received_at_monotonic_s": 10.}
+    e._thermal_poll_trace = (9.98, 10., 30, 31, "returned")
+    if boundary == "evidence":
+        assert e.evidence()["fault"] == "native thermal original RAW feedback expired/invalid"
+    else:
+        with pytest.raises(ValueError, match="native thermal original RAW feedback expired/invalid"):
+            e._update_polled_sample(copy.deepcopy(e.sample), None)
+    frozen = copy.deepcopy(e._lifecycle["thermal_rejection"])
+    assert frozen["boundary"] == boundary and frozen["checked_at_monotonic_s"] == 10.
+    assert frozen["feedback_sequence"] == 1 and frozen["ack"]["observation_id"] == 31
+    assert frozen["fault"] == "native thermal original RAW feedback expired/invalid"
+    expected = {"nonfinite": "nan"} if invalid == "nonfinite" else raw
+    assert frozen["proof"]["raw_sample_at_monotonic_s"] == expected
+    assert frozen["source_snapshot"]["sources"][2]["raw_sample_at_monotonic_s"] == expected
+    assert frozen["source_snapshot"]["published_at_monotonic_s"] == 10.
+    assert frozen["poll"] == dict(started_at_monotonic_s=9.98, returned_at_monotonic_s=10.,
+        previous_sequence=30, returned_sequence=31, outcome="returned")
+    assert len(json.dumps(frozen, allow_nan=False).encode()) < 8192
+    # Later ACKs, polls, evidence reads and finishing cannot replace the rejection.
+    e.sample["ack"]["thermal_history"]["raw_sample_at_monotonic_s"] = 9.99
+    e.sample["ack"]["thermal_raw_sources"]["sources"][2]["raw_sample_at_monotonic_s"] = 9.99
+    e.clock = lambda: 10.1
+    e._thermal_poll_trace = (10.05, 10.1, 31, 32, "returned")
+    e.evidence()
+    assert e._lifecycle["thermal_rejection"] == frozen
+    e.bind_run(str(uuid4()), RECIPES["physical-live-teleop"])
+    assert "thermal_rejection" not in e._lifecycle
+
+
+def test_thermal_rejection_diagnostics_are_bounded_and_never_replace_the_original_error(monkeypatch):
+    import json
+    from tools import am1_physical_executor as physical
+
+    e, _identity = admitted_executor()
+    original = ValueError("actual first RAW proof rejection")
+    e.sample["ack"]["thermal_history"] = {"version": 1, "raw_sample_at_monotonic_s": "x" * 100000,
+        "unexpected": ["huge"] * 100000}
+    e.sample["ack"]["thermal_raw_sources"] = {"sources": [dict(role="x" * 100000)] * 100000}
+    def reject(ack, now):
+        raise original
+    monkeypatch.setattr(physical, "thermal_history_evidence", reject)
+    with pytest.raises(ValueError) as caught:
+        e._update_polled_sample(e.sample, None)
+    assert caught.value is original
+    frozen = e._lifecycle["thermal_rejection"]
+    assert frozen["fault"] == str(original)
+    assert len(json.dumps(frozen, allow_nan=False).encode()) < 8192
+
+
+def test_thermal_rejection_retains_original_first_fault_in_the_existing_sql_lifecycle(tmp_path):
+    import json
+    from tests.robots.test_am1_physical_executor import terminal_cleanup_outcome
+
+    a, e, _identity = authority_lane(tmp_path)
+    proof = dict(version=1, raw_sample_at_monotonic_s=9.499, peaks_ready=True,
+        deficit_started_at_monotonic_s=None, deficit_ceiling_monotonic_s=None,
+        hold_sample_at_monotonic_s=None, zero_read_started_at_monotonic_s=None,
+        zero_read_completed_at_monotonic_s=None)
+    e.sample["ack"]["thermal_history"] = proof
+    try:
+        a.tick()
+        frozen = copy.deepcopy(e._lifecycle["thermal_rejection"])
+        assert a.run["first_cause"] == "native thermal original RAW feedback expired/invalid"
+        assert a.run["requested_terminal"] == "faulted" and a.applied_input is a.grant is None
+        # Simulate the existing real-owner terminal receipt path, without any I/O.
+        outcome = terminal_cleanup_outcome(e.run_id, e.host_incarnation, "faulted")
+        outcome["first_cause"] = outcome["readback"]["first_cause"] = None
+        e._lifecycle.update(outcome, phase="terminal", run_id=e.run_id)
+        e.sample["ack"]["thermal_history"]["raw_sample_at_monotonic_s"] = 9.99
+        a.tick()
+        assert a.run["status"] == "faulted" and a.run["uncertain"] is False
+        assert a.run["physical_result"]["thermal_rejection"] == frozen
+        assert a.run["first_cause"] == "native thermal original RAW feedback expired/invalid"
+        persisted = json.loads(a.db.execute("SELECT data FROM state WHERE id=1").fetchone()[0])
+        assert persisted["physical_result"]["thermal_rejection"] == frozen
+    finally:
+        a.run = None
+        a.close()
+
+
+def test_thermal_raw_sources_survive_the_existing_reader_without_safety_credit():
+    from tests.robots.test_am1_physical_executor import client_sample
+    from tools.am1_physical_executor import read_physical_sample
+
+    client = client_sample()
+    diagnostic = dict(version=1, assembled_at_monotonic_s=9.9, published_at_monotonic_s=9.91,
+        sources=[dict(bus="left", motor_id=11, role="lift_axis", raw_sample_at_monotonic_s=9.9)])
+    client.latest_am1_local_feedback["thermal_raw_sources"] = copy.deepcopy(diagnostic)
+    sample = read_physical_sample(client, "run", "host", 4, clock=lambda: 10.)
+    assert sample["ack"]["thermal_raw_sources"] == diagnostic
+    assert "thermal_history" not in sample["ack"], "diagnostics cannot synthesize the guard proof"
+    client.latest_am1_local_feedback["thermal_raw_sources"]["sources"][0]["raw_sample_at_monotonic_s"] = 0.
+    assert sample["ack"]["thermal_raw_sources"] == diagnostic
+
+
+def test_thermal_rejection_unknown_proof_shape_keeps_bounded_original_key_names():
+    import json
+
+    e, _identity = admitted_executor()
+    proof = dict(version=1, raw_sample_at_monotonic_s=9.99, peaks_ready=True,
+        deficit_started_at_monotonic_s=None, deficit_ceiling_monotonic_s=None,
+        hold_sample_at_monotonic_s=None, zero_read_started_at_monotonic_s=None,
+        zero_read_completed_at_monotonic_s=None, unexpected_original_member=["not copied"] * 100000)
+    e.sample["ack"]["thermal_history"] = proof
+    assert e.evidence()["fault"] == "native thermal history proof malformed"
+    frozen = e._lifecycle["thermal_rejection"]
+    assert frozen["fault"] == "native thermal history proof malformed"
+    assert frozen["proof_field_count"] == 9
+    assert set(frozen["proof_fields"]) == set(proof)
+    assert "unexpected_original_member" not in frozen["proof"]
+    assert len(json.dumps(frozen, allow_nan=False).encode()) < 8192
