@@ -2638,7 +2638,8 @@ class SameRunRecovery:
                 or type(run.get("intent_revision")) is not int
                 or type(remaining) not in (int, float) or not math.isfinite(remaining) or remaining <= 0):
                 raise RuntimeError(f"current uncancelled {label} finish authority unavailable")
-            prior_event = _latest_run_event(before, self.client.identities())
+            prior_event = json.loads(json.dumps(_latest_run_event(before, self.client.identities()), allow_nan=False))
+            finishing_from_running = run["status"] == "running"
             if prior_event and prior_event.get("kind") not in {"resumed", "input_expired", "native_input_expired", "required_view_expired"}:
                 raise RuntimeError(f"current {label} intent was superseded before finishing")
             ceiling = min(wall_deadline, entered + remaining)
@@ -2682,16 +2683,52 @@ class SameRunRecovery:
                          "receipt": receipt, "expected_intent_revision": revision})
             # This closure exists only after THIS request has a definite Pause
             # receipt. It is not an ordinary-recovery permission to adopt Pause.
+            ordered_pause = None
             def own_pause(state, pi_now):
+                nonlocal revision, ordered_pause
                 current = state["run"]
                 event = _latest_run_event(state, self.client.identities())
-                return (current.get("status") == "paused" and current.get("recovery") is None
-                        and type(current.get("intent_revision")) is int and current["intent_revision"] == revision
-                        and current.get("control_intent") == expected_intent
-                        and set(event) == {"kind", "at", "run_id", "service_incarnation"}
-                        and event.get("kind") == "pause"
-                        and type(event.get("at")) in (int, float) and math.isfinite(event["at"])
-                        and lower <= event["at"] <= pi_now < run["deadline"])
+                if (current.get("status") != "paused" or current.get("recovery") is not None
+                    or type(current.get("intent_revision")) is not int
+                    or current.get("control_intent") != expected_intent
+                    or set(event) != {"kind", "at", "run_id", "service_incarnation"}
+                    or event.get("kind") != "pause"
+                    or type(event.get("at")) not in (int, float) or not math.isfinite(event["at"])
+                    or not lower <= event["at"] <= pi_now < run["deadline"]
+                    or ordered_pause is not None and event != ordered_pause):
+                    return False
+                if current["intent_revision"] == revision:
+                    return True
+                # Core expires current input before handling Pause. Only this
+                # closed two-event ordering can explain one additional revision;
+                # a missing anchor or any other newer intent remains a refusal.
+                history = state.get("events")
+                if (bench or ordered_pause is not None or not finishing_from_running
+                    or prior_event.get("kind") != "resumed"
+                    or current["intent_revision"] != revision + 1
+                    or type(history) is not list or not 3 <= len(history) <= 64
+                    or any(type(item) is not dict for item in history)):
+                    return False
+                own = [item for item in history if item.get("run_id") == run["run_id"]
+                       and item.get("service_incarnation") == self.original["service"]]
+                if (len(own) < 3 or sum(item == prior_event for item in own) != 1
+                    or own[-3] != prior_event or own[-1] != event):
+                    return False
+                expired = own[-2]
+                if (set(expired) != {"kind", "at", "run_id", "service_incarnation"}
+                    or expired.get("kind") not in {"input_expired", "native_input_expired"}
+                    or type(expired.get("at")) not in (int, float) or not math.isfinite(expired["at"])
+                    or not lower <= expired["at"] <= event["at"]):
+                    return False
+                old_revision = revision
+                revision, ordered_pause = current["intent_revision"], dict(event)
+                self.record({"event": "normal_finish_pause_expiry_order_qualified",
+                             "operation_id": request["operation_id"],
+                             "expected_intent_revision": old_revision,
+                             "qualified_intent_revision": revision,
+                             "expiry_event": dict(expired), "pause_event": ordered_pause,
+                             "original_ceiling_monotonic_s": ceiling})
+                return True
 
             requalified = False
             async def held_budget():

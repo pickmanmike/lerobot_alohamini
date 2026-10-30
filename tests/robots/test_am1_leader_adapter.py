@@ -3866,6 +3866,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
     ordinary_transport = cause == "resume_send_transport" or normal_raw_close
     held120 = cause.startswith("held_command120_")
     renewal133 = cause.startswith("renewal_unknown133_")
+    finish_expiry_fixture = cause.startswith(("normal_finish_expiry_", "bench_finish_expiry_"))
     view_input_race = cause.startswith("view_refusal130_") or renewal133
     view122 = cause.startswith("view_refusal122_") or view_input_race
     connect_preflight = cause.startswith("view_refusal122_grant_connect_preflight_")
@@ -3945,10 +3946,14 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
 
     e.evidence = evidence  # Explicit fake native sensing/ACK; Core/IPC/gateway/client are production.
 
+    dispatches = [0]
     def dispatch(recipe):
         e.desired = "active"
         epoch[0] += 1
-        return True
+        dispatches[0] += 1
+        # The existing fake Native ACK takes one real Core resuming→running
+        # transition, retaining an actual prior resumed event for finish history.
+        return not (finish_expiry_fixture and dispatches[0] == 1)
 
     e.dispatch = dispatch
     real_handle = a.handle
@@ -3959,7 +3964,10 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
             assert a.run["status"] == "paused", "connect must not short-circuit Core recovery"
             if a.run["recovery_episodes"]:
                 assert any(v["kind"] == "live_sensing_requalified" for v in a.events)
-        return real_handle(command, device)
+        result = real_handle(command, device)
+        if finish_expiry_fixture and command["op"] == "resume" and result.get("status") == "resuming":
+            a.tick()  # The stopped fixture owner has no independent Native tick worker.
+        return result
 
     a.handle = handle
     cert, key = tmp_path / "cert.pem", tmp_path / "key.pem"
@@ -5750,17 +5758,50 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 cause = cause.replace("normal_finish_", "bench_finish_", 1)
                 original_evidence, original_post, original_hold = e.evidence, client.post, e.hold
                 original_call, gateway_pauses = gateway.call, []
+                expiry_case = cause.startswith("bench_finish_expiry_")
+                expiry_mode = cause.removeprefix("bench_finish_expiry_") if expiry_case else None
+                expiry_clock, native_expired, finish_reads = [10.], [False], []
+                expiry_renewals = []
                 unknown_case = cause.startswith("bench_finish_unknown_")
                 retry_expected = unknown_case and cause not in {
                     "bench_finish_unknown_wrong_status", "bench_finish_unknown_wrong_shape",
                     "bench_finish_unknown_wrong_type", "bench_finish_unknown_refused"}
                 async def pause_receipt(command, device):
+                    if expiry_case and command.get("op") == "claim":
+                        assert command == {"op": "claim", "controller_generation": ids["controller_generation"]}
+                        assert device == enrolled["device_id"]
+                        expiry_renewals.append(copy.deepcopy(command))
                     if command.get("op") != "pause":
                         return await original_call(command, device)
                     gateway_pauses.append(copy.deepcopy(command))
+                    if expiry_case and len(gateway_pauses) == 1:
+                        assert len(finish_reads) == 1 and finish_reads[0]["run"]["status"] == "running"
+                        base = finish_reads[0]["run"]["intent_revision"]
+                        expiry_clock[0] = 10.125 if expiry_mode == "manual" else 10.25
+                        if expiry_mode == "manual":
+                            assert a.handle({"op": "pause", "run_id": e.run_id,
+                                "operation_id": str(uuid4())}, enrolled["device_id"])["accepted"]
+                        elif expiry_mode == "native":
+                            a.applied_input = None  # Native's retained expiry wins before the Core input timer.
+                            native_expired[0] = True
+                            a.tick()
+                            native_expired[0] = False
+                        else:
+                            a._expire_controls(expiry_clock[0])
+                        assert a.run["intent_revision"] == base + 1 and a.run["status"] == "paused"
+                        assert a.events[-1]["kind"] == ("pause" if expiry_mode == "manual" else
+                            "native_input_expired" if expiry_mode == "native" else "input_expired")
+                        if expiry_mode == "extra_history":
+                            a._event("input_expired")
+                        expiry_clock[0] = 10.375
                     if len(gateway_pauses) == 1 and cause == "bench_finish_unknown_pre":
                         raise TimeoutError("Pause owner outcome unavailable before dispatch")
                     result = await original_call(command, device)
+                    if expiry_case and len(gateway_pauses) == 1 and expiry_mode in {"unknown", "unknown_manual"}:
+                        if expiry_mode == "unknown_manual":
+                            assert a.handle({"op": "pause", "run_id": e.run_id,
+                                "operation_id": str(uuid4())}, enrolled["device_id"])["accepted"]
+                        raise TimeoutError("own Pause reply lost after input expiry and durable owner effect")
                     if len(gateway_pauses) == 1 and unknown_case:
                         if cause == "bench_finish_unknown_new_pause":
                             assert a.handle({"op": "pause", "run_id": e.run_id,
@@ -5796,6 +5837,8 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     value["live_input"]["body"] = dict(m.ZERO_BODY)
                     value["accepted_host_action"]["accepted_action"] = (
                         {"mode": "raw_goal_hold", "body_velocity": 0.0} if e.desired != "active" else dict(m.ZERO_BODY))
+                    if native_expired[0]:
+                        value["live_input"]["state"] = "expired"
                     if pauses:
                         if cause == "bench_finish_no_ack":
                             value["hold_acknowledged"] = False
@@ -5805,8 +5848,34 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                             value["live_input"]["body"]["x.vel"] = .1
                         elif cause == "bench_finish_fault":
                             value["fault"] = "actual hard native fault"
+                        if expiry_case and a.run["status"] == "paused":
+                            if expiry_mode == "body":
+                                value["live_input"]["body"]["x.vel"] = .1
+                            elif expiry_mode in {"ack", "late_pause"}:
+                                value["hold_acknowledged"] = False
                     return value
                 e.evidence = final_evidence
+                if expiry_case:
+                    a.clock = e.clock = lambda: expiry_clock[0]
+                    frame = await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="combined", progress_s=.01)
+                    assert frame[2]["accepted"] is True and a.applied_input["expires"] == 10.25
+                    original_get = client.get
+                    async def finish_get(path):
+                        value = await original_get(path)
+                        if path == "state":
+                            finish_reads.append(copy.deepcopy(value["snapshot"]))
+                            if expiry_mode == "late_pause" and len(finish_reads) == 2:
+                                current = finish_reads[-1]
+                                assert current["run"]["intent_revision"] == finish_reads[0]["run"]["intent_revision"] + 2
+                                assert current["evidence"]["hold_acknowledged"] is False
+                                assert [event["kind"] for event in current["events"][-3:]] == ["resumed", "input_expired", "pause"]
+                                # Return this first valid ordered Pause snapshot;
+                                # the next fresh read must see the newer manual intent.
+                                expiry_clock[0] = 10.4375
+                                assert a.handle({"op": "pause", "run_id": e.run_id,
+                                    "operation_id": str(uuid4())}, enrolled["device_id"])["accepted"]
+                        return value
+                    client.get = finish_get
                 if cause.startswith("bench_finish_renewal_"):
                     # Production Core/IPC/TLS/HTTP claim loss during own Pause:
                     # fake Native sensing is the existing fixture's only device seam.
@@ -5961,6 +6030,24 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         a.service_incarnation = str(uuid4())
                     elif cause == "bench_finish_view_after":
                         a._teleop_view["qualified_until"] = 9.9
+                    if expiry_case:
+                        if expiry_mode == "cancel":
+                            raise asyncio.CancelledError("cancelled after own Pause at input-expiry boundary")
+                        if expiry_mode in {"stop", "external_pause"}:
+                            assert a.handle({"op": "stop" if expiry_mode == "stop" else "pause",
+                                "run_id": e.run_id, "operation_id": str(uuid4())}, enrolled["device_id"])["accepted"]
+                        elif expiry_mode == "takeover":
+                            a.controller["expires"] = 10.
+                            a._expire_controls(expiry_clock[0])
+                            assert a.handle({"op": "claim"}, "competitor")["accepted"]
+                        elif expiry_mode == "reboot":
+                            a.service_incarnation = str(uuid4())
+                        elif expiry_mode == "missing_history":
+                            a.events.remove(m._latest_run_event(finish_reads[0], client.identities()))
+                        elif expiry_mode == "revision":
+                            a.run["intent_revision"] += 1
+                        elif expiry_mode == "view":
+                            a._teleop_view["qualified_until"] = 10.25
                     return result
                 client.post = post
                 creation_phase = {"bench_finish_budget_post_create": "post", "bench_finish_budget_get_create": "get",
@@ -5999,6 +6086,53 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                             raise RuntimeError("current renewal refused before request creation")
                 entered = m.time.monotonic()
                 try:
+                    if expiry_case:
+                        succeeds = normal_finish and expiry_mode in {"input", "native", "unknown"}
+                        if succeeds:
+                            proof = await guard.finish_owned(bench=False, wall_deadline=entered + 2,
+                                                             renewal_check=healthy_renewal)
+                            assert proof["native_held_qualified"] and proof["zero_body_command"]
+                            current = proof["snapshot"]
+                            base = finish_reads[0]["run"]["intent_revision"]
+                            assert current["run"]["intent_revision"] == base + 2
+                            own = [event for event in current["events"] if event.get("run_id") == e.run_id
+                                   and event.get("service_incarnation") == a.service_incarnation]
+                            prior = m._latest_run_event(finish_reads[0], client.identities())
+                            assert own[-3] == prior and [event["kind"] for event in own[-2:]] == [
+                                "native_input_expired" if expiry_mode == "native" else "input_expired", "pause"]
+                            assert proof["pause_operation_id"] == pauses[0]["operation_id"]
+                            assert proof["pause_receipt"]["accepted"] is True
+                            assert m._live(current)["required_view"] == {
+                                "required": True, "qualified": True, "role": "chest", "cause": None}
+                            qualified = [row for row in records if row["event"] == "normal_finish_hold_qualified"]
+                            assert len(qualified) == 1 and qualified[0]["original_ceiling_monotonic_s"] <= entered + 2
+                        else:
+                            expected = asyncio.CancelledError if expiry_mode == "cancel" else (RuntimeError, TimeoutError)
+                            with pytest.raises(expected):
+                                await guard.finish_owned(bench=not normal_finish, wall_deadline=entered + 2,
+                                                         renewal_check=healthy_renewal)
+                            assert not any(row["event"].endswith("finish_hold_qualified") for row in records)
+                            if expiry_mode == "late_pause":
+                                ordered = [row for row in records if row["event"] == "normal_finish_pause_expiry_order_qualified"]
+                                assert len(ordered) == 1 and len(finish_reads) >= 3
+                                assert finish_reads[-1]["run"]["intent_revision"] == ordered[0]["qualified_intent_revision"] + 1
+                        unknown = expiry_mode in {"unknown", "unknown_manual"}
+                        assert len(pauses) == len(gateway_pauses) == (2 if unknown else 1)
+                        assert all(value == pauses[0] for value in pauses) and all(value == gateway_pauses[0] for value in gateway_pauses)
+                        if unknown:
+                            lost = [row for row in records if row["event"] == "normal_finish_pause_receipt_unknown"]
+                            assert len(lost) == 1 and lost[0]["http_status"] == 503
+                        assert sum(op == "grant" for op, _ in commands) == sum(op == "input" for op, _ in commands) == 1
+                        assert sum(op == "connect" for op, _ in commands) == sum(op == "resume" for op, _ in commands) == 1
+                        assert sum(op == "claim" for op, _ in commands) == len(expiry_renewals) + int(expiry_mode == "takeover")
+                        if expiry_mode != "takeover":
+                            assert a.controller["generation"] == ids["controller_generation"]
+                            assert a.controller["device_id"] == enrolled["device_id"]
+                        assert not any(op == "start" for op, _ in commands)
+                        assert m._live(a.snapshot())["reference"] == producer_workspace["reference"]
+                        assert a.run["native_live_at"] == 9. and a.run["deadline"] == 309.
+                        assert m.time.monotonic() < entered + 2.25
+                        return
                     if creation_phase:
                         with pytest.raises(RuntimeError, match="current renewal refused before request creation"):
                             await guard.finish_owned(bench=False, wall_deadline=entered + 2, renewal_check=healthy_renewal)
@@ -13327,6 +13461,13 @@ def test_ordinary_changing_runner_routes_consumed_input_without_replaying_it(tmp
     assert dispatched[0]["source"]["sample_seq"] == 1 and dispatched[1]["source"]["sample_seq"] == 2
     assert dispatched[0]["grant_id"] != dispatched[1]["grant_id"]
     assert not hasattr(original, "grant_context"), "Input uncertainty must retain its own consumed acquisition context"
+
+
+@pytest.mark.parametrize("cause", ["normal_finish_expiry_" + mode for mode in
+    ("input", "native", "unknown", "manual", "external_pause", "unknown_manual", "stop", "takeover", "reboot",
+     "missing_history", "extra_history", "revision", "cancel", "view", "body", "ack", "late_pause")] + ["bench_finish_expiry_input"])
+def test_normal_finish_owns_only_closed_single_expiry_then_own_pause(tmp_path, monkeypatch, cause):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause)
 
 
 @pytest.mark.parametrize("cause", ["normal_finish_renewal_" + mode for mode in
