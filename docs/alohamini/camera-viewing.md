@@ -19,6 +19,10 @@ retired session/clock and is excluded; DOM focus alone is not scene evidence.
 8849 has one correctly bound Live Chest screenshot with coarse-awareness scope;
 fine tips and final-window observation remain limited.
 
+Keep the actual enrolled native window restored and the camera content pane on screen. DOM visibility/focus and a browser viewport screenshot do not prove the OS window is restored. Required presentation receipts also do not prove the camera pane is in the visible viewport or the scene is useful. After an optional P1 action or diagnostic inspection scrolls the pane away, return it to the top and verify an actual camera-panel image before the next activity. Do not change decoder/network settings from dark scene content alone.
+
+The2026-10-30 P1 recordings provide useful coarse external context during5344 and71AE, with verified overlap/release; optional live P1 viewing was separately unavailable. Onboard5344 imagery was dark and71AE running screenshots were diagnostics-only. Neither result qualifies a dependable human working view. P1 remains advisory, and no special low-light mode was changed or qualified.
+
 Use the existing AM1-attached USB cameras through the ordinary protected owner.
 [`ProtectedHostRun`](../../tools/am1_physical_executor.py) starts the maintained
 [`run_am1_camera.sh`](../../tools/run_am1_camera.sh) launcher in the retained
