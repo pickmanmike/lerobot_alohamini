@@ -3491,15 +3491,16 @@ class SessionAuthority:
             "live_input",
         }
         presented_evidence = evidence
-        if run is not None and run.get("recipe") == TELEOP_RECIPE:
-            ack = evidence.get("accepted_host_action")
-            if isinstance(ack, dict):
-                # The exact live summary is already exposed separately. Keep
-                # original raw acquisition facts inside the existing ACK field
-                # without its duplicated workspace exceeding the field cap.
-                presented_evidence = {**evidence, "accepted_host_action": {
-                    key: value for key, value in ack.items() if key != "live_input"
-                }}
+        ack = evidence.get("accepted_host_action")
+        if isinstance(ack, dict):
+            # The full diagnostic vector remains in the referenced evidence.
+            # It must not hide the current control ACK at the per-field cap.
+            omitted = {"thermal_raw_sources"}
+            if run is not None and run.get("recipe") == TELEOP_RECIPE:
+                omitted.add("live_input")  # Exact live summary is exposed separately.
+            presented_evidence = {**evidence, "accepted_host_action": {
+                key: value for key, value in ack.items() if key not in omitted
+            }}
         public = _status_small(presented_evidence, keys)
         if self._physical_interactive():
             public["live_input"] = self._live_input_status(evidence)
