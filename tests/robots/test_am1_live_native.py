@@ -1010,6 +1010,42 @@ def test_practical_routine_writer_queue_full_and_sink_error_are_latched():
     assert again.value is original
 
 
+@pytest.mark.parametrize("boundary", ["serialization", "enqueue"])
+@pytest.mark.parametrize("interruption_type", [KeyboardInterrupt, SystemExit])
+def test_practical_routine_writer_stop_interruption_does_not_poison_cleanup(monkeypatch, boundary, interruption_type):
+    """CB65: a foreground Stop interrupt is not an asynchronous sink failure."""
+    output = bytearray()
+    writer = host.AM1RoutineRecordWriter(write=lambda data: output.extend(data) or len(data))
+    interruption = interruption_type("ordinary host stop")
+
+    def interrupt(*args, **kwargs):
+        raise interruption
+
+    caught = None
+    try:
+        with monkeypatch.context() as patch:
+            if boundary == "serialization":
+                patch.setattr(host.json, "dumps", interrupt)
+            else:
+                patch.setattr(writer._queue, "put_nowait", interrupt)
+            try:
+                writer.submit("[LIFT OPERATIONAL] ", {"sample": 1})
+            except BaseException as error:
+                caught = error
+        assert caught is interruption
+        # The same sink is used by normal shutdown feedback and the final report.
+        writer.raise_if_failed()
+        assert writer.submit("[LIFT OPERATIONAL] ", {"cleanup": "fresh-off-readback"})
+        writer.close(timeout=1)
+        assert output == b'[LIFT OPERATIONAL] {"cleanup":"fresh-off-readback"}\n'
+    finally:
+        try:
+            writer.close(timeout=1)
+        except BaseException as error:
+            if error is not interruption:
+                raise
+
+
 def test_practical_routine_writer_drain_timeout_is_finite():
     import threading
     entered, release = threading.Event(), threading.Event()
@@ -1142,12 +1178,15 @@ def test_practical_writer_error_still_cleans_motor_and_sockets_before_drain(monk
     evidence = SimpleNamespace(enabled=True, enrich_fault=lambda *args: None,
                                emit_pending_fault=lambda *args: events.append("fault-record"))
     class Writer:
+        checks = 0
         def submit_line(self, message, **kwargs):
             report(message, **kwargs)
         def emit_selected(self, record):
             pass
         def raise_if_failed(self):
-            if not normal_stop:
+            self.checks += 1
+            # Startup checks the writer before the host sockets exist.
+            if not normal_stop and self.checks > 1:
                 raise original
         def close(self, **kwargs):
             events.append("drain")

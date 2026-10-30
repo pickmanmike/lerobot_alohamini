@@ -82,7 +82,7 @@ class AM1RoutineRecordWriter:
         """Freeze the original record; a full/failed sink never waits on the owner."""
         try:
             return self.submit_line(prefix + json.dumps(record, allow_nan=False, separators=(",", ":")))
-        except BaseException as error:
+        except Exception as error:
             self._latch(error)
         return False
 
@@ -100,7 +100,7 @@ class AM1RoutineRecordWriter:
             return True
         except queue.Full:
             self._latch(RuntimeError("AM1 routine log queue full"))
-        except BaseException as error:
+        except Exception as error:
             self._latch(error)
         return False
 
