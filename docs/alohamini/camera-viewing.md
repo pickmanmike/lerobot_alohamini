@@ -26,6 +26,8 @@ Use the reviewed working-view routine below; [current state](current-state.md) r
 3. Verify actual current pixels showing the coarse gripper and approach area; advancing counters, qualified presentation receipts and advisory P1 recording are separate evidence, and darkness alone does not identify a decoder fault or a special low-light mode.
 4. A one-time reload to load a delivered viewer update is a development handoff; repeated manual refreshes or reconnects during ordinary use remain an operability limitation, not the working-view routine.
 
+Stage96's97a4 retained current coarse Chest pixels in a finishing browser screenshot. Its native capture returned black/wallpaper and nativeAX repeated an older run, so those observations do not qualify the actual onscreen window. A fresh regular tab in the same enrolled/software-decoder profile attached without pairing; desktop activation/capture remained unavailable. Preserve this tool/access limitation and the specific pending desktop check; do not infer a camera/decoder defect or count a viewport image as native-window proof.
+
 The2026-10-30 P1 recordings provide useful coarse external context during5344 and71AE, with verified overlap/release; optional live P1 viewing was separately unavailable. Onboard5344 imagery was dark and71AE running screenshots were diagnostics-only. Neither result qualifies a dependable human working view. P1 remains advisory, and no special low-light mode was changed or qualified.
 
 Use the existing AM1-attached USB cameras through the ordinary protected owner.
