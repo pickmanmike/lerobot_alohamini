@@ -5432,44 +5432,73 @@ async def run(args):
                         return True
                     return False
 
-                try:
-                    before_stop = (await client.get("state"))["snapshot"]
-                except (OSError, TimeoutError, aiohttp.ClientError, RuntimeError) as error:
-                    summary["pre_stop_state_error"] = {
-                        "error_type": type(error).__name__,
-                        "message": str(error),
-                    }
-                else:
-                    if terminal_qualified(before_stop):
-                        return
-                try:
-                    stopped = await client.post(
-                        "stop", {"run_id": owned_run_id, "operation_id": str(uuid4())}
-                    )
-                    summary["stop_receipt"] = stopped
-                except (OSError, TimeoutError, aiohttp.ClientError, RuntimeError) as error:
-                    try:
-                        terminal = (await client.get("state"))["snapshot"]
-                        qualified = terminal_qualified(terminal)
-                    except BaseException as qualification_error:
-                        summary["stop_qualification_error"] = {
-                            "error_type": type(qualification_error).__name__,
-                            "message": str(qualification_error),
-                        }
-                        raise error from qualification_error
-                    if not qualified:
-                        raise
-                    summary["stop_request_error"] = {
-                        "error_type": type(error).__name__,
-                        "message": str(error),
-                    }
-                    return
+                # Stop is a durable mutation: retain its identity across unknown
+                # receipts. Cleanup gets one original budget, not a new task lease.
                 until = time.monotonic() + 85
-                while time.monotonic() < until:
-                    if terminal_qualified((await client.get("state"))["snapshot"]):
+                request = {"run_id": owned_run_id, "operation_id": str(uuid4())}
+                acknowledged = False
+
+                def remaining():
+                    value = until - time.monotonic()
+                    if value <= 0:
+                        raise TimeoutError("native cleanup did not qualify")
+                    return value
+
+                def transient(step, error):
+                    detail = {"step": step, "error_type": type(error).__name__,
+                              "message": str(error)[:240]}
+                    errors = summary.setdefault("native_stop_transient_errors", [])
+                    if len(errors) < 8:
+                        errors.append(detail)
+                    else:
+                        summary["native_stop_transient_errors_dropped"] = (
+                            summary.get("native_stop_transient_errors_dropped", 0) + 1)
+                    record({"event": "native_stop_interrupted", **detail,
+                            "operation_id": request["operation_id"],
+                            "original_ceiling_monotonic_s": until})
+
+                while True:
+                    try:
+                        wait_seconds = remaining()
+                        current = (await asyncio.wait_for(client.get("state"), wait_seconds))["snapshot"]
+                    except (OSError, TimeoutError, aiohttp.ClientError) as error:
+                        summary.setdefault("pre_stop_state_error", {
+                            "error_type": type(error).__name__, "message": str(error)})
+                        transient("state", error)
+                        await asyncio.sleep(min(.1, remaining()))
+                        continue
+                    # No failed read authorizes a new or repeated Stop against an
+                    # unknown current run. A terminal ACK alone is also insufficient.
+                    if terminal_qualified(current):
                         return
-                    await asyncio.sleep(0.1)
-                raise TimeoutError("native cleanup did not qualify")
+                    if not acknowledged:
+                        try:
+                            wait_seconds = remaining()
+                            stopped = await asyncio.wait_for(client.post("stop", request), wait_seconds)
+                            summary["stop_receipt"] = stopped
+                            acknowledged = True
+                        except (OSError, TimeoutError, aiohttp.ClientError) as error:
+                            summary.setdefault("stop_request_error", {
+                                "error_type": type(error).__name__, "message": str(error)})
+                            transient("stop", error)
+                        except RuntimeError as error:
+                            # Keep definite refusals distinct from transport loss;
+                            # an independently completed terminal state may qualify.
+                            try:
+                                wait_seconds = remaining()
+                                terminal = (await asyncio.wait_for(client.get("state"), wait_seconds))["snapshot"]
+                                qualified = terminal_qualified(terminal)
+                            except BaseException as qualification_error:
+                                summary["stop_qualification_error"] = {
+                                    "error_type": type(qualification_error).__name__,
+                                    "message": str(qualification_error)}
+                                raise error from qualification_error
+                            if not qualified:
+                                raise
+                            summary["stop_request_error"] = {
+                                "error_type": type(error).__name__, "message": str(error)}
+                            return
+                    await asyncio.sleep(min(.1, remaining()))
 
             await cleanup_step("native_stop", stop_owned_run, 89.0)
             summary["physical_register_off_readback_verified"] = (

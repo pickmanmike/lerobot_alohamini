@@ -1,6 +1,12 @@
 # AM1 current state
 
-Updated2026-10-29: useful normal required-Chest follow-through completed on installed Stage93/R75. [PR45](https://github.com/pickmanmike/lerobot_alohamini/pull/45) targets integrate/am1-local-teleop; repository source identity remains separate from installed component identities. Read [decisions and lessons](decisions-and-lessons.md) and [Packet16](teleop-consolidation-16.md) for retained detail.
+Updated2026-10-29: useful normal required-Chest follow-through completed on installed Stage93/R75. [PR45](https://github.com/pickmanmike/lerobot_alohamini/pull/45) is merged into integrate/am1-local-teleop; repository source identity remains separate from installed component identities. Read [decisions and lessons](decisions-and-lessons.md) and [Packet16](teleop-consolidation-16.md) for retained detail.
+
+## Focused continuation after PR45 integration
+
+[PR45 is merged at3bf43553](https://github.com/pickmanmike/lerobot_alohamini/pull/45); its [closeout](https://github.com/pickmanmike/lerobot_alohamini/pull/45#issuecomment-6506321906) owns the postmerge7502/A531 detail.83f remains the completed reach/gripper/original-return action;7502 was interrupted and needed a separately verified agent-issued console Stop;A531 was a fresh successful reverse-direction next Start, not completion of7502. Built-in automatic recovery, agent supervisory Stop and human update handoff are different intervention scopes.
+
+The implemented PC-only follow-up preserves raw renewal TimeoutError versus canonical HTTP503 unknown outcome.7502's actual owner lease expired; its failed renewal application remains unknown. The demonstrated issue is dependable termination after transient authenticated read/Stop request loss, not permission to revive authority. The existing normal real Core/IPC/TLS Grant-close and runner cleanup fixtures cover the actual raw renewal/detach ordering, exact Stop replay after transient loss, accepted-Stop polling, refusal/cancellation, foreign runs and one bounded original cleanup ceiling. Five genuine behavioral failures became GREEN; the final affected selection passed35 checks (one existing aiohttp application-key warning), with independent source review CLEAR. Two older ordinary-pause fixture failures were reproduced on the exact integrated preimage and corrected at their shared identity contract. Useful required-Chest follow-through with overlapping finite P1 recording is next, separate from software proof. Installed Stage93/R75/M46 and matched rollback remain unchanged; no raw-timeout rearm, timer, gain, calibration or native deployment changed.
 
 ## Latest useful ordinary action and practical readiness
 
