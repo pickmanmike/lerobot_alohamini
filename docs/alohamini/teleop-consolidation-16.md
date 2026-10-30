@@ -1,5 +1,7 @@
 # AM1 teleoperation consolidation — Packet16
 
+Current follow-up: PR45 is merged; [its closeout](https://github.com/pickmanmike/lerobot_alohamini/pull/45#issuecomment-6506321906) retains postmerge7502 andA531 separately. [Current state](current-state.md) owns the focused PC termination correction, current merge/next-action pointer and unchanged Stage93/R75/M46 component binding. No unchanged native deployment or physical branch-forcing is needed.
+
 Current stopped checkpoint, October29: Fresh83f3122f/native2ed39d89 on unchanged Stage93/R75 and PC3648 completed all four streamed movement phases plus Finish under NORMAL required Chest: 514 fresh frames and33.821 producer-active seconds within the original75s window/native300s ceiling. Startup15.801s and initial qualification1.069s are separate. Four later input/native-input holds totaled4.190s (max1.205s); longest CoreRunning13.568s. Recovery used qualified fresh input without human intervention; no required-view hold or native proof-loss episode was recorded. Original reference/workspace/deadline stayed fixed. Legacy producer_program_complete/native_execution_complete remain false for this interactive path; interactive_input_complete and Finish qualification are true.
 
 Fresh elbow1094→deliveredGoal1139/PP1134 achieved3.515625° of4° requested; original-returnGoal1094/PP1116 leaves+22ticks/+1.933594° residual. Two sparse actual SDK readbacks at each endpoint match the delivered Goals; these are not continuous dwell reads. Gripper3094→3239 achieved9.570957of10 opening points, then3102 leaves+.528053point residual. This is purposeful coarse action with limited return accuracy, not precise return or object manipulation. Other joints/body/lift intent stayed held/zero; sampled nonzero body/lift velocities prevent a claim of continuous physical stationarity. Finish qualified in.484s; physical OFF/zero, P16/I0/D32/Accel0/Lock0 restoration, lift qualification, buses and camera release were verified with uncertaintyfalse/null first causes.
@@ -12,7 +14,7 @@ At the owner's request the existing guarded90s P1 advisory capture was reused wi
 
 Physical leaders are the primary input for ordinary teleoperation. An explicitly selected virtual-leader source substitutes at acquisition and uses the same mapping, authenticated transport and protected Pi-owned execution. The accepted elbow page presets remain useful diagnostic controls.
 
-## Current continuation — input continuity and original return, 2026-10-28
+## Historical continuation — input continuity and original return, 2026-10-28
 
 The continuation begins from PR44 mergea4f034e5. Stage91/R72 later completed all10 stopped/idle phases and exact normal R72 was restored after F790 stopped reconciliation. Published7085c51d is separate from installed component pins. Stage92 has built one Service-only R74 over retained R72/M46; its all10-phase delivery is complete. Current-state/private Resume rows own the next action. At that historical checkpoint8849 remained the latest completed ordinary action; later failures and the current reconciled fault do not acquire programme or Finish credit.
 

@@ -1547,6 +1547,9 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
 
     m = adapter()
     production_post = m.SessionClient.post
+    cleanup_retry = isinstance(failure, str) and failure.startswith("cleanup_retry_")
+    cleanup_mode = failure.removeprefix("cleanup_retry_") if cleanup_retry else None
+    cleanup_failure = RuntimeError("injected original run failure before dependable cleanup")
     peer_wait_case = isinstance(failure, str) and failure.startswith("peer_fixed_baseline_")
     peer_template = peer_baseline_state(peer_workspace()) if peer_wait_case else None
     initial_pause_case = failure == "initial_resume_pause"
@@ -1598,7 +1601,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         or mailbox_case
         or timed_expiry
         or initial_pause_case
-        or failure in {"zero_deadline_rounding", "zero_inner_timeout"}
+        or failure in {"zero_deadline_rounding", "zero_inner_timeout", "stop"}
     ):
         import time
 
@@ -1630,6 +1633,10 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             self.pauses = []
             self.start_requests = []
             self.cleanup_reads = 0
+            self.cleanup_started = False
+            self.stop_requests = []
+            self.cleanup_trace = []
+            self.cleanup_statuses = []
             self.inputs = []
             self.recovery_reads = 0
             self.authoritative = None
@@ -1873,10 +1880,22 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                     current["evidence"]["fault"] = "Native held qualification unavailable"
                 return {"accepted": True, "status": "paused", "effect_admitted": False}
             assert op == "stop"
+            if cleanup_retry or failure == "stop":
+                self.stop_requests.append(copy.deepcopy(payload))
+                self.cleanup_trace.append("stop")
+                assert payload["run_id"] == owned_id
+                if cleanup_mode == "cancel":
+                    raise asyncio.CancelledError("injected cleanup cancellation")
+                if cleanup_mode == "refused":
+                    raise m.HTTPOutcomeError(403, {"accepted": False, "status": "refused",
+                        "effect_admitted": False, "reason": "injected protective Stop refusal"})
+                if cleanup_mode in {"before", "combined", "foreign_after"} and len(self.stop_requests) == 1:
+                    raise TimeoutError("injected Stop request outcome unknown before effect")
             self.stops.append(payload["run_id"])
             if failure == "stop":
                 from aiohttp import ClientOSError
 
+                pc_clock[0] += 35.  # Spend the original85s cleanup budget; asyncio/production timers stay unchanged.
                 raise ClientOSError(5, "injected Stop transport failure")
             self.snapshot = self.state(owned_id)
             self.snapshot["run"].update(
@@ -1891,6 +1910,10 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 self.snapshot["run"].update(
                     native_live_at=None, native_first_cause="injected original pre-Live native fault"
                 )
+            if cleanup_retry and cleanup_mode in {"after", "combined"} and len(self.stops) == 1:
+                raise TimeoutError("injected Stop applied but receipt unavailable")
+            if cleanup_mode == "ack_pending":
+                self.snapshot["run"].update(status="finishing", cleanup=None)
             if failure in {"admission_terminal", "terminal_stop_race"}:
                 from tools.am1_session_core import SessionAuthority
 
@@ -1993,7 +2016,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             assert predicate()
 
         def identities(self):
-            if mailbox_case or initial_pause_case or bench_case:
+            if mailbox_case or initial_pause_case or bench_case or ordinary_case:
                 return dict(run_id=owned_id, service_incarnation="service",
                             controller_generation=self.generation, connection_generation=self.connection,
                             host_incarnation="host", intent_revision=self.snapshot["run"]["intent_revision"])
@@ -2090,6 +2113,10 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 return {"accepted": True, "grant_id": str(uuid4()), "expires": 99.0}
             assert payload["op"] == "input"
             self.inputs.append(copy.deepcopy(payload))
+            if cleanup_retry:
+                self.cleanup_started = True
+                self.snapshot["controller"] = None  # The expired controller cannot block protective Stop.
+                raise cleanup_failure
             if cycle_run or ordinary_arms:
                 pc_clock[0] += 14.735/224 if entry_case and failure.endswith("replan") else .1  # Full real60-active-second schedule; only PC time is accelerated.
             if peer_wait_case:
@@ -2165,7 +2192,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 or mailbox_case
                 or timed_expiry
                 or initial_pause_case
-                or failure in {"zero_deadline_rounding", "zero_inner_timeout"}
+                or failure in {"zero_deadline_rounding", "zero_inner_timeout", "stop"}
             ):
                 pc_clock[0] += 0.01
             self.snapshot["run"]["live_input"].update(
@@ -2208,6 +2235,20 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         async def get(self, op):
             assert op == "state"
             self.cleanup_reads += 1
+            if cleanup_retry and self.cleanup_started:
+                self.cleanup_trace.append("state")
+                reads = self.cleanup_trace.count("state")
+                if cleanup_mode in {"get", "combined"} and reads == 1:
+                    raise TimeoutError("injected pre-Stop state read unavailable")
+                if cleanup_mode in {"followup", "combined"} and self.stops and reads < (5 if cleanup_mode == "combined" else 4):
+                    raise TimeoutError("injected terminal state read unavailable")
+                if cleanup_mode == "foreign" or cleanup_mode == "foreign_after" and self.stop_requests:
+                    foreign = copy.deepcopy(self.snapshot)
+                    foreign["run"]["run_id"] = foreign_id
+                    return {"snapshot": foreign}
+                if cleanup_mode == "ack_pending" and self.stops and reads == 4:
+                    self.snapshot["run"].update(status="stopped", cleanup="physical_readback_verified")
+                self.cleanup_statuses.append(self.snapshot["run"]["status"])
             if entry_case and failure.endswith(("clock_late", "clock_no_reply")) and not self.stops and not entry_clock_reads:
                 entry_clock_reads.append(pc_clock[0])
                 try:
@@ -2322,6 +2363,50 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         args.duration_seconds = 0.03
     if foreign_boundary:
         args.next_start_seconds = 0.001
+    if cleanup_retry:
+        import json
+
+        args.source, args.next_start_seconds = "virtual-leaders", None
+        with pytest.raises(RuntimeError) as caught:
+            asyncio.run(asyncio.wait_for(m.run(args), 5.))
+        assert caught.value is cleanup_failure
+        summary = json.loads((tmp_path / "evidence" / "summary.json").read_text())
+        session = instances[0]
+        assert summary["failure"] == str(cleanup_failure) and summary["failure_type"] == "RuntimeError"
+        assert session.starts == session.closed == 1 and len(session.inputs) == 1
+        assert session.claim_posts == 0 and session.resumes == 0
+        assert summary["original_native_deadline"] == 301.
+        if cleanup_mode in {"get", "combined"}:
+            assert session.cleanup_trace[:2] == ["state", "state"], "a failed owner read cannot authorize Stop"
+        assert all(request == session.stop_requests[0] for request in session.stop_requests)
+        if session.stop_requests:
+            assert str(__import__("uuid").UUID(session.stop_requests[0]["operation_id"])) == session.stop_requests[0]["operation_id"]
+        if cleanup_mode in {"foreign", "foreign_after", "refused", "cancel"}:
+            assert summary["native_cleanup_uncertain"] is True
+            assert "native_terminal" not in summary
+            assert len(summary["cleanup_errors"]) == 1 and summary["cleanup_errors"][0]["step"] == "native_stop"
+            assert len(session.stop_requests) == (0 if cleanup_mode == "foreign" else 1)
+            assert session.stops == []
+            if cleanup_mode == "foreign_after":
+                assert session.cleanup_trace == ["state", "stop", "state"]
+                assert "another run" in summary["cleanup_errors"][0]["message"]
+        else:
+            assert summary["native_cleanup_uncertain"] is False and summary["cleanup_errors"] == []
+            assert summary["physical_register_off_readback_verified"] is True
+            assert summary["native_terminal"]["run"]["run_id"] == owned_id
+            assert summary["native_terminal"]["run"]["cleanup"] == "physical_readback_verified"
+            assert len(session.stop_requests) == (2 if cleanup_mode in {"before", "combined"} else 1)
+            assert session.stops == [owned_id]
+            assert session.cleanup_trace[-1] == "state"
+            evidence = summary.get("native_stop_transient_errors", [])
+            if cleanup_mode == "ack_pending":
+                assert session.cleanup_statuses == ["running", "finishing", "finishing", "stopped"]
+                assert session.cleanup_trace == ["state", "stop", "state", "state", "state"]
+                assert evidence == []
+            else:
+                assert evidence and len(evidence) <= 8
+                assert all(row["error_type"] == "TimeoutError" and 0 < len(row["message"]) <= 240 for row in evidence)
+        return
     if peer_wait_case:
         import json
         args.source, args.next_start_seconds, args.duration_seconds = "virtual-leaders", None, .05
@@ -3087,6 +3172,19 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         )
         if failure == "stop":
             assert summary["native_cleanup_uncertain"] is True
+            assert "native_terminal" not in summary and summary["physical_register_off_readback_verified"] is False
+            assert len(instances[0].stop_requests) == 3
+            assert all(request == instances[0].stop_requests[0] for request in instances[0].stop_requests)
+            assert all(request["run_id"] == owned_id for request in instances[0].stop_requests)
+            assert pc_clock[0] >= 10. + 85.
+            assert summary["cleanup_errors"] == [{"step": "native_stop", "error_type": "TimeoutError",
+                "message": "native cleanup did not qualify"}]
+            import json
+            stop_errors = [json.loads(line) for line in (tmp_path / "evidence" / "frames.jsonl").read_text().splitlines()
+                           if '"native_stop_interrupted"' in line]
+            assert len(stop_errors) == 3 and len({row["operation_id"] for row in stop_errors}) == 1
+            assert stop_errors[0]["operation_id"] == instances[0].stop_requests[0]["operation_id"]
+            assert len({row["original_ceiling_monotonic_s"] for row in stop_errors}) == 1
         if failure == "start_unknown":
             assert summary["start_outcome_uncertain"] is True and summary["start_operation_id"]
         if failure == "terminal_fault":
@@ -3123,7 +3221,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             []
             if failure in {"start_unknown", "admission_fault", "admission_terminal", "foreign_terminal"}
             or foreign_boundary
-            else [owned_id]
+            else [owned_id] * (3 if failure == "stop" else 1)
         )
         and session.closed == 1
     )
@@ -3184,6 +3282,12 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         assert 0 < summary["active_progress_s"] < 0.04
         assert summary["original_native_deadline"] == 301.0
         assert summary["cleanup_errors"] == [] and summary["final_body_zero"] is True
+
+
+@pytest.mark.parametrize("mode", ["get", "before", "after", "followup", "combined", "ack_pending", "foreign", "foreign_after", "refused", "cancel"])
+def test_runner_retries_transient_owned_stop_until_fresh_terminal_readback(tmp_path, monkeypatch, mode):
+    test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
+        tmp_path, monkeypatch, "cleanup_retry_" + mode)
 
 
 def test_runner_constructor_failure_still_saves_first_cause_without_start(tmp_path, monkeypatch):
@@ -3758,7 +3862,8 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
     initial_connect = cause.startswith("initial_connect_loss_")
     initial_view = cause.startswith("initial_view_refusal")
     ordinary_input = cause.startswith("ordinary_input_unknown_")
-    ordinary_transport = cause == "resume_send_transport"
+    normal_raw_close = cause == "grant_close_timeout_normal_renewal_raw_expired"
+    ordinary_transport = cause == "resume_send_transport" or normal_raw_close
     held120 = cause.startswith("held_command120_")
     renewal133 = cause.startswith("renewal_unknown133_")
     view_input_race = cause.startswith("view_refusal130_") or renewal133
@@ -5038,6 +5143,12 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 pending = None
                 client.record = record
                 close_entered, close_cancelled = asyncio.Event(), asyncio.Event()
+                renewal_applied, renewal_failed = asyncio.Event(), asyncio.Event()
+                renewal_calls, overlap = [], []
+                if normal_raw_close:
+                    loop, began = asyncio.get_running_loop(), m.time.monotonic()
+                    a.clock = e.clock = lambda: 10. + m.time.monotonic() - began
+                    a._teleop_view["qualified_until"] = a.clock() + .5
                 async def stalled_close(*args, **kwargs):
                     close_entered.set()
                     try:
@@ -5046,7 +5157,16 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         close_cancelled.set()
                 old_ws.close = stalled_close
                 async def missing_grant_receipt(command, device):
+                    if normal_raw_close and command.get("op") == "claim":
+                        assert command == {"op": "claim", "controller_generation": ids["controller_generation"]}
+                        a._teleop_view["qualified_until"] = a.clock() + .5
                     result = await original_call(command, device)
+                    if normal_raw_close and command.get("op") == "claim":
+                        renewal_calls.append(copy.deepcopy(result))
+                        if len(renewal_calls) == 2:
+                            assert m._normal_renewal_receipt(client._renewal_ack, client.generation)
+                            renewal_applied.set()
+                            await unblock_release.wait()  # HTTP3s deadline, outside Core/IPC1.5s deadline.
                     if command.get("op") == "grant" and not accepted_grants:
                         accepted_grants.append(copy.deepcopy(result))
                         assert result["accepted"] is True
@@ -5057,15 +5177,48 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     return result
                 gateway.call = missing_grant_receipt
                 renewal = asyncio.create_task(client.renew())
+                if normal_raw_close:
+                    def timed_out(task):
+                        overlap.append((close_entered.is_set(), close_cancelled.is_set(), task.exception()))
+                        renewal_failed.set()
+                    renewal.add_done_callback(timed_out)
                 def healthy_renewal():
                     if renewal.done():
                         renewal.result()
                 try:
+                    if normal_raw_close:
+                        await asyncio.wait_for(renewal_applied.wait(), 2.)
+                        before_commands = list(commands)
                     with pytest.raises(TimeoutError) as caught:
                         await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="combined", progress_s=.01)
                     assert producer.sequence == client.sequence == 0 and len(accepted_grants) == 1
                     pending = asyncio.get_running_loop().create_future()
                     client.pending["quarantined-test-request"] = pending
+                    if normal_raw_close:
+                        with pytest.raises(TimeoutError) as refused:
+                            await guard.resume(grant_error=caught.value, renewal_check=healthy_renewal)
+                        await renewal_failed.wait()
+                        assert refused.value is caught.value
+                        assert len(overlap) == 1 and overlap[0][:2] == (True, False)
+                        raw_timeout = overlap[0][2]
+                        assert type(raw_timeout) is TimeoutError and raw_timeout is renewal.exception()
+                        assert refused.value.__cause__ is raw_timeout and not m._owner_unknown_renewal(raw_timeout)
+                        a._expire_controls(a.clock())
+                        assert a.controller is a.connection is None and a.events[-1]["kind"] == "presence_expired"
+                        assert a.run["status"] == "paused" and e.desired == "hold" and e._live_target is None
+                        assert client.ws is client.reader is client.snapshot is None and old_reader.done()
+                        assert close_cancelled.is_set() and isinstance(pending.exception(), ConnectionError)
+                        assert client.pending == {} and producer.sequence == client.sequence == 0 and applied == []
+                        assert len(renewal_calls) == 2
+                        assert [row for row in commands[len(before_commands):] if row[0] != "snapshot"] == [("grant", "running")]
+                        closes = [row for row in records if row["event"] == "session_detach_close_interrupted"]
+                        assert len(closes) == 1 and closes[0]["quarantined_at_monotonic_s"]-closes[0]["started_at_monotonic_s"] >= 1.9
+                        assert closes[0]["reader_drained"] and closes[0]["ack_task_drained"]
+                        assert a.run.get("control_intent") is None and a.run.get("bench_continuity") is False
+                        assert m._live(caught.value.grant_context["snapshot"])["required_view"] == {
+                            "required": True, "qualified": True, "role": "chest", "cause": None}
+                        assert a.run["native_live_at"] == 9. and a.run["deadline"] == 309.
+                        return
                     if cause.endswith("cancel"):
                         detaching = asyncio.create_task(client.detach())
                         await close_entered.wait()
@@ -7150,7 +7303,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
             a.run = None
             await owner.close()
 
-    asyncio.run(asyncio.wait_for(scenario(), 8 if cause == "transport_blackout_long" else 5))
+    asyncio.run(asyncio.wait_for(scenario(), 8 if cause == "transport_blackout_long" or normal_raw_close else 5))
 
 
 @pytest.mark.parametrize("count", [3, 4])
@@ -7166,6 +7319,11 @@ def test_ordinary_pause_counter_does_not_change_native_episode_three_limit(count
     else:
         with pytest.raises(RuntimeError, match="episode budget"):
             guard.check(state)
+
+
+def test_normal_grant_timeout_with_raw_renewal_timeout_during_detach_preserves_expired_authority(tmp_path, monkeypatch):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
+        tmp_path, monkeypatch, "grant_close_timeout_normal_renewal_raw_expired")
 
 
 def test_fourth_ordinary_pause_still_requires_qualified_held_ack_before_resume():
