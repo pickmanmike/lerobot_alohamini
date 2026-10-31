@@ -1539,7 +1539,7 @@ def test_real_wss_clean_close_ends_qualified_wait_before_timeout(tmp_path):
     ],
 )
 def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
-    tmp_path, monkeypatch, failure, preserve_cadence=False
+    tmp_path, monkeypatch, failure, preserve_cadence=False, cleanup_record_fault=None
 ):
     import asyncio
     import copy
@@ -1550,6 +1550,21 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
     cleanup_retry = isinstance(failure, str) and failure.startswith("cleanup_retry_")
     cleanup_mode = failure.removeprefix("cleanup_retry_") if cleanup_retry else None
     cleanup_failure = RuntimeError("injected original run failure before dependable cleanup")
+    cleanup_http = cleanup_mode is not None and "_unknown" in cleanup_mode
+    cleanup_http_hard = cleanup_http and cleanup_mode.endswith(("_status", "_shape", "_type", "_refused"))
+
+    def unknown_cleanup_outcome():
+        result = {"accepted": None, "status": "unknown", "uncertain": True,
+                  "reason": "owner outcome unknown; inspect state or lookup the same operation",
+                  "effect_admitted": None}
+        status = 504 if cleanup_mode.endswith("_status") else 503
+        if cleanup_mode.endswith("_shape"):
+            result["extra"] = None
+        elif cleanup_mode.endswith("_type"):
+            result["uncertain"] = 1
+        elif cleanup_mode.endswith("_refused"):
+            result.update(accepted=False, status="refused", effect_admitted=False)
+        return m.HTTPOutcomeError(status, result)
     peer_wait_case = isinstance(failure, str) and failure.startswith("peer_fixed_baseline_")
     peer_template = peer_baseline_state(peer_workspace()) if peer_wait_case else None
     initial_pause_case = failure == "initial_resume_pause"
@@ -1602,6 +1617,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         or timed_expiry
         or initial_pause_case
         or failure in {"zero_deadline_rounding", "zero_inner_timeout", "stop"}
+        or cleanup_mode == "budget_unknown"
     ):
         import time
 
@@ -1889,6 +1905,14 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 if cleanup_mode == "refused":
                     raise m.HTTPOutcomeError(403, {"accepted": False, "status": "refused",
                         "effect_admitted": False, "reason": "injected protective Stop refusal"})
+                if cleanup_http and cleanup_mode.startswith(
+                    ("before_unknown", "foreign_after_unknown", "budget_unknown")
+                ):
+                    if cleanup_mode.startswith("budget_unknown"):
+                        pc_clock[0] += 35.
+                        raise unknown_cleanup_outcome()
+                    if len(self.stop_requests) == 1:
+                        raise unknown_cleanup_outcome()
                 if cleanup_mode in {"before", "combined", "foreign_after"} and len(self.stop_requests) == 1:
                     raise TimeoutError("injected Stop request outcome unknown before effect")
             self.stops.append(payload["run_id"])
@@ -1910,6 +1934,8 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 self.snapshot["run"].update(
                     native_live_at=None, native_first_cause="injected original pre-Live native fault"
                 )
+            if cleanup_http and cleanup_mode == "after_unknown" and len(self.stops) == 1:
+                raise unknown_cleanup_outcome()
             if cleanup_retry and cleanup_mode in {"after", "combined"} and len(self.stops) == 1:
                 raise TimeoutError("injected Stop applied but receipt unavailable")
             if cleanup_mode == "ack_pending":
@@ -2238,11 +2264,15 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             if cleanup_retry and self.cleanup_started:
                 self.cleanup_trace.append("state")
                 reads = self.cleanup_trace.count("state")
+                if cleanup_http and cleanup_mode.startswith("get_unknown") and reads == 1:
+                    raise unknown_cleanup_outcome()
                 if cleanup_mode in {"get", "combined"} and reads == 1:
                     raise TimeoutError("injected pre-Stop state read unavailable")
                 if cleanup_mode in {"followup", "combined"} and self.stops and reads < (5 if cleanup_mode == "combined" else 4):
                     raise TimeoutError("injected terminal state read unavailable")
-                if cleanup_mode == "foreign" or cleanup_mode == "foreign_after" and self.stop_requests:
+                if cleanup_mode == "foreign" or (
+                    cleanup_mode in {"foreign_after", "foreign_after_unknown"} and self.stop_requests
+                ):
                     foreign = copy.deepcopy(self.snapshot)
                     foreign["run"]["run_id"] = foreign_id
                     return {"snapshot": foreign}
@@ -2366,6 +2396,21 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
     if cleanup_retry:
         import json
 
+        if cleanup_record_fault is not None:
+            from pathlib import Path
+            original_open = Path.open
+
+            def open_with_failed_cleanup_record(path, *open_args, **open_kwargs):
+                handle = original_open(path, *open_args, **open_kwargs)
+                if path == tmp_path / "evidence" / "frames.jsonl" and open_args == ("x",):
+                    def failed_write(line):
+                        if '"event": "' + cleanup_record_fault + '"' in line:
+                            raise OSError("injected cleanup diagnostic write failure")
+                        return handle.write(line)
+                    return SimpleNamespace(write=failed_write, flush=handle.flush, close=handle.close)
+                return handle
+
+            monkeypatch.setattr(Path, "open", open_with_failed_cleanup_record)
         args.source, args.next_start_seconds = "virtual-leaders", None
         with pytest.raises(RuntimeError) as caught:
             asyncio.run(asyncio.wait_for(m.run(args), 5.))
@@ -2376,18 +2421,27 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         assert session.starts == session.closed == 1 and len(session.inputs) == 1
         assert session.claim_posts == 0 and session.resumes == 0
         assert summary["original_native_deadline"] == 301.
-        if cleanup_mode in {"get", "combined"}:
+        if cleanup_mode in {"get", "combined", "get_unknown"}:
             assert session.cleanup_trace[:2] == ["state", "state"], "a failed owner read cannot authorize Stop"
         assert all(request == session.stop_requests[0] for request in session.stop_requests)
         if session.stop_requests:
             assert str(__import__("uuid").UUID(session.stop_requests[0]["operation_id"])) == session.stop_requests[0]["operation_id"]
-        if cleanup_mode in {"foreign", "foreign_after", "refused", "cancel"}:
+        if cleanup_mode in {
+            "foreign", "foreign_after", "foreign_after_unknown", "refused", "cancel", "budget_unknown"
+        } or cleanup_http_hard:
             assert summary["native_cleanup_uncertain"] is True
             assert "native_terminal" not in summary
             assert len(summary["cleanup_errors"]) == 1 and summary["cleanup_errors"][0]["step"] == "native_stop"
-            assert len(session.stop_requests) == (0 if cleanup_mode == "foreign" else 1)
+            expected_requests = (
+                0 if cleanup_mode == "foreign" or cleanup_mode.startswith("get_unknown")
+                else 3 if cleanup_mode == "budget_unknown" else 1
+            )
+            assert len(session.stop_requests) == expected_requests
             assert session.stops == []
-            if cleanup_mode == "foreign_after":
+            if cleanup_mode == "budget_unknown":
+                assert pc_clock[0] >= 95.
+                assert summary["cleanup_errors"][0]["error_type"] == "TimeoutError"
+            if cleanup_mode in {"foreign_after", "foreign_after_unknown"}:
                 assert session.cleanup_trace == ["state", "stop", "state"]
                 assert "another run" in summary["cleanup_errors"][0]["message"]
         else:
@@ -2395,7 +2449,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             assert summary["physical_register_off_readback_verified"] is True
             assert summary["native_terminal"]["run"]["run_id"] == owned_id
             assert summary["native_terminal"]["run"]["cleanup"] == "physical_readback_verified"
-            assert len(session.stop_requests) == (2 if cleanup_mode in {"before", "combined"} else 1)
+            assert len(session.stop_requests) == (2 if cleanup_mode in {"before", "combined", "before_unknown"} else 1)
             assert session.stops == [owned_id]
             assert session.cleanup_trace[-1] == "state"
             evidence = summary.get("native_stop_transient_errors", [])
@@ -2405,7 +2459,22 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 assert evidence == []
             else:
                 assert evidence and len(evidence) <= 8
-                assert all(row["error_type"] == "TimeoutError" and 0 < len(row["message"]) <= 240 for row in evidence)
+                expected_error = "HTTPOutcomeError" if cleanup_http else "TimeoutError"
+                assert all(row["error_type"] == expected_error and 0 < len(row["message"]) <= 240 for row in evidence)
+        if cleanup_http:
+            records = [json.loads(line) for line in (tmp_path / "evidence" / "frames.jsonl").read_text().splitlines()]
+            prepared = [row for row in records if row["event"] == "native_stop_operation_prepared"]
+            assert all(row["operation_id"] == summary["stop_operation_id"] for row in session.stop_requests)
+            if cleanup_record_fault is not None:
+                assert summary["native_stop_record_error"] == {
+                    "error_type": "OSError", "message": "injected cleanup diagnostic write failure"}
+            if cleanup_record_fault != "native_stop_operation_prepared":
+                assert len(prepared) == 1
+                assert prepared[0]["run_id"] == owned_id
+                assert summary["stop_operation_id"] == prepared[0]["operation_id"]
+                interrupted = [row for row in records if row["event"] == "native_stop_interrupted"]
+                assert all(row["original_ceiling_monotonic_s"] == prepared[0]["original_ceiling_monotonic_s"]
+                           for row in interrupted)
         return
     if peer_wait_case:
         import json
@@ -13572,3 +13641,65 @@ def test_initial_nonadmitted_view_resume_keeps_exact_known_phase_and_cancellatio
         assert not any(x["op"] in {"claim","start","grant","input"} for x in calls)
         assert guard.original["run"]["deadline"]==400. and pc[0]<1002.
     asyncio.run(asyncio.wait_for(scenario(),.8))
+
+
+@pytest.mark.parametrize("mode", [
+    "get_unknown", "before_unknown", "after_unknown", "foreign_after_unknown", "budget_unknown",
+    "get_unknown_status", "get_unknown_shape", "get_unknown_type", "get_unknown_refused",
+    "before_unknown_status", "before_unknown_shape", "before_unknown_type", "before_unknown_refused",
+])
+def test_runner_keeps_exact_unknown_cleanup_on_original_stop_operation(tmp_path, monkeypatch, mode):
+    test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
+        tmp_path, monkeypatch, "cleanup_retry_" + mode)
+
+
+@pytest.mark.parametrize("kind", ["unknown", "refused", "malformed"])
+def test_authenticated_http_state_read_preserves_bounded_typed_outcome(kind):
+    import asyncio
+    from types import SimpleNamespace
+
+    from aiohttp import ClientSession, web
+
+    m = adapter()
+
+    async def scenario():
+        result = {"accepted": None, "status": "unknown", "uncertain": True,
+                  "reason": "owner outcome unknown; inspect state or lookup the same operation",
+                  "effect_admitted": None}
+        status = 503
+        if kind == "refused":
+            status = 403
+            result.update(accepted=False, status="refused", uncertain=False, effect_admitted=False,
+                          reason="exact protective refusal")
+
+        async def state(request):
+            assert request.path == "/api/state"
+            if kind == "malformed":
+                return web.Response(status=503, text="unavailable")
+            return web.json_response(result, status=status)
+
+        app = web.Application()
+        app.router.add_get("/api/state", state)
+        runner = web.AppRunner(app, access_log=None)
+        await runner.setup()
+        try:
+            site = web.TCPSite(runner, "127.0.0.1", 0)
+            await site.start()
+            port = site._server.sockets[0].getsockname()[1]
+            async with ClientSession() as http:
+                client = SimpleNamespace(origin=f"http://127.0.0.1:{port}", http=http)
+                with pytest.raises(m.HTTPOutcomeError) as caught:
+                    await m.SessionClient.get(client, "state")
+                assert caught.value.http_status == status
+                assert caught.value.response == (None if kind == "malformed" else result)
+                assert caught.value.non_admitted is (kind == "refused")
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("event", ["native_stop_operation_prepared", "native_stop_interrupted"])
+def test_runner_owned_stop_survives_cleanup_diagnostic_write_failure(tmp_path, monkeypatch, event):
+    test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
+        tmp_path, monkeypatch, "cleanup_retry_before_unknown", cleanup_record_fault=event)
