@@ -3909,7 +3909,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
 
 
 @pytest.mark.parametrize("cause", ["initial_view_refusal", "initial_view_refusal_pause", "initial_connect_loss_pre", "initial_connect_loss_post", "initial_connect_loss_late", "initial_connect_loss_late_pause", "initial_connect_loss_contract", "initial_connect_loss_qualified_pause", "initial_connect_loss_bound_pause", "feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "resume_reporting_pause", "resume_reporting_renewal", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_unknown_receipt", "ordinary_input_unknown_pre", "ordinary_input_unknown_post", "ordinary_input_unknown_transport", "grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_transport", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_budget_post_create", "normal_finish_budget_get_create", "normal_finish_unknown_budget_create", "normal_finish_unknown_pre", "normal_finish_unknown_post", "normal_finish_unknown_twice", "normal_finish_unknown_wrong_status", "normal_finish_unknown_wrong_shape", "normal_finish_unknown_wrong_type", "normal_finish_unknown_refused", "normal_finish_unknown_new_pause", "normal_finish_unknown_new_stop", "normal_finish_unknown_new_owner", "normal_finish_unknown_new_service", "normal_finish_unknown_cancel", "normal_finish_unknown_view_lost", "normal_finish_unknown_ceiling", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal", "peer_start_normal", "peer_start_bench", "peer_bench_unqualified_view", "peer_bench_local_loss", "peer_normal_unqualified_view", "held_command120_view_later", "held_command120_view_never", "held_command120_local_loss", "view_refusal122_input_before", "view_refusal122_input_after", "view_refusal122_grant_before", "view_refusal122_grant_after", "view_refusal122_never", "view_refusal122_pause", "view_refusal122_stop", "view_refusal122_takeover", "view_refusal122_grant_connect_preflight_before", "view_refusal122_grant_connect_preflight_pending", "view_refusal122_grant_connect_preflight_queue", "view_refusal122_grant_connect_preflight_sent", "view_refusal122_grant_connect_preflight_pause", "view_refusal122_grant_connect_preflight_stop", "view_refusal122_grant_connect_preflight_takeover", "view_refusal122_grant_connect_preflight_reboot", "view_refusal122_grant_connect_preflight_lease", "view_refusal122_grant_connect_preflight_deadline", "view_refusal122_grant_connect_preflight_cancel", "view_refusal130_grant_input_race_before", "view_refusal130_grant_input_race_never", "view_refusal130_grant_input_race_pause", "view_refusal130_grant_input_race_stop", "view_refusal130_grant_input_race_takeover", "view_refusal130_grant_input_race_revision", "view_refusal130_grant_input_race_history", "view_refusal130_grant_input_race_time", "renewal_unknown133_grant_before", "renewal_unknown133_grant_pause", "renewal_unknown133_grant_takeover", "renewal_unknown133_grant_unchanged", "renewal_unknown133_grant_receipt_unknown", "renewal_unknown133_grant_second_read", "renewal_unknown133_grant_stream_before"])
-def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause):
+def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause, initial_unknown=False):
     import asyncio
     import copy
     import json
@@ -3930,6 +3930,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
     healthy, epoch, commands = [True], [0], []
     initial_connect = cause.startswith("initial_connect_loss_")
     initial_view = cause.startswith("initial_view_refusal")
+    initial_phase = initial_connect or initial_view or initial_unknown
     ordinary_input = cause.startswith("ordinary_input_unknown_")
     normal_raw_close = cause == "grant_close_timeout_normal_renewal_raw_expired"
     ordinary_transport = cause == "resume_send_transport" or normal_raw_close
@@ -3941,7 +3942,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
     connect_preflight = cause.startswith("view_refusal122_grant_connect_preflight_")
     preflight_mode = cause.rsplit("_", 1)[1] if connect_preflight else None
     race_waiting = [False]
-    if held120 or view122 or ordinary_input or initial_connect or initial_view or ordinary_transport:
+    if held120 or view122 or ordinary_input or initial_phase or ordinary_transport:
         e.desired = "hold"
         a.run.update(accepted_at=8., startup_deadline=188., bench_continuity=False)
         e.sample["ack"]["live_input"]["workspace"] = held_command119_workspace()
@@ -3990,15 +3991,15 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 "acquired_at_monotonic_s": a.clock(),
             },
         )
-        if held120 or view122 or ordinary_input or initial_connect or initial_view or ordinary_transport:
+        if held120 or view122 or ordinary_input or initial_phase or ordinary_transport:
             native = held_command119_workspace()
-            if ordinary_input or initial_connect or initial_view or ordinary_transport:
+            if ordinary_input or initial_phase or ordinary_transport:
                 native["workspace_profile"] = m.ORDINARY_ARMS_PROFILE
                 value["source"] = "protected-physical-provider"  # Explicit fake protected-native proof, not fake lane policy.
             live.update(workspace=native, reference=copy.deepcopy(native["reference"]),
                         cursor={**native["reference"], "arm_left_shoulder_lift.pos": 100.}, body=dict(m.ZERO_BODY))
             live["accepted_target"] = dict(live["cursor"])
-            if initial_connect or initial_view:
+            if initial_phase:
                 live["last_input_seq"] = -1  # Actual5516 before any movement input.
             value["measured_positions"] = copy.deepcopy(native["reference"])
             value["accepted_host_action"]["accepted_action"] = {"mode": "raw_goal_hold", "body_velocity": 0.}
@@ -4022,7 +4023,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
         dispatches[0] += 1
         # The existing fake Native ACK takes one real Core resuming→running
         # transition, retaining an actual prior resumed event for finish history.
-        return not (finish_expiry_fixture and dispatches[0] == 1)
+        return not ((finish_expiry_fixture or initial_unknown) and dispatches[0] == 1)
 
     e.dispatch = dispatch
     real_handle = a.handle
@@ -4034,7 +4035,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
             if a.run["recovery_episodes"]:
                 assert any(v["kind"] == "live_sensing_requalified" for v in a.events)
         result = real_handle(command, device)
-        if finish_expiry_fixture and command["op"] == "resume" and result.get("status") == "resuming":
+        if (finish_expiry_fixture or initial_unknown == "before") and command["op"] == "resume" and result.get("status") == "resuming":
             a.tick()  # The stopped fixture owner has no independent Native tick worker.
         return result
 
@@ -4071,7 +4072,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
         gateway = Gateway(owner.directory, tmp_path / "auth")
         enrolled = gateway.auth.enroll(gateway.auth.pair(control=True))
         a.controller["device_id"] = a.connection["device_id"] = enrolled["device_id"]
-        if initial_connect or initial_view:
+        if initial_phase:
             a.connection = None
             a.run["source"] = e.source
             a.events = [{"kind": kind, "at": at, "run_id": e.run_id, "service_incarnation": a.service_incarnation}
@@ -4132,6 +4133,118 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     return original_ws_connect(*args, **kwargs)
                 monkeypatch.setattr(client.http, "ws_connect", fixture_heartbeat)
             await client.attach()
+            if initial_unknown:
+                a.asynchronous = True  # Native Resume dispatch is pending before its independent ACK.
+                # Actual cf6d: initial Connect/release is known, Core accepts
+                # Resume, then required viewing pauses while its real reply is lost.
+                mode = "after" if initial_unknown is True else initial_unknown
+                client.generation, client.connection = ids["controller_generation"], None
+                client._ordinary_transport_recovery = True
+                client.record = record
+                pi_clock = [10.]
+                a.clock = e.clock = lambda: pi_clock[0]
+                original_call, original_attach, original_command = gateway.call, client.attach, client.command
+                envelopes, outcomes, sent_states, errors = [], [], [], []
+                lost = [False]
+
+                async def command_initial(command, **kwargs):
+                    try:
+                        return await original_command(command, **kwargs)
+                    except TimeoutError as error:
+                        errors.append(error)
+                        raise
+
+                def capture_initial(ws):
+                    send = ws.send_json
+                    async def sent(value, **kwargs):
+                        if "command" in value:
+                            envelopes.append(copy.deepcopy(value))
+                        return await send(value, **kwargs)
+                    ws.send_json = sent
+
+                async def attached_initial():
+                    await original_attach()
+                    capture_initial(client.ws)
+
+                async def lose_initial_result(command, device):
+                    if command.get("op") == "resume" and not lost[0]:
+                        lost[0] = True
+                        sent_states.append(copy.deepcopy(client.snapshot))
+                        old = copy.deepcopy(command)
+                        result = None
+                        if mode != "before":
+                            result = await original_call(old, device)
+                            outcomes.append(copy.deepcopy(result))
+                            assert result == {"accepted": True, "status": "resuming", "effect_admitted": False}
+                        assert sent_states[0]["run"]["intent_revision"] == 1
+                        assert sent_states[0]["events"][-1]["kind"] == "observation_qualified"
+                        pi_clock[0] += .125
+                        if mode == "pause":
+                            assert real_handle({"op": "pause", "run_id": e.run_id, "operation_id": str(uuid4())},
+                                               enrolled["device_id"])["accepted"] is True
+                        elif mode != "before":
+                            a._pause_live_input("required_view_expired")
+                        progress = {"op": "view_progress", "run_id": e.run_id, "role": "chest",
+                            "owner_generation": "owner", "capture_generation": "capture", "encode_generation": "encode",
+                            "decoded_frames": 2, "media_time": 2., "source_sequence": 2, "source_fresh": True,
+                            "received_at_monotonic_s": pi_clock[0], "request_received_at_monotonic_s": pi_clock[0]}
+                        assert real_handle(progress, "gateway-view")["accepted"] is True
+                        async def original_reply():
+                            await unblock_release.wait()
+                            if mode == "before":
+                                response = await original_call(old, device)
+                                outcomes.append(copy.deepcopy(response))
+                                return response
+                            return result
+                        task = asyncio.create_task(original_reply())
+                        delayed.append(task)
+                        return await asyncio.shield(task)
+                    return await original_call(command, device)
+
+                capture_initial(client.ws)
+                client.attach, client.command, gateway.call = attached_initial, command_initial, lose_initial_result
+                guard = m.SameRunRecovery(client, record)
+                original = copy.deepcopy(guard.original)
+                ceiling = m.time.monotonic() + 8.
+                if mode == "pause":
+                    with pytest.raises(TimeoutError) as caught:
+                        await guard.resume(wall_deadline=ceiling, renewal_check=lambda: None)
+                    assert caught.value is errors[0]
+                    assert a.events[-1]["kind"] == "pause"
+                else:
+                    assert not await guard.resume(wall_deadline=ceiling, renewal_check=lambda: None)
+                    assert client.snapshot["evidence"]["active_acknowledged"] is True
+                unblock_release.set()
+                await asyncio.wait_for(asyncio.gather(*delayed), .5)
+                assert len(outcomes) == 1
+                assert outcomes[0]["accepted"] is (mode != "before")
+                if mode == "before":
+                    assert outcomes[0]["reason"] == "stale control generation"
+                resumes = [row for row in envelopes if row["command"]["op"] == "resume"]
+                assert len(resumes) == (1 if mode == "pause" else 2)
+                assert len({row["command"]["operation_id"] for row in resumes}) == len(resumes)
+                assert len({row["command"]["connection_generation"] for row in resumes}) == len(resumes)
+                unknown = [row for row in records if row["event"] == "resume_result_unknown"]
+                assert len(unknown) == 1 and "reply_timeout" in unknown[0] and unknown[0]["transport_close"] == {}
+                assert m.time.monotonic() < min(ceiling, unknown[0]["phase_ceiling_monotonic_s"])
+                frozen = errors[0].resume_result_context
+                proof = frozen["initial_connected_phase"]
+                assert frozen["identity"]["intent_revision"] == proof["identity"]["intent_revision"] == 1
+                assert proof["actual_identity"]["intent_revision"] == proof["connected_snapshot"]["run"]["intent_revision"] == 1
+                assert all(proof["released"][key] == value for key, value in
+                           {"accepted": True, "status": "released", "effect_admitted": False}.items())
+                assert m._initial_connected_phase(frozen["snapshot"], proof)
+                for member in ("connected_snapshot", "released"):
+                    missing = copy.deepcopy(proof)
+                    missing.pop(member)
+                    assert not m._initial_connected_phase(frozen["snapshot"], missing)
+                wrong = copy.deepcopy(proof)
+                wrong["connect_identity"]["intent_revision"] = 1
+                assert not m._initial_connected_phase(frozen["snapshot"], wrong)
+                assert client.sequence == 0 and e._live_target is None
+                assert not any(row["command"]["op"] in {"claim", "start", "grant", "input"} for row in envelopes)
+                assert guard.original == original and a.run["deadline"] == 309. and a.run["native_live_at"] == 9.
+                return
             if initial_view:
                 # Counterfactual79ab: the first known Connect/release succeeds,
                 # then real Core view expires only after the PC qualification.
@@ -13703,3 +13816,14 @@ def test_authenticated_http_state_read_preserves_bounded_typed_outcome(kind):
 def test_runner_owned_stop_survives_cleanup_diagnostic_write_failure(tmp_path, monkeypatch, event):
     test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
         tmp_path, monkeypatch, "cleanup_retry_before_unknown", cleanup_record_fault=event)
+
+
+def test_initial_accepted_resume_lost_reply_recovers_same_run_without_input_replay(tmp_path, monkeypatch):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
+        tmp_path, monkeypatch, "resume_reply_timeout_post", initial_unknown=True)
+
+
+@pytest.mark.parametrize("mode", ["before", "pause"])
+def test_initial_resume_lost_reply_fences_old_operation_and_honors_new_pause(tmp_path, monkeypatch, mode):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
+        tmp_path, monkeypatch, "resume_reply_timeout_post", initial_unknown=mode)

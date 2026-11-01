@@ -1411,6 +1411,70 @@ def _record_controller_command_timing(record, command, request_id, timing, *, ph
     record(row)
 
 
+def _initial_connected_phase(snapshot, proof):
+    """Validate frozen first-Connect/empty-release provenance, never later authority."""
+    try:
+        if type(proof) is not dict or set(proof) != {
+            "enabled", "connect_identity", "identity", "actual_identity", "sequence",
+            "released", "connected_snapshot",
+        }:
+            return False
+        connect_identity, identity, actual = (
+            proof["connect_identity"], proof["identity"], proof["actual_identity"]
+        )
+        released, connected = proof["released"], proof["connected_snapshot"]
+        current, old = snapshot["run"], connected["run"]
+        live, before = _live(snapshot), _live(connected)
+        own = [row for row in snapshot.get("events", []) if row.get("run_id") == current["run_id"]
+               and row.get("service_incarnation") == snapshot["service_incarnation"]]
+        stamps = [row.get("at") for row in own]
+        remaining, expiry = current.get("remaining_s"), (snapshot.get("controller") or {}).get("presence_expires")
+        return (proof["enabled"] is True
+            and isinstance(connect_identity, dict) and set(connect_identity) == set(identity) == set(actual)
+            and connect_identity.get("connection_generation") is None
+            and type(connect_identity.get("intent_revision")) is int and connect_identity["intent_revision"] == 0
+            and type(identity.get("intent_revision")) is int and identity["intent_revision"] == 1
+            and all(type(v) is str and v for k, v in identity.items() if k != "intent_revision")
+            and all(type(actual[k]) is type(v) and actual[k] == v for k, v in identity.items())
+            and all(type(connect_identity[k]) is type(v) and connect_identity[k] == v for k, v in identity.items()
+                    if k not in {"intent_revision", "connection_generation"})
+            and type(proof["sequence"]) is int and proof["sequence"] == 0
+            and isinstance(released, dict) and all(type(released.get(k)) is type(v) and released[k] == v
+                for k, v in {"accepted": True, "status": "released", "effect_admitted": False}.items())
+            and current.get("recipe") == TELEOP_RECIPE and current.get("source") == "protected-physical-provider"
+            and snapshot.get("evidence", {}).get("source") == current["source"]
+            and current.get("bench_continuity") is False and current.get("status") == old.get("status") == "paused"
+            and current.get("uncertain") is old.get("uncertain") is False and current.get("recovery") is None
+            and current.get("first_cause") is current.get("native_first_cause") is None
+            and type(current.get("recovery_episodes")) is int and current["recovery_episodes"] == 0
+            and all(type(current.get(k)) is type(old.get(k)) and current.get(k) == old.get(k) for k in
+                ("run_id", "recipe", "source", "operation_id", "backend_incarnation", "native_live_at", "deadline", "intent_revision"))
+            and str(UUID(current["operation_id"])) == current["operation_id"]
+            and live.get("workspace") == before.get("workspace") and live.get("reference") == before.get("reference")
+            and live.get("workspace", {}).get("workspace_profile") == ORDINARY_ARMS_PROFILE
+            and live.get("required_view", {}).get("required") is True
+            and all(live.get("required_view", {}).get(k) == before.get("required_view", {}).get(k) for k in ("required", "role"))
+            and type(live.get("last_input_seq")) is int and live["last_input_seq"] == -1
+            and live.get("source") is None and live.get("valid_until_monotonic_s") is None
+            and live.get("cursor") == live.get("accepted_target") and set(live.get("body") or {}) == set(ZERO_BODY)
+            and all(type(v) in (int, float) and v == 0 for v in live["body"].values())
+            and snapshot.get("evidence", {}).get("active_acknowledged") is False
+            and [row.get("kind") for row in own] == ["start", "native_live_admitted", "observation_qualified"]
+            and all(set(row) == {"kind", "at", "run_id", "service_incarnation"} for row in own)
+            and all(type(v) in (int, float) and math.isfinite(v) for v in
+                (*stamps, current.get("native_live_at"), current.get("deadline"), remaining, old.get("remaining_s"), expiry))
+            and stamps[0] <= current["native_live_at"] <= stamps[1] <= stamps[2] < current["deadline"]
+            and 0 < remaining <= old["remaining_s"] <= current["deadline"] - current["native_live_at"] <= 300.
+            and stamps[2] + remaining <= current["deadline"] < expiry + remaining
+            and all(type((snapshot.get("controller") or {}).get(k)) is type(v)
+                    and (snapshot.get("controller") or {}).get(k) == v
+                    for k, v in (connected.get("controller") or {}).items()
+                    if k in {"device_id", "controller_generation"}))
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+
 class SessionClient:
     def __init__(self, origin, ca, storage_state):
         import aiohttp
@@ -2017,60 +2081,20 @@ class SessionClient:
                 error.empty_release_context = release_context
             raise
 
-        def initial_connected_phase(snapshot):
-            # Only the acknowledged first Connect + empty release may carry
-            # initial HOLD through a definitely nonadmitted view refusal.
+        def initial_phase_context(snapshot):
             try:
-                current, old = snapshot["run"], release_context["snapshot"]["run"]
-                live, before = _live(snapshot), _live(release_context["snapshot"])
-                actual = self.identities()
-                own = [row for row in snapshot.get("events", []) if row.get("run_id") == current["run_id"]
-                       and row.get("service_incarnation") == snapshot["service_incarnation"]]
-                stamps = [row.get("at") for row in own]
-                remaining, expiry = current.get("remaining_s"), (snapshot.get("controller") or {}).get("presence_expires")
-                return (getattr(self, "_ordinary_transport_recovery", False) is True
-                    and isinstance(connect_identity, dict) and set(connect_identity) == set(identity) == set(actual)
-                    and connect_identity.get("connection_generation") is None
-                    and type(connect_identity.get("intent_revision")) is int and connect_identity["intent_revision"] == 0
-                    and type(identity.get("intent_revision")) is int and identity["intent_revision"] == 1
-                    and all(type(v) is str and v for k, v in identity.items() if k != "intent_revision")
-                    and all(type(actual[k]) is type(v) and actual[k] == v for k, v in identity.items())
-                    and all(type(connect_identity[k]) is type(v) and connect_identity[k] == v for k, v in identity.items()
-                            if k not in {"intent_revision", "connection_generation"})
-                    and type(getattr(self, "sequence", None)) is int and self.sequence == 0
-                    and isinstance(released, dict) and all(type(released.get(k)) is type(v) and released[k] == v
-                        for k, v in {"accepted": True, "status": "released", "effect_admitted": False}.items())
-                    and current.get("recipe") == TELEOP_RECIPE and current.get("source") == "protected-physical-provider"
-                    and snapshot.get("evidence", {}).get("source") == current["source"]
-                    and current.get("bench_continuity") is False and current.get("status") == old.get("status") == "paused"
-                    and current.get("uncertain") is old.get("uncertain") is False and current.get("recovery") is None
-                    and current.get("first_cause") is current.get("native_first_cause") is None
-                    and type(current.get("recovery_episodes")) is int and current["recovery_episodes"] == 0
-                    and all(type(current.get(k)) is type(old.get(k)) and current.get(k) == old.get(k) for k in
-                        ("run_id", "recipe", "source", "operation_id", "backend_incarnation", "native_live_at", "deadline", "intent_revision"))
-                    and str(UUID(current["operation_id"])) == current["operation_id"]
-                    and live.get("workspace") == before.get("workspace") and live.get("reference") == before.get("reference")
-                    and live.get("workspace", {}).get("workspace_profile") == ORDINARY_ARMS_PROFILE
-                    and live.get("required_view", {}).get("required") is True
-                    and all(live.get("required_view", {}).get(k) == before.get("required_view", {}).get(k) for k in ("required", "role"))
-                    and type(live.get("last_input_seq")) is int and live["last_input_seq"] == -1
-                    and live.get("source") is None and live.get("valid_until_monotonic_s") is None
-                    and live.get("cursor") == live.get("accepted_target") and set(live.get("body") or {}) == set(ZERO_BODY)
-                    and all(type(v) in (int, float) and v == 0 for v in live["body"].values())
-                    and snapshot.get("evidence", {}).get("active_acknowledged") is False
-                    and [row.get("kind") for row in own] == ["start", "native_live_admitted", "observation_qualified"]
-                    and all(set(row) == {"kind", "at", "run_id", "service_incarnation"} for row in own)
-                    and all(type(v) in (int, float) and math.isfinite(v) for v in
-                        (*stamps, current.get("native_live_at"), current.get("deadline"), remaining, old.get("remaining_s"), expiry))
-                    and stamps[0] <= current["native_live_at"] <= stamps[1] <= stamps[2] < current["deadline"]
-                    and 0 < remaining <= old["remaining_s"] <= current["deadline"] - current["native_live_at"] <= 300.
-                    and stamps[2] + remaining <= current["deadline"] < expiry + remaining
-                    and all(type((snapshot.get("controller") or {}).get(k)) is type(v)
-                            and (snapshot.get("controller") or {}).get(k) == v
-                            for k, v in (release_context["snapshot"].get("controller") or {}).items()
-                            if k in {"device_id", "controller_generation"}))
+                proof = {
+                    "enabled": getattr(self, "_ordinary_transport_recovery", False),
+                    "connect_identity": connect_identity, "identity": identity,
+                    "actual_identity": self.identities(), "sequence": getattr(self, "sequence", None),
+                    "released": released, "connected_snapshot": release_context["snapshot"],
+                }
+                return proof if _initial_connected_phase(snapshot, proof) else None
             except (KeyError, TypeError, ValueError):
-                return False
+                return None
+
+        def initial_connected_phase(snapshot):
+            return initial_phase_context(snapshot) is not None
 
         def qualified():
             if check:
@@ -2250,11 +2274,13 @@ class SessionClient:
                                operation_id=str(uuid4()))
                 # Freeze the actual sent authority/proof BEFORE awaiting an
                 # unknown command result. This never constitutes nonadmission.
+                initial_phase = initial_phase_context(sent_state)
                 unknown_resume = json.loads(json.dumps({
                     "identity": identity, "snapshot": sent_state, "operation_id": command["operation_id"],
                     "prior_event": prior_event, "pi_lower_bound": pi_lower_bound,
                     "phase_ceiling": phase_ceiling, "requested": time.monotonic(), "connect_identity": connect_identity,
                     "release": released,
+                    **({"initial_connected_phase": initial_phase} if initial_phase is not None else {}),
                 }, allow_nan=False))
                 try:
                     budget = phase_remaining()
@@ -3049,6 +3075,13 @@ class SameRunRecovery:
                     phase_key = ((identity["connection_generation"], identity["intent_revision"], "held")
                                  if held else context["operation_id"])
                     event, remaining, ceiling = context["prior_event"], before["run"].get("remaining_s"), context["phase_ceiling"]
+                    initial = context.get("initial_connected_phase")
+                    initial_phase = (
+                        isinstance(initial, dict) and initial.get("identity") == identity
+                        and initial.get("connect_identity") == known
+                        and initial.get("released") == context.get("release")
+                        and _initial_connected_phase(before, initial)
+                    )
                     if (set(identity) != set(actual) or any(type(identity[k]) is not type(v) or identity[k] != v for k, v in actual.items())
                         or type(identity["intent_revision"]) is not int or identity["intent_revision"] < 1
                         or any(type(v) is not str or not v for k, v in identity.items() if k != "intent_revision")
@@ -3061,7 +3094,7 @@ class SameRunRecovery:
                         or phase_key in consumed_resumes
                         or before["run"].get("status") != "paused" or before["run"].get("recovery") is not None
                         or _latest_run_event(before, identity) != event
-                        or event.get("kind") not in _ordinary_pause_kinds(self.client) | {"live_sensing_requalified"}
+                        or event.get("kind") not in _ordinary_pause_kinds(self.client) | {"live_sensing_requalified"} and not initial_phase
                         or any(type(v) not in (int, float) or not math.isfinite(v)
                                for v in (remaining, ceiling, context["requested"], context["pi_lower_bound"], event.get("at")))
                         or not 0 < remaining <= clock["remaining"]
