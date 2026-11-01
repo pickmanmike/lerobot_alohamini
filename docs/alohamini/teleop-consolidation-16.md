@@ -781,7 +781,7 @@ These are activity choices, not universal requirements. Preparation ends only af
 This coordinator is the existing LEFT elbow/gripper orchestrator at its canonical tools entry point; broader admitted targets remain available through the ordinary interactive adapter above. The exact private6c35 source and its earlier31 checks remain untouched as historical evidence. The canonical version requires explicit bindings; five legacy plan outputs and25 advancement cases retain parity, and the new grasp composition has focused motor-free checks. Per-run preparation/binding metadata and coordinator version evidence remain separate.
 
 
-**Finite grasp sequence.** Use the same canonical coordinator with the current binding:
+**Finite grasp sequence — implemented; object retention not yet demonstrated.** Use the same canonical coordinator with the current binding:
 
 ```powershell
 uv run --no-sync --project C:/Users/pickm/lerobot_alohamini_client python -u -B -m tools.am1_live_phase_coordinator `
@@ -793,6 +793,8 @@ uv run --no-sync --project C:/Users/pickm/lerobot_alohamini_client python -u -B 
 This finite virtual client streams through the existing shared adapter; it is not new physical-leader validation. Before Start it declares the admitted-interval policy. After fresh admission it validates the entire composition and records one legal10-point opening/closing interval. If the current reference is its closed endpoint, it first opens within that same interval. It then closes, moves the elbow4° increasing while retaining the closed grip, explicitly MOVEs back to the ORIGINAL elbow reference while still closed, reopens, and Finishes. The return operation that resets all joints is deliberately not used for the closed-grip segment.
 
 Planned active duration is36s, or41s with opening preparation;90s is the hard elapsed input window, with the original native300s deadline unchanged. Accepted sequence and active progress drive phase changes automatically. A complete dwell is required; expiry or insufficient remaining budget chooses truthful Finish, with no clamping, target substitution, workspace recentering or deadline extension. Keep a light soft object on stable support and observe actual retention separately from accepted targets, measured motion and programme completion. Existing temporary LEFTP32/restoration, other-joint holds, zero body/lift intent and normal required Chest viewing remain in force.
+
+The first automatic follow-through d549 validated the composition and dispatched immediately, but connection/view recovery stopped it after.300active seconds; it did not complete an opening endpoint or grasp. The owner reports a current network slowdown, handled outside this project. If the existing application cannot be reached, preserve the failed result and last verified cleanup, do not replay its request, and use a fresh bounded invocation after access recovers. P1 remains advisory; its separate-project handoff must not silently change the required onboard-view policy.
 
 Choose a lifetime for the transition, intended maintained phase and ordinary recovery—for example60seconds for a short changing action, rather than a two-second expiry used as a diagnostic. A virtual hold streams a maintained target; it is not a Core-held interval. Ramp progress pauses during recovery while the original intention TTL continues aging. The outer elapsed-wall-time window includes input waiting and recovery; CoreRunning alone is not streamed motion.
 
