@@ -766,20 +766,33 @@ Keep the ordinary enrolled viewer window restored with the selected Chest area v
 
 For the exercised cycle, derive a legal4° LEFT decrease from the FRESH admitted mapping/reference. Send one move with10s transition/90s lifetime, wait its accepted sequence and ramp_progress_active_s≥16 for the6s dwell, then send return with10/90. Wait the new acceptance/progress threshold, then send finish and observe acceptance and the sealed result. Short reuse used13s thresholds. This example does not authorize replaying old raw endpoints or silently shrinking an unsupported excursion. A local/tool coordinator may supply existing input lines continuously; no new robot runner is needed. Observe window_remaining_s; original TTL, elapsed window and native deadline are separate.
 
-For the exercised automated LEFT-only activity, reuse the existing private helper and pass the current binding explicitly (its old default is historical):
+For the exercised automated LEFT-only activity, use the canonical versioned coordinator and pass the current binding explicitly:
 
-    uv run --no-sync --project C:/Users/pickm/lerobot_alohamini_client python -u -B .cache/am1-knowledge-reuse-18/live-phase-coordinator.py --plan out-return --workpose midpoint --approach-from-below --gripper-cycle --gripper-direction admitted --ramp-seconds 10 --comparison-dwell-seconds 4 --dwell-seconds 3 --approach-room-degrees 1 --window-seconds 120 --intent-ttl-seconds 90 --bindings $bindings
+    uv run --no-sync --project C:/Users/pickm/lerobot_alohamini_client python -u -B -m tools.am1_live_phase_coordinator --plan out-return --workpose midpoint --approach-from-below --gripper-cycle --gripper-direction admitted --ramp-seconds 10 --comparison-dwell-seconds 4 --dwell-seconds 3 --approach-room-degrees 1 --window-seconds 120 --intent-ttl-seconds 90 --bindings $bindings
 
 The later8849 current-rest action uses the SAME helper without lower preparation:
 
-    uv run --no-sync --project C:/Users/pickm/lerobot_alohamini_client python -u -B .cache/am1-knowledge-reuse-18/live-phase-coordinator.py --plan out-return --workpose relative --direction increasing --degrees 4 --gripper-cycle --gripper-direction admitted --ramp-seconds 7 --comparison-dwell-seconds 4 --dwell-seconds 3 --window-seconds 75 --intent-ttl-seconds 60 --bindings $bindings
+    uv run --no-sync --project C:/Users/pickm/lerobot_alohamini_client python -u -B -m tools.am1_live_phase_coordinator --plan out-return --workpose relative --direction increasing --degrees 4 --gripper-cycle --gripper-direction admitted --ramp-seconds 7 --comparison-dwell-seconds 4 --dwell-seconds 3 --window-seconds 75 --intent-ttl-seconds 60 --bindings $bindings
 
 Derive the endpoint and gripper direction from the new run's admitted reference/bounds; never copy8849raw1074/1119 into another run. A selected unsupported excursion refuses instead of clamping or widening the workspace. Tested temporary LEFTP32/settings restoration and required Chest remain explicit.
 
 These are activity choices, not universal requirements. Preparation ends only after qualified measured room; phase changes require accepted intentions and active progress. No lower-bound achievement or target shrinkage is inferred. The short reuse variant uses the same helper with plan lower-return-gripper, current bindings,10s ramps/4s comparison dwell/3s return dwell,90s window/intent lifetime and admitted gripper direction; omit midpoint-only flags. Resolve that direction from fresh bounds.
 
-This helper is a LEFT elbow/gripper orchestrator; broader admitted targets remain available through the ordinary interactive adapter above. Exact helper6c35 final source, preimage/delta,31motor-free checks and matching private permissions are retained in the existing current-proof packet named by the private Resume row. Per-run preparation/binding metadata and coordinator version evidence remain separate.
+This coordinator is the existing LEFT elbow/gripper orchestrator at its canonical tools entry point; broader admitted targets remain available through the ordinary interactive adapter above. The exact private6c35 source and its earlier31 checks remain untouched as historical evidence. The canonical version requires explicit bindings; five legacy plan outputs and25 advancement cases retain parity, and the new grasp composition has focused motor-free checks. Per-run preparation/binding metadata and coordinator version evidence remain separate.
 
+
+**Finite grasp sequence.** Use the same canonical coordinator with the current binding:
+
+```powershell
+uv run --no-sync --project C:/Users/pickm/lerobot_alohamini_client python -u -B -m tools.am1_live_phase_coordinator `
+  --plan grasp-return --gripper-direction admitted --direction increasing --degrees 4 `
+  --ramp-seconds 10 --comparison-dwell-seconds 3 --dwell-seconds 3 `
+  --window-seconds 90 --intent-ttl-seconds 60 --bindings $bindings
+```
+
+This finite virtual client streams through the existing shared adapter; it is not new physical-leader validation. Before Start it declares the admitted-interval policy. After fresh admission it validates the entire composition and records one legal10-point opening/closing interval. If the current reference is its closed endpoint, it first opens within that same interval. It then closes, moves the elbow4° increasing while retaining the closed grip, explicitly MOVEs back to the ORIGINAL elbow reference while still closed, reopens, and Finishes. The return operation that resets all joints is deliberately not used for the closed-grip segment.
+
+Planned active duration is36s, or41s with opening preparation;90s is the hard elapsed input window, with the original native300s deadline unchanged. Accepted sequence and active progress drive phase changes automatically. A complete dwell is required; expiry or insufficient remaining budget chooses truthful Finish, with no clamping, target substitution, workspace recentering or deadline extension. Keep a light soft object on stable support and observe actual retention separately from accepted targets, measured motion and programme completion. Existing temporary LEFTP32/restoration, other-joint holds, zero body/lift intent and normal required Chest viewing remain in force.
 
 Choose a lifetime for the transition, intended maintained phase and ordinary recovery—for example60seconds for a short changing action, rather than a two-second expiry used as a diagnostic. A virtual hold streams a maintained target; it is not a Core-held interval. Ramp progress pauses during recovery while the original intention TTL continues aging. The outer elapsed-wall-time window includes input waiting and recovery; CoreRunning alone is not streamed motion.
 
