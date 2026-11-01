@@ -9946,8 +9946,9 @@ def test_runner_admission_no_pong_uses_original_real_core_detail_clocks(tmp_path
 
 
 @pytest.mark.parametrize("change", [None, "offset", "length_bool", "total", "encoding", "truncated", "hash",
-                                    "reference_bool", "budget", "refused"])
-def test_startup_run_detail_reuses_real_core_gateway_bounded_chunk_contract(tmp_path, change):
+                                    "reference_bool", "budget", "refused", "timeout_once", "timeout_later", "timeout_twice",
+                                    "timeout_budget", "body_cancel", "typed_refused"])
+def test_startup_run_detail_reuses_real_core_gateway_bounded_chunk_contract(tmp_path, monkeypatch, change):
     import asyncio
     import copy
     import json
@@ -9962,7 +9963,12 @@ def test_startup_run_detail_reuses_real_core_gateway_bounded_chunk_contract(tmp_
     authority.run.update(accepted_at=9.0, startup_deadline=189.0,
                          backend_incarnation=executor.host_incarnation, original_evidence="x" * 12000)
     state = authority.snapshot()
-    before, requests, clock = copy.deepcopy(authority.run), [], [0.0]
+    before, requests, clock, read_budgets = copy.deepcopy(authority.run), [], [0.0], []
+    original_wait_for = asyncio.wait_for
+    async def bounded_read(awaitable, timeout):
+        read_budgets.append(timeout)
+        return await original_wait_for(awaitable, timeout)
+    monkeypatch.setattr(m.asyncio, "wait_for", bounded_read)
     assert "accepted_at" not in state["run"]
     gateway = object.__new__(Gateway)
 
@@ -9979,6 +9985,25 @@ def test_startup_run_detail_reuses_real_core_gateway_bounded_chunk_contract(tmp_
                 raise RuntimeError("authenticated read refused")
             response = await Gateway.state(gateway, SimpleNamespace(query=query))
             result = json.loads(response.body)
+            if change in {"timeout_once", "timeout_later", "timeout_twice", "timeout_budget", "body_cancel", "typed_refused"}:
+                class Response:
+                    status = 403 if change == "typed_refused" else 200
+                    async def __aenter__(self):
+                        return self
+                    async def __aexit__(self, *args):
+                        pass
+                    async def json(self):
+                        if change == "body_cancel":
+                            raise asyncio.CancelledError()
+                        if change == "typed_refused":
+                            return {"accepted": False, "status": "refused", "reason": "not enrolled"}
+                        if (change == "timeout_later" and len(requests) == 2
+                            or change != "timeout_later" and len(requests) == 1 or change == "timeout_twice"):
+                            clock[0] += 2.1 if change == "timeout_budget" else .5
+                            raise TimeoutError("synthetic HTTP response-body timeout")
+                        return result
+                http = SimpleNamespace(get=lambda *args, **kwargs: Response())
+                return await m.SessionClient.get(SimpleNamespace(origin="https://fixture", http=http), path)
             if change == "budget":
                 clock[0] += 2.1
             elif change == "offset":
@@ -10007,13 +10032,26 @@ def test_startup_run_detail_reuses_real_core_gateway_bounded_chunk_contract(tmp_
         return 2.0 - clock[0]
 
     try:
-        if change is None:
+        if change is None or change in {"timeout_once", "timeout_later"}:
             result = asyncio.run(m._startup_run_detail(Client(), state, remaining))
             assert result == before and result["accepted_at"] == 9.0
-            assert [int(query["offset"]) for query in requests] == [0, 8192]
+            offsets = [0, 8192, 8192] if change == "timeout_later" else [0, 0, 8192] if change else [0, 8192]
+            assert [int(query["offset"]) for query in requests] == offsets
+            if change == "timeout_later":
+                assert requests[1] == requests[2] and read_budgets == [2., 2., 1.5]
+            elif change:
+                assert requests[0] == requests[1] and read_budgets == [2., 1.5, 1.5]
         else:
-            with pytest.raises((RuntimeError, ValueError, TimeoutError)):
+            expected = asyncio.CancelledError if change == "body_cancel" else (RuntimeError, ValueError, TimeoutError)
+            with pytest.raises(expected) as caught:
                 asyncio.run(m._startup_run_detail(Client(), state, remaining))
+            if change == "timeout_twice":
+                assert requests[0] == requests[1] and len(requests) == 2
+                assert read_budgets == [2., 1.5] and str(caught.value) == "synthetic HTTP response-body timeout"
+            elif change == "timeout_budget":
+                assert len(requests) == 1 and str(caught.value) == "original admission clock exhausted"
+            elif change in {"body_cancel", "typed_refused", "refused"}:
+                assert len(requests) == 1
         assert authority.run == before and "accepted_at" not in state["run"]
         assert all(query["limit"] == "8192" for query in requests)
     finally:

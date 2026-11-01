@@ -1253,8 +1253,16 @@ async def _startup_run_detail(client, state, remaining):
     while len(raw) < reference["bytes"]:
         query = urlencode({"reference": json.dumps(reference, separators=(",", ":")),
                            "offset": len(raw), "limit": 8192})
-        budget = remaining()
-        reply = await asyncio.wait_for(client.get("state?" + query), budget)
+        for attempt in range(2):
+            budget = remaining()
+            try:
+                reply = await asyncio.wait_for(client.get("state?" + query), budget)
+                break
+            except TimeoutError:
+                if attempt:
+                    raise
+                # One identical read-only chunk retry consumes the original
+                # admission ceiling; the HTTP request cap is unchanged.
         remaining()
         keys = {"accepted", "status", "reference", "offset", "length", "total_bytes", "encoding", "data"}
         if (not isinstance(reply, dict) or set(reply) != keys or reply["accepted"] is not True
