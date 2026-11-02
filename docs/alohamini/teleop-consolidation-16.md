@@ -783,7 +783,7 @@ This coordinator is the existing LEFT elbow/gripper orchestrator at its canonica
 
 **Finite grasp sequence — implemented; object retention not yet demonstrated.** Use the same canonical coordinator with the current binding:
 
-Current physical follow-through40de completed the explicitly decreasing composition and ordinary finishing. Full P1 images show the object above the closing pads, so actual grasp is not yet achieved. Before another grasp, place a light soft object on stable support between the opposing pads at the actual current arm pose. This is a specific task-placement refinement; no manual old-reference reset, tuning or increased amplitude is indicated. Keep source, accepted commands, sparse hardware Goals, measured movement and object retention separate.
+Current physical follow-through40de completed the explicitly decreasing composition and ordinary finishing. Its initial P1 placement assessment was upside down. The owner identifies the supported roll with the fixed lower pad behind it and movable upper pad open above/in front; exact 180-degree rotation of the original carry frame supports that description. The placement-mismatch conclusion and object-repositioning request are withdrawn. Original placement remains complete; actual contact, retention and transport remain unverified. Keep source, accepted commands, sparse hardware Goals, measured movement and object retention separate; no tuning, manual reset or new physical prerequisite follows from correcting image orientation.
 
 ```powershell
 uv run --no-sync --project C:/Users/pickm/lerobot_alohamini_client python -u -B -m tools.am1_live_phase_coordinator `
