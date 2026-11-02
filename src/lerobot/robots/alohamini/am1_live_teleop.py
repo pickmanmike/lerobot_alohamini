@@ -340,6 +340,15 @@ def enable_thermal_history(control, robot):
     windows = [operation.temperature, *(state["window"] for state in robot._am1_teleop_temperatures.values())]
     if len(windows) != 13:
         raise RuntimeError("AM1 thermal history requires all original role windows")
+    # Startup refresh has ended, but first operational qualification still needs
+    # actual due role receipts. Preserve RAW guards and strict peak readiness;
+    # no history-hold allowance exists until this complete handoff qualifies.
+    service_due_feedback(robot)
+    if (not binding_valid(robot) or robot._am1_teleop_binding != identity
+        or {**control.binding, "recipe": RECIPE} != identity
+        or control._live_summary.get("live_admitted_at_monotonic_s") != context["live_at"]
+        or control._live_summary.get("live_deadline_monotonic_s") != context["deadline"]):
+        raise RuntimeError("AM1 thermal history original owner/Live clock changed during collection")
     now = control.clock()
     for window in windows:
         window.assert_fresh(now)  # Startup must already have strictly qualified.
