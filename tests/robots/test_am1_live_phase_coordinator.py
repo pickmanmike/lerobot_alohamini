@@ -44,10 +44,10 @@ def admission(grip="closing", *, elbow_raw=1090):
     return ready, {"event": "native_admitted", "snapshot": client.snapshot}
 
 
-def grasp_options(*extra):
+def grasp_options(*extra, direction="increasing"):
     return coordinator.parse_args([
         "--plan", "grasp-return", "--gripper-direction", "admitted",
-        "--degrees", "4", "--direction", "increasing",
+        "--degrees", "4", *(["--direction", direction] if direction is not None else []),
         "--ramp-seconds", "10", "--comparison-dwell-seconds", "3", "--dwell-seconds", "3",
         "--window-seconds", "90", "--intent-ttl-seconds", "60",
         "--bindings", "unused-current-bindings.json", *extra,
@@ -63,10 +63,11 @@ def planned(ready, admitted, options):
 
 
 @pytest.mark.parametrize("grip", ["closing", "opening"])
-def test_grasp_return_keeps_one_legal_interval_and_retracts_closed_to_original(grip):
-    ready, admitted = admission(grip)
+@pytest.mark.parametrize("direction,elbow_raw", [("increasing", 1090), ("decreasing", 1128)])
+def test_grasp_return_keeps_one_legal_interval_and_retracts_closed_to_original(grip, direction, elbow_raw):
+    ready, admitted = admission(grip, elbow_raw=elbow_raw)
     original = copy.deepcopy(admitted)
-    plan, phases = planned(ready, admitted, grasp_options())
+    plan, phases = planned(ready, admitted, grasp_options(direction=direction))
     names = [phase["name"] for phase in phases]
     expected = ["grasp_close", "grasp_carry", "grasp_return_original_closed", "grasp_release", "finish"]
     if grip == "opening":
@@ -75,7 +76,8 @@ def test_grasp_return_keeps_one_legal_interval_and_retracts_closed_to_original(g
     assert sum(phase.get("ramp", 0) + phase.get("dwell", 0) for phase in phases) == (41. if grip == "opening" else 36.)
     q0 = ready["command_reference"][KEY]
     # Four physical encoder degrees through the existing side-specific calibration.
-    assert plan["target"] - q0 == pytest.approx(45.51111111111111 * 200 / 2209)
+    sign = 1 if direction == "increasing" else -1
+    assert plan["target"] - q0 == pytest.approx(sign * 45.51111111111111 * 200 / 2209)
     opening, closed = 10., 0.
     by_name = {phase["name"]: phase for phase in phases}
     assert by_name["grasp_close"]["targets"] == {KEY: q0, GRIP: closed}
@@ -98,12 +100,32 @@ def test_grasp_return_keeps_one_legal_interval_and_retracts_closed_to_original(g
 
 
 @pytest.mark.parametrize("args", [
-    ["--gripper-direction", "closing"], ["--degrees", "5"], ["--direction", "decreasing"],
+    ["--gripper-direction", "closing"], ["--degrees", "5"], ["--direction", "sideways"],
     ["--ramp-seconds", "8"], ["--comparison-dwell-seconds", "4"], ["--dwell-seconds", "4"],
 ])
 def test_grasp_selection_rejects_unapproved_composition_before_process(args):
     with pytest.raises(SystemExit):
         grasp_options(*args)
+
+
+@pytest.mark.parametrize("direction,elbow_raw", [("decreasing", 1090), ("increasing", 1128)])
+def test_grasp_full_endpoint_refuses_unsupported_direction_without_reseeding(direction, elbow_raw):
+    ready, admitted = admission(elbow_raw=elbow_raw)
+    original = copy.deepcopy((ready, admitted))
+    with pytest.raises(ValueError):
+        planned(ready, admitted, grasp_options(direction=direction))
+    assert (ready, admitted) == original
+
+
+def test_grasp_requires_explicit_direction_before_adapter_launch(tmp_path, monkeypatch):
+    (tmp_path / ".cache/am1-knowledge-reuse-18").mkdir(parents=True)
+    monkeypatch.setattr(coordinator, "ROOT", tmp_path)
+    monkeypatch.setattr(coordinator.subprocess, "Popen",
+                        lambda *args, **kwargs: pytest.fail("omitted grasp direction reached adapter launch"))
+    with pytest.raises(SystemExit):
+        coordinator.main(["--plan", "grasp-return", "--gripper-direction", "admitted",
+                          "--comparison-dwell-seconds", "3", "--bindings", "unused-current-bindings.json"])
+    assert not list((tmp_path / ".cache/am1-knowledge-reuse-18").glob("*.console.jsonl"))
 
 
 @pytest.mark.parametrize("mutation", ["no_interval", "two_intervals", "grip_rate", "elbow_limit",
@@ -175,6 +197,7 @@ def test_grasp_auto_advance_requires_current_ack_and_complete_dwell_or_truthful_
 def test_existing_plan_intentions_and_original_return_remain_available(name, extra, expected):
     ready, admitted = admission(elbow_raw=1107)
     options = coordinator.parse_args(["--plan", name, "--bindings", "unused-current-bindings.json", *extra])
+    assert options.direction == (extra[extra.index("--direction")+1] if "--direction" in extra else "decreasing")
     plan, phases = planned(ready, admitted, options)
     assert [phase["name"] for phase in phases] == expected
     returns = [phase for phase in phases if phase["name"] == "return_original"]
@@ -183,8 +206,9 @@ def test_existing_plan_intentions_and_original_return_remain_available(name, ext
 
 
 @pytest.mark.parametrize("unsupported", [False, True])
-def test_coordinator_dispatches_complete_grasp_from_status_without_manual_pacing(tmp_path, monkeypatch, unsupported):
-    ready, admitted = admission("ambiguous" if unsupported else "opening")
+@pytest.mark.parametrize("direction,elbow_raw", [("increasing", 1090), ("decreasing", 1128)])
+def test_coordinator_dispatches_complete_grasp_from_status_without_manual_pacing(tmp_path, monkeypatch, unsupported, direction, elbow_raw):
+    ready, admitted = admission("ambiguous" if unsupported else "opening", elbow_raw=elbow_raw)
     root = tmp_path / "repo"
     trial = root / "trial"
     trial.mkdir(parents=True)
@@ -244,7 +268,7 @@ def test_coordinator_dispatches_complete_grasp_from_status_without_manual_pacing
     monkeypatch.setattr(coordinator.subprocess, "Popen", Process)
     assert coordinator.main([
         "--plan", "grasp-return", "--gripper-direction", "admitted", "--degrees", "4",
-        "--direction", "increasing", "--ramp-seconds", "10", "--comparison-dwell-seconds", "3",
+        "--direction", direction, "--ramp-seconds", "10", "--comparison-dwell-seconds", "3",
         "--dwell-seconds", "3", "--window-seconds", "90", "--intent-ttl-seconds", "60",
         "--bindings", str(root / "current-bindings.json"),
     ]) == 0
@@ -258,6 +282,7 @@ def test_coordinator_dispatches_complete_grasp_from_status_without_manual_pacing
     declared = next(row for row in records if row["event"] == "local_activity_declared")
     assert declared["gripper_interval_policy"] == "one legal10-point interval; prepare opening when only opening is admitted"
     assert declared["view"] == "normal required Chest" and declared["body_lift_intent"] == "zero"
+    assert declared["direction"] == direction
     if unsupported:
         assert not intents
         assert any(row["event"] == "local_excursion_unsupported" for row in records)
