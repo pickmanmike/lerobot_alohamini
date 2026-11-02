@@ -3909,7 +3909,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
 
 
 @pytest.mark.parametrize("cause", ["initial_view_refusal", "initial_view_refusal_pause", "initial_connect_loss_pre", "initial_connect_loss_post", "initial_connect_loss_late", "initial_connect_loss_late_pause", "initial_connect_loss_contract", "initial_connect_loss_qualified_pause", "initial_connect_loss_bound_pause", "feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "resume_reporting_pause", "resume_reporting_renewal", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_unknown_receipt", "ordinary_input_unknown_pre", "ordinary_input_unknown_post", "ordinary_input_unknown_transport", "grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_transport", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_budget_post_create", "normal_finish_budget_get_create", "normal_finish_unknown_budget_create", "normal_finish_unknown_pre", "normal_finish_unknown_post", "normal_finish_unknown_twice", "normal_finish_unknown_wrong_status", "normal_finish_unknown_wrong_shape", "normal_finish_unknown_wrong_type", "normal_finish_unknown_refused", "normal_finish_unknown_new_pause", "normal_finish_unknown_new_stop", "normal_finish_unknown_new_owner", "normal_finish_unknown_new_service", "normal_finish_unknown_cancel", "normal_finish_unknown_view_lost", "normal_finish_unknown_ceiling", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal", "peer_start_normal", "peer_start_bench", "peer_bench_unqualified_view", "peer_bench_local_loss", "peer_normal_unqualified_view", "held_command120_view_later", "held_command120_view_never", "held_command120_local_loss", "view_refusal122_input_before", "view_refusal122_input_after", "view_refusal122_grant_before", "view_refusal122_grant_after", "view_refusal122_never", "view_refusal122_pause", "view_refusal122_stop", "view_refusal122_takeover", "view_refusal122_grant_connect_preflight_before", "view_refusal122_grant_connect_preflight_pending", "view_refusal122_grant_connect_preflight_queue", "view_refusal122_grant_connect_preflight_sent", "view_refusal122_grant_connect_preflight_pause", "view_refusal122_grant_connect_preflight_stop", "view_refusal122_grant_connect_preflight_takeover", "view_refusal122_grant_connect_preflight_reboot", "view_refusal122_grant_connect_preflight_lease", "view_refusal122_grant_connect_preflight_deadline", "view_refusal122_grant_connect_preflight_cancel", "view_refusal130_grant_input_race_before", "view_refusal130_grant_input_race_never", "view_refusal130_grant_input_race_pause", "view_refusal130_grant_input_race_stop", "view_refusal130_grant_input_race_takeover", "view_refusal130_grant_input_race_revision", "view_refusal130_grant_input_race_history", "view_refusal130_grant_input_race_time", "renewal_unknown133_grant_before", "renewal_unknown133_grant_pause", "renewal_unknown133_grant_takeover", "renewal_unknown133_grant_unchanged", "renewal_unknown133_grant_receipt_unknown", "renewal_unknown133_grant_second_read", "renewal_unknown133_grant_stream_before"])
-def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause, initial_unknown=False):
+def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause, initial_unknown=False, initial_ack_attach=False):
     import asyncio
     import copy
     import json
@@ -7417,6 +7417,22 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 original_attach, original_call, original_wait = client.attach, gateway.call, client.wait
                 attaching, attachment_losses = [False], [0]
                 interrupt_attachment = cause.startswith("connect_attach_loss_")
+                failed_stream, attachment_errors, unpublished = [], [], []
+                ack_failed = asyncio.Event()
+                if initial_ack_attach:
+                    from aiohttp import ClientConnectionResetError
+                    original_ack_failed = m.SessionClient._ack_failed
+                    async def delayed_ack_failure(self, ws, error):
+                        await original_ack_failed(self, ws, error)
+                        if ws in failed_stream:
+                            ack_failed.set()
+                            # Deterministically retain the demonstrated ordering:
+                            # waiter wakes before THIS reader publishes its close.
+                            try:
+                                await asyncio.sleep(.05)
+                            except asyncio.CancelledError:
+                                await asyncio.sleep(.05)
+                    monkeypatch.setattr(m.SessionClient, "_ack_failed", delayed_ack_failure)
 
                 async def wait_initial_snapshot(predicate, timeout):
                     if attaching[0] and interrupt_attachment and not attachment_losses[0]:
@@ -7424,9 +7440,25 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         attachment_losses[0] += 1
                         # Exact37 seam: actual authenticated TLS/WSS attachment
                         # loses its fresh stream before its first snapshot.
-                        client.ws._response.connection.transport.abort()
-                        await client.reader
-                    return await original_wait(predicate, timeout)
+                        if initial_ack_attach:
+                            failed_stream.append(client.ws)
+                            async def fail_ack(value, **kwargs):
+                                assert set(value) == {"ack"}
+                                if initial_ack_attach == "hard":
+                                    raise ValueError("private serialization payload" * 1000)
+                                if initial_ack_attach == "timeout":
+                                    raise TimeoutError("current WSS snapshot acknowledgement deadline expired")
+                                raise ClientConnectionResetError("Cannot write to closing transport")
+                            client.ws.send_json = fail_ack
+                        else:
+                            client.ws._response.connection.transport.abort()
+                            await client.reader
+                    try:
+                        return await original_wait(predicate, timeout)
+                    except ConnectionError:
+                        if initial_ack_attach:
+                            unpublished.append(client.transport_close is None and not client.reader.done())
+                        raise
 
                 def capture_binding(ws):
                     original_send = ws.send_json
@@ -7440,6 +7472,9 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     attaching[0] = True
                     try:
                         await original_attach()
+                    except ConnectionError as error:
+                        attachment_errors.append(error)
+                        raise
                     finally:
                         attaching[0] = False
                     capture_binding(client.ws)
@@ -7465,12 +7500,38 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                             renewal.result()
                             raise RuntimeError("original HTTP renewal ended")
                     try:
+                        if initial_ack_attach in {"hard", "timeout", "cancel"}:
+                            pending = asyncio.create_task(guard.resume(expected_pause="input_expired", renewal_check=renewal_healthy))
+                            if initial_ack_attach == "cancel":
+                                await ack_failed.wait()
+                                await asyncio.sleep(.01)
+                                pending.cancel()
+                            expected = asyncio.CancelledError if initial_ack_attach == "cancel" else ConnectionError
+                            with pytest.raises(expected):
+                                await pending
+                            assert len(sent_bindings) == 1 and unpublished == [True]
+                            if initial_ack_attach != "cancel":
+                                error = attachment_errors[0]
+                                detail = error.initial_snapshot_ack_failure
+                                assert detail["kind"] == "unqualified" and detail["message"] is None
+                                assert detail["error_type"] == ("ValueError" if initial_ack_attach == "hard" else "TimeoutError")
+                                assert not any(v["event"] == "ordinary_attachment_interrupted" for v in records)
+                                assert "private serialization payload" not in str(records)
+                            assert a.run["status"] == "paused" and a.run["deadline"] == 309.
+                            return
                         assert not await guard.resume(expected_pause="input_expired", renewal_check=renewal_healthy)
                     finally:
                         renewal.cancel()
                         await asyncio.gather(renewal, return_exceptions=True)
                     assert attachment_losses == [1]
                     assert any(row["event"] == "ordinary_attachment_interrupted" for row in records)
+                    if initial_ack_attach:
+                        assert len(attachment_errors) == 1 and unpublished == [True]
+                        detail = attachment_errors[0].initial_snapshot_ack_failure
+                        assert detail == {"kind": "transport_reset", "error_type": "ClientConnectionResetError",
+                                          "message": "Cannot write to closing transport"}
+                        assert attachment_errors[0].initial_snapshot_transport_close["close_code"] == 1006
+                        assert client.ws is not failed_stream[0] and client._ack_error is None
                 else:
                     assert not await guard.resume(expected_pause="input_expired")
                 assert len(sent_bindings) == 2
@@ -13865,3 +13926,55 @@ def test_initial_accepted_resume_lost_reply_recovers_same_run_without_input_repl
 def test_initial_resume_lost_reply_fences_old_operation_and_honors_new_pause(tmp_path, monkeypatch, mode):
     test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
         tmp_path, monkeypatch, "resume_reply_timeout_post", initial_unknown=mode)
+
+
+def test_initial_snapshot_ack_reset_waits_for_same_reader_close_before_retry(tmp_path, monkeypatch):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
+        tmp_path, monkeypatch, "connect_attach_loss_pre", initial_ack_attach=True)
+
+
+@pytest.mark.parametrize("mode", ["hard", "timeout", "cancel"])
+def test_initial_snapshot_ack_settlement_preserves_hard_failure_and_cancellation(tmp_path, monkeypatch, mode):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
+        tmp_path, monkeypatch, "connect_attach_loss_pre", initial_ack_attach=mode)
+
+
+def test_old_reader_cannot_publish_after_joining_its_ack_worker_on_a_new_stream():
+    import asyncio
+    from types import SimpleNamespace
+    m = adapter()
+    async def scenario():
+        entered, cancelled, release = (asyncio.Event() for _ in range(3))
+        async def ack_worker():
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                await release.wait()  # Controlled old-worker finalization race.
+        class Wire:
+            closed, close_code = False, 1006
+            def __aiter__(self):
+                return self
+            async def __anext__(self):
+                raise StopAsyncIteration
+            def exception(self):
+                return None
+        old, new = Wire(), Wire()
+        worker = asyncio.create_task(ack_worker())
+        await entered.wait()
+        pending = asyncio.get_running_loop().create_future()
+        client = SimpleNamespace(ws=old, _ack_task=worker, _ack_slot=None, _ack_changed=asyncio.Event(),
+            _detaching=False, pending={"new": pending}, transport_close=None, transport_error=None,
+            changed=asyncio.Event())
+        reader = asyncio.create_task(m.SessionClient._read(client))
+        await cancelled.wait()
+        client.ws, client._ack_slot = new, ("new-revision", m.time.monotonic()+2)
+        client._ack_changed = asyncio.Event()
+        release.set()
+        await reader
+        assert client.transport_close is None and client.transport_error is None
+        assert client._ack_slot[0] == "new-revision" and not client._ack_changed.is_set()
+        assert client.pending == {"new": pending} and not pending.done()
+        pending.cancel()
+    asyncio.run(asyncio.wait_for(scenario(), 1))

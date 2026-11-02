@@ -1606,12 +1606,31 @@ class SessionClient:
         self._ack_changed = asyncio.Event()
         await self.ws.send_json({"ticket": attached["ticket"]})
         self.reader = asyncio.create_task(self._read())
+        ws, reader, snapshot_ceiling = self.ws, self.reader, time.monotonic() + 3
         try:
             await self.wait(lambda: self.snapshot is not None, 3)
         except ConnectionError as error:
             # Only this first-snapshot phase can qualify a transport-only
-            # replacement. Capture the failed stream BEFORE detach changes it.
-            error.initial_snapshot_transport_close = dict(self.transport_close or {})
+            # replacement. The ACK worker wakes waiters before the same reader
+            # necessarily finishes publishing its close; never borrow another
+            # stream or restart the original snapshot/caller deadline.
+            ack_error = self._ack_error if self.ws is ws and self._ack_ws is ws else None
+            if ack_error is not None:
+                from aiohttp import ClientConnectionResetError
+                reset = (type(ack_error) is ClientConnectionResetError
+                         and str(ack_error) == "Cannot write to closing transport")
+                error.initial_snapshot_ack_error = ack_error
+                error.initial_snapshot_ack_failure = {
+                    "kind": "transport_reset" if reset else "unqualified",
+                    "error_type": type(ack_error).__name__[:64],
+                    "message": "Cannot write to closing transport" if reset else None,
+                }
+                remaining = snapshot_ceiling - time.monotonic()
+                if reset and self.reader is reader and reader is not None and remaining > 0:
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(asyncio.shield(reader), remaining)
+            error.initial_snapshot_transport_close = (
+                dict(self.transport_close or {}) if self.ws is ws and self.reader is reader else {})
             raise
 
     async def _read(self):
@@ -1666,27 +1685,28 @@ class SessionClient:
                 if task is not None and task is not asyncio.current_task():
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
-                self._ack_slot = None
-                ack_changed = getattr(self, "_ack_changed", None)
-                if ack_changed is not None:
-                    ack_changed.set()
-                exception = ws.exception()
-                self.transport_close = {
-                    "reason": reason,
-                    "expected": self._detaching,
-                    "close_code": ws.close_code,
-                    "exception_type": type(exception).__name__ if exception else None,
-                    "exception": str(exception) if exception else None,
-                    "reader_error": reader_error,
-                    "observed_at_monotonic_s": time.monotonic(),
-                }
-                if not self._detaching and self.transport_error is None:
-                    self.transport_error = "current WSS connection ended: " + reason
-                for future in self.pending.values():
-                    if not future.done():
-                        future.set_exception(ConnectionError("current WSS connection lost"))
-                self.pending.clear()
-                self.changed.set()
+                if self.ws is ws:  # A new stream may arrive while its predecessor joins the ACK worker.
+                    self._ack_slot = None
+                    ack_changed = getattr(self, "_ack_changed", None)
+                    if ack_changed is not None:
+                        ack_changed.set()
+                    exception = ws.exception()
+                    self.transport_close = {
+                        "reason": reason,
+                        "expected": self._detaching,
+                        "close_code": ws.close_code,
+                        "exception_type": type(exception).__name__ if exception else None,
+                        "exception": str(exception) if exception else None,
+                        "reader_error": reader_error,
+                        "observed_at_monotonic_s": time.monotonic(),
+                    }
+                    if not self._detaching and self.transport_error is None:
+                        self.transport_error = "current WSS connection ended: " + reason
+                    for future in self.pending.values():
+                        if not future.done():
+                            future.set_exception(ConnectionError("current WSS connection lost"))
+                    self.pending.clear()
+                    self.changed.set()
 
     async def _ack_failed(self, ws, error):
         if self.ws is not ws or self._ack_ws is not ws:
@@ -3236,6 +3256,13 @@ class SameRunRecovery:
             try:
                 await asyncio.wait_for(self.client.attach(), budget)
             except ConnectionError as interrupted_attach:
+                ack_failure = getattr(interrupted_attach, "initial_snapshot_ack_failure", None)
+                if ack_failure is not None:
+                    self.record({"event": "ordinary_attachment_ack_failed", "phase": "initial_snapshot",
+                                 "ack_failure": ack_failure, "attachment_attempt": attachment_attempt,
+                                 "remaining_s": remaining()})
+                    if ack_failure.get("kind") != "transport_reset":
+                        raise  # Protocol/serialization/timeout failures are not transport permission.
                 failed_close = getattr(interrupted_attach, "initial_snapshot_transport_close", None)
                 if (not isinstance(failed_close, dict) or failed_close.get("expected") is not False
                     or failed_close.get("reason") != "stream-ended" or failed_close.get("close_code") != 1006
