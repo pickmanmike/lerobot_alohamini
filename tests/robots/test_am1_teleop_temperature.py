@@ -2317,3 +2317,79 @@ def test_thermal_raw_sources_share_the_actual_owner_snapshot_without_extra_io(co
     assert min(actual.values()) == proof["raw_sample_at_monotonic_s"]
     assert before == [len(bus.port_handler.writes) for bus in (robot.left_bus, robot.right_bus)]
     assert len(json.dumps(ack, allow_nan=False).encode()) < 32768
+
+
+@pytest.mark.parametrize("fault", [None, "stale_raw", "binding", "device", "owner_during_read", "clock_during_read"])
+def test_first_thermal_handoff_services_original_windows_before_strict_optin(
+    command_cadence_boundary, monkeypatch, fault,
+):
+    state, robot = command_cadence_boundary, command_cadence_boundary.robot
+    control, _identity, _owner, _ = _live_cadence_owner(state, admit_active=False)
+    assert robot._am1_teleop_startup_temperature is False
+    assert not getattr(robot, "_am1_thermal_history_enabled", False)
+    assert control.live_sample is None
+    base = state.clock.now + .01
+    motor = "arm_left_elbow_flex"
+    for index in range(5):
+        state.operation.emit_pending_sample()
+        state.clock.now = base + index * .1
+        robot.left_bus.registers["Present_Temperature", motor] = 70 if index == 2 else 28
+        state.operation.poll(defer_sample_log=True)
+        teleop.read_groups(robot, ("Present_Temperature",), active=True)
+    windows = [state.operation.temperature, *(v["window"] for v in robot._am1_teleop_temperatures.values())]
+    origins = [window._origin_ns for window in windows]
+    hot = robot._am1_teleop_temperatures["left", 3]["window"]
+    peak = next(row for row in hot.samples if row[1] == 70)
+    frozen = control.live_snapshot()
+    state.clock.now = base + .51
+    assert max(state.clock.now-window.samples[0][0] for window in windows) > .5
+    assert all(state.clock.now-window._last_sample_at < .5 for window in windows)
+    assert all(window.allow_history_hold is False for window in windows)
+    if fault == "stale_raw":
+        state.clock.now = base + .91
+    elif fault == "binding":
+        robot._am1_teleop_binding = dict(robot._am1_teleop_binding, run_id=str(uuid4()))
+    elif fault == "device":
+        from tests.robots.test_am1_teleop_settings import reply_packet
+        port = robot.left_bus.port_handler
+        original_reply = port.respond
+        def failed_device_reply(packet):
+            if packet[5:7] == [63, 1]:
+                return reply_packet(packet[7], [], 126)
+            return original_reply(packet)
+        monkeypatch.setattr(port, "respond", failed_device_reply)
+    calls = []
+    for side, bus, _names in teleop._groups(robot):
+        original = bus.sync_read
+        def read(register, names, *, _original=original, _side=side, **kwargs):
+            values = _original(register, names, **kwargs)
+            if register == "Present_Temperature":
+                calls.append((_side, state.clock.now))
+                if _side == "left" and len(calls) == 1:
+                    if fault == "owner_during_read":
+                        control.binding = dict(control.binding, run_id=str(uuid4()))
+                    elif fault == "clock_during_read":
+                        control._live_summary["live_deadline_monotonic_s"] += 1.
+            return values
+        monkeypatch.setattr(bus, "sync_read", read)
+    state.command_writes.clear()
+    if fault:
+        with pytest.raises(RuntimeError):
+            control.check_live(robot)
+        assert getattr(robot, "_am1_thermal_history_context", None) is None
+        assert not getattr(robot, "_am1_thermal_history_enabled", False)
+        assert all(window.allow_history_hold is False for window in windows)
+        if fault in {"stale_raw", "binding"}:
+            assert not calls
+    else:
+        assert control.check_live(robot)
+        assert calls and len(calls) <= 4  # One bounded shared batch, not retry-until-ready.
+        assert all(window.allow_history_hold and window.ready for window in windows)
+        for window in windows:
+            window.assert_fresh(state.clock.now)
+        assert peak in hot.samples and hot.outliers == 1
+        assert [window._origin_ns for window in windows] == origins
+        assert control.live_snapshot() == frozen
+        before = list(calls)
+        assert control.check_live(robot) and calls == before  # Already-enabled context performs no extra I/O.
+    assert not state.command_writes
