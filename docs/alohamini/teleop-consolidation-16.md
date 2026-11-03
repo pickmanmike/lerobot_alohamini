@@ -783,12 +783,16 @@ This coordinator is the existing LEFT elbow/gripper orchestrator at its canonica
 
 **Finite grasp sequence — implemented; object retention not yet demonstrated.** Use the same canonical coordinator with the current binding:
 
+Current physical follow-through40de completed the explicitly decreasing composition and ordinary finishing. Its initial P1 placement assessment was upside down. The owner identifies the supported roll with the fixed lower pad behind it and movable upper pad open above/in front; exact 180-degree rotation of the original carry frame supports that description. The placement-mismatch conclusion and object-repositioning request are withdrawn. Original placement remains complete; actual contact, retention and transport remain unverified. Keep source, accepted commands, sparse hardware Goals, measured movement and object retention separate; no tuning, manual reset or new physical prerequisite follows from correcting image orientation.
+
 ```powershell
 uv run --no-sync --project C:/Users/pickm/lerobot_alohamini_client python -u -B -m tools.am1_live_phase_coordinator `
   --plan grasp-return --gripper-direction admitted --direction increasing --degrees 4 `
   --ramp-seconds 10 --comparison-dwell-seconds 3 --dwell-seconds 3 `
   --window-seconds 90 --intent-ttl-seconds 60 --bindings $bindings
 ```
+
+The fixed grasp composition requires an explicit increasing or decreasing direction before Start. Choose the sign from current measured-pose evidence; fresh admission must still validate the full four-degree endpoint, rate and original return. If that direction does not fit, the coordinator refuses without clamping, recentering, automatic reversal or a smaller substitute. The example above retains the earlier increasing action; use an explicitly declared --direction decreasing for its supported opposite-direction counterpart. Both retain the same ten-point gripper interval, timing, normal required Chest view and temporary-setting restoration.
 
 This finite virtual client streams through the existing shared adapter; it is not new physical-leader validation. Before Start it declares the admitted-interval policy. After fresh admission it validates the entire composition and records one legal10-point opening/closing interval. If the current reference is its closed endpoint, it first opens within that same interval. It then closes, moves the elbow4° increasing while retaining the closed grip, explicitly MOVEs back to the ORIGINAL elbow reference while still closed, reopens, and Finishes. The return operation that resets all joints is deliberately not used for the closed-grip segment.
 

@@ -35,8 +35,8 @@ def parse_args(argv=None):
     parser.add_argument("--gripper-cycle", action="store_true", help="out-return: same elbow workpose, declared10-point gripper excursion then original")
     parser.add_argument("--gripper-direction", choices=("opening", "closing", "admitted"), default="closing")
     parser.add_argument("--degrees", type=lambda v: finite(v), default=4., help="out-return encoder degrees")
-    parser.add_argument("--direction", choices=("decreasing", "increasing"), default="decreasing",
-                        help="out-return normalized-coordinate direction")
+    parser.add_argument("--direction", choices=("decreasing", "increasing"), default=None,
+                        help="normalized-coordinate direction; explicit for grasp-return, otherwise defaults to decreasing")
     for name, default in (("ramp-seconds", 10.), ("window-seconds", 90.), ("intent-ttl-seconds", 90.),
                           ("comparison-dwell-seconds", 6.), ("approach-room-degrees", 1.)):
         parser.add_argument("--"+name, type=lambda v: finite(v), default=default)
@@ -55,10 +55,12 @@ def parse_args(argv=None):
     if args.gripper_cycle and (args.plan != "out-return" or args.workpose == "relative" and args.direction != "increasing"):
         parser.error("relative gripper-cycle requires out-return and explicit increasing direction")
     if args.plan == "grasp-return" and (
-        args.gripper_direction != "admitted" or args.degrees != 4. or args.direction != "increasing"
+        args.gripper_direction != "admitted" or args.degrees != 4. or args.direction is None
         or args.ramp_seconds != 10. or args.comparison_dwell_seconds != 3. or args.dwell_seconds != 3.
     ):
-        parser.error("grasp-return requires admitted gripper,4degrees increasing,10second ramp and3second holds")
+        parser.error("grasp-return requires admitted gripper,4degrees with explicit direction,10second ramp and3second holds")
+    if args.direction is None:
+        args.direction = "decreasing"
     return args
 
 
