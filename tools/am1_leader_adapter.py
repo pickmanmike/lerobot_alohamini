@@ -39,6 +39,7 @@ from examples.alohamini.am1_live_teleop import (
 )
 
 ORDINARY_ARMS_PROFILE = "ordinary-arms-left-current-rest-1051-1164"
+SUPPORTED_GRASP_CLOSING_RAW = (2799, 3102)
 
 
 def virtual_input_progress(workload, *, window_started_at, window_deadline, now_monotonic, now_perf_counter):
@@ -281,6 +282,12 @@ def _ordinary_arms_options(args):
         or not getattr(args, "output_root", None) or not 0 < args.duration_seconds <= 60.
     ):
         raise ValueError("LEFT entry requires the explicit routine interactive current-rest frontdoor and wall budget <=60s")
+    if getattr(args, "supported_grasp_closing", False) and (
+        not selected or getattr(args, "virtual_input", None) != "interactive"
+        or not getattr(args, "prepare_current_rest", False) or not getattr(args, "bindings", None)
+        or not getattr(args, "output_root", None) or getattr(args, "left_entry", False)
+    ):
+        raise ValueError("supported grasp closing requires the routine normal interactive LEFT-P32 preparation")
     return selected
 
 
@@ -326,6 +333,8 @@ def prepare_current_rest_invocation(args, output):
         ssh="am1-pi", ttl_seconds=120, workload_segment="ordinary-arms",
         workspace_profile=LEFT_ENTRY_WORKSPACE_PROFILE if getattr(args, "left_entry", False) else ORDINARY_ARMS_PROFILE,
         left_shoulder_startup_degrees=1,
+        **({"left_gripper_raw_interval": list(SUPPORTED_GRASP_CLOSING_RAW)}
+           if getattr(args, "supported_grasp_closing", False) else {}),
     )
     with (output / "preparation-receipt.private.json").open("x", encoding="utf-8") as stream:
         json.dump(receipt, stream, sort_keys=True, indent=2, allow_nan=False)
@@ -339,6 +348,13 @@ def prepare_current_rest_invocation(args, output):
         json.dump(metadata, stream, sort_keys=True, indent=2, allow_nan=False)
     if receipt["request"].get("source_head") != config["motorSourceSha"]:
         raise ValueError("prepared current-rest source differs from matched motor binding")
+    if getattr(args, "supported_grasp_closing", False) and (
+        type(receipt["request"].get("left_gripper_raw_interval")) is not list
+        or receipt["request"]["left_gripper_raw_interval"] != list(SUPPORTED_GRASP_CLOSING_RAW)
+        or any(type(value) is not int for value in receipt["request"]["left_gripper_raw_interval"])
+        or type(receipt["request"].get("proportional")) is not int or receipt["request"]["proportional"] != 32
+    ):
+        raise ValueError("prepared supported grasp closing interval/LEFT-P32 selection differs")
     return config
 
 
@@ -5684,6 +5700,8 @@ def main(argv=None):
     parser.add_argument("--bindings", help="existing matched component binding for routine invocation metadata")
     parser.add_argument("--prepare-current-rest", action="store_true",
                         help="prepare the explicit ordinary-arms LEFT-P32 request once before Claim/Start")
+    parser.add_argument("--supported-grasp-closing", action="store_true",
+                        help="explicit ordinary LEFT-P32 grasp admission with raw gripper interval2799..3102")
     parser.add_argument("--left-entry", action="store_true",
                         help=f"explicit P16 inward-only LEFT elbow entry to raw{LEFT_ENTRY_ENDPOINT_RAW}; ordinary fresh Stop required before P32")
     parser.add_argument("--virtual-input", choices=("interactive", "jsonl"),

@@ -748,7 +748,8 @@ def test_controller_command_timing_does_not_add_per_frame_or_grant_records(op):
 
 
 @pytest.mark.parametrize("foreign", [False, True])
-def test_changing_activity_frontdoor_derives_fresh_invocation_and_prepares_before_ownership(tmp_path, monkeypatch, foreign):
+@pytest.mark.parametrize("supported_closing", [False, True])
+def test_changing_activity_frontdoor_derives_fresh_invocation_and_prepares_before_ownership(tmp_path, monkeypatch, foreign, supported_closing):
     import hashlib
     import json
     from pathlib import Path
@@ -768,7 +769,8 @@ def test_changing_activity_frontdoor_derives_fresh_invocation_and_prepares_befor
     def prepare(config, **options):
         calls.append((config, options))
         return {"canonical_read_verified": True, "hardware_started": False,
-                "request": {"source_head": "d"*40 if foreign else "a"*40}}
+                "request": {"source_head": "d"*40 if foreign else "a"*40, "proportional": 32,
+                            **({"left_gripper_raw_interval": [2799, 3102]} if supported_closing else {})}}
 
     async def run(args):
         # Exercise preparation/metadata creation at the actual before-ownership boundary.
@@ -783,7 +785,7 @@ def test_changing_activity_frontdoor_derives_fresh_invocation_and_prepares_befor
     monkeypatch.setattr(m, "run", run)
     argv = ["--url", "unused", "--ca", "unused", "--storage-state", "unused",
             "--bindings", str(bindings), "--output-root", str(tmp_path), "--prepare-current-rest",
-            "--virtual-input", "interactive"]
+            "--virtual-input", "interactive", *(["--supported-grasp-closing"] if supported_closing else [])]
     if foreign:
         with pytest.raises(ValueError, match="source"):
             m.main(argv)
@@ -795,7 +797,8 @@ def test_changing_activity_frontdoor_derives_fresh_invocation_and_prepares_befor
         for config, options in calls[::2]:
             assert config == "/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/" + "c"*16 + "/physical.json"
             assert options == {"ssh": "am1-pi", "ttl_seconds": 120, "workload_segment": "ordinary-arms",
-                               "workspace_profile": m.ORDINARY_ARMS_PROFILE, "left_shoulder_startup_degrees": 1}
+                               "workspace_profile": m.ORDINARY_ARMS_PROFILE, "left_shoulder_startup_degrees": 1,
+                               **({"left_gripper_raw_interval": [2799, 3102]} if supported_closing else {})}
         assert all((Path(output)/"invocation-config.private.json").is_file() for output in calls[1::2])
         for output in calls[1::2]:
             metadata = json.loads((Path(output)/"launch-metadata.private.json").read_text())
@@ -804,6 +807,54 @@ def test_changing_activity_frontdoor_derives_fresh_invocation_and_prepares_befor
                 pointer = metadata[key]
                 assert Path(pointer["path"]).is_absolute()
                 assert hashlib.sha256(Path(pointer["path"]).read_bytes()).hexdigest() == pointer["sha256"]
+
+
+@pytest.mark.parametrize("mismatch", ["missing_interval", "different_interval", "float_interval", "p16"])
+def test_supported_grasp_closing_refuses_different_canonical_preparation(tmp_path, monkeypatch, mismatch):
+    import json
+    from types import SimpleNamespace
+    from tools import am1_physical_executor as executor
+    m = adapter()
+    path = tmp_path/"binding.json"
+    path.write_text(json.dumps(dict(kind="am1-teleop28-feedback-loss-admitted-known-cleanup-bindings",
+        motor_head="a"*40, executor_head="b"*40, manifest_sha256="c"*64)))
+    request = dict(source_head="a"*40, proportional=32, left_gripper_raw_interval=[2799, 3102])
+    if mismatch == "missing_interval":
+        request.pop("left_gripper_raw_interval")
+    elif mismatch == "different_interval":
+        request["left_gripper_raw_interval"] = [2799, 3101]
+    elif mismatch == "float_interval":
+        request["left_gripper_raw_interval"] = [2799., 3102.]
+    else:
+        request["proportional"] = 16
+    monkeypatch.setattr(executor, "prepare_left_response_p_remote", lambda *a, **k:
+                        dict(request=request, hardware_started=False, canonical_read_verified=True))
+    output = tmp_path/"fresh"; output.mkdir()
+    with pytest.raises(ValueError):
+        m.prepare_current_rest_invocation(SimpleNamespace(bindings=str(path), supported_grasp_closing=True), output)
+
+
+def test_supported_grasp_closing_cli_requires_routine_normal_interactive_preparation(tmp_path, monkeypatch):
+    m, seen = adapter(), []
+    async def run(args):
+        seen.append(args)
+        return {}
+    monkeypatch.setattr(m, "run", run)
+    argv = ["--url", "unused", "--ca", "unused", "--storage-state", "unused",
+            "--bindings", "unused", "--output-root", str(tmp_path), "--prepare-current-rest",
+            "--virtual-input", "interactive", "--supported-grasp-closing"]
+    m.main(argv)
+    assert len(seen) == 1 and seen[0].supported_grasp_closing
+    assert seen[0].workload_segment == "ordinary-arms" and seen[0].source == "virtual-leaders"
+    for extra in (["--left-entry"], ["--virtual-input", "jsonl"], ["--bench-continuity"],
+                  ["--workload-segment", "left-reach"], ["--source", "usb-leaders"]):
+        with pytest.raises(SystemExit):
+            m.main(argv+extra)
+    assert len(seen) == 1
+    with pytest.raises(SystemExit):
+        m.main(["--url", "unused", "--ca", "unused", "--storage-state", "unused", "--output", "unused",
+                "--source", "virtual-leaders", "--workload-segment", "ordinary-arms",
+                "--virtual-input", "interactive", "--supported-grasp-closing"])
 
 
 @pytest.mark.parametrize("changed", ["bench", "advisory", "temporarily_unqualified"])
@@ -3949,7 +4000,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
         a._teleop_view = {"run_id": e.run_id, "qualified_until": 9.5 if held120 else 10.5, "role": "chest"}
         if cause in {"held_command120_view_never", "view_refusal122_never"} or view_input_race and cause.endswith("never"):
             # Clip the existing qualification to actual remaining native time,
-            # retaining the original9Ã¢â€ â€™309 ceiling rather than adding a timer.
+            # retaining the original9ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢309 ceiling rather than adding a timer.
             a.clock = e.clock = lambda: 308.6 if view_input_race else 308.85
             a.controller["expires"] = 310.
             if view122:
@@ -4021,7 +4072,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
         e.desired = "active"
         epoch[0] += 1
         dispatches[0] += 1
-        # The existing fake Native ACK takes one real Core resumingâ†’running
+        # The existing fake Native ACK takes one real Core resumingÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢running
         # transition, retaining an actual prior resumed event for finish history.
         return not ((finish_expiry_fixture or initial_unknown) and dispatches[0] == 1)
 
