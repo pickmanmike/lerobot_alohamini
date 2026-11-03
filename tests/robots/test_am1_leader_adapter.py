@@ -3908,7 +3908,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
     asyncio.run(asyncio.wait_for(scenario(), 0.3))
 
 
-@pytest.mark.parametrize("cause", ["initial_view_refusal", "initial_view_refusal_pause", "initial_connect_loss_pre", "initial_connect_loss_post", "initial_connect_loss_late", "initial_connect_loss_late_pause", "initial_connect_loss_contract", "initial_connect_loss_qualified_pause", "initial_connect_loss_bound_pause", "feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "resume_reporting_pause", "resume_reporting_renewal", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_unknown_receipt", "ordinary_input_unknown_pre", "ordinary_input_unknown_post", "ordinary_input_unknown_transport", "grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_transport", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_budget_post_create", "normal_finish_budget_get_create", "normal_finish_unknown_budget_create", "normal_finish_unknown_pre", "normal_finish_unknown_post", "normal_finish_unknown_twice", "normal_finish_unknown_wrong_status", "normal_finish_unknown_wrong_shape", "normal_finish_unknown_wrong_type", "normal_finish_unknown_refused", "normal_finish_unknown_new_pause", "normal_finish_unknown_new_stop", "normal_finish_unknown_new_owner", "normal_finish_unknown_new_service", "normal_finish_unknown_cancel", "normal_finish_unknown_view_lost", "normal_finish_unknown_ceiling", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal", "peer_start_normal", "peer_start_bench", "peer_bench_unqualified_view", "peer_bench_local_loss", "peer_normal_unqualified_view", "held_command120_view_later", "held_command120_view_never", "held_command120_local_loss", "view_refusal122_input_before", "view_refusal122_input_after", "view_refusal122_grant_before", "view_refusal122_grant_after", "view_refusal122_never", "view_refusal122_pause", "view_refusal122_stop", "view_refusal122_takeover", "view_refusal122_grant_connect_preflight_before", "view_refusal122_grant_connect_preflight_pending", "view_refusal122_grant_connect_preflight_queue", "view_refusal122_grant_connect_preflight_sent", "view_refusal122_grant_connect_preflight_pause", "view_refusal122_grant_connect_preflight_stop", "view_refusal122_grant_connect_preflight_takeover", "view_refusal122_grant_connect_preflight_reboot", "view_refusal122_grant_connect_preflight_lease", "view_refusal122_grant_connect_preflight_deadline", "view_refusal122_grant_connect_preflight_cancel", "view_refusal130_grant_input_race_before", "view_refusal130_grant_input_race_never", "view_refusal130_grant_input_race_pause", "view_refusal130_grant_input_race_stop", "view_refusal130_grant_input_race_takeover", "view_refusal130_grant_input_race_revision", "view_refusal130_grant_input_race_history", "view_refusal130_grant_input_race_time", "renewal_unknown133_grant_before", "renewal_unknown133_grant_pause", "renewal_unknown133_grant_takeover", "renewal_unknown133_grant_unchanged", "renewal_unknown133_grant_receipt_unknown", "renewal_unknown133_grant_second_read", "renewal_unknown133_grant_stream_before"])
+@pytest.mark.parametrize("cause", ["grant_native_renewal_before", "grant_native_renewal_pause", "grant_native_renewal_stop", "grant_native_renewal_takeover", "grant_native_renewal_deadline", "grant_native_renewal_descriptor", "initial_view_refusal", "initial_view_refusal_pause", "initial_connect_loss_pre", "initial_connect_loss_post", "initial_connect_loss_late", "initial_connect_loss_late_pause", "initial_connect_loss_contract", "initial_connect_loss_qualified_pause", "initial_connect_loss_bound_pause", "feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "resume_reporting_pause", "resume_reporting_renewal", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_unknown_receipt", "ordinary_input_unknown_pre", "ordinary_input_unknown_post", "ordinary_input_unknown_transport", "grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_transport", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_budget_post_create", "normal_finish_budget_get_create", "normal_finish_unknown_budget_create", "normal_finish_unknown_pre", "normal_finish_unknown_post", "normal_finish_unknown_twice", "normal_finish_unknown_wrong_status", "normal_finish_unknown_wrong_shape", "normal_finish_unknown_wrong_type", "normal_finish_unknown_refused", "normal_finish_unknown_new_pause", "normal_finish_unknown_new_stop", "normal_finish_unknown_new_owner", "normal_finish_unknown_new_service", "normal_finish_unknown_cancel", "normal_finish_unknown_view_lost", "normal_finish_unknown_ceiling", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal", "peer_start_normal", "peer_start_bench", "peer_bench_unqualified_view", "peer_bench_local_loss", "peer_normal_unqualified_view", "held_command120_view_later", "held_command120_view_never", "held_command120_local_loss", "view_refusal122_input_before", "view_refusal122_input_after", "view_refusal122_grant_before", "view_refusal122_grant_after", "view_refusal122_never", "view_refusal122_pause", "view_refusal122_stop", "view_refusal122_takeover", "view_refusal122_grant_connect_preflight_before", "view_refusal122_grant_connect_preflight_pending", "view_refusal122_grant_connect_preflight_queue", "view_refusal122_grant_connect_preflight_sent", "view_refusal122_grant_connect_preflight_pause", "view_refusal122_grant_connect_preflight_stop", "view_refusal122_grant_connect_preflight_takeover", "view_refusal122_grant_connect_preflight_reboot", "view_refusal122_grant_connect_preflight_lease", "view_refusal122_grant_connect_preflight_deadline", "view_refusal122_grant_connect_preflight_cancel", "view_refusal130_grant_input_race_before", "view_refusal130_grant_input_race_never", "view_refusal130_grant_input_race_pause", "view_refusal130_grant_input_race_stop", "view_refusal130_grant_input_race_takeover", "view_refusal130_grant_input_race_revision", "view_refusal130_grant_input_race_history", "view_refusal130_grant_input_race_time", "renewal_unknown133_grant_before", "renewal_unknown133_grant_pause", "renewal_unknown133_grant_takeover", "renewal_unknown133_grant_unchanged", "renewal_unknown133_grant_receipt_unknown", "renewal_unknown133_grant_second_read", "renewal_unknown133_grant_stream_before"])
 def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause, initial_unknown=False, initial_ack_attach=False):
     import asyncio
     import copy
@@ -3949,7 +3949,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
         a._teleop_view = {"run_id": e.run_id, "qualified_until": 9.5 if held120 else 10.5, "role": "chest"}
         if cause in {"held_command120_view_never", "view_refusal122_never"} or view_input_race and cause.endswith("never"):
             # Clip the existing qualification to actual remaining native time,
-            # retaining the original9â†’309 ceiling rather than adding a timer.
+            # retaining the original9Ã¢â€ â€™309 ceiling rather than adding a timer.
             a.clock = e.clock = lambda: 308.6 if view_input_race else 308.85
             a.controller["expires"] = 310.
             if view122:
@@ -4021,7 +4021,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
         e.desired = "active"
         epoch[0] += 1
         dispatches[0] += 1
-        # The existing fake Native ACK takes one real Core resuming→running
+        # The existing fake Native ACK takes one real Core resumingâ†’running
         # transition, retaining an actual prior resumed event for finish history.
         return not ((finish_expiry_fixture or initial_unknown) and dispatches[0] == 1)
 
@@ -5731,6 +5731,144 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     await asyncio.gather(qualification, renewal, return_exceptions=True)
                     service.time, gateway.onboard = old_time, None
                     await proxy.close()
+                return
+            if cause.startswith("grant_native_renewal_"):
+                # Stage99: a discarded unknown Grant opens real native recovery;
+                # an independent unknown renewal surfaces only after its HOLD
+                # has qualified, before any replacement Resume/active ACK.
+                import tools.am1_session_ipc as ipc
+                mode = cause.removeprefix("grant_native_renewal_")
+                pi_clock = [10.]
+                a.clock = e.clock = lambda: pi_clock[0]
+                original_call, original_write = gateway.call, ipc.write_frame
+                lost_grants, lost_renewals, descriptors, restarts = [], [], [], []
+                envelopes, fresh_claims = [], []
+                original_attach = client.attach
+
+                def capture(ws):
+                    send = ws.send_json
+                    async def sent(value, **kwargs):
+                        if "command" in value:
+                            envelopes.append(copy.deepcopy(value))
+                        return await send(value, **kwargs)
+                    ws.send_json = sent
+
+                async def attached():
+                    await original_attach()
+                    capture(client.ws)
+
+                async def owner_call(command, device):
+                    if command.get("op") == "claim" and entered.is_set() and not lost_renewals:
+                        pi_clock[0] += .125  # A genuinely later presence receipt.
+                    elif command.get("op") == "claim" and lost_renewals:
+                        fresh_claims.append(copy.deepcopy(command))
+                    return await original_call(command, device)
+
+                async def lose_ipc_receipt(writer, value, limit):
+                    result = value.get("result", {})
+                    if "grant_id" in result and not lost_grants:
+                        lost_grants.append(copy.deepcopy(result))
+                        pi_clock[0] += .125
+                        healthy[0] = False
+                        a.tick()
+                        descriptors.append(copy.deepcopy(a.run["recovery"]))
+                        assert a.run["status"] == "recovering"
+                        await unblock_release.wait()
+                    elif result.get("status") == "claimed" and entered.is_set() and not lost_renewals:
+                        lost_renewals.append(copy.deepcopy(result))
+                        await unblock_release.wait()  # Real IPC timeout -> typed HTTP503.
+                    return await original_write(writer, value, limit)
+
+                capture(client.ws)
+                client.attach, gateway.call = attached, owner_call
+                monkeypatch.setattr(ipc, "write_frame", lose_ipc_receipt)
+                renewal = asyncio.create_task(client.renew())
+                while getattr(client, "_renewal_ack", None) is None:
+                    assert not renewal.done()
+                    await asyncio.sleep(.01)
+
+                async def qualify_native():
+                    await asyncio.wait_for(entered.wait(), 3.)
+                    while not renewal.done():
+                        await asyncio.sleep(.01)
+                    assert m._owner_unknown_renewal(renewal.exception())
+                    pi_clock[0] += .125
+                    healthy[0] = True
+                    a.tick()  # Native public descriptor clears; executor has not resumed.
+                    assert a.run["status"] == "paused" and a.run["recovery"] is None
+                    assert a.events[-1]["kind"] == "live_sensing_requalified"
+                    a._teleop_view["qualified_until"] = pi_clock[0] + .5
+
+                def healthy_renewal():
+                    if renewal.done():
+                        renewal.result()
+                        raise RuntimeError("original renewal ended")
+
+                async def restart(error):
+                    nonlocal renewal
+                    assert renewal.done() and renewal.exception() is error
+                    assert guard.episodes == 1 and guard.completed_episodes == 0
+                    assert not any(row["command"]["op"] == "resume" for row in envelopes)
+                    restarts.append(error)
+                    if mode == "pause":
+                        assert a.handle({"op": "pause", "run_id": e.run_id,
+                                         "operation_id": str(uuid4())}, enrolled["device_id"])["accepted"]
+                    elif mode == "stop":
+                        assert a.handle({"op": "stop", "run_id": e.run_id,
+                                         "operation_id": str(uuid4())}, enrolled["device_id"])["accepted"]
+                    elif mode == "takeover":
+                        a.controller["expires"] = pi_clock[0] - .1
+                        a._expire_controls(pi_clock[0])
+                        assert a.handle({"op": "claim"}, "competitor")["accepted"]
+                    elif mode == "deadline":
+                        pi_clock[0] = descriptors[0]["ceiling"]
+                        a.tick()
+                    elif mode == "descriptor":
+                        hold = next(row for row in reversed(a.events) if row["kind"] == "required_hold")
+                        hold["recovery"]["started"] -= .125  # Retained source no longer matches.
+                    renewal = asyncio.create_task(client.renew())
+
+                qualification = asyncio.create_task(qualify_native())
+                try:
+                    with pytest.raises(m.CommandRefusedError) as caught:
+                        await m.send_leader_sample(client, producer, m.ZERO_BODY, record,
+                                                   phase="individual", progress_s=0)
+                    original = caught.value
+                    assert m._owner_unknown_result(original, "grant")
+                    assert producer.sequence == client.sequence == 0 and not any(op == "input" for op, _ in commands)
+                    ceiling = m.time.monotonic() + 4.
+                    if mode == "before":
+                        assert await guard.resume(grant_error=original, renewal_check=healthy_renewal,
+                                                  renewal_reconcile=restart, wall_deadline=ceiling)
+                        assert guard.episodes == guard.completed_episodes == 1
+                        assert client.snapshot["evidence"]["active_acknowledged"] is True
+                        assert a.run["status"] == "running"
+                        assert len([row for row in records if row["event"] == "qualified_native_recovery"]) == 1
+                        producer.native_cursor, producer.reacquire = m._live(client.snapshot)["cursor"], True
+                        fresh = await m.send_leader_sample(client, producer, m.ZERO_BODY, record,
+                                                           phase="individual", progress_s=.04)
+                        assert fresh[2]["accepted"] is True and producer.sequence == 1
+                        assert fresh[0]["grant_id"] != lost_grants[0]["grant_id"]
+                        assert fresh[0]["expires"]-fresh[0]["issued"] == .25
+                    else:
+                        with pytest.raises(m.CommandRefusedError) as refused:
+                            await guard.resume(grant_error=original, renewal_check=healthy_renewal,
+                                               renewal_reconcile=restart, wall_deadline=ceiling)
+                        assert refused.value is original
+                        assert guard.completed_episodes == 0
+                        assert not any(row["command"]["op"] in {"resume", "input"} for row in envelopes)
+                    await qualification
+                    assert len(lost_renewals) == len(restarts) == len(descriptors) == 1
+                    assert len(fresh_claims) == 1
+                    assert a.run["native_live_at"] == 9. and a.run["deadline"] == 309.
+                    assert m.time.monotonic() < ceiling
+                    assert sum(row["command"]["op"] == "grant" for row in envelopes) == (2 if mode == "before" else 1)
+                    assert not any(row["command"]["op"] in {"claim", "start"} for row in envelopes)
+                finally:
+                    unblock_release.set()
+                    qualification.cancel()
+                    renewal.cancel()
+                    await asyncio.gather(qualification, renewal, return_exceptions=True)
                 return
             if cause in {"grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_unknown_receipt"}:
                 # Synthetic47: real Core creates and qualifies an episode while
