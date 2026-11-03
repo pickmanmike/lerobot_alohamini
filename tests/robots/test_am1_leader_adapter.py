@@ -748,7 +748,7 @@ def test_controller_command_timing_does_not_add_per_frame_or_grant_records(op):
 
 
 @pytest.mark.parametrize("foreign", [False, True])
-@pytest.mark.parametrize("supported_closing", [False, True])
+@pytest.mark.parametrize("supported_closing", [False, True, "extended"])
 def test_changing_activity_frontdoor_derives_fresh_invocation_and_prepares_before_ownership(tmp_path, monkeypatch, foreign, supported_closing):
     import hashlib
     import json
@@ -756,6 +756,8 @@ def test_changing_activity_frontdoor_derives_fresh_invocation_and_prepares_befor
     from tools import am1_physical_executor as executor
 
     m, calls = adapter(), []
+    interval = [1886, 3102] if supported_closing == "extended" else [2799, 3102]
+    flag = "--extended-grasp-closing" if supported_closing == "extended" else "--supported-grasp-closing"
     binding = {"kind": "am1-teleop28-feedback-loss-admitted-known-cleanup-bindings",
                "motor_head": "a"*40, "executor_head": "b"*40, "manifest_sha256": "c"*64}
     bindings = tmp_path / "binding.json"
@@ -770,7 +772,7 @@ def test_changing_activity_frontdoor_derives_fresh_invocation_and_prepares_befor
         calls.append((config, options))
         return {"canonical_read_verified": True, "hardware_started": False,
                 "request": {"source_head": "d"*40 if foreign else "a"*40, "proportional": 32,
-                            **({"left_gripper_raw_interval": [2799, 3102]} if supported_closing else {})}}
+                            **({"left_gripper_raw_interval": interval} if supported_closing else {})}}
 
     async def run(args):
         # Exercise preparation/metadata creation at the actual before-ownership boundary.
@@ -785,7 +787,7 @@ def test_changing_activity_frontdoor_derives_fresh_invocation_and_prepares_befor
     monkeypatch.setattr(m, "run", run)
     argv = ["--url", "unused", "--ca", "unused", "--storage-state", "unused",
             "--bindings", str(bindings), "--output-root", str(tmp_path), "--prepare-current-rest",
-            "--virtual-input", "interactive", *(["--supported-grasp-closing"] if supported_closing else [])]
+            "--virtual-input", "interactive", *([flag] if supported_closing else [])]
     if foreign:
         with pytest.raises(ValueError, match="source"):
             m.main(argv)
@@ -798,7 +800,7 @@ def test_changing_activity_frontdoor_derives_fresh_invocation_and_prepares_befor
             assert config == "/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/" + "c"*16 + "/physical.json"
             assert options == {"ssh": "am1-pi", "ttl_seconds": 120, "workload_segment": "ordinary-arms",
                                "workspace_profile": m.ORDINARY_ARMS_PROFILE, "left_shoulder_startup_degrees": 1,
-                               **({"left_gripper_raw_interval": [2799, 3102]} if supported_closing else {})}
+                               **({"left_gripper_raw_interval": interval} if supported_closing else {})}
         assert all((Path(output)/"invocation-config.private.json").is_file() for output in calls[1::2])
         for output in calls[1::2]:
             metadata = json.loads((Path(output)/"launch-metadata.private.json").read_text())
@@ -810,7 +812,8 @@ def test_changing_activity_frontdoor_derives_fresh_invocation_and_prepares_befor
 
 
 @pytest.mark.parametrize("mismatch", ["missing_interval", "different_interval", "float_interval", "p16"])
-def test_supported_grasp_closing_refuses_different_canonical_preparation(tmp_path, monkeypatch, mismatch):
+@pytest.mark.parametrize("extended", [False, True])
+def test_supported_grasp_closing_refuses_different_canonical_preparation(tmp_path, monkeypatch, mismatch, extended):
     import json
     from types import SimpleNamespace
     from tools import am1_physical_executor as executor
@@ -818,23 +821,26 @@ def test_supported_grasp_closing_refuses_different_canonical_preparation(tmp_pat
     path = tmp_path/"binding.json"
     path.write_text(json.dumps(dict(kind="am1-teleop28-feedback-loss-admitted-known-cleanup-bindings",
         motor_head="a"*40, executor_head="b"*40, manifest_sha256="c"*64)))
-    request = dict(source_head="a"*40, proportional=32, left_gripper_raw_interval=[2799, 3102])
+    interval = [1886, 3102] if extended else [2799, 3102]
+    request = dict(source_head="a"*40, proportional=32, left_gripper_raw_interval=interval)
     if mismatch == "missing_interval":
         request.pop("left_gripper_raw_interval")
     elif mismatch == "different_interval":
         request["left_gripper_raw_interval"] = [2799, 3101]
     elif mismatch == "float_interval":
-        request["left_gripper_raw_interval"] = [2799., 3102.]
+        request["left_gripper_raw_interval"] = list(map(float, interval))
     else:
         request["proportional"] = 16
     monkeypatch.setattr(executor, "prepare_left_response_p_remote", lambda *a, **k:
                         dict(request=request, hardware_started=False, canonical_read_verified=True))
     output = tmp_path/"fresh"; output.mkdir()
     with pytest.raises(ValueError):
-        m.prepare_current_rest_invocation(SimpleNamespace(bindings=str(path), supported_grasp_closing=True), output)
+        m.prepare_current_rest_invocation(SimpleNamespace(bindings=str(path), supported_grasp_closing=not extended,
+                                                        extended_grasp_closing=extended), output)
 
 
-def test_supported_grasp_closing_cli_requires_routine_normal_interactive_preparation(tmp_path, monkeypatch):
+@pytest.mark.parametrize("flag", ["--supported-grasp-closing", "--extended-grasp-closing"])
+def test_supported_grasp_closing_cli_requires_routine_normal_interactive_preparation(tmp_path, monkeypatch, flag):
     m, seen = adapter(), []
     async def run(args):
         seen.append(args)
@@ -842,9 +848,9 @@ def test_supported_grasp_closing_cli_requires_routine_normal_interactive_prepara
     monkeypatch.setattr(m, "run", run)
     argv = ["--url", "unused", "--ca", "unused", "--storage-state", "unused",
             "--bindings", "unused", "--output-root", str(tmp_path), "--prepare-current-rest",
-            "--virtual-input", "interactive", "--supported-grasp-closing"]
+            "--virtual-input", "interactive", flag]
     m.main(argv)
-    assert len(seen) == 1 and seen[0].supported_grasp_closing
+    assert len(seen) == 1 and getattr(seen[0], flag[2:].replace("-", "_"))
     assert seen[0].workload_segment == "ordinary-arms" and seen[0].source == "virtual-leaders"
     for extra in (["--left-entry"], ["--virtual-input", "jsonl"], ["--bench-continuity"],
                   ["--workload-segment", "left-reach"], ["--source", "usb-leaders"]):
@@ -854,7 +860,9 @@ def test_supported_grasp_closing_cli_requires_routine_normal_interactive_prepara
     with pytest.raises(SystemExit):
         m.main(["--url", "unused", "--ca", "unused", "--storage-state", "unused", "--output", "unused",
                 "--source", "virtual-leaders", "--workload-segment", "ordinary-arms",
-                "--virtual-input", "interactive", "--supported-grasp-closing"])
+                "--virtual-input", "interactive", flag])
+    with pytest.raises(SystemExit):
+        m.main(argv + ["--supported-grasp-closing" if flag == "--extended-grasp-closing" else "--extended-grasp-closing"])
 
 
 @pytest.mark.parametrize("changed", ["bench", "advisory", "temporarily_unqualified"])

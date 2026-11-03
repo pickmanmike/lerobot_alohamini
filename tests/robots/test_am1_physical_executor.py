@@ -3891,22 +3891,24 @@ def test_left_entry_fresh_preparer_refuses_retired_profile_without_remote_work(t
 
 
 @pytest.mark.parametrize("shoulder", [None, 1])
-def test_supported_gripper_interval_preparer_keeps_canonical_request(tmp_path, monkeypatch, shoulder):
+@pytest.mark.parametrize("interval", [[2799, 3102], [1886, 3102]])
+def test_supported_gripper_interval_preparer_keeps_canonical_request(tmp_path, monkeypatch, shoulder, interval):
     from pathlib import Path
     m = module()
     path, config, gains, _ = request_preparation_config(tmp_path, monkeypatch)
     result = m.prepare_left_response_p_request(str(path), workload_segment="ordinary-arms",
         workspace_profile="ordinary-arms-left-current-rest-1051-1164",
-        left_shoulder_startup_degrees=shoulder, left_gripper_raw_interval=[2799, 3102])
+        left_shoulder_startup_degrees=shoulder, left_gripper_raw_interval=interval)
     request, raw, _ = gains._right_p20_file(Path(result["path"]))
-    assert request == result["request"] and request["left_gripper_raw_interval"] == [2799, 3102]
+    assert request == result["request"] and request["left_gripper_raw_interval"] == interval
     assert request["source_head"] == config["host_head"] and request["proportional"] == 32
     assert raw == gains._right_p20_json(request)
     assert result["canonical_read_verified"] is True and result["hardware_started"] is False
 
 
 @pytest.mark.parametrize("shoulder", [None, 1])
-def test_supported_gripper_interval_remote_executes_same_canonical_preparer(tmp_path, monkeypatch, shoulder):
+@pytest.mark.parametrize("interval", [[2799, 3102], [1886, 3102]])
+def test_supported_gripper_interval_remote_executes_same_canonical_preparer(tmp_path, monkeypatch, shoulder, interval):
     import io, shlex, subprocess, sys
     from contextlib import redirect_stdout
     m = module()
@@ -3925,8 +3927,8 @@ def test_supported_gripper_interval_remote_executes_same_canonical_preparer(tmp_
     monkeypatch.setattr(subprocess, "run", remote)
     result = m.prepare_left_response_p_remote(native, workload_segment="ordinary-arms",
         workspace_profile="ordinary-arms-left-current-rest-1051-1164",
-        left_shoulder_startup_degrees=shoulder, left_gripper_raw_interval=[2799, 3102])
-    assert result["request"]["left_gripper_raw_interval"] == [2799, 3102]
+        left_shoulder_startup_degrees=shoulder, left_gripper_raw_interval=interval)
+    assert result["request"]["left_gripper_raw_interval"] == interval
     assert len(calls) == 1 and result["hardware_started"] is False
 
 
@@ -3945,36 +3947,38 @@ def test_supported_gripper_interval_remote_rejects_invalid_scope_before_transpor
         m.prepare_left_response_p_remote("/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/920da4d77fc3ab1c/physical.json", **kwargs)
 
 
-@pytest.mark.parametrize("requested,returned", [(True, False), (False, True)])
+@pytest.mark.parametrize("requested,returned", [([2799, 3102], None), (None, [2799, 3102]),
+    ([1886, 3102], None), (None, [1886, 3102]), ([1886, 3102], [2799, 3102]), ([2799, 3102], [1886, 3102])])
 def test_supported_gripper_interval_remote_requires_exact_optional_field_echo(monkeypatch, requested, returned):
     import hashlib, json, subprocess
     m = module()
     profile = "ordinary-arms-left-current-rest-1051-1164"
     receipt = public_remote_preparation_receipt(workload="ordinary-arms", profile=profile)
     if returned:
-        receipt["request"]["left_gripper_raw_interval"] = [2799, 3102]
+        receipt["request"]["left_gripper_raw_interval"] = returned
     receipt["sha256"] = hashlib.sha256(json.dumps(receipt["request"], sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
     calls = []
     def remote(*args, **kwargs):
         calls.append(args)
         return SimpleNamespace(stdout=json.dumps(receipt), stderr="", returncode=0)
     monkeypatch.setattr(subprocess, "run", remote)
-    options = {"left_gripper_raw_interval": [2799, 3102]} if requested else {}
+    options = {"left_gripper_raw_interval": requested} if requested else {}
     with pytest.raises(ValueError, match="requested canonical scope"):
         m.prepare_left_response_p_remote("/home/pickmanmike/.local/share/am1-physical-adapter-01/deployments/920da4d77fc3ab1c/physical.json",
             workload_segment="ordinary-arms", workspace_profile=profile, **options)
     assert len(calls) == 1
 
 
-def test_supported_gripper_interval_preparer_freezes_selection_before_stopped_guard(tmp_path, monkeypatch):
+@pytest.mark.parametrize("selected", [[2799, 3102], [1886, 3102]])
+def test_supported_gripper_interval_preparer_freezes_selection_before_stopped_guard(tmp_path, monkeypatch, selected):
     from tools import am1_physical_reconciliation as reconciliation
     m = module()
     path, _, _, _ = request_preparation_config(tmp_path, monkeypatch)
-    interval = [2799, 3102]
+    interval = list(selected)
     def guard(_config):
         interval[0] = 0
         return SimpleNamespace(close=lambda: None)
     monkeypatch.setattr(reconciliation, "acquire_stopped_guard", guard)
     receipt = m.prepare_left_response_p_request(str(path), workload_segment="ordinary-arms",
         workspace_profile="ordinary-arms-left-current-rest-1051-1164", left_gripper_raw_interval=interval)
-    assert interval == [0, 3102] and receipt["request"]["left_gripper_raw_interval"] == [2799, 3102]
+    assert interval == [0, 3102] and receipt["request"]["left_gripper_raw_interval"] == selected

@@ -13,7 +13,9 @@ from examples.alohamini.am1_live_teleop import (
     CURRENT_REST_WORKSPACE_PROFILES, normalized_raw, validate_target, validate_workspace,
 )
 from examples.alohamini.am1_session_contract import PRACTICAL_ELBOW_COUNTS_PER_REVOLUTION
-from tools.am1_leader_adapter import SUPPORTED_GRASP_CLOSING_RAW, _qualified_command_reference
+from tools.am1_leader_adapter import (
+    EXTENDED_GRASP_CLOSING_RAW, SUPPORTED_GRASP_CLOSING_RAW, _qualified_command_reference,
+)
 
 KEY = "arm_left_elbow_flex.pos"
 GRIP = "arm_left_gripper.pos"
@@ -29,13 +31,18 @@ def finite(value, *, zero=False):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--plan", choices=("out-return", "bidirectional-midpoint", "lower-return-gripper", "grasp-return"), default="out-return")
+    parser.add_argument("--plan", choices=("out-return", "bidirectional-midpoint", "lower-return-gripper", "grasp-return", "gripper-close-return"), default="out-return")
     parser.add_argument("--workpose", choices=("relative", "midpoint"), default="relative")
     parser.add_argument("--approach-from-below", action="store_true")
     parser.add_argument("--gripper-cycle", action="store_true", help="out-return: same elbow workpose, declared10-point gripper excursion then original")
     parser.add_argument("--gripper-direction", choices=("opening", "closing", "admitted"), default="closing")
-    parser.add_argument("--supported-grasp-closing", action="store_true",
+    closing = parser.add_mutually_exclusive_group()
+    closing.add_argument("--supported-grasp-closing", action="store_true",
                         help="grasp-return only: admit supported raw2799..3102 and require full10-point closing")
+    closing.add_argument("--extended-grasp-closing", action="store_true",
+                        help="explicit current-rest raw1886..3102 closing with a declared absolute endpoint")
+    parser.add_argument("--gripper-closed-opening", type=lambda v: finite(v, zero=True),
+                        help="explicit absolute gripper opening percentage; requires extended grasp closing")
     parser.add_argument("--degrees", type=lambda v: finite(v), default=4., help="out-return encoder degrees")
     parser.add_argument("--direction", choices=("decreasing", "increasing"), default=None,
                         help="normalized-coordinate direction; explicit for grasp-return, otherwise defaults to decreasing")
@@ -63,6 +70,15 @@ def parse_args(argv=None):
         parser.error("grasp-return requires admitted gripper,4degrees with explicit direction,10second ramp and3second holds")
     if args.supported_grasp_closing and (args.plan != "grasp-return" or args.gripper_direction != "admitted"):
         parser.error("supported grasp closing requires grasp-return and explicit admitted gripper policy")
+    if args.extended_grasp_closing and (
+        args.plan not in ("grasp-return", "gripper-close-return") or args.gripper_direction != "admitted"
+        or args.gripper_closed_opening is None or args.gripper_closed_opening > 100.
+    ):
+        parser.error("extended grasp closing requires admitted gripper, an explicit0..100opening endpoint and grasp plan")
+    if args.gripper_closed_opening is not None and not args.extended_grasp_closing:
+        parser.error("absolute closing endpoint requires explicit extended grasp closing")
+    if args.plan == "gripper-close-return" and not args.extended_grasp_closing:
+        parser.error("gripper-close-return requires explicit extended grasp closing")
     if args.direction is None:
         args.direction = "decreasing"
     return args
@@ -102,14 +118,20 @@ def phases_for(plan, options, *, admitted=None):
     ramp, dwell = options.ramp_seconds, options.dwell_seconds
     lower_return = options.plan == "lower-return-gripper"
     grasp_return = options.plan == "grasp-return"
+    gripper_only = options.plan == "gripper-close-return"
+    extended_closing = getattr(options, "extended_grasp_closing", False)
     supported_closing = getattr(options, "supported_grasp_closing", False)
     if supported_closing and (not grasp_return or options.gripper_direction != "admitted"
         or plan["workspace"]["raw_bounds"][GRIP] != list(SUPPORTED_GRASP_CLOSING_RAW)):
         raise ValueError("supported grasp closing requires its exact admitted raw interval")
+    if extended_closing and (supported_closing or not (grasp_return or gripper_only)
+        or options.gripper_direction != "admitted"
+        or plan["workspace"]["raw_bounds"][GRIP] != list(EXTENDED_GRASP_CLOSING_RAW)):
+        raise ValueError("extended grasp closing requires its exact admitted raw interval")
     midpoint_workpose = options.plan == "out-return" and getattr(options, "workpose", "relative") == "midpoint"
     if midpoint_workpose and not (getattr(options, "gripper_cycle", False) and getattr(options, "approach_from_below", False)):
         raise ValueError("explicit midpoint activity requires gripper-cycle and approach-from-below")
-    if getattr(options, "gripper_cycle", False) or lower_return or grasp_return:
+    if getattr(options, "gripper_cycle", False) or lower_return or grasp_return or gripper_only:
         snapshot = admitted["snapshot"]
         owner = snapshot["controller"]
         origin = _qualified_command_reference(SimpleNamespace(snapshot=snapshot, device=owner["device_id"],
@@ -122,12 +144,20 @@ def phases_for(plan, options, *, admitted=None):
             or abs(normalized_raw(point["raw"], cal)-point["normalized"]) > 1e-7):
             raise ValueError("fresh qualified measured original mapping required")
         bound = plan["workspace"]["bounds"][KEY]
-        elbow = origin[KEY] if lower_return else (bound["min"]+bound["max"])/2 if midpoint_workpose else plan["target"]
+        elbow = origin[KEY] if lower_return or gripper_only else (bound["min"]+bound["max"])/2 if midpoint_workpose else plan["target"]
         held = validate_target(dict(origin, **{KEY: elbow}), workspace=plan["workspace"])
         grip_direction = getattr(options, "gripper_direction", "closing")
         if grip_direction not in ("opening", "closing", "admitted"):
             raise ValueError("explicit opening/closing/admitted gripper policy required")
-        if grip_direction == "admitted":
+        grip_ramp = 3.
+        if extended_closing:
+            endpoint = finite(options.gripper_closed_opening, zero=True)
+            if endpoint > 100. or endpoint >= origin[GRIP]:
+                raise ValueError("absolute closing endpoint must be below the fresh gripper origin")
+            grip_direction = "closing"
+            grip_target = validate_target(dict(held, **{GRIP: endpoint}), workspace=plan["workspace"])
+            grip_ramp = max(3., (origin[GRIP]-endpoint)*3./10.)
+        elif grip_direction == "admitted":
             candidates = {}
             for candidate, delta in (("opening", 10.), ("closing", -10.)):
                 try:
@@ -140,11 +170,11 @@ def phases_for(plan, options, *, admitted=None):
         else:
             grip_target = validate_target(dict(held, **{GRIP: origin[GRIP]+(10. if grip_direction == "opening" else -10.)}),
                                           workspace=plan["workspace"])
-        if 10./3. > plan["workspace"]["bounds"][GRIP]["rate_per_s"]:
+        if abs(grip_target[GRIP]-origin[GRIP])/grip_ramp > plan["workspace"]["bounds"][GRIP]["rate_per_s"]:
             raise ValueError("full gripper excursion/return exceeds admitted rate")
         if supported_closing and grip_direction != "closing":
             raise ValueError("supported grasp closing requires the full closing endpoint; no opening substitute")
-        if grasp_return:
+        if grasp_return or gripper_only:
             if (grip_direction not in ("opening", "closing") or options.gripper_direction != "admitted"
                 or any(origin[key] != plan["workspace"]["reference"][key] for key in (KEY, GRIP))):
                 raise ValueError("grasp-return requires the original selected references and admitted interval")
@@ -158,11 +188,14 @@ def phases_for(plan, options, *, admitted=None):
 
             phases = ([grasp_phase("grasp_prepare_open", origin[KEY], opening, ramp=3., dwell=2.)]
                       if grip_direction == "opening" else [])
+            phases += [grasp_phase("grasp_close", origin[KEY], closed, ramp=grip_ramp, dwell=2.)]
+            if not gripper_only:
+                phases += [
+                    grasp_phase("grasp_carry", elbow, closed, ramp=ramp, dwell=options.comparison_dwell_seconds),
+                    grasp_phase("grasp_return_original_closed", origin[KEY], closed, ramp=ramp, dwell=dwell),
+                ]
             phases += [
-                grasp_phase("grasp_close", origin[KEY], closed, ramp=3., dwell=2.),
-                grasp_phase("grasp_carry", elbow, closed, ramp=ramp, dwell=options.comparison_dwell_seconds),
-                grasp_phase("grasp_return_original_closed", origin[KEY], closed, ramp=ramp, dwell=dwell),
-                grasp_phase("grasp_release", origin[KEY], opening, ramp=3., dwell=2.),
+                grasp_phase("grasp_release", origin[KEY], opening, ramp=grip_ramp, dwell=2.),
                 dict(name="finish", op="finish"),
             ]
             phases[0]["gripper_direction"] = grip_direction
@@ -329,7 +362,7 @@ def approach_pp(frame, *, run_id, accepted, now, workspace, midpoint, side, room
 
 def main(argv=None):
     options = parse_args(argv)
-    uses_gripper = options.gripper_cycle or options.plan in ("lower-return-gripper", "grasp-return")
+    uses_gripper = options.gripper_cycle or options.plan in ("lower-return-gripper", "grasp-return", "gripper-close-return")
     relative_workpose = options.plan == "grasp-return" or options.plan == "out-return" and options.workpose == "relative"
     has_preparation = options.plan in ("bidirectional-midpoint", "lower-return-gripper") or options.approach_from_below
     console = console_path(ROOT)
@@ -339,6 +372,8 @@ def main(argv=None):
             "--prepare-current-rest", "--virtual-input", "interactive", "--duration-seconds", str(options.window_seconds)]
     if options.supported_grasp_closing:
         args.append("--supported-grasp-closing")
+    elif options.extended_grasp_closing:
+        args.append("--extended-grasp-closing")
     ready = plan = tail = process = output = None
     phases, index, pending, accepted, last_report = [dict(name="finish", op="finish")], -1, None, None, -100.
     supported = False
@@ -374,6 +409,13 @@ def main(argv=None):
               preparation_dwell_seconds=0. if has_preparation else None,
               approach_room_degrees=options.approach_room_degrees,
               view="normal required Chest", other_joints="fresh admitted holds", body_lift_intent="zero",
+              **({"gripper_interval_policy": "explicit absolute closing endpoint; no opening substitute",
+                  "selected_gripper_raw_interval": list(EXTENDED_GRASP_CLOSING_RAW),
+                  "gripper_closed_opening": options.gripper_closed_opening,
+                  "gripper_max_opening_points_per_second": 10./3.,
+                  "gripper_ramp_policy": "max(3seconds, absolute fresh-origin excursion *3/10)",
+                  "gripper_opening_preparation_active_seconds": 0.}
+                 if options.extended_grasp_closing else {}),
               **({"gripper_interval_policy": ("supported closing10-point interval; refuse opening substitute"
                                               if options.supported_grasp_closing else
                                               "one legal10-point interval; prepare opening when only opening is admitted"),
@@ -381,7 +423,7 @@ def main(argv=None):
                   "gripper_opening_preparation_active_seconds": 0. if options.supported_grasp_closing else 5.,
                   **({"selected_gripper_raw_interval": list(SUPPORTED_GRASP_CLOSING_RAW)}
                      if options.supported_grasp_closing else {})}
-                 if options.plan == "grasp-return" else {}))
+                 if options.plan == "grasp-return" and not options.extended_grasp_closing else {}))
         try:
             process = subprocess.Popen(args, cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                        text=True, encoding="utf-8", errors="replace", bufsize=1)
@@ -411,7 +453,8 @@ def main(argv=None):
                               gripper_target=next((p["targets"][GRIP] for p in phases if "gripper_direction" in p), None),
                               gripper_calibration=plan["workspace"]["calibration"][GRIP[:-4]] if uses_gripper else None,
                               phases=phases, planned_active_seconds=sum(p.get("ramp", 0)+p.get("dwell", 0) for p in phases),
-                              **({"gripper_interval": phases[0]["gripper_interval"]} if options.plan == "grasp-return" else {}))
+                              **({"gripper_interval": phases[0]["gripper_interval"]}
+                                 if options.plan in ("grasp-return", "gripper-close-return") else {}))
                     except (ValueError, KeyError, TypeError, AttributeError, OSError) as error:
                         local("local_excursion_unsupported", reason=str(error), action="Finish without substitute")
                 elif event == "virtual_intent_accepted":

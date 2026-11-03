@@ -69,6 +69,145 @@ def planned(ready, admitted, options):
     return plan, coordinator.phases_for(plan, options, admitted=admitted)
 
 
+def extended_options(*extra, plan="gripper-close-return"):
+    return coordinator.parse_args([
+        "--plan", plan, "--extended-grasp-closing", "--gripper-direction", "admitted",
+        "--gripper-closed-opening", "50", "--direction", "decreasing",
+        "--comparison-dwell-seconds", "3", "--bindings", "unused-current-bindings.json", *extra,
+    ])
+
+
+@pytest.mark.parametrize("name,elbow_raw", [("gripper-close-return", 1150), ("grasp-return", 1128)])
+def test_extended_closure_uses_explicit_absolute_target_slow_rate_and_original_return(name, elbow_raw):
+    ready, admitted = admission(elbow_raw=elbow_raw, gripper_raw=2957, gripper_interval=[1886, 3102])
+    original = copy.deepcopy(admitted)
+    options = extended_options(plan=name)
+    plan = coordinator.fresh_target(ready, admitted, degrees=0. if name == "gripper-close-return" else 4.,
+                                   direction="decreasing", ramp_seconds=10.)
+    phases = coordinator.phases_for(plan, options, admitted=admitted)
+    names = [phase["name"] for phase in phases]
+    assert names == (["grasp_close", "grasp_release", "finish"] if name == "gripper-close-return" else
+                     ["grasp_close", "grasp_carry", "grasp_return_original_closed", "grasp_release", "finish"])
+    g0, q0 = plan["origin"][GRIP], plan["origin"][KEY]
+    assert phases[0]["targets"] == {KEY: q0, GRIP: 50.}
+    assert phases[-2]["targets"] == {KEY: q0, GRIP: g0}
+    for phase in (phases[0], phases[-2]):
+        assert phase["ramp"] == pytest.approx((g0-50.)*3./10.) and phase["ramp"] >= 3.
+        assert (g0-50.)/phase["ramp"] <= 10./3. + 1e-12
+    if name == "gripper-close-return":
+        assert all(phase["targets"][KEY] == q0 for phase in phases[:-1])
+    else:
+        assert phases[1]["ramp"] == phases[2]["ramp"] == 10.
+        assert phases[1]["dwell"] == phases[2]["dwell"] == 3.
+        assert phases[2]["targets"] == {KEY: q0, GRIP: 50.}
+    assert all(phase.get("complete_before_advance") for phase in phases[:-1])
+    assert admitted == original and phases[-1] == {"name": "finish", "op": "finish"}
+
+
+@pytest.mark.parametrize("target", ["-1", "101", "nan", "inf", "70.6930693069307", "75"])
+def test_extended_closure_refuses_invalid_or_nonclosing_endpoint(target):
+    ready, admitted = admission(gripper_raw=2957, gripper_interval=[1886, 3102])
+    try:
+        options = extended_options("--gripper-closed-opening", target)
+    except (SystemExit, ValueError):
+        return
+    plan = coordinator.fresh_target(ready, admitted, degrees=0., direction="decreasing", ramp_seconds=10.)
+    with pytest.raises(ValueError):
+        coordinator.phases_for(plan, options, admitted=admitted)
+
+
+@pytest.mark.parametrize("extra", [
+    ["--supported-grasp-closing"], ["--plan", "out-return"], ["--gripper-direction", "opening"],
+])
+def test_extended_closure_cli_refuses_incompatible_selection(extra):
+    with pytest.raises(SystemExit):
+        extended_options(*extra)
+
+
+def test_absolute_closing_target_requires_extended_selection_and_matching_native_interval():
+    with pytest.raises(SystemExit):
+        grasp_options("--gripper-closed-opening", "50")
+    with pytest.raises(SystemExit):
+        coordinator.parse_args(["--plan", "gripper-close-return", "--bindings", "unused"])
+    ready, admitted = admission(gripper_raw=2957, gripper_interval=[2799, 3102])
+    plan = coordinator.fresh_target(ready, admitted, degrees=0., direction="decreasing", ramp_seconds=10.)
+    with pytest.raises(ValueError):
+        coordinator.phases_for(plan, extended_options(), admitted=admitted)
+
+
+@pytest.mark.parametrize("name,elbow_raw", [("gripper-close-return", 1150), ("grasp-return", 1128)])
+def test_extended_closure_actual_coordinator_relay_declares_before_start_and_paces_original_return(tmp_path, monkeypatch, name, elbow_raw):
+    ready, admitted = admission(elbow_raw=elbow_raw, gripper_raw=2957, gripper_interval=[1886, 3102])
+    root, trial = tmp_path / "repo", tmp_path / "repo/trial"
+    trial.mkdir(parents=True)
+    (root / ".cache/am1-knowledge-reuse-18").mkdir(parents=True)
+    (trial / "frames.jsonl").write_text(json.dumps(admitted) + "\n")
+    now, commands, intents = [100.], [], []
+    reader = VirtualIntentReader("interactive", clock=lambda: now[0],
+        intent_channel="11111111-1111-4111-8111-111111111111")
+    grip_duration = (ready["command_reference"][GRIP]-50.)*3./10.+2.
+    durations = [grip_duration, grip_duration] if name == "gripper-close-return" else [grip_duration, 13., 13., grip_duration]
+
+    def status(seq, elapsed, progress=0., state="current"):
+        return dict(event="virtual_input_status", window_elapsed_s=elapsed, window_remaining_s=90.-elapsed,
+                    current_accepted_intent_seq=seq, input_state=state, ramp_progress_active_s=progress)
+
+    class Input:
+        def write(self, command):
+            commands.append(command)
+            reader.receive_line(command)
+        def flush(self):
+            pass
+        def close(self):
+            pass
+
+    class Process:
+        def __init__(self, args, **kwargs):
+            assert "--extended-grasp-closing" in args and "--supported-grasp-closing" not in args
+            declaration = json.loads(next((root / ".cache/am1-knowledge-reuse-18").glob("*.console.jsonl")).read_text().splitlines()[0])
+            assert declaration["event"] == "local_activity_declared"
+            assert declaration["gripper_closed_opening"] == 50.
+            assert declaration["selected_gripper_raw_interval"] == [1886, 3102]
+            self.stdin, self.stdout, self.returncode = Input(), self.output(), None
+        def output(self):
+            yield json.dumps(dict(event="virtual_input_opened", output=str(trial))) + "\n"
+            yield json.dumps(ready) + "\n"
+            yield json.dumps(status(None, 0., state="waiting")) + "\n"
+            elapsed = 0.
+            for index, duration in enumerate(durations):
+                intent = reader.take(); intents.append(intent)
+                assert intent["op"] == "move"
+                yield json.dumps(dict(event="virtual_intent_accepted", op="move", seq=intent["seq"])) + "\n"
+                yield json.dumps(status(intent["seq"], elapsed, duration-.1)) + "\n"
+                assert len(commands) == index+1, "incomplete dwell must not advance"
+                now[0] += duration; elapsed += duration
+                yield json.dumps(status(intent["seq"], elapsed, duration)) + "\n"
+            finish = reader.take()
+            assert finish["op"] == "finish"
+            yield json.dumps(dict(event="virtual_intent_accepted", op="finish", seq=finish["seq"])) + "\n"
+            self.returncode = 0
+        def poll(self):
+            return self.returncode
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(coordinator, "ROOT", root)
+    monkeypatch.setattr(coordinator.subprocess, "Popen", Process)
+    assert coordinator.main(["--plan", name, "--extended-grasp-closing", "--gripper-closed-opening", "50",
+        "--gripper-direction", "admitted", "--direction", "increasing" if name == "gripper-close-return" else "decreasing",
+        "--comparison-dwell-seconds", "3",
+        "--bindings", str(root / "bindings.json"), "--intent-ttl-seconds", "60"]) == 0
+    assert len(commands) == len(durations)+1
+    assert intents[0]["targets"] == {KEY: ready["command_reference"][KEY], GRIP: 50.}
+    assert intents[-1]["targets"] == {KEY: ready["command_reference"][KEY], GRIP: ready["command_reference"][GRIP]}
+    if name == "gripper-close-return":
+        assert all(intent["targets"][KEY] == ready["command_reference"][KEY] for intent in intents)
+    records = [json.loads(line) for line in next((root / ".cache/am1-knowledge-reuse-18").glob("*.console.jsonl")).read_text().splitlines()]
+    fresh = next(row for row in records if row["event"] == "local_fresh_targets")
+    assert fresh["planned_active_seconds"] == pytest.approx(sum(durations))
+    assert not any(row["event"] == "local_excursion_unsupported" for row in records)
+
+
 @pytest.mark.parametrize("grip", ["closing", "opening"])
 @pytest.mark.parametrize("direction,elbow_raw", [("increasing", 1090), ("decreasing", 1128)])
 def test_grasp_return_keeps_one_legal_interval_and_retracts_closed_to_original(grip, direction, elbow_raw):
