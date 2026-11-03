@@ -1073,15 +1073,19 @@ def _normal_renewal_receipt(receipt, generation):
             and receipt["presence_expires"] == timing["service_received_at"] + 3.)
 
 
-def _owner_unknown_renewal(error):
+def _owner_unknown_http(error):
+    """Only the exact authenticated owner-IPC unknown outcome is retryable."""
     expected = {
         "accepted": None, "status": "unknown", "uncertain": True,
         "reason": "owner outcome unknown; inspect state or lookup the same operation", "effect_admitted": None,
     }
     return (type(error) is HTTPOutcomeError and type(error.http_status) is int and error.http_status == 503
             and isinstance(error.response, dict) and set(error.response) == set(expected)
-            and all(type(error.response[k]) is type(v) and error.response[k] == v for k, v in expected.items())
-            and isinstance(getattr(error, "renewal_context", None), dict))
+            and all(type(error.response[k]) is type(v) and error.response[k] == v for k, v in expected.items()))
+
+
+def _owner_unknown_renewal(error):
+    return _owner_unknown_http(error) and isinstance(getattr(error, "renewal_context", None), dict)
 
 
 def _owner_unknown_result(error, operation):
@@ -1458,10 +1462,15 @@ class SessionClient:
         self._ack_changed = asyncio.Event()
 
     async def get(self, path):
+        from aiohttp import ContentTypeError
+
         async with self.http.get(self.origin + "/api/" + path, allow_redirects=False) as response:
-            result = await response.json()
+            try:
+                result = await response.json()
+            except (ValueError, UnicodeError, ContentTypeError) as error:
+                raise HTTPOutcomeError(response.status, None, detail="invalid HTTP JSON outcome") from error
             if response.status != 200:
-                raise RuntimeError(result.get("reason", "authenticated session read refused"))
+                raise HTTPOutcomeError(response.status, result)
             return result
 
     async def post(self, path, body):
@@ -5473,6 +5482,18 @@ async def run(args):
                 # receipts. Cleanup gets one original budget, not a new task lease.
                 until = time.monotonic() + 85
                 request = {"run_id": owned_run_id, "operation_id": str(uuid4())}
+                summary["stop_operation_id"] = request["operation_id"]
+
+                def record_stop(value):
+                    try:
+                        record(value)
+                    except Exception as error:
+                        # A broken evidence sink cannot prevent actual cancellation.
+                        summary.setdefault("native_stop_record_error", {
+                            "error_type": type(error).__name__, "message": str(error)[:240]})
+
+                record_stop({"event": "native_stop_operation_prepared", **request,
+                             "original_ceiling_monotonic_s": until})
                 acknowledged = False
 
                 def remaining():
@@ -5490,15 +5511,17 @@ async def run(args):
                     else:
                         summary["native_stop_transient_errors_dropped"] = (
                             summary.get("native_stop_transient_errors_dropped", 0) + 1)
-                    record({"event": "native_stop_interrupted", **detail,
-                            "operation_id": request["operation_id"],
-                            "original_ceiling_monotonic_s": until})
+                    record_stop({"event": "native_stop_interrupted", **detail,
+                                 "operation_id": request["operation_id"],
+                                 "original_ceiling_monotonic_s": until})
 
                 while True:
                     try:
                         wait_seconds = remaining()
                         current = (await asyncio.wait_for(client.get("state"), wait_seconds))["snapshot"]
-                    except (OSError, TimeoutError, aiohttp.ClientError) as error:
+                    except (OSError, TimeoutError, aiohttp.ClientError, HTTPOutcomeError) as error:
+                        if isinstance(error, HTTPOutcomeError) and not _owner_unknown_http(error):
+                            raise
                         summary.setdefault("pre_stop_state_error", {
                             "error_type": type(error).__name__, "message": str(error)})
                         transient("state", error)
@@ -5519,6 +5542,12 @@ async def run(args):
                                 "error_type": type(error).__name__, "message": str(error)})
                             transient("stop", error)
                         except RuntimeError as error:
+                            if _owner_unknown_http(error):
+                                summary.setdefault("stop_request_error", {
+                                    "error_type": type(error).__name__, "message": str(error)})
+                                transient("stop", error)
+                                await asyncio.sleep(min(.1, remaining()))
+                                continue  # Re-read this run before retrying the identical Stop.
                             # Keep definite refusals distinct from transport loss;
                             # an independently completed terminal state may qualify.
                             try:
