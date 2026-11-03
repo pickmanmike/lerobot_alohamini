@@ -910,7 +910,12 @@ class Gateway:
         while True:
             await asyncio.sleep(0.1)
             try:
-                snapshot = await self.current()
+                try:
+                    snapshot = await self.current()
+                except TimeoutError:
+                    # A missed read-only publication is not a disconnected owner.
+                    # Retry on the existing cadence without reusing old evidence.
+                    continue
                 controller = snapshot.get("controller")
                 if controller and not self.auth.capable(controller["device_id"]):
                     await self.fence(controller["device_id"])

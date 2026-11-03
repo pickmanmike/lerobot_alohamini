@@ -1749,6 +1749,215 @@ def test_bootstrap_grace_real_session_client_uses_same_three_second_pong_allowan
     asyncio.run(scenario())
 
 
+def test_first_admission_persistence_delay_does_not_end_native_admission_wait(cluster, tmp_path, monkeypatch):
+    """Fresh injected RAW can outlive a blocked Core snapshot's reporting budget."""
+    import threading
+    from types import SimpleNamespace
+
+    from aiohttp import web
+
+    from lerobot.robots.alohamini import alohamini_host as host
+    from tests.robots.test_am1_live_native import ExecutorNativeHost
+    from tests.robots.test_am1_live_teleop_native import lane
+    from tests.robots.test_am1_physical_executor import executor, terminal_cleanup_outcome
+    from tools.am1_leader_adapter import SessionClient
+    from tools.am1_session_ipc import OwnerServer
+    from tools.am1_session_service import Gateway
+
+    class FreshThermalHost(ExecutorNativeHost):
+        def start(self, run_id, incarnation, recipe, cancel):
+            self.run_id, self.incarnation = run_id, incarnation
+            _, _, _, self.robot, _ = lane()
+            self.robot._am1_live_before_write = lambda: None
+            self.robot._am1_teleop_binding = {
+                "run_id": run_id, "host_incarnation": incarnation, "recipe": recipe.name,
+            }
+            self.control = host.AM1LocalControl(
+                run_id=run_id, host_incarnation=incarnation, live=True, live_recipe=recipe.name,
+            )
+
+        def poll(self, previous):
+            sample = super().poll(previous)
+            sample["ack"]["thermal_history"] = {
+                "version": 1, "raw_sample_at_monotonic_s": sample["at"], "peaks_ready": True,
+                "deficit_started_at_monotonic_s": None, "deficit_ceiling_monotonic_s": None,
+                "hold_sample_at_monotonic_s": None, "zero_read_started_at_monotonic_s": None,
+                "zero_read_completed_at_monotonic_s": None,
+            }  # Explicit new simulated sensor proof on each actual native poll.
+            return sample
+
+        def finish(self, status):
+            outcome = terminal_cleanup_outcome(self.run_id, self.incarnation, status)
+            outcome["first_cause"] = outcome["readback"]["first_cause"] = None
+            return outcome
+
+    async def scenario():
+        e = executor(FreshThermalHost())
+        owner = OwnerServer(tmp_path / "admission-owner", executor=e)
+        a = owner.authority
+        entered, completed = threading.Event(), threading.Event()
+        samples, reporting_errors = [], []
+        save = a._save
+
+        def delayed_admission_save():
+            if not entered.is_set() and any(row["kind"] == "native_live_admitted" for row in a.events):
+                entered.set()
+                first = e.evidence()
+                time.sleep(1.35)  # Real wall delay, beyond unchanged1s IPC reporting cap.
+                latest = e.evidence()
+                samples.extend((first, latest))
+                completed.set()
+            return save()
+
+        monkeypatch.setattr(a, "_save", delayed_admission_save)
+        await owner.start()
+        gateway = Gateway(owner.directory, tmp_path / "admission-auth")
+        current = gateway.current
+
+        async def observed_current():
+            try:
+                return await current()
+            except (OSError, ValueError, TimeoutError, asyncio.IncompleteReadError) as error:
+                reporting_errors.append(type(error).__name__)
+                raise
+
+        monkeypatch.setattr(gateway, "current", observed_current)
+        runner = web.AppRunner(gateway.app)
+        server_tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_tls.load_cert_chain(cluster.cert, cluster.key)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0, ssl_context=server_tls)
+        await site.start()
+        gateway.origin = "https://127.0.0.1:" + str(site._server.sockets[0].getsockname()[1])
+        local = SimpleNamespace(url=gateway.origin, cert=cluster.cert, pair=gateway.auth.pair)
+        session = await enrolled(local)
+        client = None
+        try:
+            cookie = next(row.value for row in session.cookie_jar if row.key == "__Host-am1-device")
+            state = tmp_path / "admission-enrolled-state.json"
+            state.write_text(json.dumps({"cookies": [{"name": "__Host-am1-device", "value": cookie,
+                "domain": "127.0.0.1", "path": "/", "secure": True}]}), encoding="utf-8")
+            client = SessionClient(local.url, local.cert, state)
+            await client.attach()
+            claim = await client.post("claim", {})
+            started = await client.post("start", {
+                "recipe": "physical-live-teleop", "operation_id": oid(),
+                "controller_generation": claim["controller_generation"],
+            })
+            assert started["accepted"], started
+            wait_error = None
+            try:
+                await client.wait(lambda: (client.snapshot.get("run") or {}).get("status") == "paused", 5)
+            except ConnectionError as error:
+                wait_error = error
+            assert await asyncio.to_thread(completed.wait, 3), "first admission delay did not complete"
+            restored = await gateway.current()
+            assert entered.is_set() and len(samples) == 2
+            assert samples[1]["feedback_sequence"] > samples[0]["feedback_sequence"]
+            assert samples[1]["feedback"] and samples[1]["fault"] is None
+            assert samples[1]["accepted_host_action"]["thermal_history"]["raw_sample_at_monotonic_s"] > (
+                samples[0]["accepted_host_action"]["thermal_history"]["raw_sample_at_monotonic_s"] + 1)
+            assert restored["run"]["run_id"] == started["run_id"]
+            assert restored["run"]["native_live_at"] is not None
+            assert restored["run"]["first_cause"] is None, restored["run"]
+            assert reporting_errors, "real publisher reporting path did not encounter the blocked Core mutex"
+            assert wait_error is None, {
+                "admission_wait_error": str(wait_error), "reporting_errors": reporting_errors,
+                "transport_close": client.transport_close, "native_status": restored["run"]["status"],
+                "native_first_cause": restored["run"]["first_cause"],
+            }
+        finally:
+            if client:
+                await client.close()
+            await session.close()
+            await runner.cleanup()
+            await owner.close()
+            if e.worker:
+                e.worker.join(2)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure", [
+    "one_timeout", "timeouts", "os", "value", "incomplete", "response_limit",
+    "fence_timeout", "post_fence_timeout", "native_fault",
+])
+def test_publisher_retries_only_read_only_snapshot_timeout_without_freshness_credit(failure):
+    from types import SimpleNamespace
+
+    from tools import am1_session_ipc as ipc
+    from tools.am1_session_service import Gateway
+
+    async def scenario():
+        gateway = Gateway.__new__(Gateway)
+        values, calls, fences = [], [], []
+        delivered, twice = asyncio.Event(), asyncio.Event()
+        peer = SimpleNamespace(ack=True, revision="original", device="pc", token="token")
+
+        def put(value, snapshot):
+            assert snapshot is True
+            values.append(value)
+            delivered.set()
+
+        peer.put = put
+        gateway.peers = [peer]
+        gateway.revision, gateway.incarnation = 0, "gateway"
+        gateway.auth = SimpleNamespace(resolve=lambda token: True,
+            capable=lambda device: failure not in {"fence_timeout", "post_fence_timeout"})
+        snapshot = {"run": {"first_cause": "actual native fault" if failure == "native_fault" else None},
+                    "evidence": {"original_source_at": 17.0}}
+        if failure in {"fence_timeout", "post_fence_timeout"}:
+            snapshot["controller"] = {"device_id": "revoked"}
+        reporting_error = {"status": "reporting_error", "code": "response_limit", "reason": "full frame"}
+
+        async def current():
+            calls.append(len(calls) + 1)
+            if len(calls) >= 2:
+                twice.set()
+            if failure == "timeouts" or failure == "one_timeout" and len(calls) == 1:
+                raise TimeoutError("snapshot reporting timeout")
+            if failure == "os":
+                raise OSError("actual owner connection failure")
+            if failure == "value":
+                raise ValueError("invalid owner snapshot")
+            if failure == "incomplete":
+                raise asyncio.IncompleteReadError(b"", 4)
+            if failure == "response_limit":
+                raise ipc.ReportingError(reporting_error)
+            if failure == "post_fence_timeout" and len(calls) == 2:
+                raise TimeoutError("post-fence reporting timeout")
+            return snapshot
+
+        async def fence(device):
+            fences.append(device)
+            if failure == "fence_timeout":
+                raise TimeoutError("unknown fence outcome")
+
+        gateway.current, gateway.fence = current, fence
+        task = asyncio.create_task(gateway.publish())
+        try:
+            await asyncio.wait_for(twice.wait() if failure == "timeouts" else delivered.wait(), 1)
+            if failure == "timeouts":
+                assert values == [] and calls == [1, 2]
+            elif failure in {"one_timeout", "native_fault"}:
+                assert values == [{"kind": "snapshot", "snapshot": snapshot}]
+                assert calls == ([1, 2] if failure == "one_timeout" else [1])
+                assert values[0]["snapshot"]["evidence"]["original_source_at"] == 17.0
+            elif failure == "response_limit":
+                assert values == [dict(reporting_error, kind="unavailable")]
+                assert peer.ack is False and peer.revision != "original"
+            else:
+                assert values == [{"kind": "unavailable"}]
+            if failure != "response_limit":
+                assert peer.ack is True and peer.revision == "original"
+            assert fences == (["revoked"] if failure in {"fence_timeout", "post_fence_timeout"} else [])
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
 def test_bootstrap_grace_real_tls_stale_ack_still_closes_policy_boundary(cluster):
     async def scenario():
         session=await enrolled(cluster);ws=None
