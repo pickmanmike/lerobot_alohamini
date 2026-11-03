@@ -7465,7 +7465,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                                                    phase="individual", progress_s=.04)
                 assert fresh[2]["accepted"] is True and producer.sequence == 2
                 return
-            if cause in {"resume_view_pause", "resume_view_twice"}:
+            if cause in {"resume_view_pause", "resume_view_twice"} or cause.startswith("resume_view_renewal_"):
                 # Synthetic view expiry AFTER a positively accepted Resume,
                 # before an active snapshot. Core/Gateway/client are real.
                 pi_clock, remaining_pauses = [10.01], [2 if cause == "resume_view_twice" else 1]
@@ -7473,6 +7473,11 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 a._pause_live_input("required_view_expired")
                 a._teleop_view["qualified_until"] = pi_clock[0] + .5
                 original_call, original_get = gateway.call, client.get
+                original_wait = client.wait
+                coupled_renewal = cause.startswith("resume_view_renewal_")
+                renewal_mode = cause.rsplit("_", 1)[-1] if coupled_renewal else None
+                renewal_before_classification = cause.startswith("resume_view_renewal_predicate_")
+                failed_renewal, renewal_errors, renewal_restarts = [], [], []
                 original_evidence, defer_active = e.evidence, [False]
                 def pending_active_evidence():
                     value = original_evidence()
@@ -7487,9 +7492,15 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 current_pause = [None]
 
                 async def pause_accepted_resume(command, device):
+                    if coupled_renewal and command.get("op") == "claim":
+                        pi_clock[0] += .01
                     if command.get("op") == "resume" and remaining_pauses[0]:
                         defer_active[0] = True
                     result = await original_call(command, device)
+                    if (coupled_renewal and command.get("op") == "claim"
+                        and len(resume_commands) == 1 and not failed_renewal):
+                        failed_renewal.append(copy.deepcopy(result))
+                        raise TimeoutError("injected lost receipt after real accepted renewal")
                     if command.get("op") == "resume":
                         assert result["accepted"] is True
                         resume_commands.append(copy.deepcopy(command))
@@ -7512,12 +7523,84 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         new_pause_reads.append(current_pause[0])
                         current_pause[0] = None
                         pi_clock[0] += .01
-                        a._teleop_view["qualified_until"] = pi_clock[0] + .5
+                        if renewal_mode != "view":
+                            a._teleop_view["qualified_until"] = pi_clock[0] + .5
+                        if renewal_mode in {"pause", "stop"}:
+                            await original_call(dict(op=renewal_mode, run_id=a.run["run_id"],
+                                operation_id=str(uuid4())), client.device)
+                            result = await original_get(path)
+                        elif renewal_mode == "takeover":
+                            a.controller.update(device_id="new-owner", generation=str(uuid4()))
+                            result = await original_get(path)
+                        elif renewal_mode == "expired":
+                            a.controller["expires"] = pi_clock[0]
+                            a.tick()
+                            result = await original_get(path)
+                        elif renewal_mode == "reference":
+                            m._live(result["snapshot"])["reference"][KEYS[0]] += .1
+                        elif renewal_mode == "workspace":
+                            m._live(result["snapshot"])["workspace"]["bounds"][KEYS[0]]["max"] += .1
+                        elif renewal_mode == "deadline":
+                            result["snapshot"]["run"]["deadline"] += .1
+                        elif renewal_mode == "history":
+                            result["snapshot"]["events"][-1]["at"] += .001
+                        elif renewal_mode == "cancel":
+                            raise asyncio.CancelledError()
                     return result
 
                 gateway.call, client.get = pause_accepted_resume, fresh_owner
-                ceiling = m.time.monotonic() + 1.5
-                assert not await guard.resume(expected_pause="required_view_expired", wall_deadline=ceiling)
+                renewal = None
+                if coupled_renewal:
+                    async def active_wait_with_failed_renewal(predicate, timeout):
+                        async def failed_renewal_outcome():
+                            while not renewal.done():
+                                await asyncio.sleep(.01)
+                            original = renewal.exception()
+                            assert m._owner_unknown_renewal(original)
+                            renewal_errors.append(original)
+                        if (renewal_before_classification and timeout == 5
+                            and len(resume_commands) == 1 and not renewal_errors):
+                            await failed_renewal_outcome()
+                        try:
+                            return await original_wait(predicate, timeout)
+                        except m._ResumePausedError:
+                            if timeout == 5 and len(resume_commands) == 1 and not renewal_errors:
+                                await failed_renewal_outcome()
+                            raise
+                    client.wait = active_wait_with_failed_renewal
+                    renewal = asyncio.create_task(client.renew())
+                    while getattr(client, "_renewal_ack", None) is None:
+                        assert not renewal.done()
+                        await asyncio.sleep(.01)
+                def renewal_healthy():
+                    if renewal is not None and renewal.done():
+                        renewal.result()
+                async def restart_renewal(error):
+                    nonlocal renewal
+                    assert renewal.done() and renewal.exception() is error
+                    renewal_restarts.append(error)
+                    renewal = asyncio.create_task(client.renew())
+                ceiling = m.time.monotonic() + (3. if coupled_renewal else 1.5)
+                try:
+                    if coupled_renewal and renewal_mode != "hold":
+                        with pytest.raises((RuntimeError, TimeoutError, asyncio.CancelledError)):
+                            await guard.resume(expected_pause="required_view_expired", wall_deadline=ceiling,
+                                renewal_check=renewal_healthy, renewal_reconcile=restart_renewal)
+                        assert len(resume_commands) == 1
+                        assert sum(op == "input" for op, _ in commands) == 1
+                        assert a.run["deadline"] == 309. and a.run["native_live_at"] == 9.
+                        assert len(failed_renewal) == len(renewal_errors) == 1
+                        return
+                    assert not await guard.resume(expected_pause="required_view_expired", wall_deadline=ceiling,
+                        **({"renewal_check": renewal_healthy, "renewal_reconcile": restart_renewal} if coupled_renewal else {}))
+                finally:
+                    if renewal is not None:
+                        renewal.cancel()
+                        await asyncio.gather(renewal, return_exceptions=True)
+                if coupled_renewal:
+                    assert len(failed_renewal) == len(renewal_errors) == len(renewal_restarts) == 1
+                    assert failed_renewal[0]["presence_expires"] > renewal_errors[0].renewal_context["previous_expiry"]
+                    assert sum(row["event"] == "controller_renewal_requalified" for row in records) == 1
                 count = 3 if cause == "resume_view_twice" else 2
                 assert len(resume_commands) == count and len(new_pause_reads) == count - 1
                 assert len({c["operation_id"] for c in resume_commands}) == count
@@ -13953,6 +14036,14 @@ def test_normal_finish_owns_only_closed_single_expiry_then_own_pause(tmp_path, m
      "badreceipt", "second_read", "deadline")])
 def test_normal_finish_requalifies_unknown_renewal_after_own_pause(tmp_path, monkeypatch, cause):
     test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause)
+
+
+@pytest.mark.parametrize("mode", ["hold", "pause", "stop", "takeover", "expired", "reference", "workspace",
+                                  "deadline", "history", "view", "cancel"])
+@pytest.mark.parametrize("ordering", ["handler", "predicate"])
+def test_known_accepted_resume_new_view_pause_requalifies_unknown_renewal(tmp_path, monkeypatch, mode, ordering):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
+        tmp_path, monkeypatch, "resume_view_renewal_" + ordering + "_" + mode)
 
 
 @pytest.mark.parametrize("changed",[None,"policy","known_connection","prior_input","source","input_expiry","local_sequence",

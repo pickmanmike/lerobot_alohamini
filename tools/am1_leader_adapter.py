@@ -2453,8 +2453,6 @@ class SessionClient:
             raise
 
     def _resume_active(self, identity, prior_event, pi_lower_bound, resumed, check=None):
-        if check:
-            check(self.snapshot)
         run = self.snapshot["run"]
         if run.get("status") == "paused" and run.get("intent_revision") != identity["intent_revision"]:
             event = _latest_run_event(self.snapshot, identity)
@@ -2470,8 +2468,14 @@ class SessionClient:
                 and all(type(value) in (int, float) and math.isfinite(value)
                         for value in (at, prior_at, pi_lower_bound))
                 and prior_at < at and pi_lower_bound <= at < run["deadline"]):
+                # Preserve this known accepted transition before a concurrent
+                # renewal failure. Recovery still checks current owner proof.
                 raise _ResumePausedError(identity, event)
+            if check:
+                check(self.snapshot)
             raise RuntimeError("accepted Resume superseded by an unqualified pause")
+        if check:
+            check(self.snapshot)
         return run.get("status") == "running" and self.snapshot["evidence"].get("active_acknowledged") is True
 
     async def detach(self):
@@ -3462,6 +3466,11 @@ class SameRunRecovery:
                 or state["run"]["intent_revision"] != identity["intent_revision"] + 2
                 or _latest_run_event(state, identity) != interrupted.event):
                 raise RuntimeError("fresh authority for superseding ordinary pause changed")
+            # A known accepted Resume has ended in this freshly verified HOLD.
+            # Reuse pre-Resume renewal qualification, never the old active input.
+            clock["before_resume"] = True
+            if renewal_check:
+                renewal_check()
         if bound_refusal and (
             self.client.connection != refusal_identity["connection_generation"]
             or state["run"]["status"] != "paused"
@@ -3862,8 +3871,6 @@ class SameRunRecovery:
         except _ResumePausedError as outcome:
             self.check(self.client.snapshot)
             outcome.episode = episode if recovered else None
-            if renewal_check:
-                renewal_check()
             raise
         except (ConnectionError, TimeoutError) as original:
             if getattr(original, "resume_result_context", None) is not None:
