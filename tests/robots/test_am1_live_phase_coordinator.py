@@ -77,6 +77,154 @@ def extended_options(*extra, plan="gripper-close-return"):
     ])
 
 
+
+def opening_options(*extra):
+    return coordinator.parse_args([
+        "--plan", "gripper-open-finish", "--extended-grasp-closing", "--gripper-direction", "admitted",
+        "--gripper-open-opening", "68", "--bindings", "unused-current-bindings.json", *extra,
+    ])
+
+
+@pytest.mark.parametrize("declared_ramp", [3., 12.])
+def test_opening_only_uses_fresh_absolute_endpoint_slow_ramp_and_finishes_without_return(declared_ramp):
+    ready, admitted = admission(elbow_raw=1150, gripper_raw=2347, gripper_interval=[1886, 3102])
+    original = copy.deepcopy((ready, admitted))
+    options = opening_options("--ramp-seconds", str(declared_ramp))
+    plan = coordinator.fresh_target(ready, admitted, degrees=0., direction=options.direction,
+                                   ramp_seconds=options.ramp_seconds)
+    phases = coordinator.phases_for(plan, options, admitted=admitted)
+    assert [phase["name"] for phase in phases] == ["gripper_open", "finish"]
+    opening = phases[0]
+    assert opening["targets"] == {KEY: ready["command_reference"][KEY], GRIP: 68.}
+    assert opening["gripper_direction"] == "opening"
+    assert opening["gripper_interval"] == {"origin": ready["command_reference"][GRIP], "open": 68., "opening_only": True}
+    assert opening["ramp"] == pytest.approx(max(declared_ramp, 11.27128712871287))
+    assert (68.-ready["command_reference"][GRIP])/opening["ramp"] <= 10./3. + 1e-12
+    assert options.dwell_seconds == opening["dwell"] == 2.
+    assert opening["complete_before_advance"] is True
+    assert phases[-1] == {"name": "finish", "op": "finish"}
+    assert plan["origin"] == ready["command_reference"] and (ready, admitted) == original
+
+
+@pytest.mark.parametrize("target", ["-1", "101", "nan", "inf", "origin", "20", "81"])
+def test_opening_only_refuses_invalid_nonopening_or_unadmitted_absolute_endpoint(target):
+    ready, admitted = admission(gripper_raw=2347, gripper_interval=[1886, 3102])
+    original = copy.deepcopy((ready, admitted))
+    try:
+        options = opening_options("--gripper-open-opening", str(ready["command_reference"][GRIP]) if target == "origin" else target)
+    except (SystemExit, ValueError):
+        return
+    plan = coordinator.fresh_target(ready, admitted, degrees=0., direction=options.direction, ramp_seconds=10.)
+    with pytest.raises(ValueError):
+        coordinator.phases_for(plan, options, admitted=admitted)
+    assert (ready, admitted) == original
+
+
+@pytest.mark.parametrize("extra", [
+    ["--gripper-closed-opening", "20"], ["--plan", "gripper-close-return"],
+    ["--gripper-direction", "opening"], ["--gripper-cycle"], ["--dwell-seconds", "3"],
+])
+def test_opening_only_cli_refuses_incompatible_selection(extra):
+    with pytest.raises(SystemExit):
+        opening_options(*extra)
+
+
+def test_opening_only_requires_explicit_endpoint_extended_scope_and_exact_admission():
+    for args in (["--plan", "gripper-open-finish"],
+                 ["--plan", "gripper-open-finish", "--gripper-open-opening", "68"],
+                 ["--plan", "out-return", "--gripper-open-opening", "68"]):
+        with pytest.raises(SystemExit):
+            coordinator.parse_args(["--bindings", "unused", *args])
+    ready, admitted = admission(gripper_raw=2957, gripper_interval=[2799, 3102])
+    plan = coordinator.fresh_target(ready, admitted, degrees=0., direction="decreasing", ramp_seconds=10.)
+    with pytest.raises(ValueError):
+        coordinator.phases_for(plan, opening_options("--gripper-open-opening", "75"), admitted=admitted)
+
+
+def test_opening_only_actual_coordinator_dispatches_fresh_finish_after_acknowledged_active_dwell(tmp_path, monkeypatch):
+    ready, admitted = admission(elbow_raw=1150, gripper_raw=2347, gripper_interval=[1886, 3102])
+    original = copy.deepcopy((ready, admitted))
+    root, trial = tmp_path / "repo", tmp_path / "repo/trial"
+    trial.mkdir(parents=True)
+    (root / ".cache/am1-knowledge-reuse-18").mkdir(parents=True)
+    (trial / "frames.jsonl").write_text(json.dumps(admitted) + "\n", encoding="utf-8")
+    now, commands, launches = [100.], [], []
+    reader = VirtualIntentReader("interactive", clock=lambda: now[0],
+        intent_channel="11111111-1111-4111-8111-111111111111")
+
+    def status(seq, elapsed, progress=0., state="current"):
+        return dict(event="virtual_input_status", window_elapsed_s=elapsed, window_remaining_s=60.-elapsed,
+                    current_accepted_intent_seq=seq, input_state=state, ramp_progress_active_s=progress)
+
+    class Input:
+        def write(self, command):
+            commands.append(command)
+            reader.receive_line(command)
+        def flush(self):
+            pass
+        def close(self):
+            pass
+
+    class Process:
+        def __init__(self, args, **kwargs):
+            launches.append((args, kwargs))
+            declaration = json.loads(next((root / ".cache/am1-knowledge-reuse-18").glob("*.console.jsonl")).read_text().splitlines()[0])
+            assert declaration["gripper_open_opening"] == 68.
+            assert "gripper_closed_opening" not in declaration
+            assert declaration["gripper_activity"] == "opening only; Finish without closed-reference return"
+            assert declaration["gripper_interval_policy"] == "explicit absolute opening endpoint; no closing substitute"
+            assert declaration["selected_gripper_raw_interval"] == [1886, 3102]
+            assert declaration["gripper_direction"] == "opening" and declaration["gripper_cycle"] is False
+            assert declaration["degrees"] is declaration["direction"] is None
+            assert declaration["elbow_excursion_degrees"] == 0.
+            assert declaration["view"] == "normal required Chest" and declaration["body_lift_intent"] == "zero"
+            assert declaration["other_joints"] == "fresh admitted holds" and declaration["dwell_seconds"] == 2.
+            self.stdin, self.stdout, self.returncode = Input(), self.output(), None
+        def output(self):
+            yield json.dumps(dict(event="virtual_input_opened", output=str(trial))) + "\n"
+            yield json.dumps(ready) + "\n"
+            yield json.dumps(status(None, 0., state="waiting")) + "\n"
+            opening = reader.take()
+            assert opening["op"] == "move" and opening["targets"] == {KEY: ready["command_reference"][KEY], GRIP: 68.}
+            assert opening["transition_seconds"] == 12.
+            assert opening["issued_at_perf_counter_s"] == 100. and opening["expires_at_perf_counter_s"] == 145.
+            yield json.dumps(dict(event="virtual_intent_accepted", op="move", seq=opening["seq"])) + "\n"
+            yield json.dumps(status(None, 1., 14.)) + "\n"
+            assert len(commands) == 1, "foreign acceptance must not advance"
+            yield json.dumps(status(opening["seq"], 2., 14., state="waiting")) + "\n"
+            assert len(commands) == 1, "held progress must not advance"
+            yield json.dumps(status(opening["seq"], 13.9, 13.9)) + "\n"
+            assert len(commands) == 1, "incomplete dwell must not advance"
+            now[0] = 114.
+            yield json.dumps(status(opening["seq"], 14., 14.)) + "\n"
+            finish = reader.take()
+            assert finish["op"] == "finish" and finish["seq"] == opening["seq"]+1
+            assert finish["issued_at_perf_counter_s"] == 114. and finish["expires_at_perf_counter_s"] == 115.
+            yield json.dumps(dict(event="virtual_intent_accepted", op="finish", seq=finish["seq"])) + "\n"
+            yield json.dumps(status(finish["seq"], 14., state="finished")) + "\n"
+            self.returncode = 0
+        def poll(self):
+            return self.returncode
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(coordinator, "ROOT", root)
+    monkeypatch.setattr(coordinator.subprocess, "Popen", Process)
+    assert coordinator.main(["--plan", "gripper-open-finish", "--extended-grasp-closing", "--gripper-open-opening", "68",
+        "--gripper-direction", "admitted", "--ramp-seconds", "12", "--window-seconds", "60",
+        "--intent-ttl-seconds", "45", "--bindings", str(root / "bindings.json")]) == 0
+    assert len(commands) == 2 and commands[0].startswith("move 12.0 45.0 ") and commands[1] == "finish\n"
+    argv, kwargs = launches[0]
+    assert kwargs["cwd"] == root and "--prepare-current-rest" in argv and "--extended-grasp-closing" in argv
+    assert argv[argv.index("--bindings")+1] == str(root / "bindings.json")
+    assert argv[argv.index("--duration-seconds")+1] == "60.0"
+    records = [json.loads(line) for line in next((root / ".cache/am1-knowledge-reuse-18").glob("*.console.jsonl")).read_text().splitlines()]
+    fresh = next(row for row in records if row["event"] == "local_fresh_targets")
+    assert fresh["planned_active_seconds"] == 14. and fresh["gripper_target"] == 68.
+    assert fresh["gripper_interval"] == {"origin": ready["command_reference"][GRIP], "open": 68., "opening_only": True}
+    assert not any(row["event"] == "local_excursion_unsupported" for row in records)
+    assert (ready, admitted) == original
+
 @pytest.mark.parametrize("name,elbow_raw", [("gripper-close-return", 1150), ("grasp-return", 1128)])
 def test_extended_closure_uses_explicit_absolute_target_slow_rate_and_original_return(name, elbow_raw):
     ready, admitted = admission(elbow_raw=elbow_raw, gripper_raw=2957, gripper_interval=[1886, 3102])
@@ -133,6 +281,7 @@ def test_absolute_closing_target_requires_extended_selection_and_matching_native
     plan = coordinator.fresh_target(ready, admitted, degrees=0., direction="decreasing", ramp_seconds=10.)
     with pytest.raises(ValueError):
         coordinator.phases_for(plan, extended_options(), admitted=admitted)
+
 
 
 @pytest.mark.parametrize("name,elbow_raw", [("gripper-close-return", 1150), ("grasp-return", 1128)])
