@@ -3474,11 +3474,13 @@ class SameRunRecovery:
                              and resume_context["pi_lower_bound"] <= event["at"] < run["deadline"])
                 if run.get("status") != "paused" or run.get("recovery") is not None or not (same or new_pause):
                     raise RuntimeError("fresh unknown Resume own paused phase unavailable")
+        pending_grant_episode = None
         if grant_context is not None:
             if self.client.connection != grant_context["identity"]["connection_generation"]:
                 raise RuntimeError("original ambiguous grant connection changed")
-            if not self.history_qualified(state):
-                retained = self._grant_episode(state, grant_context)
+            pending_grant_episode = clock.get("pending_grant_episode")
+            if not self.history_qualified(state) or pending_grant_episode is not None:
+                retained = self._grant_episode(state, grant_context, pending=pending_grant_episode)
         if state["run"]["status"] != "recovering" and retained is None and (require_episode or expected_pause or grant_context is not None):
             run = state["run"]
             event = next(
@@ -3538,7 +3540,8 @@ class SameRunRecovery:
                 < episode["ceiling"]
                 <= min(episode["started"] + 10, run["deadline"])
                 or run["recovery_episodes"] != self.episodes + (0 if (pending_recovery is not None and pending_recovery.pending_episode is not None
-                    or resume_context is not None and resume_context["pending_episode"] is not None) else 1)
+                    or resume_context is not None and resume_context["pending_episode"] is not None
+                    or pending_grant_episode is not None) else 1)
                 or run.get("first_cause")
                 not in {"feedback_loss", "native_active_ack_loss", "required_proof_loss"}
             ):
@@ -3619,6 +3622,11 @@ class SameRunRecovery:
                         and _view_admitted(state)
                     ):
                         self.episodes, self.cause, recovered = count, cause, True
+                        if grant_context is not None:
+                            # Presence reconciliation may interrupt before Resume.
+                            # Retain this qualified source episode until its fresh
+                            # executor ACK closes it; neither clock is restarted.
+                            clock["pending_grant_episode"] = {"recovery": dict(episode), "count": count, "cause": cause}
                         break
                 elif current["status"] != "recovering" or current.get("recovery") != episode:
                     raise RuntimeError("original native recovery descriptor changed")
