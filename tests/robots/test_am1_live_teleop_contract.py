@@ -186,6 +186,37 @@ def test_ordinary_arms_workspace_is_a_distinct_closed_current_rest_profile():
         m.validate_workspace(changed)
 
 
+@pytest.mark.parametrize("fault", [None, "profile", "right", "calibration", "lower", "upper", "rate"])
+def test_extended_left_gripper_workspace_is_exact_role_profile_mapping_and_interval(fault):
+    m, value = contract(), workspace()
+    elbow = "arm_left_elbow_flex.pos"
+    value["workspace_profile"] = "ordinary-arms-left-current-rest-1051-1164"
+    value["calibration"][elbow.removesuffix(".pos")] = [3, 0, 1845, 864, 3073]
+    value["raw_bounds"][elbow] = [1051, 1164]
+    endpoints = [m.normalized_raw(raw, value["calibration"][elbow.removesuffix(".pos")]) for raw in (1051, 1164)]
+    value["bounds"][elbow].update(min=endpoints[0], max=endpoints[1])
+    value["reference"][elbow] = m.normalized_raw(1090, value["calibration"][elbow.removesuffix(".pos")])
+    key = "arm_right_gripper.pos" if fault == "right" else "arm_left_gripper.pos"
+    cal = [6, 0, 934 if fault == "calibration" else 933, 1886, 3401]
+    raw = [1885 if fault == "lower" else 1886, 3103 if fault == "upper" else 3102]
+    value["calibration"][key.removesuffix(".pos")] = cal
+    value["raw_bounds"][key] = raw
+    low, high = [m.normalized_raw(v, cal, gripper=True) for v in raw]
+    value["bounds"][key].update(min=low, max=high, rate_per_s=20.001 if fault == "rate" else 20.)
+    value["reference"][key] = m.normalized_raw(3094, cal, gripper=True)
+    if fault == "profile":
+        value["workspace_profile"] = "left-current-rest-1051-1164"
+    if fault:
+        with pytest.raises(ValueError):
+            m.validate_workspace(value)
+    else:
+        assert m.validate_workspace(value) == value
+        target = dict(value["reference"], **{key: 0.})
+        assert m.validate_target(target, workspace=value) == target
+        with pytest.raises(ValueError):
+            m.validate_target(dict(target, **{key: -.01}), workspace=value)
+
+
 @pytest.mark.parametrize("profile,endpoint,upper,seed", [
     ("ordinary-arms-left-entry-p16-1164-1324",1164,1324,seed) for seed in (1165,1299,1324)
 ] + [("ordinary-arms-left-entry-p16-1108-1268",1108,1268,seed) for seed in (1165,1204,1268)])

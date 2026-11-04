@@ -1692,13 +1692,13 @@ def test_current_entry_native_refuses_inside_corridor_or_retired_larger_seed(mon
         left_entry_lane(monkeypatch, seed=seed)
 
 
-def supported_gripper_interval_lane(monkeypatch, *, selected=True, raw=3094, goal=None, calibration=None):
+def supported_gripper_interval_lane(monkeypatch, *, selected=True, raw=3094, goal=None, calibration=None, interval=None):
     from lerobot.robots.alohamini.am1_live_teleop import before_write
     now, identity, owner, robot, control = lane()
     trial = install_left_response_trial(monkeypatch, robot, workload="ordinary-arms")
     trial.binding["request"]["workspace_profile"] = "ordinary-arms-left-current-rest-1051-1164"
     if selected:
-        trial.binding["request"]["left_gripper_raw_interval"] = [2799, 3102]
+        trial.binding["request"]["left_gripper_raw_interval"] = [2799, 3102] if interval is None else list(interval)
     robot._am1_left_response_p_binding = copy.deepcopy(trial.binding)
     name = "arm_left_gripper"
     robot.left_bus.calibration[name] = MotorCalibration(*(calibration or (6, 0, 933, 1886, 3401)))
@@ -1711,20 +1711,23 @@ def supported_gripper_interval_lane(monkeypatch, *, selected=True, raw=3094, goa
 
 
 @pytest.mark.parametrize("raw", [3094, 3102])
-def test_supported_gripper_interval_native_admits_fresh_closing_without_pivot_or_reseed(monkeypatch, raw):
+@pytest.mark.parametrize("interval", [[2799, 3102], [1886, 3102]])
+def test_supported_gripper_interval_native_admits_fresh_closing_without_pivot_or_reseed(monkeypatch, raw, interval):
     from examples.alohamini.am1_live_teleop import normalized_raw, validate_target
-    now, identity, owner, robot, control, _ = supported_gripper_interval_lane(monkeypatch, raw=raw)
+    now, identity, owner, robot, control, _ = supported_gripper_interval_lane(monkeypatch, raw=raw, interval=interval)
     assert control.apply(robot, frame(identity, owner, 0))
     workspace = copy.deepcopy(control.live_snapshot()["workspace"])
     key = "arm_left_gripper.pos"
-    assert workspace["raw_bounds"][key] == [2799, 3102]
+    assert workspace["raw_bounds"][key] == interval
     assert workspace["reference"][key] == pytest.approx(normalized_raw(raw, (6, 0, 933, 1886, 3401), gripper=True))
     assert workspace["bounds"][key]["rate_per_s"] == 20.0
     target = dict(control._live_summary["cursor"])
-    target[key] = workspace["reference"][key] - 10.0
+    target[key] = 0.0 if interval == [1886, 3102] else workspace["reference"][key] - 10.0
     validate_target(target, workspace=workspace)
     encoded = robot.left_bus._unnormalize({6: target[key]})[6]
-    assert 2799 <= encoded <= 3102 and encoded < raw
+    assert interval[0] <= encoded <= interval[1] and encoded < raw
+    if interval == [1886, 3102]:
+        assert encoded == 1886, "selected closing endpoint is the unchanged calibrated0%"
     value = sample(control)
     value["target"] = target
     now[0] += .05
@@ -1753,12 +1756,22 @@ def test_supported_gripper_interval_native_refuses_outside_origin_goal_or_mappin
     assert not [event for event in robot.events if event[0] == "action"]
 
 
-def test_supported_gripper_interval_native_keeps_full_target_bounds(monkeypatch):
+@pytest.mark.parametrize("interval,raw", [([2799, 3102], 2799), ([1886, 3102], 1886)])
+def test_supported_gripper_interval_native_keeps_full_target_bounds(monkeypatch, interval, raw):
     from examples.alohamini.am1_live_teleop import validate_target
-    _, identity, owner, robot, control, _ = supported_gripper_interval_lane(monkeypatch, raw=2799)
+    _, identity, owner, robot, control, _ = supported_gripper_interval_lane(monkeypatch, raw=raw, interval=interval)
     assert control.apply(robot, frame(identity, owner, 0))
     workspace = control.live_snapshot()["workspace"]
     target = dict(control._live_summary["cursor"])
     target["arm_left_gripper.pos"] -= 10.0
     with pytest.raises(ValueError):
         validate_target(target, workspace=workspace)
+
+
+@pytest.mark.parametrize("raw,goal", [(1885, None), (3094, 1885), (3103, None), (3094, 3103)])
+def test_extended_gripper_interval_native_rejects_measured_or_held_goal_outside_selected_bounds(monkeypatch, raw, goal):
+    _, identity, owner, robot, control, _ = supported_gripper_interval_lane(
+        monkeypatch, raw=raw, goal=goal, interval=[1886, 3102])
+    with pytest.raises(RuntimeError):
+        control.apply(robot, frame(identity, owner, 0))
+    assert not [event for event in robot.events if event[0] == "action"]

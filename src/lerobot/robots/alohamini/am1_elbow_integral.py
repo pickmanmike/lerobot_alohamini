@@ -896,15 +896,15 @@ def _left_response_p_boot_id():
 
 
 def _left_gripper_raw_interval(value, *, kind, proportional, workload_segment, workspace_profile):
-    """Select only the exercised LEFT interval under its existing current-rest authority."""
+    """Select only explicit LEFT closing intervals under current-rest authority."""
     from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES
 
     if (kind != LEFT_RESPONSE_P_KIND or type(proportional) is not int or proportional != 32
             or workload_segment != "ordinary-arms"
             or workspace_profile != CURRENT_REST_WORKSPACE_PROFILES["ordinary-arms"]
             or type(value) is not list or len(value) != 2
-            or any(type(raw) is not int for raw in value) or value != [2799, 3102]):
-        raise ValueError("Supported gripper interval requires exact LEFT/P32 ordinary-arms [2799,3102]")
+            or any(type(raw) is not int for raw in value) or value not in ([2799, 3102], [1886, 3102])):
+        raise ValueError("Supported gripper interval requires exact LEFT/P32 ordinary-arms [2799,3102] or [1886,3102]")
     return list(value)
 
 

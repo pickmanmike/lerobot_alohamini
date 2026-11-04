@@ -229,7 +229,11 @@ def validate_workspace(workspace):
                 raise ValueError("current-rest workspace requires its actual calibrated reference")
             if list(raw) != expected:
                 raise ValueError("native elbow workspace differs from demonstrated command bounds")
+        extended_left_closing = (workspace.get("workspace_profile") == CURRENT_REST_WORKSPACE_PROFILES["ordinary-arms"]
+                                 and key == "arm_left_gripper.pos" and list(cal) == [6, 0, 933, 1886, 3401]
+                                 and list(raw) == [1886, 3102])
         maximum_span = (160 if entry and key == "arm_left_elbow_flex.pos" else
+                        3102 - 1886 if extended_left_closing else
                         0.2 * (cal[4] - cal[3]) if gripper else math.floor(10 * 4096 / 360))
         maximum_rate = 20.0 if gripper else 5 * 4096 / 360 * 200 / (cal[4] - cal[3])
         if raw[1] - raw[0] > maximum_span + 1e-9 or bounds["rate_per_s"] > maximum_rate + 1e-9:
