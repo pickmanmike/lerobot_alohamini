@@ -24,6 +24,8 @@ The explicit candidate correction is limited to powered AM1 live teleoperation: 
 
 ## MOTOR-01: useful movement before micro-positioning
 
+- **Current-path context:** Packet13/14 and Actual89 proved useful RIGHT P16 motion, re-jog and reuse; later weak response does not erase it.2f delivered actualGoal1945 but achieved1.494° of7°. Compare fresh pose, fixed admitted endpoints, rate and achieved preparation before tuning. The nominal10° recipe does not authorize a relative10° move from every interior pose or a compensation multiplier.
+
 - **Accepted / scope:** useful ordinary elbow motion at nominal 10 degrees and approximately 5 degrees/s; stop stimulus escalation when the task-relevant behavior works. Exact endpoint return/sub-degree response is not an ordinary-use prerequisite.
 - **Result/source:** [Packet14][p14], exercised `bea11a7925ef439eaa91da5c76a71f43fe557221`: both elbows sequentially moved approximately 6–8.3 degrees per direction at P16/I0/D32; no P24/P32 or optional 20-degree trial was needed. Fine residuals remain recorded.
 - **Implementation/tests/status:** [native host](../../src/lerobot/robots/alohamini/alohamini_host.py), [ordinary presets](../../tests/robots/test_am1_practical_presets.py), [native controls](../../tests/robots/test_am1_practical_native.py). Legacy practical result accepted; whole-robot Packet16 outcome remains unqualified.
@@ -31,12 +33,16 @@ The explicit candidate correction is limited to powered AM1 live teleoperation: 
 
 ## MOTOR-02: retain role-specific settings and units
 
+- **Do not transfer LEFT conditions to RIGHT:** current RIGHT baseline is P16/I0/D32/Acceleration0.2f sparse right-bus ID3 samples show175.5mA, signed Present_Load−260,11.7V/status0 at Goal1945/PP1883; these are real effort indicators, not calibrated torque, proven saturation or a supply diagnosis. The historical selected500mA host ceiling is not established for this ordinary path.
+
 - **Accepted / scope:** C001 leaders, C018 followers, angle joints, gripper contact/opening, wheel velocity and lift home/relief retain their own semantics. Neither elbow P16 nor its provisional selected-elbow 500 mA host ceiling is universal. An abort ceiling is not commanded current or a continuous rating.
 - **Result/source:** [Packet13][p13] and [Packet14][p14]; sampled successful selected-elbow peaks 52–65 mA do not prove that raising an older ceiling caused motion. Packet14 records actual firmware Protection_Current 310 = 2015 mA separately.
 - **Implementation/tests/status:** [prepare_settings/verify_settings][live], [settings tests](../../tests/robots/test_am1_teleop_settings.py) and [shared path][live]. Current settings/calibration/mappings are preserved, not blanket retuned.
 - **Reopen:** a demonstrated role-specific incompatibility, changed installed setting or task/load requirement with evidence; never extrapolate one joint's numeric setting to all motors.
 
 ## MOTOR-03: observe the full command and measurement chain
+
+- **Score timed preparation honestly:** fixed-span RIGHT sequencing derives endpoints from fresh admitted bounds, preserves the full original reference and streams current input throughout each active hold. Timed lower preparation is not a measured reset or achieved full-span start. Gripper work follows original elbow return; actual accepted grip commands remain separate from an unavailable gripper hardware-Goal read.
 
 - **Apply now:** use the ordinary adapter/current-rest factory and source-bound collector. Keep original within-run endpoints and measured achieved preparation; a prepared increasing LEFT approach is supported only for its tested pose/direction, not a universal tracking correction. The b752 preparation of1.670deg ended after measured approach room qualified; it is not a failed4deg comparison. [Working invocation][p16] and the private current helper proof packet own the procedure. Reopen only a task-relevant new delivery/response discrepancy.
 
@@ -166,6 +172,8 @@ Virtual changing input remains at the existing acquisition/mapping/transport/exe
 
 ## PROCESS-02: one lean runner, focused informative checks
 
+- **Use the same side-aware path:** add only selection/sequencing at the existing coordinator when native ordinary-arms admission already supports that role.2f completed354frames/23.537active with one1.458s operating hold and no human intervention; modest elbow response still limits useful reach. Preserve failed zero-input prefixes separately. Logging correlation alone is not a transport repair.
+
 - **Finish useful work after consolidation:** reuse exact-head reviews/checks and prove each actual merge tree, without CI credit when no jobs ran or redeployment for source-equivalent PC/docs work. Start simultaneous collectors before a finite source activity. A healthy live interval plus an unresolved later WSS close does not identify a network/camera cause or require indefinite diagnosis. Proceed with informative ordinary activity when current conditions support it.
 - **Let the runner finish:** e1c83fff and fresh463c8cee completed changing intentions and automatic Finish without manual intervention. Prospectively declare enough wall-window for ordinary holds; preserve250ms input freshness, sensing/viewing, original reference/deadline and restoration. Judge holds by practical interruption/recovery, not a zero-hold rule, arbitrary count or success streak. PR60 OPEN is for a meaningful outstanding opening, not near-zero coverage after a successful reopen.
 
@@ -291,6 +299,8 @@ The practical-use continuation supersedes earlier experiment-specific retry/dura
 - **Completed builds, missing wrapper closure:** Stage57 built the exact full13/full22 projections, then the final local wrapper refused five retained115 originals absent from its upload list. Keep the successful bundles and original refusal; repair the existing exact-case common wrapper, verify the real artifact-to-audit path, and finish only missing metadata. The reviewed correction passed10 focused checks; no rebuild or extra native attempt was needed. Browser-control tool reconnection is separate from source/decoder behavior: reuse the enrolled open-only launcher/profile, not new pairing or a new streaming stack.
 
 ## EVIDENCE-01: retain success, first cause and limits
+
+- **Audit context is separate from physical outcome:** a Gateway-only runtime successor can leave an existing pure settings proof valid but its private source-registration chain incomplete. Preserve each refused audit and all original artifacts; correct the exact context/production-proof path with negative tests and a fresh output, without modifying native evidence or repeating motion. An unobserved PC admission remains unobserved in corrected analysis.
 
 - **Keep simultaneous boundaries and ordinary use distinct:** working-view-delivery-1793759746858 captured responsive PiIPC/HTTP and404 ACKed WSS snapshots before a later1006 close; its precise sender/peer cause remains unknown. All22 full Chest JPEGs decompressed; native0–7 zero-padding bytes after EOI explain the original strict suffix flags without proving truncation. Preserve original flags and validation separately. e1c83fff/463c8cee then completed separate NORMAL-required-Chest sessions, with measured undertravel, holds and fresh executor-acknowledged recovery. Never aggregate separate sessions into one full benchmark or treat native ACKs as extra hardware Goal reads.
 - **Accept attributed practical evidence:** the owner observed the roll gripped/held above ground and released. That milestone is complete, while older image-only contact uncertainty and failed finishing remain historical. Controlled placement is future work; no repeated placement/camera clarification is pending.
