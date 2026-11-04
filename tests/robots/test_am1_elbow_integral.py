@@ -2725,3 +2725,50 @@ def test_selected_acceleration_stopped_goal_telemetry_rejects_impossible_decoded
     with pytest.raises((ValueError,RuntimeError)):
         stopped_selected_acceleration(module,r,trial,directory)
     assert writes(r.left_bus)==before and trial.snapshot_path.read_bytes()==raw
+
+
+@pytest.mark.parametrize("shoulder", [None, 1])
+def test_supported_gripper_interval_request_is_canonical_one_use(tmp_path, monkeypatch, shoulder):
+    profile = "ordinary-arms-left-current-rest-1051-1164"
+    module, state, directory, request, value = left_response_p_files(
+        tmp_path, monkeypatch, workspace_profile=profile, workload_segment="ordinary-arms",
+        left_shoulder_startup_degrees=shoulder,
+    )
+    value["left_gripper_raw_interval"] = [2799, 3102]
+    module._left_response_p_request(value, "a" * 40)
+    request.write_bytes(module._right_p20_json(value))
+    path = module.consume_left_response_p_request(state, directory, "physical-live-teleop", RIGHT_P20_RUN, RIGHT_P20_HOST, "a" * 40)
+    bound = module.load_left_response_p_binding(path, directory, RIGHT_P20_RUN, RIGHT_P20_HOST)
+    assert bound["request"] == value and bound["request"]["left_gripper_raw_interval"] == [2799, 3102]
+    assert not request.exists()
+    request.write_bytes(module._right_p20_json(value))
+    request.chmod(0o600)
+    with pytest.raises(ValueError, match="retired"):
+        module.consume_left_response_p_request(state, directory, "physical-live-teleop", RIGHT_P20_RUN, RIGHT_P20_HOST, "a" * 40)
+
+
+@pytest.mark.parametrize("interval", [None, True, (2799, 3102), [2799.0, 3102], [True, 3102],
+    [2798, 3102], [2799, 3103], [3102, 2799], [2799], [2799, 3102, 3103]])
+def test_supported_gripper_interval_request_rejects_other_raw_ranges(tmp_path, monkeypatch, interval):
+    module, _, _, request, value = left_response_p_files(tmp_path, monkeypatch,
+        workspace_profile="ordinary-arms-left-current-rest-1051-1164", workload_segment="ordinary-arms")
+    original = request.read_bytes()
+    value["left_gripper_raw_interval"] = interval
+    with pytest.raises(ValueError):
+        module._left_response_p_request(value, "a" * 40)
+    assert request.read_bytes() == original
+
+
+@pytest.mark.parametrize("fault", ["side", "gain", "segment", "profile", "no_profile", "source"])
+def test_supported_gripper_interval_request_cannot_broaden_other_authority(tmp_path, monkeypatch, fault):
+    module, _, _, _, value = left_response_p_files(tmp_path, monkeypatch,
+        workspace_profile="ordinary-arms-left-current-rest-1051-1164", workload_segment="ordinary-arms")
+    value["left_gripper_raw_interval"] = [2799, 3102]
+    if fault == "side": value["kind"] = "right-response-p"
+    elif fault == "gain": value["proportional"] = 16
+    elif fault == "segment": value["workload_segment"] = "left-reach"
+    elif fault == "profile": value["workspace_profile"] = "ordinary-arms-left-entry-p16-1108-1268"
+    elif fault == "no_profile": del value["workspace_profile"]
+    else: value["source_head"] = "b" * 40
+    with pytest.raises(ValueError):
+        module._left_response_p_request(value, "a" * 40)

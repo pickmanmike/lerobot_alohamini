@@ -15,7 +15,7 @@ KEY = "arm_left_elbow_flex.pos"
 GRIP = "arm_left_gripper.pos"
 
 
-def admission(grip="closing", *, elbow_raw=1090):
+def admission(grip="closing", *, elbow_raw=1090, gripper_raw=None, gripper_interval=None):
     client, _ = held_command119_client()
     native = workspace()
     native["workspace_profile"] = CURRENT_REST_WORKSPACE_PROFILES["ordinary-arms"]
@@ -32,6 +32,13 @@ def admission(grip="closing", *, elbow_raw=1090):
     if grip == "ambiguous":
         native["raw_bounds"][GRIP] = [1000, 1400]
         native["bounds"][GRIP]["max"] = 20.
+    if gripper_raw is not None:
+        cal = [6, 0, 933, 1886, 3401]
+        native["calibration"][GRIP[:-4]] = cal
+        native["raw_bounds"][GRIP] = list(gripper_interval or [2799, 3102])
+        native["bounds"][GRIP].update(min=normalized_raw(native["raw_bounds"][GRIP][0], cal, gripper=True),
+                                     max=normalized_raw(native["raw_bounds"][GRIP][1], cal, gripper=True))
+        native["reference"][GRIP] = normalized_raw(gripper_raw, cal, gripper=True)
     live = client.snapshot["run"]["live_input"]
     live.update(workspace=native, reference=copy.deepcopy(native["reference"]),
                 cursor=dict(native["reference"]), accepted_target=dict(native["reference"]))
@@ -97,6 +104,36 @@ def test_grasp_return_keeps_one_legal_interval_and_retracts_closed_to_original(g
     assert admitted == original  # No reseeding of measured references or workspace.
     if grip == "opening":
         assert by_name["grasp_prepare_open"]["targets"] == {KEY: q0, GRIP: opening}
+
+
+@pytest.mark.parametrize("condition", ["closing", "legacy_opening", "opening_only"])
+def test_supported_grasp_closing_keeps_fresh_reference_and_refuses_opening_substitute(condition):
+    ready, admitted = admission(elbow_raw=1128, gripper_raw=2942 if condition == "opening_only" else 3094,
+                                gripper_interval=[3094, 3397] if condition == "legacy_opening" else None)
+    original = copy.deepcopy((ready, admitted))
+    options = grasp_options(direction="decreasing")
+    options.supported_grasp_closing = True
+    if condition != "closing":
+        with pytest.raises(ValueError):
+            planned(ready, admitted, options)
+    else:
+        plan, phases = planned(ready, admitted, options)
+        q0, g0 = plan["origin"][KEY], plan["origin"][GRIP]
+        assert q0 == ready["command_reference"][KEY] and g0 == pytest.approx(79.73597359735973)
+        assert [phase["name"] for phase in phases] == ["grasp_close", "grasp_carry", "grasp_return_original_closed", "grasp_release", "finish"]
+        assert phases[0]["gripper_interval"] == {"open": g0, "closed": g0-10., "opening_preparation": False}
+        assert phases[2]["targets"] == {KEY: q0, GRIP: g0-10.}
+        assert phases[3]["targets"] == {KEY: q0, GRIP: g0}
+        assert sum(phase.get("ramp", 0)+phase.get("dwell", 0) for phase in phases) == 36.
+    assert (ready, admitted) == original
+
+
+def test_supported_grasp_closing_requires_grasp_and_declared_admitted_policy():
+    options = grasp_options("--supported-grasp-closing")
+    assert options.supported_grasp_closing
+    for extra in (["--plan", "out-return"], ["--plan", "lower-return-gripper"], ["--gripper-direction", "closing"]):
+        with pytest.raises(SystemExit):
+            grasp_options("--supported-grasp-closing", *extra)
 
 
 @pytest.mark.parametrize("args", [
@@ -207,8 +244,11 @@ def test_existing_plan_intentions_and_original_return_remain_available(name, ext
 
 @pytest.mark.parametrize("unsupported", [False, True])
 @pytest.mark.parametrize("direction,elbow_raw", [("increasing", 1090), ("decreasing", 1128)])
-def test_coordinator_dispatches_complete_grasp_from_status_without_manual_pacing(tmp_path, monkeypatch, unsupported, direction, elbow_raw):
-    ready, admitted = admission("ambiguous" if unsupported else "opening", elbow_raw=elbow_raw)
+@pytest.mark.parametrize("supported_closing", [False, True])
+def test_coordinator_dispatches_complete_grasp_from_status_without_manual_pacing(tmp_path, monkeypatch, unsupported, direction, elbow_raw, supported_closing):
+    ready, admitted = admission("ambiguous" if unsupported else "opening", elbow_raw=elbow_raw,
+        gripper_raw=3094 if supported_closing else None,
+        gripper_interval=[3094, 3397] if supported_closing and unsupported else None)
     root = tmp_path / "repo"
     trial = root / "trial"
     trial.mkdir(parents=True)
@@ -241,7 +281,7 @@ def test_coordinator_dispatches_complete_grasp_from_status_without_manual_pacing
             yield json.dumps(ready) + "\n"
             yield json.dumps(status(None, 0., state="waiting")) + "\n"
             elapsed = 0.
-            for i, duration in enumerate([] if unsupported else [5., 5., 13., 13., 5.]):
+            for i, duration in enumerate([] if unsupported else [5., 13., 13., 5.] if supported_closing else [5., 5., 13., 13., 5.]):
                 intent = reader.take()
                 assert intent["op"] == "move"
                 intents.append(intent)
@@ -271,16 +311,19 @@ def test_coordinator_dispatches_complete_grasp_from_status_without_manual_pacing
         "--direction", direction, "--ramp-seconds", "10", "--comparison-dwell-seconds", "3",
         "--dwell-seconds", "3", "--window-seconds", "90", "--intent-ttl-seconds", "60",
         "--bindings", str(root / "current-bindings.json"),
+        *(["--supported-grasp-closing"] if supported_closing else []),
     ]) == 0
     assert len(launches) == 1 and launches[0][1]["cwd"] == root
     argv = launches[0][0]
     assert argv[argv.index("-m")+1] == "tools.am1_leader_adapter"
     assert argv[argv.index("--duration-seconds")+1] == "90.0"
+    assert ("--supported-grasp-closing" in argv) is supported_closing
     assert all(not command.startswith("return ") for command in commands)
-    assert len(commands) == (1 if unsupported else 6)
+    assert len(commands) == (1 if unsupported else 5 if supported_closing else 6)
     records = [json.loads(line) for line in next((root / ".cache/am1-knowledge-reuse-18").glob("*.console.jsonl")).read_text().splitlines()]
     declared = next(row for row in records if row["event"] == "local_activity_declared")
-    assert declared["gripper_interval_policy"] == "one legal10-point interval; prepare opening when only opening is admitted"
+    assert declared["gripper_interval_policy"] == ("supported closing10-point interval; refuse opening substitute" if supported_closing
+                                                   else "one legal10-point interval; prepare opening when only opening is admitted")
     assert declared["view"] == "normal required Chest" and declared["body_lift_intent"] == "zero"
     assert declared["direction"] == direction
     if unsupported:
@@ -289,13 +332,15 @@ def test_coordinator_dispatches_complete_grasp_from_status_without_manual_pacing
         assert not any(row["event"] == "local_fresh_targets" for row in records)
     else:
         planned_record = next(row for row in records if row["event"] == "local_fresh_targets")
-        assert planned_record["planned_active_seconds"] == 41.
-        assert planned_record["gripper_interval"] == {"open": 10., "closed": 0., "opening_preparation": True}
-        assert [intent["seq"] for intent in intents] == [1, 2, 3, 4, 5]
-        assert intents[3]["targets"] == {"arm_left_elbow_flex.pos": ready["command_reference"][KEY],
-                                        "arm_left_gripper.pos": 0.}
-        assert intents[-1]["targets"][GRIP] == 10.
-        assert len({intent["issued_at_perf_counter_s"] for intent in intents}) == 5
+        assert planned_record["planned_active_seconds"] == (36. if supported_closing else 41.)
+        g0 = ready["command_reference"][GRIP]
+        assert planned_record["gripper_interval"] == {"open": g0 if supported_closing else 10.,
+            "closed": g0-10. if supported_closing else 0., "opening_preparation": not supported_closing}
+        assert [intent["seq"] for intent in intents] == ([1, 2, 3, 4] if supported_closing else [1, 2, 3, 4, 5])
+        assert intents[2 if supported_closing else 3]["targets"] == {KEY: ready["command_reference"][KEY],
+                                        GRIP: g0-10. if supported_closing else 0.}
+        assert intents[-1]["targets"][GRIP] == (g0 if supported_closing else 10.)
+        assert len({intent["issued_at_perf_counter_s"] for intent in intents}) == (4 if supported_closing else 5)
 
 
 def test_missing_current_bindings_refuses_before_adapter_launch(tmp_path, monkeypatch):

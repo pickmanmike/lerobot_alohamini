@@ -2406,7 +2406,8 @@ def invocation_config(binding, source="virtual-leaders"):
 
 
 def prepare_left_response_p_request(config_path, *, ttl_seconds=120, workspace_profile=None,
-                                    left_shoulder_startup_degrees=None, workload_segment="left-reach"):
+                                    left_shoulder_startup_degrees=None, workload_segment="left-reach",
+                                    left_gripper_raw_interval=None):
     """Prepare one explicit boot-local LEFT workload request; never consume or Start it.
 
     This self-contained function is relayed by the PC CLI and imports the installed
@@ -2422,6 +2423,7 @@ def prepare_left_response_p_request(config_path, *, ttl_seconds=120, workspace_p
         AM1ElbowIntegralTrial,
         _left_response_p_boot_id,
         _left_response_p_request,
+        _left_gripper_raw_interval,
         _right_p20_file,
         _right_p20_json,
     )
@@ -2449,6 +2451,9 @@ def prepare_left_response_p_request(config_path, *, ttl_seconds=120, workspace_p
         or workspace_profile != CURRENT_REST_WORKSPACE_PROFILES[workload_segment] and not entry
     ):
         raise ValueError("Left shoulder startup allowance requires exactly 1 degree and the current-rest workspace")
+    gripper_interval = None if left_gripper_raw_interval is None else _left_gripper_raw_interval(
+        left_gripper_raw_interval, kind="left-response-p", proportional=16 if entry else 32,
+        workload_segment=workload_segment, workspace_profile=workspace_profile)
     path = Path(config_path)
     if not path.is_absolute() or path.resolve() != path or path.is_symlink():
         raise ValueError("Exact absolute installed physical configuration required")
@@ -2496,6 +2501,8 @@ def prepare_left_response_p_request(config_path, *, ttl_seconds=120, workspace_p
             request["workspace_profile"] = workspace_profile
         if left_shoulder_startup_degrees is not None:
             request["left_shoulder_startup_degrees"] = left_shoulder_startup_degrees
+        if gripper_interval is not None:
+            request["left_gripper_raw_interval"] = gripper_interval
         _left_response_p_request(request, config["host_head"])
         used = state / ("left-response-p-used-" + request["request_id"] + ".json")
         retired_nonce = state / ("left-response-p-expired-" + request["request_id"] + ".json")
@@ -2530,7 +2537,7 @@ def prepare_left_response_p_request(config_path, *, ttl_seconds=120, workspace_p
 
 def prepare_left_response_p_remote(config_path, *, ssh="am1-pi", ttl_seconds=120,
                                    workspace_profile=None, left_shoulder_startup_degrees=None,
-                                   workload_segment="left-reach"):
+                                   workload_segment="left-reach", left_gripper_raw_interval=None):
     """Relay the canonical stopped preparer once and return its bounded receipt.
 
     Transport ambiguity is never retried: the pending request may already exist.
@@ -2567,6 +2574,11 @@ def prepare_left_response_p_remote(config_path, *, ssh="am1-pi", ttl_seconds=120
         or workspace_profile != CURRENT_REST_WORKSPACE_PROFILES[workload_segment] and not entry
     ):
         raise ValueError("Left shoulder startup allowance requires exactly 1 degree and the current-rest workspace")
+    from lerobot.robots.alohamini.am1_elbow_integral import _left_gripper_raw_interval
+
+    gripper_interval = None if left_gripper_raw_interval is None else _left_gripper_raw_interval(
+        left_gripper_raw_interval, kind="left-response-p", proportional=16 if entry else 32,
+        workload_segment=workload_segment, workspace_profile=workspace_profile)
     profile_args = [workspace_profile] if workspace_profile is not None else []
     profile_keyword = ", workspace_profile=sys.argv[3]" if profile_args else ""
     startup_args = ["1"] if left_shoulder_startup_degrees is not None else []
@@ -2574,16 +2586,19 @@ def prepare_left_response_p_remote(config_path, *, ssh="am1-pi", ttl_seconds=120
     workload_args = ["ordinary-arms"] if workload_segment == "ordinary-arms" else []
     workload_keyword = (", workload_segment=sys.argv[" + str(3 + len(profile_args) + len(startup_args)) + "]"
                         if workload_args else "")
+    gripper_args = [json.dumps(gripper_interval, separators=(",", ":"))] if gripper_interval is not None else []
+    gripper_keyword = (", left_gripper_raw_interval=json.loads(sys.argv["
+        + str(3 + len(profile_args) + len(startup_args) + len(workload_args)) + "])" if gripper_args else "")
     payload = (
         "import json, sys\n"
         "sys.path[:0] = ['/home/pickmanmike/am1_physical_trial', "
         "'/home/pickmanmike/lerobot_alohamini/src']\n"
         + inspect.getsource(prepare_left_response_p_request)
         + "\nprint(json.dumps(prepare_left_response_p_request(sys.argv[1], "
-        "ttl_seconds=int(sys.argv[2])" + profile_keyword + startup_keyword + workload_keyword + "), sort_keys=True))\n"
+        "ttl_seconds=int(sys.argv[2])" + profile_keyword + startup_keyword + workload_keyword + gripper_keyword + "), sort_keys=True))\n"
     )
     remote = shlex.join(["/home/pickmanmike/lerobot_alohamini/.venv/bin/python", "-B", "-",
-                         config_path, str(ttl_seconds), *profile_args, *startup_args, *workload_args])
+                         config_path, str(ttl_seconds), *profile_args, *startup_args, *workload_args, *gripper_args])
     reply = subprocess.run(
         ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", ssh, remote],
         input=payload, text=True, encoding="utf-8", capture_output=True, timeout=30, check=True, shell=False,
@@ -2606,6 +2621,8 @@ def prepare_left_response_p_remote(config_path, *, ssh="am1-pi", ttl_seconds=120
             or ("workspace_profile" in request) != (workspace_profile is not None)
             or request.get("left_shoulder_startup_degrees") != left_shoulder_startup_degrees
             or ("left_shoulder_startup_degrees" in request) != (left_shoulder_startup_degrees is not None)
+            or request.get("left_gripper_raw_interval") != gripper_interval
+            or ("left_gripper_raw_interval" in request) != (gripper_interval is not None)
             or hashlib.sha256(_right_p20_json(request)).hexdigest() != receipt["sha256"]):
         raise ValueError("Preparation receipt differs from the requested canonical scope; do not retry pending authority")
     return receipt

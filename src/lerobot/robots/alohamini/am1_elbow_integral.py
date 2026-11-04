@@ -895,6 +895,19 @@ def _left_response_p_boot_id():
     return value
 
 
+def _left_gripper_raw_interval(value, *, kind, proportional, workload_segment, workspace_profile):
+    """Select only the exercised LEFT interval under its existing current-rest authority."""
+    from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES
+
+    if (kind != LEFT_RESPONSE_P_KIND or type(proportional) is not int or proportional != 32
+            or workload_segment != "ordinary-arms"
+            or workspace_profile != CURRENT_REST_WORKSPACE_PROFILES["ordinary-arms"]
+            or type(value) is not list or len(value) != 2
+            or any(type(raw) is not int for raw in value) or value != [2799, 3102]):
+        raise ValueError("Supported gripper interval requires exact LEFT/P32 ordinary-arms [2799,3102]")
+    return list(value)
+
+
 def _response_p_request(value, source_head=None, *, kind):
     import re
     from examples.alohamini.am1_live_teleop import CURRENT_REST_WORKSPACE_PROFILES, LEFT_ENTRY_WORKSPACE_PROFILE
@@ -905,7 +918,7 @@ def _response_p_request(value, source_head=None, *, kind):
                 if kind == LEFT_RESPONSE_P_KIND else ("right-peer-fixed",))
     if (
         not isinstance(value, dict)
-        or set(value) not in ({
+        or set(value) - {"left_gripper_raw_interval"} not in ({
             "version",
             "kind",
             "request_id",
@@ -952,6 +965,10 @@ def _response_p_request(value, source_head=None, *, kind):
         or value["left_shoulder_startup_degrees"] != 1
     ):
         raise ValueError("Left shoulder startup allowance requires exactly 1 degree on the current-rest LEFT/P32 request")
+    if "left_gripper_raw_interval" in value:
+        _left_gripper_raw_interval(value["left_gripper_raw_interval"], kind=kind,
+            proportional=value["proportional"], workload_segment=value["workload_segment"],
+            workspace_profile=value.get("workspace_profile"))
     return value
 
 

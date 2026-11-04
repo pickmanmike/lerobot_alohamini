@@ -1488,6 +1488,7 @@ def workspace(robot, identity, measured, *, goals=None):
     receipt = response_receipt(robot)
     from examples.alohamini.am1_live_teleop import LEFT_ENTRY_ENDPOINT_RAW, LEFT_ENTRY_START_MIN_RAW, LEFT_ENTRY_START_MAX_RAW, LEFT_ENTRY_WORKSPACE_PROFILE
     profile = None
+    gripper_interval = None
     if receipt is not None:
         side = "left" if receipt["kind"] == "left-response-p" else "right"
         trial = getattr(robot, "_am1_" + side + "_response_p_trial")
@@ -1500,6 +1501,13 @@ def workspace(robot, identity, measured, *, goals=None):
                     or receipt["configured_p"] != (16 if entry else 32)):
                 raise RuntimeError("AM1 current-rest workspace requires its exact active left trial")
             result["workspace_profile"] = profile
+        if "left_gripper_raw_interval" in trial.binding["request"]:
+            from .am1_elbow_integral import _left_gripper_raw_interval
+
+            gripper_interval = _left_gripper_raw_interval(
+                trial.binding["request"]["left_gripper_raw_interval"], kind=receipt["kind"],
+                proportional=receipt["configured_p"], workload_segment=receipt["workload_segment"],
+                workspace_profile=profile)
     if goals is None:
         goals = read_groups(robot, ("Goal_Position",))
     for side, bus, names in _groups(robot):
@@ -1521,6 +1529,13 @@ def workspace(robot, identity, measured, *, goals=None):
                     low, high = LEFT_ENTRY_ENDPOINT_RAW, seed
                 else:
                     low = high = seed
+            elif name == "arm_left_gripper" and gripper_interval is not None:
+                if tuple(cal) != (6, 0, 933, 1886, 3401):
+                    raise RuntimeError("AM1 supported gripper interval calibration/mapping changed")
+                low, high = gripper_interval
+                lower, upper = sorted(normalized_raw(raw, cal, gripper=True) for raw in (low, high))
+                if not low <= seed <= high or not lower <= q0 <= upper:
+                    raise RuntimeError("AM1 supported gripper measured rest/held Goal is outside its selected interval")
             elif name.endswith("_elbow_flex"):
                 low, high = ((1051, 1164) if profile is not None else (2011, 2124)) if side == "left" else (1847, 1960)
                 if not low <= seed <= high:
