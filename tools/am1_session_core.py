@@ -3071,8 +3071,20 @@ class SessionAuthority:
             if e["fault"]:
                 self._finish("faulted", str(e["fault"]))
                 return
+            admitting_native_live = self.asynchronous and r.get("native_live_at") is None
             if self.asynchronous and self._physical_lifecycle(e, now):
                 return
+            if admitting_native_live:
+                # Admission event/save can outlast a copied proof while the sole
+                # worker keeps sampling. Consume its current ORIGINAL clocks;
+                # persistence must neither expire fresh RAW nor renew authority.
+                now = self.clock()
+                self._expire_controls(now)
+                e = self._evidence()
+                now = self.clock()
+                if e["fault"]:
+                    self._finish("faulted", str(e["fault"]))
+                    return
             if now >= r["deadline"]:
                 self._finish("stopped", "live_deadline")
                 return

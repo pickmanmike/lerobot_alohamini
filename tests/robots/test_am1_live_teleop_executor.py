@@ -2758,6 +2758,79 @@ def test_active_wal_uncertain_reopen_defers_before_restart_commit_and_existing_r
         restored.close()
 
 
+@pytest.mark.parametrize("latest", ["fresh", "stale", "malformed", "foreign_run", "foreign_host",
+                                  "native_fault", "owner_expired", "deadline_expired", "local_input_lost"])
+def test_first_native_admission_persistence_consumes_current_raw_cache(tmp_path, monkeypatch, latest):
+    # The real admission event/save may outlast a copied proof while the sole
+    # executor's independent feedback cache continues to advance normally.
+    a, e, _ = authority_lane(tmp_path)
+    now = [10.]
+    a.clock = e.clock = lambda: now[0]
+    a.run.update(status="starting", native_live_at=None, accepted_at=8., startup_deadline=188.,
+                 backend_incarnation=e.host_incarnation, recovery_episodes=0)
+    e._lifecycle["backend_incarnation"] = e.host_incarnation
+    e._execution = dict(progress_s=0., complete=False, fault=None)
+    e._epoch, e._epoch_mode, e.desired = 0, "pause", "hold"
+    e._aligned.extend([9.7, 9.8, 10.])
+    e.sample["ack"].update(state="paused", epoch=0)
+    e.sample["ack"]["live_input"].update(state="held", reference=e.sample["ack"]["live_input"]["workspace"]["reference"])
+    proof = dict(version=1, raw_sample_at_monotonic_s=9.99, peaks_ready=True,
+                 deficit_started_at_monotonic_s=None, deficit_ceiling_monotonic_s=None,
+                 hold_sample_at_monotonic_s=None, zero_read_started_at_monotonic_s=None,
+                 zero_read_completed_at_monotonic_s=None)
+    e.sample["ack"]["thermal_history"] = copy.deepcopy(proof)
+    save = a._save
+    admission_saves = []
+    def delayed_admission_save():
+        if not admission_saves and any(row["kind"] == "native_live_admitted" for row in a.events):
+            admission_saves.append(now[0])
+            now[0] = 310. if latest == "deadline_expired" else 12. if latest == "owner_expired" else 10.6
+            with e.mutex:
+                e.sample["at"], e.sample["sequence"] = now[0], 2
+                raw = now[0] - (.501 if latest == "stale" else .01)
+                e.sample["ack"]["thermal_history"] = dict(proof, raw_sample_at_monotonic_s=raw)
+                if latest == "malformed":
+                    e.sample["ack"]["thermal_history"]["peaks_ready"] = 1
+                elif latest == "foreign_run":
+                    e.sample["ack"]["run_id"] = str(uuid4())
+                elif latest == "foreign_host":
+                    e.sample["ack"]["host_incarnation"] = str(uuid4())
+                elif latest == "native_fault":
+                    e._fault = "retained native hardware fault"
+                elif latest == "local_input_lost":
+                    e.observation.qualified = False
+        return save()
+    monkeypatch.setattr(a, "_save", delayed_admission_save)
+    try:
+        copied = e.evidence()
+        a.tick()
+        assert admission_saves == [10.], (a.run["status"], a.run["first_cause"], e._lifecycle)
+        assert copied["thermal_history"] == proof, "never retimestamp a copied proof"
+        assert a.run["native_live_at"] == 9. and a.run["deadline"] == 309.
+        assert a.grant is a.applied_input is e._live_target is None and e.desired == "hold"
+        if latest in {"stale", "malformed", "native_fault", "deadline_expired"}:
+            expected = {"stale": "native thermal original RAW feedback expired/invalid",
+                        "malformed": "native thermal history proof malformed",
+                        "native_fault": "retained native hardware fault", "deadline_expired": "live_deadline"}
+            assert a.run["requested_terminal"] == ("stopped" if latest == "deadline_expired" else "faulted")
+            assert a.run["first_cause"] == expected[latest]
+        elif latest == "owner_expired":
+            assert a.controller is a.connection is None
+            assert a.run["intent_revision"] == 1 and a.run["status"] == "paused"
+            assert a.run["first_cause"] is None
+            assert a.events[-1]["kind"] == "presence_expired"
+        elif latest in {"foreign_run", "foreign_host", "local_input_lost"}:
+            assert a.run["status"] == "preparing" and a.run["first_cause"] is None
+            assert [row["kind"] for row in a.events] == ["native_live_admitted"]
+        else:
+            assert (a.run["status"], a.run["first_cause"]) == ("paused", None)
+            assert a.run["intent_revision"] == 0
+            assert [row["kind"] for row in a.events] == ["native_live_admitted", "observation_qualified"]
+    finally:
+        a.run = None
+        a.close()
+
+
 @pytest.mark.parametrize("latest", ["fresh", "stale", "future", "invalid", "hard_fault"])
 def test_thermal_core_advance_consumes_latest_owned_held_cache_not_aged_local_copy(tmp_path, monkeypatch, latest):
     # c4-like initial native HOLD, no admitted input: this isolates RAW evidence
