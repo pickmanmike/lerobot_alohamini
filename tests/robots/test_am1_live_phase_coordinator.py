@@ -867,3 +867,188 @@ def test_right_meaningful_seven_degree_request_uses_fresh_interior_pose_and_decl
     assert sum(phase.get("ramp", 0)+phase.get("dwell", 0) for phase in phases) == 22.
     assert phases[1]["targets"] == pytest.approx({RIGHT_KEY: 13.364444444444445, RIGHT_GRIP: 0.})
     assert (ready, admitted) == original
+
+
+def right_span_admission(elbow_raw=1883):
+    ready, admitted = right_admission()
+    native = admitted["snapshot"]["run"]["live_input"]["workspace"]
+    native["calibration"][RIGHT_KEY[:-4]] = [3, 0, -658, 827, 3039]
+    native["raw_bounds"][RIGHT_KEY] = [1847, 1960]
+    native["bounds"][RIGHT_KEY] = dict(min=-7.775768535262202, max=2.441229656419523,
+                                      rate_per_s=5.143660839863371)
+    native["reference"][RIGHT_KEY] = (elbow_raw-827)*200/2212-100
+    native["calibration"][RIGHT_GRIP[:-4]] = [6, 0, -1811, 1657, 3191]
+    native["raw_bounds"][RIGHT_GRIP] = [2699, 3005]
+    native["bounds"][RIGHT_GRIP] = dict(min=67.92698826597132, max=87.8748370273794, rate_per_s=20.)
+    native["reference"][RIGHT_GRIP] = 87.8748370273794
+    current = admitted["snapshot"]["run"]["live_input"]
+    current.update(reference=dict(native["reference"]), cursor=dict(native["reference"]),
+                   accepted_target=dict(native["reference"]))
+    admitted["snapshot"]["evidence"]["accepted_host_action"]["arm_feedback"]["positions"][RIGHT_KEY] = {
+        "raw": elbow_raw, "normalized": native["reference"][RIGHT_KEY],
+    }
+    ready.update(command_reference=dict(native["reference"]), bounds=copy.deepcopy(native["bounds"]))
+    return ready, admitted
+
+
+def span_options(*extra):
+    return coordinator.parse_args(["--side", "right", "--workpose", "admitted-span",
+        "--ramp-seconds", "2.1", "--dwell-seconds", "2", "--window-seconds", "90",
+        "--intent-ttl-seconds", "60", "--bindings", "unused-current-bindings.json", *extra])
+
+
+def span_planned(ready, admitted, options):
+    plan = coordinator.fresh_target(ready, admitted, side=options.side, workpose=options.workpose,
+        degrees=options.degrees, direction=options.direction, ramp_seconds=options.ramp_seconds)
+    return plan, coordinator.phases_for(plan, options, admitted=admitted)
+
+
+@pytest.mark.parametrize("gripper", [False, True])
+@pytest.mark.parametrize("elbow_raw", [1883, 1945])
+def test_right_admitted_span_real_relay_uses_fixed_bounds_then_original_gripper_pose(tmp_path, monkeypatch, gripper, elbow_raw):
+    from uuid import uuid4
+
+    from examples.alohamini.am1_teleop_workload import VirtualIntentWorkload
+    from tools.am1_leader_adapter import FrameProducer, ZERO_BODY
+
+    ready, admitted = right_span_admission(elbow_raw)
+    original = copy.deepcopy((ready, admitted))
+    native = admitted["snapshot"]["run"]["live_input"]["workspace"]
+    origin = dict(ready["command_reference"])
+    lower, upper = -7.775768535262202, 2.441229656419523
+    root, trial = tmp_path/"repo", tmp_path/"repo/trial"
+    trial.mkdir(parents=True)
+    (root/".cache/am1-knowledge-reuse-18").mkdir(parents=True)
+    (trial/"frames.jsonl").write_text(json.dumps(admitted)+"\n", encoding="utf-8")
+    now, commands, launches = [100.], [], []
+    reader = VirtualIntentReader("interactive", clock=lambda: now[0], intent_channel=str(uuid4()))
+    source = VirtualIntentWorkload(native, command_reference=origin, clock=lambda: now[0], intent_channel=reader.intent_channel)
+    producer = FrameProducer(source, clock=lambda: now[0], source_id=reader.intent_channel)
+    producer.workspace, producer.native_cursor = native, dict(origin)
+    expected = [("move", {RIGHT_KEY: lower}, 4.1), ("move", {RIGHT_KEY: upper}, 4.1),
+                ("move", {RIGHT_KEY: lower}, 4.1), ("return", None, 4.1)]
+    if gripper:
+        expected += [("move", {RIGHT_KEY: origin[RIGHT_KEY], RIGHT_GRIP: origin[RIGHT_GRIP]-10.}, 5.),
+                     ("move", {RIGHT_KEY: origin[RIGHT_KEY], RIGHT_GRIP: origin[RIGHT_GRIP]}, 5.)]
+
+    def status(seq, elapsed, progress=0., state="current"):
+        return dict(event="virtual_input_status", window_elapsed_s=elapsed, window_remaining_s=90.-elapsed,
+                    current_accepted_intent_seq=seq, input_state=state, ramp_progress_active_s=progress)
+    class Input:
+        def write(self, command):
+            commands.append(command)
+            reader.receive_line(command)
+        def flush(self):
+            pass
+        def close(self):
+            pass
+    class Process:
+        def __init__(self, args, **kwargs):
+            launches.append((args, kwargs))
+            self.stdin, self.stdout, self.returncode = Input(), self.output(), None
+        def output(self):
+            yield json.dumps(dict(event="virtual_input_opened", output=str(trial)))+"\n"
+            yield json.dumps(ready)+"\n"
+            yield json.dumps(status(None, 0., state="waiting"))+"\n"
+            elapsed = 0.
+            for index, (op, targets, duration) in enumerate(expected):
+                intent = reader.take()
+                assert intent["op"] == op and intent["seq"] == index+1
+                if targets is not None:
+                    assert intent["targets"] == pytest.approx(targets)
+                assert intent["expires_at_perf_counter_s"] == now[0]+60.
+                assert source.submit(intent)
+                source.admit(now[0])
+                for _ in range(round(duration*10)):
+                    now[0] += .1
+                    source.advance(now[0])
+                frame = producer.serialize(producer.capture({"grant_id": str(uuid4())}))
+                wanted = dict(origin) if op == "return" else {**source.start_target, **targets}
+                assert frame["target"] == pytest.approx(wanted) and frame["body"] == ZERO_BODY
+                assert all(frame["target"][key] == origin[key] for key in origin if key not in {RIGHT_KEY, RIGHT_GRIP})
+                source.accepted(frame["target"])
+                yield json.dumps(dict(event="virtual_intent_accepted", op=op, seq=intent["seq"]))+"\n"
+                for sample in (status(None, elapsed, duration), status(intent["seq"], elapsed, duration, "waiting"),
+                               status(intent["seq"], elapsed, duration-.1)):
+                    yield json.dumps(sample)+"\n"
+                    assert len(commands) == index+1, "phase cannot advance without current acknowledged complete dwell"
+                elapsed += duration
+                yield json.dumps(status(intent["seq"], elapsed, duration))+"\n"
+                assert len(commands) == index+2
+            assert source.cursor == pytest.approx(origin)
+            finish = reader.take()
+            assert finish["op"] == "finish" and finish["expires_at_perf_counter_s"] == now[0]+1.
+            assert source.submit(finish) and source.complete
+            yield json.dumps(dict(event="virtual_intent_accepted", op="finish", seq=finish["seq"]))+"\n"
+            yield json.dumps(status(finish["seq"], elapsed, state="finished"))+"\n"
+            self.returncode = 0
+        def poll(self):
+            return self.returncode
+        def wait(self):
+            return 0
+    monkeypatch.setattr(coordinator, "ROOT", root)
+    monkeypatch.setattr(coordinator.subprocess, "Popen", Process)
+    monkeypatch.setattr(coordinator, "approach_pp", lambda *a, **k: pytest.fail("timed RIGHT prep reached LEFT approach gate"))
+    assert coordinator.main(["--side", "right", "--workpose", "admitted-span", "--ramp-seconds", "2.1",
+        "--dwell-seconds", "2", "--window-seconds", "90", "--intent-ttl-seconds", "60",
+        "--bindings", str(root/"bindings.json"), *(["--gripper-cycle"] if gripper else [])]) == 0
+    argv, kwargs = launches[0]
+    assert "--prepare-current-rest" in argv and kwargs["cwd"] == root
+    assert "--supported-grasp-closing" not in argv and "--extended-grasp-closing" not in argv
+    rows = [json.loads(line) for line in next((root/".cache/am1-knowledge-reuse-18").glob("*.console.jsonl")).read_text().splitlines()]
+    declared = next(row for row in rows if row["event"] == "local_activity_declared")
+    planned = next(row for row in rows if row["event"] == "local_fresh_targets")
+    assert declared["workpose"] == "admitted-span" and declared["degrees"] is declared["direction"] is None
+    assert declared["preparation_policy"] == "ordinary-timed; no measured endpoint gate"
+    assert planned["planned_active_seconds"] == pytest.approx(26.4 if gripper else 16.4)
+    span = planned["admitted_span"]
+    assert span["raw_bounds"] == [1847, 1960] and span["bounds"] == [lower, upper]
+    assert span["encoder_degrees"] == pytest.approx(9.931640625)
+    phases = planned["phases"]
+    assert [p["name"] for p in phases[:4]] == ["prepare_lower", "span_upper", "span_lower", "return_original"]
+    assert phases[0]["timed_preparation"] is True and "preparation" not in phases[0]
+    assert phases[0]["dwell"] == 2. and phases[0]["targets"] == {RIGHT_KEY: lower}
+    assert all("preparation" not in p and "approach" not in p for p in phases)
+    assert (ready, admitted) == original
+
+
+@pytest.mark.parametrize("extra", [
+    ["--side", "left"], ["--degrees", "4"], ["--degrees=7"], ["--direction", "increasing"],
+    ["--approach-from-below"], ["--supported-grasp-closing"], ["--extended-grasp-closing"],
+    ["--gripper-closed-opening", "50"], ["--gripper-open-opening", "68"], ["--plan", "grasp-return"],
+    ["--gripper-cycle", "--gripper-direction", "opening"], ["--gripper-cycle", "--gripper-direction", "admitted"],
+])
+def test_admitted_span_refuses_left_and_relative_or_left_only_flags_before_launch(monkeypatch, extra):
+    monkeypatch.setattr(coordinator.subprocess, "Popen", lambda *a, **k: pytest.fail("invalid span reached adapter"))
+    with pytest.raises(SystemExit):
+        coordinator.main(["--side", "right", "--workpose", "admitted-span", "--bindings", "unused", *extra])
+
+
+@pytest.mark.parametrize("fault", ["zero", "expanded", "rate", "gripper_rate", "reference", "hold", "gripper_endpoint"])
+def test_right_admitted_span_refuses_expansion_rates_and_changed_fresh_origin_without_mutation(fault):
+    ready, admitted = right_span_admission()
+    native = admitted["snapshot"]["run"]["live_input"]["workspace"]
+    if fault == "zero":
+        native["raw_bounds"][RIGHT_KEY] = [1883, 1883]
+        native["bounds"][RIGHT_KEY].update(min=native["reference"][RIGHT_KEY], max=native["reference"][RIGHT_KEY])
+    elif fault == "expanded":
+        native["raw_bounds"][RIGHT_KEY] = [1846, 1960]
+        native["bounds"][RIGHT_KEY]["min"] = (1846-827)*200/2212-100
+    elif fault == "rate":
+        native["bounds"][RIGHT_KEY]["rate_per_s"] = 4.
+    elif fault == "gripper_rate":
+        native["bounds"][RIGHT_GRIP]["rate_per_s"] = 2.
+    elif fault == "reference":
+        ready["command_reference"][RIGHT_KEY] += .1
+    elif fault == "hold":
+        admitted["snapshot"]["evidence"]["hold_acknowledged"] = False
+    else:
+        native["reference"][RIGHT_GRIP] = 70.
+        current = admitted["snapshot"]["run"]["live_input"]
+        for values in (current["reference"], current["cursor"], current["accepted_target"], ready["command_reference"]):
+            values[RIGHT_GRIP] = 70.
+    ready["bounds"] = copy.deepcopy(native["bounds"])
+    original = copy.deepcopy((ready, admitted))
+    with pytest.raises((ValueError, RuntimeError)):
+        span_planned(ready, admitted, span_options("--gripper-cycle"))
+    assert (ready, admitted) == original
