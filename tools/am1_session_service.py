@@ -76,12 +76,20 @@ async def close_socket(ws, transport, code=1000):
     try:
         async with asyncio.timeout(0.5):
             await asyncio.shield(closing)
-    except (TimeoutError, ConnectionError, RuntimeError):
+    except (TimeoutError, ConnectionError, RuntimeError) as error:
         transport.abort()
         closing.cancel()
-    except asyncio.CancelledError:
+        with contextlib.suppress(Exception):
+            trace = getattr(ws, "_am1_close_trace", None)
+            if trace is not None:
+                trace("close", "abort", code=code, error=error)
+    except asyncio.CancelledError as error:
         transport.abort()
         closing.cancel()
+        with contextlib.suppress(Exception):
+            trace = getattr(ws, "_am1_close_trace", None)
+            if trace is not None:
+                trace("close", "cancelled_abort", code=code, error=error)
         raise
 
 
@@ -178,7 +186,33 @@ class Peer:
         self.commands = {"normal": 0, "protective": 0}
         self.latest_input = None
         self.input_task = None
+        self.close_logger = self.diagnostic_generation = self.close_diagnostic = None
+        with contextlib.suppress(Exception):
+            ws._am1_close_trace = self._trace_close
         self.sender = asyncio.create_task(self.send())
+
+    def _trace_close(self, origin, reason, *, code=None, error=None, send_elapsed=None):
+        """Bounded private journal metadata; never payloads, authority or close policy."""
+        with contextlib.suppress(Exception):
+            if self.close_diagnostic is None:
+                self.close_diagnostic = {
+                    "generation": self.diagnostic_generation,
+                    "origin": origin, "reason": reason,
+                    "exception": "None" if error is None else type(error).__name__[:48],
+                    "attempted_code": code,
+                    "send_elapsed_s": None if send_elapsed is None else round(send_elapsed, 6),
+                }
+            if self.close_logger is None:
+                return
+            first = self.close_diagnostic
+            self.close_logger.warning(
+                "AM1 WSS close generation=%s origin=%s reason=%s first_origin=%s first_reason=%s "
+                "exception=%s attempted_code=%s observed_code=%s first_exception=%s first_code=%s send_elapsed_s=%s",
+                first["generation"], origin, reason, first["origin"], first["reason"],
+                "None" if error is None else type(error).__name__[:48], code,
+                getattr(self.ws, "close_code", None), first["exception"], first["attempted_code"],
+                first["send_elapsed_s"],
+            )
 
     def put(self, value, snapshot=False, *, grant_reply=False):
         if self.closed:
@@ -195,6 +229,7 @@ class Peer:
             if snapshot:
                 return False
             self.closed = True
+            self._trace_close("queue", "reply_overflow", code=1013)
             asyncio.create_task(close_socket(self.ws, self.ws._writer.transport, 1013))
             return False
         self.queue.append((data, snapshot, reservation))
@@ -203,6 +238,7 @@ class Peer:
         return True
 
     async def send(self):
+        send_started = None
         try:
             while not self.closed:
                 await self.wake.wait()
@@ -210,6 +246,7 @@ class Peer:
                     data, _, reservation = self.queue.popleft()
                     self.bytes -= len(data) + reservation
                     self.inflight = len(data) + reservation
+                    send_started = time.monotonic()
                     if reservation:
                         async def send_grant():
                             wire = data
@@ -227,8 +264,12 @@ class Peer:
                         await asyncio.wait_for(self.ws.send_str(data.decode()), 0.5)
                     self.inflight = 0
                 self.wake.clear()
-        except (TimeoutError, ConnectionError, RuntimeError):
+        except (TimeoutError, ConnectionError, RuntimeError) as error:
             self.closed = True
+            reason = ("send_timeout" if isinstance(error, TimeoutError) else
+                      "send_connection" if isinstance(error, ConnectionError) else "send_runtime")
+            self._trace_close("sender", reason, code=1013, error=error,
+                              send_elapsed=None if send_started is None else time.monotonic() - send_started)
             await close_socket(self.ws, self.ws._writer.transport, 1013)
 
     async def close(self):
@@ -807,6 +848,11 @@ class Gateway:
             self.pending_ws -= 1
             pending = False
             peer.revision = self.next_revision()
+            # Public initial snapshot revision is immutable transport correlation,
+            # distinct from controller authority and later reporting revisions.
+            peer.diagnostic_generation = peer.revision
+            with contextlib.suppress(Exception):
+                peer.close_logger = request.app.logger
             stage = "initial_snapshot"
             peer.put({"kind": "snapshot", "revision": peer.revision, "snapshot": await self.current()}, True)
             count, since = 0, time.monotonic()
@@ -847,8 +893,11 @@ class Gateway:
                 self.enqueue(peer, value, received_at=now)
                 stage = "stream_receive"
         except ReportingError as exc:
-            with contextlib.suppress(Exception):
-                request.app.logger.warning("AM1 WSS close stage=%s exception=%s", stage, type(exc).__name__[:48])
+            if peer:
+                peer._trace_close("handler", "reporting_error", code=1013, error=exc)
+            else:
+                with contextlib.suppress(Exception):
+                    request.app.logger.warning("AM1 WSS close stage=%s exception=%s", stage, type(exc).__name__[:48])
             with contextlib.suppress(TimeoutError, ConnectionError):
                 await asyncio.wait_for(
                     ws.send_str(encode(dict(exc.result, kind="unavailable")).decode()), 0.5
@@ -863,14 +912,20 @@ class Gateway:
             OSError,
             asyncio.IncompleteReadError,
         ) as exc:
-            with contextlib.suppress(Exception):
-                request.app.logger.warning("AM1 WSS close stage=%s exception=%s", stage, type(exc).__name__[:48])
+            if peer:
+                peer._trace_close("handler", stage, code=1008, error=exc)
+            else:
+                with contextlib.suppress(Exception):
+                    request.app.logger.warning("AM1 WSS close stage=%s exception=%s", stage, type(exc).__name__[:48])
             await close_socket(ws, request.transport, 1008)
         else:
             with contextlib.suppress(Exception):
                 error = ws.exception()
-                request.app.logger.warning("AM1 WSS close stage=%s exception=%s", stage,
-                                           "None" if error is None else type(error).__name__[:48])
+                if peer:
+                    peer._trace_close("receiver", "stream_end" if stage == "stream_receive" else stage, error=error)
+                else:
+                    request.app.logger.warning("AM1 WSS close stage=%s exception=%s", stage,
+                                               "None" if error is None else type(error).__name__[:48])
         finally:
             if pending:
                 self.pending_ws -= 1
@@ -904,6 +959,8 @@ class Gateway:
                         pass
                 await peer.close()
             await close_socket(ws, request.transport)
+            if peer:
+                peer._trace_close("final", "closed", code=1000)
         return ws
 
     async def publish(self):
