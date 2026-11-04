@@ -639,3 +639,231 @@ def test_missing_current_bindings_refuses_before_adapter_launch(tmp_path, monkey
     with pytest.raises(SystemExit):
         coordinator.main(["--plan", "out-return"])
     assert not list((tmp_path / ".cache/am1-knowledge-reuse-18").glob("*.console.jsonl"))
+
+RIGHT_KEY = "arm_right_elbow_flex.pos"
+RIGHT_GRIP = "arm_right_gripper.pos"
+
+
+def right_admission(grip="closing"):
+    ready, admitted = admission(elbow_raw=1090)
+    snapshot = admitted["snapshot"]
+    native = snapshot["run"]["live_input"]["workspace"]
+    native["reference"][RIGHT_KEY] = 10.3  # raw1903, actual RIGHT800..2800 calibration.
+    native["reference"][RIGHT_GRIP] = 10. if grip == "closing" else 0.
+    native["bounds"][RIGHT_GRIP]["rate_per_s"] = 20.
+    current = snapshot["run"]["live_input"]
+    current.update(reference=dict(native["reference"]), cursor=dict(native["reference"]),
+                   accepted_target=dict(native["reference"]))
+    snapshot["evidence"]["accepted_host_action"]["arm_feedback"]["positions"][RIGHT_KEY] = {
+        "raw": 1903, "normalized": 10.3,
+    }
+    ready.update(command_reference=dict(native["reference"]), bounds=copy.deepcopy(native["bounds"]))
+    return ready, admitted
+
+
+def right_options(*extra):
+    return coordinator.parse_args(["--side", "right", "--plan", "out-return", "--degrees", "4",
+        "--direction", "decreasing", "--bindings", "unused-current-bindings.json", *extra])
+
+
+def right_planned(ready, admitted, options):
+    plan = coordinator.fresh_target(ready, admitted, side=options.side, degrees=options.degrees,
+                                   direction=options.direction, ramp_seconds=options.ramp_seconds)
+    return plan, coordinator.phases_for(plan, options, admitted=admitted)
+
+
+@pytest.mark.parametrize("direction,grip", [("increasing", "opening"), ("decreasing", "closing"), ("decreasing", None)])
+def test_right_coordinator_real_intent_mapping_original_return_and_automatic_finish(tmp_path, monkeypatch, direction, grip):
+    from uuid import uuid4
+
+    from examples.alohamini.am1_teleop_workload import VirtualIntentWorkload
+    from tools.am1_leader_adapter import FrameProducer, ZERO_BODY
+
+    ready, admitted = right_admission(grip)
+    original = copy.deepcopy((ready, admitted))
+    native = admitted["snapshot"]["run"]["live_input"]["workspace"]
+    origin = dict(ready["command_reference"])
+    endpoint = 14.85111111111111 if direction == "increasing" else 5.748888888888889
+    root, trial = tmp_path / "repo", tmp_path / "repo/trial"
+    trial.mkdir(parents=True)
+    (root / ".cache/am1-knowledge-reuse-18").mkdir(parents=True)
+    (trial / "frames.jsonl").write_text(json.dumps(admitted)+"\n", encoding="utf-8")
+    now, commands, launches = [100.], [], []
+    reader = VirtualIntentReader("interactive", clock=lambda: now[0], intent_channel=str(uuid4()))
+    source = VirtualIntentWorkload(native, command_reference=origin, clock=lambda: now[0], intent_channel=reader.intent_channel)
+    producer = FrameProducer(source, clock=lambda: now[0], source_id=reader.intent_channel)
+    producer.workspace, producer.native_cursor = native, dict(origin)
+    outward = {RIGHT_KEY: endpoint, **({RIGHT_GRIP: origin[RIGHT_GRIP]} if grip else {})}
+    expected = [("move", outward, 16. if grip else 13.)]
+    if grip:
+        expected += [("move", {RIGHT_KEY: endpoint, RIGHT_GRIP: 10. if grip == "opening" else 0.}, 5.),
+                     ("move", {RIGHT_KEY: endpoint, RIGHT_GRIP: origin[RIGHT_GRIP]}, 5.)]
+    expected += [("return", None, 13.)]
+
+    def status(seq, elapsed, progress=0., state="current"):
+        return dict(event="virtual_input_status", window_elapsed_s=elapsed, window_remaining_s=120.-elapsed,
+                    current_accepted_intent_seq=seq, input_state=state, ramp_progress_active_s=progress)
+
+    class Input:
+        def write(self, command):
+            commands.append(command)
+            reader.receive_line(command)
+        def flush(self):
+            pass
+        def close(self):
+            pass
+
+    class Process:
+        def __init__(self, args, **kwargs):
+            launches.append((args, kwargs))
+            self.stdin, self.stdout, self.returncode = Input(), self.output(), None
+        def output(self):
+            yield json.dumps(dict(event="virtual_input_opened", output=str(trial)))+"\n"
+            yield json.dumps(ready)+"\n"
+            yield json.dumps(status(None, 0., state="waiting"))+"\n"
+            elapsed = 0.
+            for index, (op, targets, duration) in enumerate(expected):
+                intent = reader.take()
+                assert intent["op"] == op and intent["seq"] == index+1
+                if targets is not None:
+                    assert intent["targets"] == pytest.approx(targets)
+                    assert all(key.startswith("arm_right_") for key in intent["targets"])
+                assert intent["issued_at_perf_counter_s"] == now[0]
+                assert intent["expires_at_perf_counter_s"] == now[0]+60.
+                assert source.submit(intent)
+                source.admit(now[0])
+                for _ in range(round(duration*10)):
+                    now[0] += .1
+                    source.advance(now[0])
+                frame = producer.serialize(producer.capture({"grant_id": str(uuid4())}))
+                wanted = dict(origin) if op == "return" else {**source.start_target, **targets}
+                assert frame["target"] == pytest.approx(wanted)
+                assert frame["body"] == ZERO_BODY
+                assert all(frame["target"][key] == origin[key] for key in origin if key not in {RIGHT_KEY, RIGHT_GRIP})
+                source.accepted(frame["target"])
+                yield json.dumps(dict(event="virtual_intent_accepted", op=op, seq=intent["seq"]))+"\n"
+                yield json.dumps(status(None, elapsed, duration))+"\n"
+                assert len(commands) == index+1, "foreign acceptance cannot advance"
+                yield json.dumps(status(intent["seq"], elapsed, duration, state="waiting"))+"\n"
+                assert len(commands) == index+1, "held status cannot advance"
+                yield json.dumps(status(intent["seq"], elapsed, duration-.1))+"\n"
+                assert len(commands) == index+1, "incomplete active dwell cannot advance"
+                elapsed += duration
+                yield json.dumps(status(intent["seq"], elapsed, duration))+"\n"
+                assert len(commands) == index+2
+            assert source.cursor == pytest.approx(origin)
+            finish = reader.take()
+            assert finish["op"] == "finish" and finish["seq"] == len(expected)+1
+            assert finish["issued_at_perf_counter_s"] == now[0] and finish["expires_at_perf_counter_s"] == now[0]+1.
+            assert source.submit(finish) and source.complete
+            yield json.dumps(dict(event="virtual_intent_accepted", op="finish", seq=finish["seq"]))+"\n"
+            yield json.dumps(status(finish["seq"], elapsed, state="finished"))+"\n"
+            self.returncode = 0
+        def poll(self):
+            return self.returncode
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(coordinator, "ROOT", root)
+    monkeypatch.setattr(coordinator.subprocess, "Popen", Process)
+    assert coordinator.main(["--side", "right", "--plan", "out-return", "--direction", direction,
+        "--degrees", "4", "--ramp-seconds", "10", "--comparison-dwell-seconds", "6", "--dwell-seconds", "3",
+        "--window-seconds", "120", "--intent-ttl-seconds", "60", "--bindings", str(root / "bindings.json"),
+        *(["--gripper-cycle", "--gripper-direction", grip] if grip else [])]) == 0
+    argv, kwargs = launches[0]
+    assert "--prepare-current-rest" in argv and "--virtual-input" in argv and kwargs["cwd"] == root
+    assert "--supported-grasp-closing" not in argv and "--extended-grasp-closing" not in argv
+    assert argv[argv.index("--bindings")+1] == str(root / "bindings.json")
+    records = [json.loads(line) for line in next((root / ".cache/am1-knowledge-reuse-18").glob("*.console.jsonl")).read_text().splitlines()]
+    declaration = next(row for row in records if row["event"] == "local_activity_declared")
+    assert declaration["side"] == "right" and declaration["view"] == "normal required Chest"
+    assert declaration["body_lift_intent"] == "zero" and declaration["other_joints"] == "fresh admitted holds"
+    planned = next(row for row in records if row["event"] == "local_fresh_targets")
+    assert planned["calibration"] == [3, 0, 0, 800, 2800] and planned["original_q0"] == 10.3
+    if grip:
+        assert planned["gripper_calibration"] == [6, 0, 0, 1000, 3000]
+        assert planned["gripper_origin"] == origin[RIGHT_GRIP]
+    assert (ready, admitted) == original
+    assert coordinator.KEY == KEY and coordinator.GRIP == GRIP
+
+
+@pytest.mark.parametrize("extra", [
+    ["--plan", "grasp-return"], ["--plan", "lower-return-gripper"], ["--plan", "bidirectional-midpoint"],
+    ["--plan", "gripper-close-return"], ["--plan", "gripper-open-finish"], ["--workpose", "midpoint"],
+    ["--approach-from-below"], ["--supported-grasp-closing"], ["--extended-grasp-closing"],
+    ["--gripper-closed-opening", "50"], ["--gripper-open-opening", "68"],
+    ["--gripper-cycle", "--gripper-direction", "admitted"],
+])
+def test_right_selection_refuses_left_only_compositions_before_adapter_launch(tmp_path, monkeypatch, extra):
+    monkeypatch.setattr(coordinator.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("invalid RIGHT selection reached adapter"))
+    with pytest.raises(SystemExit):
+        coordinator.main(["--side", "right", "--bindings", "unused", *extra])
+
+
+@pytest.mark.parametrize("mutation", ["elbow_bounds", "elbow_rate", "gripper_rate", "gripper_endpoint", "zero_gripper",
+    "ready_bounds", "foreign_run", "changed_origin", "lost_hold", "stale_ack", "point_mapping", "side_mismatch"])
+def test_right_selection_refuses_illegal_or_unqualified_fresh_admission_without_mutation(mutation):
+    ready, admitted = right_admission()
+    snapshot = admitted["snapshot"]
+    current = snapshot["run"]["live_input"]
+    native = current["workspace"]
+    options = right_options("--gripper-cycle", "--gripper-direction", "closing")
+    if mutation == "elbow_bounds":
+        options.degrees = 10.
+    elif mutation == "elbow_rate":
+        options.ramp_seconds = .1
+    elif mutation == "gripper_rate":
+        native["bounds"][RIGHT_GRIP]["rate_per_s"] = 2.
+        ready["bounds"] = copy.deepcopy(native["bounds"])
+    elif mutation in {"gripper_endpoint", "zero_gripper"}:
+        native["reference"][RIGHT_GRIP] = 5. if mutation == "gripper_endpoint" else 0.
+        if mutation == "zero_gripper":
+            native["bounds"][RIGHT_GRIP]["max"] = 0.
+            native["raw_bounds"][RIGHT_GRIP] = [1000, 1000]
+            ready["bounds"] = copy.deepcopy(native["bounds"])
+        current.update(reference=dict(native["reference"]), cursor=dict(native["reference"]), accepted_target=dict(native["reference"]))
+        ready["command_reference"] = dict(native["reference"])
+    elif mutation == "ready_bounds":
+        ready["bounds"][RIGHT_KEY]["max"] -= 1.
+    elif mutation == "foreign_run":
+        ready["run_id"] = "foreign"
+    elif mutation == "changed_origin":
+        for value in (current["cursor"], current["accepted_target"], ready["command_reference"]):
+            value[RIGHT_KEY] += 1.
+    elif mutation == "lost_hold":
+        snapshot["evidence"]["hold_acknowledged"] = False
+    elif mutation == "stale_ack":
+        snapshot["evidence"]["accepted_host_action"]["acquired_at_monotonic_s"] = 99.
+    elif mutation == "point_mapping":
+        snapshot["evidence"]["accepted_host_action"]["arm_feedback"]["positions"][RIGHT_KEY]["normalized"] += 1.
+    original = copy.deepcopy((ready, admitted))
+    if mutation == "side_mismatch":
+        plan = coordinator.fresh_target(ready, admitted, degrees=4., direction="increasing", ramp_seconds=10.)
+        with pytest.raises(ValueError):
+            coordinator.phases_for(plan, options, admitted=admitted)
+    else:
+        with pytest.raises((ValueError, RuntimeError)):
+            right_planned(ready, admitted, options)
+    assert (ready, admitted) == original
+
+
+def test_right_meaningful_seven_degree_request_uses_fresh_interior_pose_and_declared_rate():
+    ready, admitted = right_admission()
+    snapshot = admitted["snapshot"]
+    current = snapshot["run"]["live_input"]
+    native = current["workspace"]
+    native["reference"][RIGHT_KEY] = 5.4
+    native["bounds"][RIGHT_KEY]["rate_per_s"] = 3.
+    for values in (current["reference"], current["cursor"], current["accepted_target"], ready["command_reference"]):
+        values[RIGHT_KEY] = 5.4
+    ready["bounds"] = copy.deepcopy(native["bounds"])
+    snapshot["evidence"]["accepted_host_action"]["arm_feedback"]["positions"][RIGHT_KEY] = {"raw": 1854, "normalized": 5.4}
+    original = copy.deepcopy((ready, admitted))
+    options = right_options("--degrees", "7", "--direction", "increasing", "--ramp-seconds", "3",
+                            "--comparison-dwell-seconds", "3", "--gripper-cycle", "--gripper-direction", "closing")
+    plan, phases = right_planned(ready, admitted, options)
+    assert plan["q0"] == 5.4 and plan["target"] == pytest.approx(13.364444444444445)
+    assert [phase["name"] for phase in phases] == ["elbow_workpose", "gripper_close", "gripper_return_original", "return_original", "finish"]
+    assert sum(phase.get("ramp", 0)+phase.get("dwell", 0) for phase in phases) == 22.
+    assert phases[1]["targets"] == pytest.approx({RIGHT_KEY: 13.364444444444445, RIGHT_GRIP: 0.})
+    assert (ready, admitted) == original

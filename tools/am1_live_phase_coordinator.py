@@ -31,6 +31,7 @@ def finite(value, *, zero=False):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--side", choices=("left", "right"), default="left", help="selected elbow/gripper; RIGHT uses relative out-return only")
     parser.add_argument("--plan", choices=("out-return", "bidirectional-midpoint", "lower-return-gripper", "grasp-return", "gripper-close-return", "gripper-open-finish"), default="out-return")
     parser.add_argument("--workpose", choices=("relative", "midpoint"), default="relative")
     parser.add_argument("--approach-from-below", action="store_true")
@@ -58,6 +59,11 @@ def parse_args(argv=None):
     parser.add_argument("--storage-state", default=".cache/am1-physical-adapter-01/physical-runs/browser-state.private.json")
     parser.add_argument("--output-root", default=".cache/am1-teleop-consolidation-16/physical-runs")
     args = parser.parse_args(argv)
+    if args.side == "right":
+        try:
+            _right_options(args)
+        except ValueError as error:
+            parser.error(str(error))
     opening_only = args.plan == "gripper-open-finish"
     if args.dwell_seconds is None:
         args.dwell_seconds = 2. if opening_only else 3.
@@ -66,7 +72,7 @@ def parse_args(argv=None):
     if (args.workpose == "midpoint" or args.approach_from_below) and not (
         args.plan == "out-return" and args.gripper_cycle and args.workpose == "midpoint" and args.approach_from_below):
         parser.error("midpoint requires out-return, gripper-cycle and explicit approach-from-below")
-    if args.gripper_cycle and (args.plan != "out-return" or args.workpose == "relative" and args.direction != "increasing"):
+    if args.gripper_cycle and (args.plan != "out-return" or args.side == "left" and args.workpose == "relative" and args.direction != "increasing"):
         parser.error("relative gripper-cycle requires out-return and explicit increasing direction")
     if args.plan == "grasp-return" and (
         args.gripper_direction != "admitted" or args.degrees != 4. or args.direction is None
@@ -103,7 +109,18 @@ def live(snapshot):
     return snapshot["run"].get("live_input") or snapshot["evidence"]["live_input"]
 
 
-def fresh_target(ready, admitted, *, degrees, direction, ramp_seconds):
+def _right_options(options):
+    if (options.plan != "out-return" or options.workpose != "relative" or options.approach_from_below
+        or options.supported_grasp_closing or options.extended_grasp_closing
+        or options.gripper_closed_opening is not None or options.gripper_open_opening is not None
+        or options.gripper_cycle and options.gripper_direction not in ("opening", "closing")):
+        raise ValueError("RIGHT requires relative out-return without LEFT-only selections and an explicit opening/closing gripper policy")
+
+
+def fresh_target(ready, admitted, *, degrees, direction, ramp_seconds, side="left"):
+    if side not in ("left", "right"):
+        raise ValueError("selected side must be left or right")
+    key = f"arm_{side}_elbow_flex.pos"
     snapshot = admitted["snapshot"]
     workspace = validate_workspace(live(snapshot)["workspace"])
     commands = validate_target(ready["command_reference"], workspace=workspace)
@@ -114,19 +131,55 @@ def fresh_target(ready, admitted, *, degrees, direction, ramp_seconds):
         or workspace.get("workspace_profile") != CURRENT_REST_WORKSPACE_PROFILES["ordinary-arms"]
         or direction not in ("decreasing", "increasing")):
         raise ValueError("fresh ready/native workspace, run, units and legal command reference must match")
-    cal = workspace["calibration"][KEY[:-4]]
-    delta = abs(normalized_raw(cal[3]+finite(degrees, zero=True)*PRACTICAL_ELBOW_COUNTS_PER_REVOLUTION/360, cal)
+    cal = workspace["calibration"][key[:-4]]
+    if side == "right":
+        owner = snapshot["controller"]
+        origin = _qualified_command_reference(SimpleNamespace(snapshot=snapshot, device=owner["device_id"],
+            generation=owner["controller_generation"], transport_error=None), workspace)
+        point = snapshot["evidence"]["accepted_host_action"]["arm_feedback"]["positions"][key]
+        if (origin != commands or commands[key] != workspace["reference"][key]
+            or type(point["raw"]) is not int or not cal[3] <= point["raw"] <= cal[4]
+            or not math.isfinite(point["normalized"])
+            or abs(normalized_raw(point["raw"], cal)-point["normalized"]) > 1e-7):
+            raise ValueError("fresh qualified RIGHT original mapping required")
+    delta = abs(normalized_raw(cal[3]+finite(degrees, zero=side == "left")*PRACTICAL_ELBOW_COUNTS_PER_REVOLUTION/360, cal)
                 - normalized_raw(cal[3], cal))
-    q0 = commands[KEY]
+    q0 = commands[key]
     target = q0 + (delta if direction == "increasing" else -delta)
-    targets = validate_target(dict(commands, **{KEY: target}), workspace=workspace)
-    if delta/finite(ramp_seconds) > workspace["bounds"][KEY]["rate_per_s"]:
+    targets = validate_target(dict(commands, **{key: target}), workspace=workspace)
+    if delta/finite(ramp_seconds) > workspace["bounds"][key]["rate_per_s"]:
         raise ValueError("declared excursion/ramp exceeds the existing admitted rate")
-    return dict(q0=q0, target=target, targets=targets, origin=dict(commands), calibration=list(cal), workspace=workspace)
+    return dict(q0=q0, target=target, targets=targets, origin=dict(commands), calibration=list(cal), workspace=workspace, side=side)
 
 
 def phases_for(plan, options, *, admitted=None):
     ramp, dwell = options.ramp_seconds, options.dwell_seconds
+    side = getattr(options, "side", "left")
+    if side != plan.get("side", "left"):
+        raise ValueError("selected side differs from the fresh original plan")
+    if side == "right":
+        _right_options(options)
+        key, grip = "arm_right_elbow_flex.pos", "arm_right_gripper.pos"
+        origin, workspace = plan["origin"], plan["workspace"]
+        outward = dict(name="move", op="move", target=plan["target"], targets={key: plan["target"]},
+                       ramp=ramp, dwell=dwell, complete_before_advance=True)
+        phases = [outward]
+        if options.gripper_cycle:
+            if origin[grip] != workspace["reference"][grip]:
+                raise ValueError("RIGHT gripper requires its original fresh reference")
+            endpoint = origin[grip]+(10. if options.gripper_direction == "opening" else -10.)
+            validate_target(dict(plan["targets"], **{grip: endpoint}), workspace=workspace)
+            if 10./3. > workspace["bounds"][grip]["rate_per_s"]:
+                raise ValueError("RIGHT gripper excursion/return exceeds admitted rate")
+            outward.update(name="elbow_workpose", targets={key: plan["target"], grip: origin[grip]},
+                           dwell=options.comparison_dwell_seconds)
+            phases += [dict(name=name, op="move", target=plan["target"], targets={key: plan["target"], grip: target},
+                            ramp=3., dwell=2., complete_before_advance=True)
+                       for name, target in (("gripper_open" if options.gripper_direction == "opening" else "gripper_close", endpoint),
+                                            ("gripper_return_original", origin[grip]))]
+            phases[1]["gripper_direction"] = options.gripper_direction
+        return phases+[dict(name="return_original", op="return", ramp=ramp, dwell=dwell, complete_before_advance=True),
+                       dict(name="finish", op="finish")]
     lower_return = options.plan == "lower-return-gripper"
     grasp_return = options.plan == "grasp-return"
     opening_only = options.plan == "gripper-open-finish"
@@ -387,6 +440,7 @@ def approach_pp(frame, *, run_id, accepted, now, workspace, midpoint, side, room
 def main(argv=None):
     options = parse_args(argv)
     opening_only = options.plan == "gripper-open-finish"
+    grip = f"arm_{options.side}_gripper.pos"
     uses_gripper = options.gripper_cycle or options.plan in ("lower-return-gripper", "grasp-return", "gripper-close-return", "gripper-open-finish")
     relative_workpose = options.plan == "grasp-return" or options.plan == "out-return" and options.workpose == "relative"
     has_preparation = options.plan in ("bidirectional-midpoint", "lower-return-gripper") or options.approach_from_below
@@ -422,7 +476,7 @@ def main(argv=None):
             return approach_pp(tail.latest, run_id=ready["run_id"], accepted=accepted, now=time.monotonic(),
                                workspace=plan["workspace"], midpoint=phases[preparation_index]["approach_endpoint"],
                                side=phases[preparation_index]["approach_side"], room=room)
-        local("local_activity_declared", console=str(console), plan=options.plan, gripper_cycle=uses_gripper and not opening_only,
+        local("local_activity_declared", console=str(console), plan=options.plan, side=options.side, gripper_cycle=uses_gripper and not opening_only,
               gripper_direction="opening" if opening_only else options.gripper_direction if uses_gripper else None,
               workpose=options.workpose if options.plan == "out-return" else None,
               approach_from_below=options.approach_from_below,
@@ -477,15 +531,15 @@ def main(argv=None):
                         tail.refresh()
                         plan = fresh_target(ready, tail.admitted, degrees=options.degrees if relative_workpose else 0.,
                                             direction=options.direction,
-                                            ramp_seconds=options.ramp_seconds)
+                                            ramp_seconds=options.ramp_seconds, side=options.side)
                         phases = phases_for(plan, options, admitted=tail.admitted); supported = True
                         local("local_fresh_targets", run_id=ready["run_id"], original_q0=plan["q0"],
                               calibration=plan["calibration"], counts_per_revolution=PRACTICAL_ELBOW_COUNTS_PER_REVOLUTION,
-                              gripper_origin=plan["origin"][GRIP] if uses_gripper else None,
+                              gripper_origin=plan["origin"][grip] if uses_gripper else None,
                               gripper_direction_requested=options.gripper_direction if uses_gripper else None,
                               gripper_direction_resolved=next((p["gripper_direction"] for p in phases if "gripper_direction" in p), None),
-                              gripper_target=next((p["targets"][GRIP] for p in phases if "gripper_direction" in p), None),
-                              gripper_calibration=plan["workspace"]["calibration"][GRIP[:-4]] if uses_gripper else None,
+                              gripper_target=next((p["targets"][grip] for p in phases if "gripper_direction" in p), None),
+                              gripper_calibration=plan["workspace"]["calibration"][grip[:-4]] if uses_gripper else None,
                               phases=phases, planned_active_seconds=sum(p.get("ramp", 0)+p.get("dwell", 0) for p in phases),
                               **({"gripper_interval": phases[0]["gripper_interval"]}
                                  if options.plan in ("grasp-return", "gripper-close-return", "gripper-open-finish") else {}))
