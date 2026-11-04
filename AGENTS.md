@@ -1,5 +1,7 @@
 ## Active AM1 working rules
 
+Current consolidation: PR55–60 are integrated into integrate/am1-local-teleop; Stage102/M53/R80 remains separately installed with matched rollback. Owner-observed roll grasp/hold/release and the later e1c83fff ordinary action plus463c8cee fresh reuse are complete at their recorded scopes. No placement/camera/enrollment/USB-leader action is pending. Use current records; historical draft and pending-action language is not active authority.
+
 Begin with [current state](docs/alohamini/current-state.md), [named lessons](docs/alohamini/decisions-and-lessons.md), [camera viewing](docs/alohamini/camera-viewing.md), the relevant [Packet16 procedure](docs/alohamini/teleop-consolidation-16.md#verification-and-ordinary-use), and the existing private .cache/am1-knowledge-reuse-18/current-work.private.md pointer. Current-state/private rows own the next action and exact component pins; detailed outcomes stay in their existing records. Apply the latest owner authority instead of reviving historical assembly unknowns or superseded operating restrictions.
 
 The objective is useful, stable and reasonably resilient personal-use teleoperation. Durability means software continuity, preserved state and recovery. A test count, clean Stop, documentation update or merge is a checkpoint. Continue useful authorized work, using finite informative activities and qualified recovery; do not repeat unchanged workloads solely for publication or forced branch coverage.

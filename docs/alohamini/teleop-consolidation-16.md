@@ -1,5 +1,7 @@
 # AM1 teleoperation consolidation — Packet16
 
+Current November3 closeout: PR55–60 are integrated at da04477b, source-equivalent to reviewed aed5b20b; Stage102/M53/R80 and matched Stage101 rollback remain installed separately. e1c83fff completed the unloaded ordinary close/arm/original-return/reopen/automatic-Finish action, and463c8cee completed a separate fresh out-return/Finish with qualified recovery, both NORMAL required Chest. Use [current state](current-state.md#current-operation-and-installation) and the existing private Resume row; older sections below retain historical scopes.
+
 Historical PR46/47 follow-up: [PR46](https://github.com/pickmanmike/lerobot_alohamini/pull/46) integrated dependable Stop; [PR47](https://github.com/pickmanmike/lerobot_alohamini/pull/47) contains the reviewed normal expiry-before-ownPause finishing correction. E34F completed48.074 active seconds/arm-gripper-return but retained FinishFALSE and verified automatic Stop. Separate873C completed16.890 active seconds/outward-return, qualified Finish/restoration and ordinary reuse; two automatic holds totaled2.183s. Required Chest remained current, with coarse silhouettes/approach visible and limited fine detail; P1 recording overlapped873C. [Current state](current-state.md) owns exact motion, startup/view/hold scopes and retained C606/AE84 failures.49 focused software checks/reviews are separate from physical branch entry, which did not occur. Stage93/R75/M46 and matched rollback remained unchanged at that checkpoint; no deployment or powered repeat was required for integration.
 
 Earlier PR45 operating checkpoint, October29: Fresh83f3122f/native2ed39d89 on unchanged Stage93/R75 and PC3648 completed all four streamed movement phases plus Finish under NORMAL required Chest: 514 fresh frames and33.821 producer-active seconds within the original75s window/native300s ceiling. Startup15.801s and initial qualification1.069s are separate. Four later input/native-input holds totaled4.190s (max1.205s); longest CoreRunning13.568s. Recovery used qualified fresh input without human intervention; no required-view hold or native proof-loss episode was recorded. Original reference/workspace/deadline stayed fixed. Legacy producer_program_complete/native_execution_complete remain false for this interactive path; interactive_input_complete and Finish qualification are true.
@@ -689,6 +691,26 @@ Packet14 demonstrated coarse6–8.3degree elbow movement for nominal10degree com
 One stopped format inventory found all five roles advertise MJPEG/YUYV, including640×480 at30fps, and no native H264 format. Installed go2rtc1.9.14 and ffmpeg7.1.5/libx264 serve one modest selected-camera encode shared by viewers, using the existing exclusive capture owner. Rotation/aspect ratio and required local JPEG acquisition metadata remain intact. Selected WebRTC viewing is the default; prior MJPEG viewing remains explicit rollback. Decoded progress, source age and capture/encode generations qualify visibility separately from control health. P1 remains advisory.
 
 ## Verification and ordinary use
+
+Use the established AM1_PROJECT_ROOT, uv --no-sync environment, enrolled software-decoder viewer and explicit current matched binding. Restore the actual native camera pane before Start; Chest is fixed and physical USB leaders remain deferred. The ordinary application/state check and fresh current-rest admission supply actual references; never replay an old raw reference.
+
+For an unloaded useful close/move/original-return/reopen, the current existing command is:
+
+```powershell
+uv run --no-sync --project $env:AM1_PROJECT_ROOT python -u -B -m tools.am1_live_phase_coordinator --plan grasp-return --extended-grasp-closing --gripper-closed-opening 50 --gripper-direction admitted --degrees 4 --direction decreasing --ramp-seconds 10 --comparison-dwell-seconds 3 --dwell-seconds 3 --window-seconds 120 --intent-ttl-seconds 90 --bindings .cache/am1-knowledge-reuse-18/stage-data-102/selected06-bindings.json
+```
+
+It creates the canonical request through the current-rest preparer, selects the existing temporary LEFT P32/I0/D32 transaction, preserves nonselected holds/zero body intent, and automatically sends fresh Finish after acknowledged active progress. e1c83fff exercised this command at integrated da04477b:42.825 active seconds/all phases/normal finishing. The120s prospective activity window permits ordinary holds around roughly41 planned active seconds;90s intention TTL is separate from unchanged250ms movement-input expiry, required sensing/viewing and original300s native deadline. No expired deadline is extended.
+
+After verified terminal restoration, separate fresh reuse used:
+
+```powershell
+uv run --no-sync --project $env:AM1_PROJECT_ROOT python -u -B -m tools.am1_live_phase_coordinator --plan out-return --degrees 4 --direction decreasing --ramp-seconds 10 --dwell-seconds 3 --window-seconds 60 --intent-ttl-seconds 60 --bindings .cache/am1-knowledge-reuse-18/stage-data-102/selected06-bindings.json
+```
+
+463c8cee exercised that fresh admission and automatic Finish:27.005 active seconds with bounded qualified recovery. Both runs preserved their own original reference and supported endpoints; useful coarse displacement is not full4° achievement. Do not append a nearly-zero OPEN for coverage. The existing gripper-open-finish plan is useful only when a real interrupted closure leaves meaningful opening outstanding. Source is software-qualified for that mode; add21 used the older coordinator and remains a separate timed, noninteractive-complete result.
+
+
 
 After Actual89, focused review reproduced two canceled-report races: already-admitted server work can finish after a new offer, and an old attachment can arrive during or after same-source reconnect. Source `73690add34643fb087e8cf735c3002b9d3404bfb` retires the old attachment before asynchronous offer work, requires the new server-issued view identity at the Gateway before/after source lookup, and rejects older original Pi floors at Core before identity reset. Standalone viewing without progress publication remains compatible. Required view500ms, native input250ms, normal ownership and original deadlines are unchanged. The source-specific checks passed33 media,28 browser/VM (including standalone),29 earlier affected Core/view and4 real-Core/TLS cases; the retained full browser29 cohort predates the standalone-only correction. This repair is separate from Actual89 and was not credited to its movement or timing.
 
