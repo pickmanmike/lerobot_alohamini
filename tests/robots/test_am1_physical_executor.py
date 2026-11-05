@@ -10,6 +10,7 @@ import pytest
 
 from examples.alohamini.am1_finite_task import JOINT_KEYS
 from tests.robots import test_alohamini_lift_operational as operational_tests
+from tests.robots.test_am1_pre_activation import activation as activation
 
 # Reuse the actual protected operation and grouped fake-bus fixture unchanged.
 operating_robot = operational_tests.operating_robot
@@ -3982,3 +3983,70 @@ def test_supported_gripper_interval_preparer_freezes_selection_before_stopped_gu
     receipt = m.prepare_left_response_p_request(str(path), workload_segment="ordinary-arms",
         workspace_profile="ordinary-arms-left-current-rest-1051-1164", left_gripper_raw_interval=interval)
     assert interval == [0, 3102] and receipt["request"]["left_gripper_raw_interval"] == selected
+
+
+@pytest.mark.parametrize("right_p", [16, 32])
+def test_ordinary_profile_native_host_launch_has_no_experiment_request_dependency(tmp_path, monkeypatch, right_p):
+    from uuid import uuid4
+    from examples.alohamini.am1_session_contract import RECIPES
+    from lerobot.robots.alohamini import am1_elbow_integral as integral
+    m = module()
+    state, root = tmp_path/"state", tmp_path/"runs"
+    state.mkdir(mode=0o700); root.mkdir(mode=0o700)
+    provider = object.__new__(m.ProtectedHostRun)
+    provider.config = {"physical_state_directory":str(state), "run_root":str(root), "host_head":"a"*40,
+        "host_repository":str(tmp_path), "host_python":"unused-python", "camera_python":"unused-python",
+        "camera_repository":str(tmp_path), "camera_config":str(tmp_path/"config"),
+        "camera_credentials":str(tmp_path/"credentials"), "camera_binary":str(tmp_path/"binary"),
+        "camera_state":str(tmp_path/"camera")}
+    provider.observation = SimpleNamespace()
+    monkeypatch.setattr(provider,"_validate_source",lambda:None)
+    monkeypatch.setattr(m,"wait_required_camera",lambda *args:None)
+    for name in ("consume_left_response_p_request", "consume_right_response_p_request", "consume_right_p20_request"):
+        monkeypatch.setattr(integral,name,lambda *a,**k:pytest.fail("ordinary settings cannot consume an experiment nonce"))
+    owned=[]
+    def unit(name,*args,**kwargs):
+        owned.append((name,args))
+        if "host" in name:raise OSError("fixture stops before native device process")
+        return SimpleNamespace()
+    monkeypatch.setattr(m,"OwnedUnit",unit)
+    run, host = str(uuid4()), str(uuid4())
+    policy={"profile":"ordinary-am1-arms-v1", "right_elbow_p":right_p}
+    with pytest.raises(OSError,match="before native device"):
+        provider.start(run,host,RECIPES["physical-live-teleop"],lambda:None,ordinary_arm_profile=policy)
+    command=owned[-1][1][1]
+    assert command[command.index("--am1-ordinary-arm-profile")+1] == policy["profile"]
+    assert command[command.index("--am1-ordinary-right-elbow-p")+1] == str(right_p)
+    assert command[command.index("--am1-run-id")+1] == run
+    assert command[command.index("--am1-host-incarnation")+1] == host
+    assert not any("trial-file" in arg or "experiment-file" in arg for arg in command)
+    assert not list(state.iterdir()) and not list((root/run[:8]).glob("*response*.json"))
+
+
+
+
+@pytest.mark.parametrize("fault", [None,"missing","wrong_policy","host","restoration","obligation","body_off"])
+def test_ordinary_profile_cleanup_requires_exact_settings_restoration_in_addition_to_all_off(activation,tmp_path,fault):
+    from tests.robots.test_am1_teleop_settings import ordinary_configured_robot
+    robot=ordinary_configured_robot(activation,tmp_path,right_p=32)
+    ordinary=robot._am1_ordinary_arm_profile
+    ordinary.restore(robot)
+    binding=robot._am1_teleop_binding;run,host=binding["run_id"],binding["host_incarnation"]
+    proof=ordinary.receipt
+    policy={"profile":"ordinary-am1-arms-v1","right_elbow_p":32}
+    m=module()
+    readbacks=[{"bus":"left" if "_left_" in key else "right","motor":key[:-4],
+                "register":"Torque_Enable","value":0} for key in JOINT_KEYS]
+    readbacks += [{"bus":"left","motor":key,"register":reg,"value":0}
+                  for key in m.BODY_MOTORS for reg in ("Torque_Enable","Goal_Velocity")]
+    receipt={"version":1,"run_id":run,"host_incarnation":host,"cleanup":"physical_readback_verified",
+             "uncertain":False,"cleanup_errors":[],"readback":{"verified":True,"lift_readback":"qualified",
+             "selected_gain_restore_required":False,"readbacks":readbacks,
+             "ordinary_arm_profile":proof,"ordinary_arm_profile_restore_required":False}}
+    if fault=="missing":receipt["readback"].pop("ordinary_arm_profile")
+    elif fault=="wrong_policy":policy["right_elbow_p"]=16
+    elif fault=="host":proof["binding"]["host_incarnation"]=str(__import__("uuid").uuid4())
+    elif fault=="restoration":proof["restored_registers"]["right"]["P_Coefficient"]=32
+    elif fault=="obligation":receipt["readback"]["ordinary_arm_profile_restore_required"]=True
+    elif fault=="body_off":readbacks[-1]["value"]=1
+    assert m.qualified_cleanup_receipt(receipt,run,host,ordinary_arm_profile=policy) is (fault is None)

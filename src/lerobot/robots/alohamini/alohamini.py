@@ -521,9 +521,12 @@ class AlohaMini(Robot):
                     raise RuntimeError(f"AM1 {side} response transaction cannot be reacquired or reused")
             selected_sides = [side for side in ("left", "right")
                               if getattr(self, "_am1_" + side + "_response_p_binding", None) is not None]
+            ordinary = getattr(self, "_am1_ordinary_arm_profile_binding", None)
+            if ordinary is not None and (selected_sides or getattr(self, "_am1_ordinary_arm_profile", None) is not None):
+                raise RuntimeError("Ordinary arm profile cannot share or reacquire a settings transaction")
             if len(selected_sides) > 1:
                 raise RuntimeError("AM1 response comparison requires only one selected elbow")
-            selected = bool(selected_sides)
+            selected = bool(selected_sides) or ordinary is not None
             if selected:
                 if not binding_valid(self):
                     raise RuntimeError("AM1 teleop settings need the protected binding")
@@ -537,7 +540,15 @@ class AlohaMini(Robot):
                     for name in names:
                         refresh_startup_temperatures(self)
                         set_torque_enabled(bus, (name,), enabled=False)
-            if selected:
+            if ordinary is not None:
+                from .am1_elbow_integral import AM1OrdinaryArmProfile
+                transaction = AM1OrdinaryArmProfile(ordinary, self._am1_ordinary_arm_profile_directory)
+                self._am1_ordinary_arm_profile = transaction
+                transaction.prepare(self)
+                transaction.disable_torque(self)
+                transaction.apply(self)
+                qualify_startup_temperatures(self)
+            elif selected:
                 from .am1_elbow_integral import (
                     AM1LeftResponseProportionalTrial,
                     AM1RightResponseProportionalTrial,
@@ -1006,6 +1017,13 @@ class AlohaMini(Robot):
         return present
 
     def _am1_current_rest_activation_trial(self):
+        ordinary = getattr(self, "_am1_ordinary_arm_profile", None)
+        if ordinary is not None or getattr(self, "_am1_ordinary_arm_profile_binding", None) is not None:
+            from .am1_elbow_integral import AM1OrdinaryArmProfile
+            if type(ordinary) is not AM1OrdinaryArmProfile:
+                raise RuntimeError("Ordinary arm activation requires its retained settings obligation")
+            ordinary.require_normal_activation_owner(self)
+            return ordinary
         trial = getattr(self, "_am1_left_response_p_trial", None)
         binding = getattr(self, "_am1_left_response_p_binding", None)
         requests = [value.get("request", {}) for value in
@@ -1167,6 +1185,9 @@ class AlohaMini(Robot):
                 response = getattr(self, "_am1_" + side + "_response_p_trial", None)
                 if response is not None:
                     response.verify_active(self)
+            ordinary = getattr(self, "_am1_ordinary_arm_profile", None)
+            if ordinary is not None:
+                ordinary.verify_active(self)
             if getattr(self, "_am1_teleop_binding", None) is not None:
                 from .am1_live_teleop import verify_settings
                 verify_settings(self)
@@ -1230,7 +1251,10 @@ class AlohaMini(Robot):
                 try:
                     elbow_trial = getattr(self, "_am1_elbow_integral_trial", None)
                     left_response = getattr(self, "_am1_left_response_p_trial", None)
-                    if (bus is self.left_bus and name == RECOVERY_ELBOW and left_response is not None
+                    ordinary = getattr(self, "_am1_ordinary_arm_profile", None)
+                    if ordinary is not None and ordinary.restore_required and name == "arm_" + bus_name + "_elbow_flex":
+                        ordinary.disable_torque(self, side=bus_name)
+                    elif (bus is self.left_bus and name == RECOVERY_ELBOW and left_response is not None
                             and left_response.restore_required):
                         left_response.disable_torque(self)
                     elif (bus is self.right_bus and name == "arm_right_elbow_flex"
@@ -1272,6 +1296,12 @@ class AlohaMini(Robot):
                 right_response.restore(self)
             except BaseException as error:
                 errors.append(f"restore AM1 right response proportional: {type(error).__name__}: {error}")
+        ordinary = getattr(self, "_am1_ordinary_arm_profile", None)
+        if ordinary is not None:
+            try:
+                ordinary.restore(self)
+            except BaseException as error:
+                errors.append(f"restore AM1 ordinary arm profile: {type(error).__name__}: {error}")
         integral_trial = getattr(self, "_am1_shoulder_integral_trial", None)
         if integral_trial is not None:
             try:
@@ -1324,6 +1354,7 @@ class AlohaMini(Robot):
                 or (right_p20 is not None and right_p20.restore_required)
                 or (left_response is not None and left_response.restore_required)
                 or (right_response is not None and right_response.restore_required)
+                or (ordinary is not None and ordinary.restore_required)
             )
             if elbow_trial is not None:
                 evidence["elbow_integral"] = elbow_trial.evidence
@@ -1333,6 +1364,8 @@ class AlohaMini(Robot):
                 evidence["left_response_p_trial"] = left_response.evidence
             if right_response is not None:
                 evidence["right_response_p_trial"] = right_response.evidence
+            if ordinary is not None:
+                evidence["ordinary_arm_profile"] = ordinary.receipt
             evidence["completed_at_monotonic_s"] = time.monotonic()
             evidence["verified"] = not errors
 

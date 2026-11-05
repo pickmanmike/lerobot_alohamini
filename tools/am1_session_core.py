@@ -2390,8 +2390,17 @@ class SessionAuthority:
             if not recipe or not self.executor.supports(recipe):
                 return self._refuse("unknown fake recipe")
             allowed = {"op", "operation_id", "recipe", "controller_generation"}
+            ordinary_profile = None
             if recipe.name == TELEOP_RECIPE:
-                allowed.add("bench_continuity")
+                allowed.update(("bench_continuity", "ordinary_arm_profile"))
+                if "ordinary_arm_profile" in c:
+                    from examples.alohamini.am1_live_teleop import validate_ordinary_arm_profile
+                    if self.executor.source != "protected-physical-provider" or c.get("bench_continuity") is True:
+                        return self._refuse("ordinary arms require protected normal required-view operation")
+                    try:
+                        ordinary_profile = validate_ordinary_arm_profile(c["ordinary_arm_profile"])
+                    except (TypeError, ValueError) as error:
+                        return self._refuse(str(error))
                 if ("bench_continuity" in c and type(c["bench_continuity"]) is not bool
                         or c.get("bench_continuity") is True and self.executor.source != "protected-physical-provider"):
                     return self._refuse("explicit protected virtual bench policy required")
@@ -2418,6 +2427,7 @@ class SessionAuthority:
             canonical = json.dumps(
                 {"recipe": recipe.name, "device_id": d, **({"confirmation_of":confirmation_of} if confirmation_of else {}),
                  **({"selected_experiment":selected_definition.payload} if selected_definition else {}),
+                 **({"ordinary_arm_profile":ordinary_profile} if ordinary_profile is not None else {}),
                  **({"bench_continuity": c["bench_continuity"]} if "bench_continuity" in c else {})},
                 sort_keys=True, separators=(",", ":")
             )
@@ -2470,6 +2480,14 @@ class SessionAuthority:
                     return self._refuse("idle checkpoint busy or incomplete")
                 if not self._owned(c, d):
                     return self._refuse("current controller lease required")
+            ordinary_setter = getattr(self.executor, "set_ordinary_arm_profile", None)
+            if callable(ordinary_setter):
+                try:
+                    ordinary_setter(ordinary_profile)
+                except (RuntimeError, ValueError) as error:
+                    return self._refuse(str(error))
+            elif ordinary_profile is not None:
+                return self._refuse("ordinary arms require the protected executor")
             positive_prerequisite = None
             selected_setter = getattr(self.executor, "set_selected_experiment", None)
             if callable(selected_setter):
@@ -2547,6 +2565,8 @@ class SessionAuthority:
             }
             if recipe.name == TELEOP_RECIPE:
                 self.run["bench_continuity"] = c.get("bench_continuity", False)
+                if ordinary_profile is not None:
+                    self.run["ordinary_arm_profile"] = copy.deepcopy(ordinary_profile)
                 if self.run["bench_continuity"]:
                     self.run["control_intent"] = {
                         "eligible": True, "device_id": d,
@@ -3443,6 +3463,7 @@ class SessionAuthority:
                 "mode",
                 "live_input",
                 "bench_continuity",
+                "ordinary_arm_profile",
                 "control_intent",
             }
             public = _status_small(run, keys)

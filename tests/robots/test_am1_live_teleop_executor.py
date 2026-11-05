@@ -3560,3 +3560,104 @@ def test_thermal_rejection_unknown_proof_shape_keeps_bounded_original_key_names(
     assert set(frozen["proof_fields"]) == set(proof)
     assert "unexpected_original_member" not in frozen["proof"]
     assert len(json.dumps(frozen, allow_nan=False).encode()) < 8192
+
+
+@pytest.mark.parametrize("right_p", [16, 32])
+def test_ordinary_profile_start_freezes_policy_without_experiment_or_advisory_view(tmp_path, monkeypatch, right_p):
+    from tools.am1_session_core import SessionAuthority
+    e, _ = admitted_executor()
+    a = SessionAuthority(tmp_path, clock=lambda: 10., executor=e)
+    monkeypatch.setattr(e, "begin", lambda recipe: True)
+    policy = {"profile": "ordinary-am1-arms-v1", "right_elbow_p": right_p}
+    expected = copy.deepcopy(policy)
+    try:
+        claim = a._handle({"op": "claim"}, "pc")
+        request = {"op": "start", "operation_id": str(uuid4()), "recipe": "physical-live-teleop",
+                   "controller_generation": claim["controller_generation"], "ordinary_arm_profile": policy}
+        result = a._handle(request, "pc")
+        assert result["accepted"], result
+        assert a.run["ordinary_arm_profile"] == e.ordinary_arm_profile == expected
+        assert a.snapshot()["run"]["ordinary_arm_profile"] == expected
+        assert a.run["bench_continuity"] is False and "control_intent" not in a.run
+        assert "selected_experiment" not in a.run and a.run["recovery_episodes"] == 0
+        policy["right_elbow_p"] = 32 if right_p == 16 else 16
+        assert a.run["ordinary_arm_profile"] == e.ordinary_arm_profile == expected
+        assert not a._handle(request, "pc")["accepted"], "same operation cannot change its ordinary settings policy"
+    finally:
+        a.run = None
+        a.close()
+
+
+@pytest.mark.parametrize("policy", [None, {}, {"profile": "ordinary-am1-arms-v1", "right_elbow_p": True},
+    {"profile": "ordinary-am1-arms-v1", "right_elbow_p": 24},
+    {"profile": "ordinary-am1-arms-v1", "right_elbow_p": 16, "left_elbow_p": 64},
+    {"profile": "foreign", "right_elbow_p": 16}])
+def test_ordinary_profile_start_refuses_invalid_policy_before_binding_or_native_begin(tmp_path, monkeypatch, policy):
+    from tools.am1_session_core import SessionAuthority
+    e, _ = admitted_executor()
+    a = SessionAuthority(tmp_path, clock=lambda: 10., executor=e)
+    began = []
+    monkeypatch.setattr(e, "begin", lambda recipe: began.append(recipe) or True)
+    try:
+        claim = a._handle({"op": "claim"}, "pc")
+        result = a._handle({"op": "start", "operation_id": str(uuid4()), "recipe": "physical-live-teleop",
+            "controller_generation": claim["controller_generation"], "ordinary_arm_profile": policy}, "pc")
+        assert result["accepted"] is False and a.run is None and began == []
+    finally:
+        a.run = None
+        a.close()
+
+
+def test_ordinary_profile_executor_selection_is_copied_and_cannot_change_while_owner_alive():
+    from types import SimpleNamespace
+    e = executor(ControlledHost())
+    policy = {"profile": "ordinary-am1-arms-v1", "right_elbow_p": 32}
+    e.set_ordinary_arm_profile(policy)
+    policy["right_elbow_p"] = 16
+    assert e.ordinary_arm_profile == {"profile": "ordinary-am1-arms-v1", "right_elbow_p": 32}
+    e.worker = SimpleNamespace(is_alive=lambda: True)
+    with pytest.raises(RuntimeError):
+        e.set_ordinary_arm_profile(None)
+    assert e.ordinary_arm_profile["right_elbow_p"] == 32
+    e.worker = None
+    e.set_ordinary_arm_profile(None)
+    assert e.ordinary_arm_profile is None
+
+
+def _ordinary_workspace_for_executor():
+    from examples.alohamini.am1_live_teleop import (
+        ORDINARY_AM1_ARMS_PROFILE, ORDINARY_AM1_ARM_CALIBRATION, ORDINARY_AM1_RAW_BOUNDS, normalized_raw,
+    )
+    value = {"version":1,"workspace_profile":ORDINARY_AM1_ARMS_PROFILE,
+             "calibration":{k:list(v) for k,v in ORDINARY_AM1_ARM_CALIBRATION.items()},
+             "raw_bounds":{k:list(v) for k,v in ORDINARY_AM1_RAW_BOUNDS.items()},
+             "bounds":{},"units":{},"reference":{}}
+    for key,(lower,upper) in ORDINARY_AM1_RAW_BOUNDS.items():
+        cal=ORDINARY_AM1_ARM_CALIBRATION[key[:-4]];gripper=key.endswith("gripper.pos")
+        value["bounds"][key]={"min":normalized_raw(lower,cal,gripper=gripper),
+            "max":normalized_raw(upper,cal,gripper=gripper),
+            "rate_per_s":20. if gripper else 4096/360*5*200/(cal[4]-cal[3])}
+        value["units"][key]="gripper_opening_percent" if gripper else "normalized_arm"
+        value["reference"][key]=normalized_raw((lower+upper)//2,cal,gripper=gripper)
+    return value
+
+
+def test_ordinary_profile_rejects_body_intent_and_foreign_workspace_without_consuming_fresh_input():
+    e,ids=admitted_executor()
+    e.set_ordinary_arm_profile({"profile":"ordinary-am1-arms-v1","right_elbow_p":16})
+    ordinary=_ordinary_workspace_for_executor()
+    e.sample["ack"]["live_input"]["workspace"]=ordinary
+    for key in ordinary["reference"]:e.sample["positions"][key]=ordinary["reference"][key]
+    bad_source=source()
+    assert not e.apply(ordinary["reference"],body={"x.vel":.1,"y.vel":0.,"theta.vel":0.,"lift_axis.vel":0},
+        source=bad_source,valid_until_monotonic_s=10.2,grant_id=bad_source["grant_id"],seq=1,**ids)
+    assert e._live_target is None and e._live_last_seq == -1
+    fresh=source(grant=str(uuid4()))
+    assert e.apply(ordinary["reference"],body={"x.vel":0.,"y.vel":0.,"theta.vel":0.,"lift_axis.vel":0},
+        source=fresh,valid_until_monotonic_s=10.2,grant_id=fresh["grant_id"],seq=1,**ids)
+    accepted=copy.deepcopy(e._live_target)
+    e.sample["ack"]["live_input"]["workspace"]=workspace()
+    foreign=source(seq=2,grant=str(uuid4()))
+    assert not e.apply(dict.fromkeys(KEYS,5.),body={"x.vel":0.,"y.vel":0.,"theta.vel":0.,"lift_axis.vel":0},
+        source=foreign,valid_until_monotonic_s=10.2,grant_id=foreign["grant_id"],seq=2,**ids)
+    assert e._live_target == accepted

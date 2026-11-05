@@ -1675,6 +1675,8 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--am1-right-p20-trial-file")
     parser.add_argument("--am1-left-response-p-trial-file")
     parser.add_argument("--am1-right-response-p-trial-file")
+    parser.add_argument("--am1-ordinary-arm-profile")
+    parser.add_argument("--am1-ordinary-right-elbow-p", type=int)
     parser.add_argument("--am1-admission-fd", type=int)
     parser.add_argument("--am1-host-runtime-s", type=int, default=480)
     parser.add_argument("--am1-physical-state-directory", default=str(Path.home() / ".local/state/am1-session"))
@@ -1790,6 +1792,30 @@ def visible_control_binding(args):
         raise ValueError("Selected experiment file must contain its exact canonical finite JSON")
     args._am1_selected_elbow_experiment = definition
     return dict(binding, experiment_sha256=definition.sha256)
+
+
+def ordinary_arm_profile_binding(args, teleop_binding):
+    """Select an ordinary session policy only inside the existing protected owner."""
+    profile = getattr(args, "am1_ordinary_arm_profile", None)
+    proportional = getattr(args, "am1_ordinary_right_elbow_p", None)
+    if profile is None and proportional is None:
+        return None
+    from .am1_elbow_integral import validate_ordinary_arm_profile_binding
+
+    expected = {"run_id": args.am1_run_id, "host_incarnation": args.am1_host_incarnation, "recipe": "physical-live-teleop"}
+    if (teleop_binding != expected or args.robot_model != "alohamini1" or args.no_follower or not args.no_cameras
+            or not getattr(args, "am1_protected_run_directory", None)
+            or os.environ.get("AM1_VISIBLE_CONTROL_RECIPE") != "physical-live-teleop"
+            or os.environ.get("AM1_SCRIPTED_PREPARE") != "1"
+            or os.environ.get("AM1_SELECTED_JOINT_EVIDENCE") == "1"
+            or os.environ.get("AM1_SHOULDER_INTEGRAL_TEST") == "1"
+            or any(os.environ.get(key) is not None for key in ("AM1_ELBOW_RECOVERY", "AM1_ELBOW_RECOVERY_RECIPE", "AM1_ELBOW_INTEGRAL"))
+            or any(getattr(args, key, None) is not None for key in (
+                "am1_selected_experiment_file", "am1_right_p20_trial_file",
+                "am1_left_response_p_trial_file", "am1_right_response_p_trial_file"))):
+        raise ValueError("ordinary arm profile requires its exact protected WholeRobot owner without an experiment")
+    return validate_ordinary_arm_profile_binding(dict(expected, version=1, profile=profile,
+        workload_segment="ordinary-arms", right_elbow_p=proportional))
 
 
 def left_response_p_trial_binding(args, teleop_binding):
@@ -1911,6 +1937,7 @@ def _run_host(args):
     right_p20_binding = right_p20_trial_binding(args, visible_binding)
     left_response_binding = left_response_p_trial_binding(args, visible_binding)
     right_response_binding = right_response_p_trial_binding(args, visible_binding)
+    ordinary_binding = ordinary_arm_profile_binding(args, visible_binding)
     practical_config = live_elbow_config(None if visible_binding is None else visible_binding["recipe"])
     if right_p20_binding is not None and right_p20_binding["kind"] == "practical13-right":
         from examples.alohamini.am1_session_contract import PracticalElbowConfig
@@ -1947,6 +1974,9 @@ def _run_host(args):
         robot._am1_elbow_recovery_binding = recovery_binding
     if teleop:
         robot._am1_teleop_binding = visible_binding
+        if ordinary_binding is not None:
+            robot._am1_ordinary_arm_profile_binding = ordinary_binding
+            robot._am1_ordinary_arm_profile_directory = args.am1_protected_run_directory
         if left_response_binding is not None:
             robot._am1_left_response_p_binding = left_response_binding
             robot._am1_left_response_p_trial_directory = args.am1_protected_run_directory
@@ -2081,6 +2111,8 @@ def _run_host(args):
                            if getattr(robot, "_am1_left_response_p_trial", None) is not None else {}),
                         **({"right_response_p_trial": robot._am1_right_response_p_trial.receipt}
                            if getattr(robot, "_am1_right_response_p_trial", None) is not None else {}),
+                        **({"ordinary_arm_profile": robot._am1_ordinary_arm_profile.receipt}
+                           if getattr(robot, "_am1_ordinary_arm_profile", None) is not None else {}),
                     })
                 routine_writer.submit("[AM1 TELEOP REST] ", {
                     "binding": robot._am1_teleop_binding,

@@ -774,6 +774,23 @@ def test_left_response_cli_binding_is_opt_in_and_exact_protected_teleop(monkeypa
     assert len(calls) == 2
 
 
+@pytest.mark.parametrize("proportional", [16, 32])
+def test_ordinary_profile_cli_uses_protected_run_without_an_experiment(monkeypatch, proportional):
+    args = SimpleNamespace(robot_model="alohamini1", no_follower=False, no_cameras=True,
+        am1_run_id=str(uuid4()), am1_host_incarnation=str(uuid4()), am1_protected_run_directory="/private/run",
+        am1_ordinary_arm_profile="ordinary-am1-arms-v1", am1_ordinary_right_elbow_p=proportional)
+    identity = {"run_id": args.am1_run_id, "host_incarnation": args.am1_host_incarnation, "recipe": "physical-live-teleop"}
+    monkeypatch.setenv("AM1_VISIBLE_CONTROL_RECIPE", "physical-live-teleop")
+    monkeypatch.setenv("AM1_SCRIPTED_PREPARE", "1")
+    monkeypatch.delenv("AM1_SELECTED_JOINT_EVIDENCE", raising=False)
+    actual = host.ordinary_arm_profile_binding(args, identity)
+    assert actual == dict(identity, version=1, profile="ordinary-am1-arms-v1",
+                          workload_segment="ordinary-arms", right_elbow_p=proportional)
+    args.am1_left_response_p_trial_file = "/private/run/left-response-p.json"
+    with pytest.raises(ValueError, match="without an experiment"):
+        host.ordinary_arm_profile_binding(args, identity)
+
+
 @pytest.mark.parametrize("workload", ["left-maintained", "left-reach"])
 @pytest.mark.parametrize("change", ["other_arm", "right_gripper", "body", "lift", "left_gripper"])
 def test_left_response_native_frames_fence_unselected_targets_before_admission(monkeypatch, workload, change):

@@ -501,6 +501,7 @@ class PhysicalExecutor:
         self._completion_returns = []
         self.positive_prerequisite = None
         self.selected_experiment = None
+        self.ordinary_arm_profile = None
         self._lifecycle = {
             "run_id": None,
             "phase": "idle",
@@ -661,6 +662,14 @@ class PhysicalExecutor:
                 raise RuntimeError("Positive prerequisite cannot change during an active owner")
             self.positive_prerequisite = copy.deepcopy(proof)
 
+    def set_ordinary_arm_profile(self, policy):
+        """Freeze a closed ordinary operating policy before fresh native ownership."""
+        from examples.alohamini.am1_live_teleop import validate_ordinary_arm_profile
+        with self.mutex:
+            if self.worker and self.worker.is_alive():
+                raise RuntimeError("Ordinary settings cannot change during an active owner")
+            self.ordinary_arm_profile = validate_ordinary_arm_profile(policy) if policy is not None else None
+
     def set_selected_experiment(self, definition):
         """Freeze only an authority-validated descriptor before native admission."""
         with self.mutex:
@@ -804,6 +813,8 @@ class PhysicalExecutor:
 
     def bind_run(self, run_id, recipe):
         with self.mutex:
+            if self.ordinary_arm_profile is not None and recipe.name != TELEOP_RECIPE:
+                raise ValueError("Ordinary arms policy requires the whole-frame teleop recipe")
             if recipe.name == SelectedElbowExperiment.recipe_name and self.selected_experiment is None:
                 raise RuntimeError("Selected experiment definition required before binding")
             if (
@@ -962,6 +973,9 @@ class PhysicalExecutor:
             workspace = validate_workspace((self.sample or {}).get("ack", {}).get("live_input", {}).get("workspace"))
             target = validate_target(target, workspace=workspace)
             body = validate_body(body)
+            if self.ordinary_arm_profile is not None and (
+                    workspace.get("workspace_profile") != self.ordinary_arm_profile["profile"] or body != ZERO_BODY):
+                return False
             source = validate_source(source, grant_id=grant_id, previous=self._teleop_source)
         except (KeyError, TypeError, ValueError):
             return False
@@ -1375,6 +1389,8 @@ class PhysicalExecutor:
                 self.run_id, self.host_incarnation, self.recipe, cancel,
                 **({"selected_experiment": self.selected_experiment.payload}
                    if self.recipe.name == SelectedElbowExperiment.recipe_name else {}),
+                **({"ordinary_arm_profile": copy.deepcopy(self.ordinary_arm_profile)}
+                   if self.ordinary_arm_profile is not None else {}),
             )
             while True:
                 with self.mutex:
@@ -1735,7 +1751,7 @@ class PhysicalExecutor:
 BODY_MOTORS = ("base_left_wheel", "base_back_wheel", "base_right_wheel", "lift_axis")
 
 
-def qualified_cleanup_receipt(receipt, run_id, incarnation):
+def qualified_cleanup_receipt(receipt, run_id, incarnation, *, ordinary_arm_profile=None):
     if (
         not isinstance(receipt, dict)
         or receipt.get("version") != 1
@@ -1757,6 +1773,21 @@ def qualified_cleanup_receipt(receipt, run_id, incarnation):
         or readback.get("selected_gain_restore_required")
     ):
         return False
+    ordinary = readback.get("ordinary_arm_profile")
+    if ordinary_arm_profile is not None or ordinary is not None or "ordinary_arm_profile_restore_required" in readback:
+        try:
+            from examples.alohamini.am1_live_teleop import validate_ordinary_arm_profile
+            from lerobot.robots.alohamini.am1_elbow_integral import validate_ordinary_arm_profile_receipt
+            if readback.get("ordinary_arm_profile_restore_required") is not False:
+                return False
+            proof = validate_ordinary_arm_profile_receipt(ordinary, run_id=run_id,
+                                                        host_incarnation=incarnation, restored=True)
+            if ordinary_arm_profile is not None and {
+                    key: proof["binding"][key] for key in ("profile", "right_elbow_p")
+            } != validate_ordinary_arm_profile(ordinary_arm_profile):
+                return False
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return False
     expected = {
         ("left" if "_left_" in k else "right", k.removesuffix(".pos"), "Torque_Enable") for k in JOINT_KEYS
     }
@@ -1854,7 +1885,11 @@ class ProtectedHostRun:
             if hashlib.sha256(Path(path).read_bytes()).hexdigest() != digest:
                 raise RuntimeError("preserved calibration content changed")
 
-    def start(self, run_id, incarnation, recipe, cancel, *, selected_experiment=None):
+    def start(self, run_id, incarnation, recipe, cancel, *, selected_experiment=None, ordinary_arm_profile=None):
+        from examples.alohamini.am1_live_teleop import validate_ordinary_arm_profile
+        ordinary = validate_ordinary_arm_profile(ordinary_arm_profile) if ordinary_arm_profile is not None else None
+        if ordinary is not None and (recipe.name != TELEOP_RECIPE or selected_experiment is not None):
+            raise ValueError("Ordinary arms require the existing whole-frame recipe without an experiment")
         definition = None
         if recipe.name == SelectedElbowExperiment.recipe_name:
             if selected_experiment is None:
@@ -1874,12 +1909,15 @@ class ProtectedHostRun:
 
         self.run_id, self.incarnation = run_id, incarnation
         self.recipe = recipe
+        self.ordinary_arm_profile = copy.deepcopy(ordinary)
         self._validate_source()
         cancel()
         state = Path(self.config["physical_state_directory"])
         if (state / "cleanup-uncertain.json").exists() or (state / "physical-in-progress.json").exists():
             raise RuntimeError("previous physical cleanup requires actual stopped reconciliation")
         pending_response = [state / (side + "-response-p-request.json") for side in ("left", "right")]
+        if ordinary is not None and any(path.exists() or path.is_symlink() for path in pending_response):
+            raise ValueError("Ordinary arms cannot consume a pending legacy response experiment")
         if all(path.exists() or path.is_symlink() for path in pending_response):
             raise ValueError("response P admission requires one selected elbow request")
         # The isolated hardware host unit acquires canonical + serial admission before robot construction.
@@ -1895,18 +1933,19 @@ class ProtectedHostRun:
             consume_right_p20_request,
             consume_right_response_p_request,
         )
-        left_response_p_file = consume_left_response_p_request(
-            state, self.run_directory, recipe.name, run_id, incarnation, self.config["host_head"]
-        )
-        right_response_p_file = None
-        if left_response_p_file is None:
-            right_response_p_file = consume_right_response_p_request(
+        left_response_p_file = right_response_p_file = None
+        if ordinary is None:
+            left_response_p_file = consume_left_response_p_request(
                 state, self.run_directory, recipe.name, run_id, incarnation, self.config["host_head"]
             )
+            if left_response_p_file is None:
+                right_response_p_file = consume_right_response_p_request(
+                    state, self.run_directory, recipe.name, run_id, incarnation, self.config["host_head"]
+                )
         # Named baseline presets derive fixed native settings from the authenticated
         # recipe and this fresh run identity; experimental nonces are unrelated.
         right_p20_file = None
-        if recipe.name not in PRACTICAL_ELBOW_PRESETS:
+        if ordinary is None and recipe.name not in PRACTICAL_ELBOW_PRESETS:
             right_p20_file = consume_right_p20_request(state, self.run_directory, recipe.name,
                                                      run_id, incarnation, self.config["host_head"])
         experiment_file = None
@@ -2012,6 +2051,9 @@ class ProtectedHostRun:
             "--am1-physical-state-directory",
             str(state),
         ]
+        if ordinary is not None:
+            host_command.extend(["--am1-ordinary-arm-profile", ordinary["profile"],
+                                 "--am1-ordinary-right-elbow-p", str(ordinary["right_elbow_p"])])
         if experiment_file is not None:
             host_command.extend(["--am1-selected-experiment-file", str(experiment_file)])
         if right_p20_file is not None:
@@ -2143,7 +2185,8 @@ class ProtectedHostRun:
                 self.client.disconnect()
             except Exception as exc:
                 errors.append("local client close: " + str(exc))
-        motors = qualified_cleanup_receipt(receipt, self.run_id, self.incarnation)
+        motors = qualified_cleanup_receipt(receipt, self.run_id, self.incarnation,
+                                            ordinary_arm_profile=getattr(self, "ordinary_arm_profile", None))
         no_device_effects = self.host is None
         # Required camera remains through host finishing. Release main process once; it cleans its child.
         camera_receipt = None
@@ -2648,6 +2691,8 @@ def main(argv=None):
                         help="Explicit temporary 1-degree inward LEFT shoulder startup allowance for current-rest only")
     args = parser.parse_args(argv)
     profile = CURRENT_REST_WORKSPACE_PROFILES[args.left_response_workload] if args.left_response_workspace is not None else None
+    if args.left_shoulder_startup_degrees is not None and profile is None:
+        parser.error("Left shoulder startup allowance requires the explicit current-rest workspace")
     receipt = prepare_left_response_p_remote(args.config, ssh=args.ssh, ttl_seconds=args.ttl_seconds,
         workspace_profile=profile, left_shoulder_startup_degrees=args.left_shoulder_startup_degrees,
         workload_segment=args.left_response_workload)

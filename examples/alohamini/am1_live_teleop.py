@@ -150,11 +150,55 @@ CURRENT_REST_WORKSPACE_PROFILES = {
     "ordinary-arms": "ordinary-arms-left-current-rest-1051-1164",
 }
 
+# Fixed initial ordinary region, expressed in each installed calibrated encoder.
+# The non-elbow arm rows include a declared three-count normal rest margin;
+# endpoints at calibration limits remain literal limits, never runtime clipping.
+ORDINARY_AM1_ARMS_PROFILE = "ordinary-am1-arms-v1"
+ORDINARY_AM1_ARM_CALIBRATION = {
+    "arm_left_shoulder_pan": (1, 0, -1761, 731, 3438),
+    "arm_left_shoulder_lift": (2, 0, 515, 848, 3223),
+    "arm_left_elbow_flex": (3, 0, 1845, 864, 3073),
+    "arm_left_wrist_flex": (4, 0, -1939, 1314, 3208),
+    "arm_left_wrist_roll": (5, 0, 879, 0, 4095),
+    "arm_left_gripper": (6, 0, 933, 1886, 3401),
+    "arm_right_shoulder_pan": (1, 0, -1719, 752, 3456),
+    "arm_right_shoulder_lift": (2, 0, -1852, 1331, 3264),
+    "arm_right_elbow_flex": (3, 0, -658, 827, 3039),
+    "arm_right_wrist_flex": (4, 0, -1609, 1461, 3167),
+    "arm_right_wrist_roll": (5, 0, 1869, 0, 4095),
+    "arm_right_gripper": (6, 0, -1811, 1657, 3191),
+}
+ORDINARY_AM1_RAW_BOUNDS = {
+    "arm_left_shoulder_pan.pos": (2674, 2793),
+    "arm_left_shoulder_lift.pos": (3106, 3223),
+    "arm_left_elbow_flex.pos": (1051, 1164),
+    "arm_left_wrist_flex.pos": (2762, 2881),
+    "arm_left_wrist_roll.pos": (2421, 2540),
+    "arm_left_gripper.pos": (1886, 3102),
+    "arm_right_shoulder_pan.pos": (2876, 2995),
+    "arm_right_shoulder_lift.pos": (3136, 3255),
+    "arm_right_elbow_flex.pos": (1847, 1960),
+    "arm_right_wrist_flex.pos": (3127, 3167),
+    "arm_right_wrist_roll.pos": (3140, 3259),
+    # RIGHT-specific practical qualification region (about30.052..87.875 opening%).
+    # This is not a claim that every closure or combined pose has been qualified.
+    "arm_right_gripper.pos": (2118, 3005),
+}
+
+
+def validate_ordinary_arm_profile(value):
+    """Closed session policy; authority still comes from ordinary owned Start."""
+    if (type(value) is not dict or set(value) != {"profile", "right_elbow_p"}
+            or value["profile"] != ORDINARY_AM1_ARMS_PROFILE
+            or type(value["right_elbow_p"]) is not int or value["right_elbow_p"] not in (16, 32)):
+        raise ValueError("exact ordinary AM1 arm profile and RIGHT P16/P32 required")
+    return dict(value)
+
 
 def validate_workspace(workspace):
     fields = {"version", "units", "bounds", "reference", "calibration", "raw_bounds"}
     if isinstance(workspace, dict) and "workspace_profile" in workspace:
-        if workspace["workspace_profile"] not in (*CURRENT_REST_WORKSPACE_PROFILES.values(), *_LEFT_ENTRY_WORKSPACE_DESCRIPTORS):
+        if workspace["workspace_profile"] not in (*CURRENT_REST_WORKSPACE_PROFILES.values(), *_LEFT_ENTRY_WORKSPACE_DESCRIPTORS, ORDINARY_AM1_ARMS_PROFILE):
             raise ValueError("unknown native workspace profile")
         fields.add("workspace_profile")
     if (
@@ -166,6 +210,7 @@ def validate_workspace(workspace):
         raise ValueError("closed native workspace required")
     entry_descriptor = _LEFT_ENTRY_WORKSPACE_DESCRIPTORS.get(workspace.get("workspace_profile"))
     entry = entry_descriptor is not None
+    ordinary = workspace.get("workspace_profile") == ORDINARY_AM1_ARMS_PROFILE
     keys = set(TELEOP_ARM_KEYS)
     for field in ("units", "bounds", "reference", "raw_bounds"):
         if not isinstance(workspace[field], dict) or set(workspace[field]) != keys:
@@ -212,7 +257,12 @@ def validate_workspace(workspace):
         endpoints = sorted(normalized_raw(v, cal, gripper=gripper) for v in raw)
         if any(abs(a - b) > 1e-7 for a, b in zip(endpoints, (bounds["min"], bounds["max"]), strict=True)):
             raise ValueError("native raw/normalized workspace roundtrip differs")
-        if entry:
+        if ordinary:
+            if (tuple(cal) != ORDINARY_AM1_ARM_CALIBRATION[key.removesuffix(".pos")]
+                    or tuple(raw) != ORDINARY_AM1_RAW_BOUNDS[key]
+                    or not bounds["min"] <= workspace["reference"][key] <= bounds["max"]):
+                raise ValueError("ordinary AM1 fixed region/calibration/reference differs")
+        elif entry:
             if key == "arm_left_elbow_flex.pos":
                 if (list(cal) != [3, 0, 1845, 864, 3073] or raw[0] != entry_descriptor[0]
                         or not entry_descriptor[1] <= raw[1] <= entry_descriptor[2]
@@ -232,7 +282,8 @@ def validate_workspace(workspace):
         extended_left_closing = (workspace.get("workspace_profile") == CURRENT_REST_WORKSPACE_PROFILES["ordinary-arms"]
                                  and key == "arm_left_gripper.pos" and list(cal) == [6, 0, 933, 1886, 3401]
                                  and list(raw) == [1886, 3102])
-        maximum_span = (160 if entry and key == "arm_left_elbow_flex.pos" else
+        maximum_span = (ORDINARY_AM1_RAW_BOUNDS[key][1] - ORDINARY_AM1_RAW_BOUNDS[key][0] if ordinary else
+                        160 if entry and key == "arm_left_elbow_flex.pos" else
                         3102 - 1886 if extended_left_closing else
                         0.2 * (cal[4] - cal[3]) if gripper else math.floor(10 * 4096 / 360))
         maximum_rate = 20.0 if gripper else 5 * 4096 / 360 * 200 / (cal[4] - cal[3])

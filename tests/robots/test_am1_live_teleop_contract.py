@@ -19,6 +19,28 @@ def contract():
     return importlib.import_module(name)
 
 
+@pytest.mark.parametrize("value", [
+    {}, {"profile": "ordinary-am1-arms-v1", "right_elbow_p": True},
+    {"profile": "ordinary-am1-arms-v1", "right_elbow_p": 20},
+    {"profile": "other", "right_elbow_p": 16},
+    {"profile": "ordinary-am1-arms-v1", "right_elbow_p": 16, "extra": 1},
+])
+def test_ordinary_arm_policy_rejects_open_or_unsupported_settings(value):
+    validate = getattr(contract(), "validate_ordinary_arm_profile", None)
+    assert callable(validate), "ordinary profile must validate before authority or native settings"
+    with pytest.raises(ValueError):
+        validate(value)
+
+
+@pytest.mark.parametrize("proportional", [16, 32])
+def test_ordinary_arm_policy_is_closed_and_copied(proportional):
+    validate = getattr(contract(), "validate_ordinary_arm_profile", None)
+    assert callable(validate), "ordinary profile must validate before authority or native settings"
+    value = {"profile": "ordinary-am1-arms-v1", "right_elbow_p": proportional}
+    result = validate(value)
+    assert result == value and result is not value
+
+
 def source(seq=1, grant=None):
     return {
         "kind": "virtual-leaders",
