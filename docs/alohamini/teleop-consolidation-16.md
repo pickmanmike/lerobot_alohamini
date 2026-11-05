@@ -692,6 +692,51 @@ One stopped format inventory found all five roles advertise MJPEG/YUYV, includin
 
 ## Verification and ordinary use
 
+
+### Ordinary two-arm profile and input boundary
+
+The [canonical current-state record](current-state.md#current-operation-and-installation) identifies the actual installed profile, component bindings, rollback and physical qualification. The new `ordinary-am1-arms-v1` procedure below is implemented but its affected-component staging and useful operating qualification are still in progress. Earlier LEFT response-experiment invocations below are historical; their nonce is not the normal profile's permission token.
+
+Use the existing enrolled Edge profile through `tools/run_am1_console.ps1 -SoftwareVideoDecode` and leave the actual **Working camera** visible. Normal operation requires useful current onboard imagery, not only frame counters or advisory P1. P1 images use the owner's exact 180° orientation; physical USB-leader connection remains deferred.
+
+The stable private `ordinary-am1-arms.private.json` selects the current immutable deployment binding/hash, existing HTTPS origin/CA/enrollment/output directory, prospective input duration and the closed `{profile, right_elbow_p}` policy. Its version1 schema accepts only those documented fields; relative paths resolve from that configuration's parent. Configuration changes happen at a reviewed deployment/policy boundary, not by hand-authoring a new experiment request each run. Every invocation freezes a fresh configuration/binding/invocation/audit context and creates a new UUID output; native settings capture, OFF verification and durable restoration remain required.
+
+```powershell
+Set-Location 'C:/Users/pickm/.codex/worktrees/am1-reliability-01/lerobot_alohamini_client'
+$env:AM1_PROJECT_ROOT = 'C:/Users/pickm/lerobot_alohamini_client'
+$env:PYTHONUTF8 = '1'
+$env:PYTHONDONTWRITEBYTECODE = '1'
+$env:PYTHONPATH = "$PWD/src;$PWD;$PWD/.cache/am1-session-pi-01/http-overlay"
+uv run --no-sync --project $env:AM1_PROJECT_ROOT python -u -B -m tools.am1_leader_adapter `
+  --ordinary-config '.cache/am1-knowledge-reuse-18/ordinary-am1-arms.private.json' `
+  --virtual-input interactive
+```
+
+Wait for actual admission/ready before acquiring a movement intention. The existing input accepts `move SECONDS VALID_FOR joint=value...`, `hold VALID_FOR`, `return SECONDS VALID_FOR` and `finish`; targets may change any subset of the twelve published keys, with omitted joints retaining their admitted command. `SECONDS` is a rate-checked transition and `VALID_FOR` bounds that acquired intention; neither extends the original run deadline. Published keys are `arm_{left,right}_{shoulder_pan,shoulder_lift,elbow_flex,wrist_flex,wrist_roll,gripper}.pos`; interactive input also accepts the shorter names without `arm_`/`.pos`. Read actual bounds/reference/current command from the fresh admission, rather than copying old raw poses. A timed transition or hold is not evidence of physical arrival.
+
+Deliberate Pause/Resume support is being verified for the virtual changing-input source at this PC entrypoint. USB acquisition can select the operating policy but still follows its existing Pause/refusal→Stop behavior; held re-engagement is not newly implemented or validated for USB. Physical USB leaders remain deferred. Future Quest input must wire its explicit control/rearm events into the common qualified helpers rather than assuming that acquisition alone supplies this lifecycle. Its intended procedure is explicit `pause VALID_FOR`, wait for the qualified paused acknowledgment, explicit `resume VALID_FOR`, wait for resumed acknowledgment, then acquire a **new** movement intention. Pause never expires into automatic motion, and buffered movement is discarded at both boundaries. `finish` performs the owned held/zero qualification and normal restoration; the existing browser **Stop** or adapter cancellation stops instead of replaying activity. Newer Pause, Stop, takeover and owner reboot prevail. Do not advertise this lifecycle as physically exercised until the canonical current state records that result.
+
+The single existing coordinator can supply a representative changing-input session using `--ordinary-config` and `--plan ordinary-arms`; it does not create a new Pi trajectory or motor protocol. Its fixed endpoints are derived once from the admitted run, and refusal to fit the full declared excursion is reported instead of silently shrinking or recentering it. Normal pause/re-engagement and fresh reuse are separate results from phase completion.
+
+The declared initial qualification envelope is below. Positioning values use `normalized_arm`; grippers use opening percentage. Raw counts show the exact fixed boundaries for the accepted calibration, not URDF angles. The region is not a claim that every joint combination is clear or that every endpoint has been achieved.
+
+| Joint | LEFT normalized bounds (raw counts) | RIGHT normalized bounds (raw counts) |
+| --- | --- | --- |
+| shoulder_pan | 43.554..52.346 (2674..2793) | 57.101..65.902 (2876..2995) |
+| shoulder_lift | 90.147..100.000 (3106..3223) | 86.756..99.069 (3136..3255) |
+| elbow_flex | -83.069..-72.838 (1051..1164) | -7.776..2.441 (1847..1960) |
+| wrist_flex | 52.904..65.470 (2762..2881) | 95.311..100.000 (3127..3167) |
+| wrist_roll | 18.242..24.054 (2421..2540) | 53.358..59.170 (3140..3259) |
+| gripper | 0.000..80.264 (1886..3102) | 30.052..87.875 (2118..3005) |
+
+Positioning rate is at most5 encoder degrees/s, converted into each calibration's normalized units; grippers are at most20 opening points/s. The actual workspace publishes the exact rates. LEFT uses tested temporary P32/I0/D32/Acceleration254, RIGHT explicitly P16 or the scoped temporary P32 comparison with I0/D32/Acceleration0, and other joints retain baseline. Both elbow originals are captured and restored; there is no permanent EEPROM default change. Body/lift movement intent stays zero. The original300s native ceiling and prospective configured input window remain fixed within each operation; movement expiry250ms and sensing/required-view freshness500ms are independent of controller lifetime.
+
+### Quest handoff boundary
+
+Quest should supply genuinely acquired, expiring intentions at the existing producer boundary before mapping, clutch, FrameProducer, grant/transport and sole-owner execution. Each arm has five positioning joints plus one opening-percentage gripper. Headset/controller pose needs a later calibrated pose/IK mapping into these normalized targets; the current bounds are not an anatomical or URDF joint model. Preserve actual headset sample time through transport, reject replay, and qualify the actual headset's useful view. A cached pose or healthy desktop video cannot stand in for current headset input or viewing. No Quest app, autonomy stack, THETA dependency or new GPU environment is implemented by this continuation.
+
+### Historical procedure and source-specific evidence
+
 Use the established AM1_PROJECT_ROOT, uv --no-sync environment, enrolled software-decoder viewer and explicit current matched binding. Restore the actual native camera pane before Start; Chest is fixed and physical USB leaders remain deferred. The ordinary application/state check and fresh current-rest admission supply actual references; never replay an old raw reference.
 
 For an unloaded useful close/move/original-return/reopen, the current existing command is:

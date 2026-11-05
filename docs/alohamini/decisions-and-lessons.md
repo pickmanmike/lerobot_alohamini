@@ -24,6 +24,8 @@ The explicit candidate correction is limited to powered AM1 live teleoperation: 
 
 ## MOTOR-01: useful movement before micro-positioning
 
+- **Matched interval, different operating conditions:** Packet13 next Start and48565af9 both measured1854→hardwareGoal1960 (9.316° requested), reaching1932 (6.855°) versus1895 (3.604°). Historical full-target delivery lasted2.243s; current upper-target acknowledgments spanned2.569s with two actual Goal reads1.001s apart, before its sole input hold. Current sparse effort214.5–247mA at11.7V exceeds historical45.5mA/11.8V samples, but whole-arm poses differ substantially. Acceleration254 occurred in strong and other weak cases; Acceleration0 alone is not an established cause. Preserve unknown historical external loading and avoid a blanket gain/acceleration inference.
+
 - **Current-path context:** Packet13/14 and Actual89 proved useful RIGHT P16 motion, re-jog and reuse; later weak response does not erase it.2f delivered actualGoal1945 but achieved1.494° of7°;48565af9 then achieved3.604° per direction with fixed fresh corridor endpoints, without tuning. Preparation reached1854 rather than1847; original-return residual−1.055° remains. Compare fresh pose, endpoints, rate and achieved preparation before assigning causation. The nominal10° recipe does not authorize a relative10° move from every interior pose or a compensation multiplier.
 
 - **Accepted / scope:** useful ordinary elbow motion at nominal 10 degrees and approximately 5 degrees/s; stop stimulus escalation when the task-relevant behavior works. Exact endpoint return/sub-degree response is not an ordinary-use prerequisite.
@@ -32,6 +34,8 @@ The explicit candidate correction is limited to powered AM1 live teleoperation: 
 - **Reopen:** task-relevant response/accuracy deficiency in the actual new path. Do not infer exact target delivery, load-independent precision, a 10/6 multiplier or quantized leader gestures.
 
 ## MOTOR-02: retain role-specific settings and units
+
+- **Ordinary profile candidate, not yet deployed:** `ordinary-am1-arms-v1` captures verified OFF originals and restores them durably. Its intentional settings are LEFT P32/I0/D32/Acceleration254 and explicitly selected RIGHT P16 or temporary P32/I0/D32/Acceleration0; other joints retain baseline. RIGHT dead zones/Max_Torque_Limit must come from actual sole-owner startup reads, not historical defaults. The fixed declared qualification region is separate from calibrated full travel or proof of every combined pose. See the canonical current state for deployment and physical scope.
 
 - **Do not transfer LEFT conditions to RIGHT:** current RIGHT baseline is P16/I0/D32/Acceleration0.2f sparse right-bus ID3 samples show175.5mA, signed Present_Load−260,11.7V/status0 at Goal1945/PP1883; these are real effort indicators, not calibrated torque, proven saturation or a supply diagnosis. The historical selected500mA host ceiling is not established for this ordinary path.
 
@@ -52,6 +56,8 @@ The explicit candidate correction is limited to powered AM1 live teleoperation: 
 - **Reopen:** an actual discrepancy in that chain or task-relevant positioning failure; elapsed time, browser cursor or accepted-message counts alone are insufficient motion evidence.
 
 ## START-01: accept actual supported normal rest
+
+- **Measured reference and legal command origin are distinct:** preserve both in ordinary sequencing. A legal current HOLD command can differ from the measured Start reference because of retained Goal/feedback offsets; do not impose equality as an exact-reset gate. Derive fixed full endpoints once, refuse an unsupported excursion explicitly, and retain measured achieved endpoints and residuals. Never shrink or recenter a failed action silently.
 
 - **Accepted / scope:** keep fresh measured q0, fixed supported workspace and new-gesture cursor separate. Freeze the actual nonselected Goals within a run. New Start measures rest without requiring old encoder fingerprints; repeated Starts cannot ratchet the workspace.
 - **Result/source:** [Packet14][p14] next right Start accepted actual left Goal2101 instead of the earlier2124 anchor; [Packet13][p13] used supported initial return when needed without manual positioning or deadline renewal.
@@ -93,6 +99,10 @@ The explicit candidate correction is limited to powered AM1 live teleoperation: 
 - **Entrypoint exception identity:** Combined27 shows that a `-m` owner defines its sentinel in `__main__`, while importing the named owner module in a shared catch creates a different class. Keep ordinary expiry handling at the owning boundary using its exact sentinel; preserve completed hold, failed-write/cursor fences and hard-fault propagation. Test the actual entrypoint namespace, not only a named import. The narrow correction passes335affected checks/8skips/scoped lint/independent review and all ten Stage24 stopped/idle phases; physical qualification remains separate.
 
 ## COMM-02: ordinary pause and ambiguous Start have distinct meanings
+
+- **Explicit virtual Pause:** the reviewed path holds until explicit fresh Resume and discards movement across both barriers. An accepted Resume need not fabricate a new `resumed` history event: correlate the exact old Pause, fresh connection/release, accepted new revision and native active acknowledgment before consuming only that old Pause locally. A newer Pause/Stop/takeover/reboot still prevails. After a known Grant/Input refusal, reconcile an authenticated same-run Pause instead of treating stale running WSS state as current authority. USB held re-engagement and Quest control acquisition remain separate unvalidated scope.
+
+- **Zero-input failures:** realistic existing Core→IPC→TLS fixtures demonstrate owned certain cleanup followed by an explicitly fresh ordinary Start for initial view qualification timeout and reporting/renewal loss before PC-observed admission. The fresh operation has new identity/reference/deadline/input channel; failed summaries stay immutable. Uncertain cleanup still blocks it. These are software recovery checks, not new powered or physical-leader validation.
 
 - **Preserve a confirmed transition before concurrent renewal failure:**7fa2 ended after an unknown renewal during late reopening; the last acknowledged lease still covered the earlier view pause and Stop, so lease expiry is not its demonstrated cause. Independent real Core/IPC/TLS/WSS replay exposed two orderings in which a positively accepted Resume, a new ordinary view pause and an unknown renewal lost their existing composition. Classify only that exact accepted/revision+2/identity/event transition, immediately check current proof, then authenticate the same HOLD before renewal reconciliation. Reuse full held/view/new-ACK qualification under the original ceiling; never revive expired authority, accept an unknown Resume or replay old input. Sixty focused checks cover both orderings and retained refusal/finishing behavior. The actual historical inner chain remains unknown; software qualification is not retrospective physical recovery credit.
 
@@ -151,6 +161,8 @@ The explicit candidate correction is limited to powered AM1 live teleoperation: 
 
 ## DEPLOY-01: verify actual imports and matched rollback
 
+- **Proof dependencies:** bind ordinary settings to the actual five Motor source files and the two shared Runtime copies; unrelated gateway changes must not invalidate unchanged Motor proof. Outer current Runtime/import/stopped-owner checks remain mandatory. Component projection starts from installed rows and takes only reviewed deltas; an older repository reconciliation change outside those deltas is not implicitly deployed. Keep full matched rollback before either owner advances.
+
 - **Accepted / scope:** inspect the actual service interpreter, cwd and import path before crediting a correction. Keep separate motor/runtime/camera/helper pins, compatible manifest and complete matched rollback; source publication, tests and installation are separate.
 - **Result/source:** [Packet16][p16] Combined10 imported the old runtime copy although the corrected client was in the motor checkout. Stage10 verified the actual runtime import and nine non-actuating request-accounting cases; no new production packages were installed.
 - **Implementation/tests/status:** [current deployment and rollback](current-state.md#published-tested-and-deployed-are-separate), private Packet16 publication/staging records; [lean launcher tests](../../tests/robots/test_am1_lean_launchers.py). Known installed identity is recorded, not inferred from this branch HEAD. Packet18's retained runtime has immediate chain `cdbd…` → `68118…` → full base `f8ff…`; full-context base and immediate parent are different facts. Both builder and native verifier must consume that exact chain/file closure. Failed partial staging is preserved under existing locks and requalified before a fresh retry; never overwrite old receipts or assume the staging bundle is still the old rollback bundle.
@@ -171,6 +183,8 @@ Virtual changing input remains at the existing acquisition/mapping/transport/exe
 - **Reopen:** concrete task evidence changing product priorities or proving a shared-path gap. Do not substitute more per-joint menus or precision scores for the representative combined workload.
 
 ## PROCESS-02: one lean runner, focused informative checks
+
+- **Current foundation scope:** continue changing twelve-target virtual input through the same acquisition/mapping/transport/execution boundary, with one closed normal profile and finite declared activity. Close ordinary Pause/re-engagement, Finish and fresh reuse without turning separate fixed elbow routines, test counts or source integration into completion. A supported explicit tool-argument correction is a tool-error retry, not a new robot hypothesis or approval cycle.
 
 - **Use the same side-aware path:** add only selection/sequencing at the existing coordinator when native ordinary-arms admission already supports that role.2f completed354frames/23.537active with one1.458s operating hold and no human intervention; modest elbow response still limits useful reach. Latest48565af9 completed465frames/30.289active with one.876s operating hold, longestRunning25.271s and113 accepted renewals/no failures. Preserve failed zero-input prefixes separately; do not require a further success streak. Logging correlation alone is not a transport repair.
 
@@ -299,6 +313,8 @@ The practical-use continuation supersedes earlier experiment-specific retry/dura
 - **Completed builds, missing wrapper closure:** Stage57 built the exact full13/full22 projections, then the final local wrapper refused five retained115 originals absent from its upload list. Keep the successful bundles and original refusal; repair the existing exact-case common wrapper, verify the real artifact-to-audit path, and finish only missing metadata. The reviewed correction passed10 focused checks; no rebuild or extra native attempt was needed. Browser-control tool reconnection is separate from source/decoder behavior: reuse the enrolled open-only launcher/profile, not new pairing or a new streaming stack.
 
 ## EVIDENCE-01: retain success, first cause and limits
+
+- **Full interval accounting:** report measured preparation, actual maintained target opportunity, operating holds and sparse hardware Goal reads separately. Native active acknowledgments do not add hardware samples. A released finite camera source, retrieved original frames, decoded presentation and useful scene geometry are separate claims; an expired window alone does not verify release.
 
 - **Audit context is separate from physical outcome:** a Gateway-only runtime successor can leave an existing pure settings proof valid but its private source-registration chain incomplete. Preserve each refused audit and all original artifacts; correct the exact context/production-proof path with negative tests and a fresh output, without modifying native evidence or repeating motion.2f audit03 passed with the same nativeSHA after both refused outputs were retained;48565af9 then passed its first strict audit. An unobserved PC admission remains unobserved in corrected analysis.
 

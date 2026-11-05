@@ -231,6 +231,243 @@ def test_virtual_intent_reader_stamps_friendly_input_and_keeps_only_latest_comma
     reader.close()
 
 
+def test_ordinary_control_reader_keeps_pause_barrier_ahead_of_later_movement():
+    m, now = adapter(), [10.]
+    reader = m.VirtualIntentReader("interactive", clock=lambda: now[0], allow_controls=True)
+    reader.receive_line("move 1 4 right_elbow_flex=1\n")
+    reader.receive_line("pause 4\n")
+    reader.receive_line("move 1 4 right_elbow_flex=2\n")
+    assert reader.take()["op"] == "pause"
+    assert reader.control_generation == reader.taken_control_generation == 1
+    floor = reader.discard_motion()
+    assert floor == 3 and reader.take() is None
+    now[0] = 10.1
+    reader.receive_line("resume 4\n")
+    old_resume = reader.take()
+    generation = reader.taken_control_generation
+    reader.receive_line("pause 4\n")
+    assert old_resume["op"] == "resume" and generation < reader.control_generation
+    assert reader.take()["op"] == "pause"
+
+
+def test_ordinary_control_reader_finish_and_bounded_queue_cannot_be_overwritten():
+    m = adapter()
+    reader = m.VirtualIntentReader("interactive", clock=lambda: 10., allow_controls=True)
+    reader.receive_line("pause 4\n")
+    reader.receive_line("finish\n")
+    reader.receive_line("move 1 4 right_elbow_flex=2\n")
+    assert reader.finished
+    assert [reader.take()["op"], reader.take()["op"]] == ["pause", "finish"]
+    assert reader.take() is None
+    another = m.VirtualIntentReader("interactive", clock=lambda: 10., allow_controls=True)
+    for _ in range(8):
+        another.receive_line("pause 4\n")
+    with pytest.raises(ValueError, match="bounded"):
+        another.receive_line("resume 4\n")
+    assert [another.take()["op"] for _ in range(8)] == ["pause"] * 8
+
+
+def test_ordinary_control_expired_finish_requires_a_new_acquisition_after_rejection():
+    m, now = adapter(), [10.]
+    reader = m.VirtualIntentReader("interactive", clock=lambda: now[0], allow_controls=True)
+    reader.receive_line("finish")
+    old = reader.take()
+    now[0] = 12.
+    reader.receive_line("move 1 2 right_elbow_flex=2")
+    assert reader.take() is None  # Pending Finish cannot be silently countermanded.
+    reader.discard_rejected_finish(old["seq"])
+    reader.receive_line("finish")
+    fresh = reader.take()
+    assert fresh["op"] == "finish" and fresh["seq"] > old["seq"]
+    assert fresh["issued_at_perf_counter_s"] == 12. and fresh["expires_at_perf_counter_s"] == 13.
+
+
+@pytest.mark.parametrize("op", ["move", "resume", "pause", "finish"])
+def test_ordinary_control_receive_parse_race_enforces_acquisition_epoch_and_preserves_barriers(op):
+    import threading
+
+    m = adapter()
+    acquired, release = threading.Event(), threading.Event()
+    main = threading.get_ident()
+    def clock():
+        if threading.get_ident() != main:
+            acquired.set()
+            assert release.wait(2.)
+            return 10.
+        return 12.
+    reader = m.VirtualIntentReader("interactive", clock=clock, allow_controls=True)
+    line = "move 1 10 right_elbow_flex=2" if op == "move" else "finish" if op == "finish" else op+" 10"
+    worker = threading.Thread(target=reader.receive_line, args=(line,))
+    worker.start()
+    try:
+        assert acquired.wait(2.)
+        reader.discard_motion()  # Actual accepted Resume/HOLD acquisition boundary.
+    finally:
+        release.set(); worker.join(2.)
+    assert not worker.is_alive()
+    result = reader.take()
+    assert (result is None) is (op in {"move", "resume"})
+    if result is not None: assert result["op"] == op
+
+
+@pytest.mark.parametrize("op", ["move", "hold", "return", "resume", "pause", "finish"])
+def test_ordinary_control_jsonl_old_issued_time_cannot_become_fresh_after_resume_receipt(op):
+    import json
+
+    m = adapter()
+    reader = m.VirtualIntentReader("jsonl", clock=lambda: 12., allow_controls=True)
+    reader.discard_motion()
+    value = dict(seq=1, op=op, intent_channel=reader.intent_channel,
+                 issued_at_perf_counter_s=10., expires_at_perf_counter_s=20.)
+    if op in {"move", "return"}: value["transition_seconds"] = 1.
+    if op == "move": value["targets"] = {"arm_right_elbow_flex.pos": 2.}
+    reader.receive_line(json.dumps(value))
+    result = reader.take()
+    assert (result is None) is (op not in {"pause", "finish"})
+    if result is not None: assert result == value
+
+
+@pytest.mark.parametrize("changed", ["extra", "channel", "lifetime", "boolean_seq"])
+def test_ordinary_control_jsonl_uses_closed_original_acquisition_envelope(changed):
+    import json
+
+    m = adapter()
+    reader = m.VirtualIntentReader("jsonl", clock=lambda: 10., allow_controls=True)
+    value = dict(seq=1, op="pause", intent_channel=reader.intent_channel,
+                 issued_at_perf_counter_s=10., expires_at_perf_counter_s=14.)
+    if changed == "extra": value["targets"] = {}
+    elif changed == "channel": value["intent_channel"] = str(uuid4())
+    elif changed == "lifetime": value["expires_at_perf_counter_s"] = float("inf")
+    else: value["seq"] = True
+    with pytest.raises(ValueError):
+        reader.receive_line(json.dumps(value))
+    assert reader.take() is None
+
+
+def ordinary_paused_control_client():
+    import copy
+    import types
+    m = adapter()
+    client, _ = held_command119_client()
+    state = client.snapshot
+    client.fixture_state = state
+    state["run"].update(recovery_episodes=0, bench_continuity=False, operation_id=str(uuid4()))
+    state["events"][-1].update(kind="pause", at=100.2)
+    state["evidence"]["measured_body"] = dict(m.ZERO_BODY)
+    client.connection, client.sequence, client.transport_error = str(uuid4()), 0, None
+    client.ws, client.reader = None, None
+    commands = []
+    def identities():
+        return dict(run_id=state["run"]["run_id"], service_incarnation=state["service_incarnation"],
+                    host_incarnation=state["run"]["backend_incarnation"], controller_generation=client.generation,
+                    connection_generation=client.connection, intent_revision=state["run"]["intent_revision"])
+    def change(kind=None, active=False):
+        run, evidence, live = state["run"], state["evidence"], state["run"]["live_input"]
+        run["remaining_s"] -= .001
+        run["intent_revision"] += 1
+        run["status"] = "running" if active else "paused"
+        if kind:
+            state["events"].append(dict(kind=kind, at=run["deadline"]-run["remaining_s"],
+                run_id=run["run_id"], service_incarnation=state["service_incarnation"]))
+        revision = run["intent_revision"]
+        live["cursor_intent_revision"] = evidence["acknowledged_intent_revision"] = revision
+        evidence["active_acknowledged"] = active
+        evidence["hold_acknowledged"] = not active
+        evidence["accepted_host_action"].update(intent_revision=revision, state="active" if active else "paused",
+            acquired_at_monotonic_s=run["deadline"]-run["remaining_s"], epoch=revision+1)
+    async def get(path): return {"snapshot": copy.deepcopy(state)}
+    async def post(path, body):
+        commands.append(dict(op=path, **body))
+        assert path == "pause"
+        change("pause")
+        return dict(accepted=True, status="paused", uncertain=False, effect_admitted=False)
+    async def command(value, **kwargs):
+        commands.append(dict(value))
+        if value["op"] == "connect":
+            client.connection = str(uuid4()); change()
+            return dict(connection_generation=client.connection, snapshot=state)
+        if value["op"] == "release_input":
+            return dict(accepted=True, status="released", effect_admitted=False)
+        assert value["op"] == "resume"
+        change("resumed", active=True)
+        return dict(accepted=True, status="running", effect_admitted=True)
+    async def wait(predicate, seconds):
+        assert predicate(), "fixture provides current real-method qualification proof"
+    client.identities, client.get, client.post, client.command, client.wait = identities, get, post, command, wait
+    client.resume = types.MethodType(m.SessionClient.resume, client)
+    return client, commands, change
+
+
+def test_explicit_pause_reuses_current_hold_then_generic_fresh_resume_without_input():
+    import asyncio
+    m = adapter()
+    client, commands, _ = ordinary_paused_control_client()
+    guard = m.SameRunRecovery(client, lambda value: None)
+    original = guard.original.copy()
+    async def check():
+        proof = await guard.finish_owned(bench=False, wall_deadline=m.time.monotonic()+2,
+            renewal_check=lambda: None, deliberate=True, observed_pause=client.snapshot["events"][-1])
+        assert proof["native_held_qualified"] and proof["pause_operation_id"] is None
+        await guard.resume_paused(proof, wall_deadline=m.time.monotonic()+2, renewal_check=lambda: None,
+                                  control_check=lambda: None)
+    asyncio.run(check())
+    assert [value["op"] for value in commands] == ["connect", "release_input", "resume"]
+    assert client.snapshot["run"]["status"] == "running" and guard.original == original
+
+
+def test_deliberate_pause_unknown_receipt_replays_only_same_operation_and_keeps_hold():
+    import asyncio
+    m = adapter()
+    client, commands, _ = ordinary_paused_control_client()
+    guard = m.SameRunRecovery(client, lambda value: None)
+    post, bodies, accepted = client.post, [], []
+    async def lost(path, body):
+        bodies.append(dict(body))
+        if not accepted:
+            accepted.append(await post(path, body))
+            from tools.am1_session_service import unknown_outcome
+            raise m.HTTPOutcomeError(503, unknown_outcome())
+        assert body == bodies[0]
+        return accepted[0]
+    client.post = lost
+    async def check():
+        result = await guard.finish_owned(bench=False, deliberate=True,
+            wall_deadline=m.time.monotonic()+2, renewal_check=lambda: None)
+        assert result["pause_operation_id"] == bodies[0]["operation_id"]
+        assert result["native_held_qualified"] is True
+    asyncio.run(check())
+    assert len(bodies) == 2 and bodies[0] == bodies[1]
+    assert [value["op"] for value in commands] == ["pause"]
+
+
+@pytest.mark.parametrize("fault", ["new_pause", "stop", "reboot", "takeover", "local_barrier"])
+def test_explicit_resume_keeps_newer_pause_stop_and_authority_changes(fault):
+    import asyncio
+    m = adapter()
+    client, commands, change = ordinary_paused_control_client()
+    guard = m.SameRunRecovery(client, lambda value: None)
+    async def check():
+        proof = await guard.finish_owned(bench=False, wall_deadline=m.time.monotonic()+2,
+            renewal_check=lambda: None, deliberate=True, observed_pause=client.snapshot["events"][-1])
+        if fault == "new_pause": change("pause")
+        elif fault == "stop": client.fixture_state["run"]["status"] = "stopped"
+        elif fault == "reboot": client.fixture_state["service_incarnation"] = str(uuid4())
+        elif fault == "takeover": client.fixture_state["controller"]["controller_generation"] = str(uuid4())
+        def control():
+            if fault == "local_barrier": raise RuntimeError("newer local Pause")
+        with pytest.raises(RuntimeError):
+            await guard.resume_paused(proof, wall_deadline=m.time.monotonic()+2,
+                                      renewal_check=lambda: None, control_check=control)
+    asyncio.run(check())
+    assert not commands
+
+
+@pytest.mark.parametrize("ending", ["control_cycle", "control_finish", "control_expired_resume", "control_new_pause", "control_lost_resume", "control_finish_race"])
+def test_ordinary_runner_explicit_pause_requires_new_resume_and_movement(tmp_path, monkeypatch, ending):
+    test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
+        tmp_path, monkeypatch, "normal_program_finish_ordinary_arms_intents_" + ending)
+
+
 @pytest.mark.parametrize("line", ["move 1 2 body.x=1\n", "move nan 2 left_gripper=4\n",
                                  "hold inf\n", "{" * 4097], ids=["body", "nan", "infinite", "oversized"])
 def test_virtual_intent_reader_rejects_invalid_or_oversized_input_without_fresh_sample(line):
@@ -1632,6 +1869,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
     cycle_run = failure in {"normal_program_finish_left_reach_cycles", "normal_program_finish_left_reach_closing_cycles"}
     ordinary_arms = isinstance(failure, str) and failure.startswith("normal_program_finish_ordinary_arms")
     changing_intents = ordinary_arms and "_intents" in failure
+    control_case = changing_intents and failure.endswith(("control_cycle", "control_finish", "control_expired_resume", "control_new_pause", "control_lost_resume", "control_finish_race"))
     entry_case = changing_intents and "_intents_entry" in failure
     finish_recovery = changing_intents and failure.endswith("expired_finish_recovery")
     pending_recovery_finish, recovery_reader = [], []
@@ -2107,7 +2345,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                             host_incarnation="host", intent_revision=self.snapshot["run"]["intent_revision"])
             return {"run_id": self.snapshot["run"]["run_id"] if foreign_boundary else owned_id}
 
-        async def resume(self, *, check=None, refusal_record=None):
+        async def resume(self, *, check=None, refusal_record=None, qualification_ceiling=None):
             assert self.snapshot["run"]["run_id"] == owned_id
             if failure in {"bench_renewal_during_resume", "bench_renewal_attach_ceiling"} and self.resumes == 0:
                 self.resumes += 1
@@ -2157,6 +2395,13 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 ]
                 self.connection = str(uuid4())
                 self.sequence = 0
+                if control_case:
+                    self.snapshot["events"] = [{"kind": "resumed", "at": 2., "run_id": owned_id, "service_incarnation": "service"}]
+                    self.snapshot["evidence"]["active_acknowledged"] = True
+                    if failure.endswith("control_lost_resume") and self.resumes == 2:
+                        raise TimeoutError("original explicit Resume outcome lost after admission")
+                    if failure.endswith("control_finish_race") and self.resumes == 2:
+                        recovery_reader[-1].finished = True
 
         async def command(self, payload, *, check=None):
             if check is not None:
@@ -2609,15 +2854,51 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                         self.delivered = set()
                         self.waits = 0
                         self.intent_channel = options["intent_channel"]
-                        if finish_recovery:
+                        if control_case:
+                            self.control_generation = self.taken_control_generation = self.sequence = self.revision = 0
+                            self.discards = 0
+                        if finish_recovery or control_case:
                             recovery_reader.append(self)
                     def start(self):
                         assert not instances, "stdin acquisition must begin before ownership/cold startup"
                     def close(self):
                         pass
+                    def discard_motion(self):
+                        self.discards += 1
+                        self.revision += 1
+                        return self.sequence
                     def take(self):
                         session = instances[0]
                         count = len(session.inputs)
+                        if control_case:
+                            if not self.delivered: name, op = "first", "move"
+                            elif count >= 3 and "pause" not in self.delivered: name, op = "pause", "pause"
+                            elif self.discards and "resume" not in self.delivered:
+                                name, op = "resume", "finish" if failure.endswith("control_finish") else "resume"
+                            elif failure.endswith("control_new_pause") and "resume" in self.delivered and "second_pause" not in self.delivered:
+                                name, op = "second_pause", "pause"
+                            elif failure.endswith(("control_expired_resume", "control_lost_resume", "control_new_pause", "control_finish_race")) and "resume" in self.delivered:
+                                if "finish" in self.delivered: return None
+                                name, op = "finish", "finish"
+                            elif session.resumes >= 2 and "new_move" not in self.delivered: name, op = "new_move", "move"
+                            elif count >= 6 and "finish" not in self.delivered: name, op = "finish", "finish"
+                            else: return None
+                            self.delivered.add(name)
+                            self.sequence += 1
+                            self.revision += 1
+                            self.taken_revision = self.revision
+                            if op == "pause": self.control_generation += 1
+                            self.taken_control_generation = self.control_generation
+                            command = dict(seq=self.sequence, op=op, intent_channel=self.intent_channel,
+                                issued_at_perf_counter_s=source_clock[0], expires_at_perf_counter_s=source_clock[0]+5.)
+                            if op == "move":
+                                command.update(transition_seconds=.2,
+                                    targets={"arm_left_gripper.pos" if name == "first" else "arm_right_gripper.pos": 4. if name == "first" else 6.})
+                            if name == "resume" and failure.endswith("control_new_pause"):
+                                self.control_generation += 1  # A newer acquired Pause fences this older Resume.
+                            if name == "resume" and failure.endswith("control_expired_resume"):
+                                source_clock[0] += 6.
+                            return command
                         if entry_case:
                             if failure.endswith("wall_cap"):
                                 pc_clock[0] += 20.
@@ -2790,7 +3071,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 assert session.starts == 1 and session.resumes == 0 and not session.inputs
                 assert session.stops == [owned_id]
                 return
-            if changing_intents and failure.endswith("pause"):
+            if changing_intents and failure.endswith("pause") and not control_case:
                 with pytest.raises(RuntimeError, match="held|superseded|pause"):
                     asyncio.run(asyncio.wait_for(m.run(args), 10))
                 session = instances[0]
@@ -2807,6 +3088,21 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             session = instances[0]
             records = [json.loads(line) for line in (tmp_path / "evidence/frames.jsonl").read_text().splitlines()]
             start = next(row for row in records if row["event"] == "start_requested")
+            if control_case:
+                frames = [row for row in records if row["event"] == "leader_frame"]
+                assert summary["finish_qualified"] and summary["native_held_qualified"]
+                assert summary["original_native_deadline"] == 301.
+                cycle = failure.endswith("control_cycle")
+                assert len(frames) == (6 if cycle else 3)
+                assert session.resumes == (2 if cycle or failure.endswith(("control_lost_resume", "control_finish_race")) else 1)
+                assert len(session.pauses) == (3 if failure.endswith(("control_lost_resume", "control_new_pause", "control_finish_race")) else 2)
+                assert session.stops == [owned_id]
+                assert [row["event"] for row in records if row["event"] in {"virtual_control_paused", "virtual_control_resumed"}] == (
+                    ["virtual_control_paused", "virtual_control_resumed"] if cycle else
+                    ["virtual_control_paused"] * (2 if failure.endswith(("control_lost_resume", "control_new_pause", "control_finish_race")) else 1))
+                assert all(row["virtual_intent"]["seq"] in {1, 4} for row in frames)
+                assert all(row["frame"]["body"] == m.ZERO_BODY for row in frames)
+                return
             if entry_case:
                 frames = [row for row in records if row["event"] == "leader_frame"]
                 assert summary["finish_qualified"] and summary["native_held_qualified"]
@@ -3968,7 +4264,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
 
 
 @pytest.mark.parametrize("cause", ["grant_native_renewal_before", "grant_native_renewal_pause", "grant_native_renewal_stop", "grant_native_renewal_takeover", "grant_native_renewal_deadline", "grant_native_renewal_descriptor", "initial_view_refusal", "initial_view_refusal_pause", "initial_connect_loss_pre", "initial_connect_loss_post", "initial_connect_loss_late", "initial_connect_loss_late_pause", "initial_connect_loss_contract", "initial_connect_loss_qualified_pause", "initial_connect_loss_bound_pause", "feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "resume_reporting_pause", "resume_reporting_renewal", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_unknown_receipt", "ordinary_input_unknown_pre", "ordinary_input_unknown_post", "ordinary_input_unknown_transport", "grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_transport", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_budget_post_create", "normal_finish_budget_get_create", "normal_finish_unknown_budget_create", "normal_finish_unknown_pre", "normal_finish_unknown_post", "normal_finish_unknown_twice", "normal_finish_unknown_wrong_status", "normal_finish_unknown_wrong_shape", "normal_finish_unknown_wrong_type", "normal_finish_unknown_refused", "normal_finish_unknown_new_pause", "normal_finish_unknown_new_stop", "normal_finish_unknown_new_owner", "normal_finish_unknown_new_service", "normal_finish_unknown_cancel", "normal_finish_unknown_view_lost", "normal_finish_unknown_ceiling", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal", "peer_start_normal", "peer_start_bench", "peer_bench_unqualified_view", "peer_bench_local_loss", "peer_normal_unqualified_view", "held_command120_view_later", "held_command120_view_never", "held_command120_local_loss", "view_refusal122_input_before", "view_refusal122_input_after", "view_refusal122_grant_before", "view_refusal122_grant_after", "view_refusal122_never", "view_refusal122_pause", "view_refusal122_stop", "view_refusal122_takeover", "view_refusal122_grant_connect_preflight_before", "view_refusal122_grant_connect_preflight_pending", "view_refusal122_grant_connect_preflight_queue", "view_refusal122_grant_connect_preflight_sent", "view_refusal122_grant_connect_preflight_pause", "view_refusal122_grant_connect_preflight_stop", "view_refusal122_grant_connect_preflight_takeover", "view_refusal122_grant_connect_preflight_reboot", "view_refusal122_grant_connect_preflight_lease", "view_refusal122_grant_connect_preflight_deadline", "view_refusal122_grant_connect_preflight_cancel", "view_refusal130_grant_input_race_before", "view_refusal130_grant_input_race_never", "view_refusal130_grant_input_race_pause", "view_refusal130_grant_input_race_stop", "view_refusal130_grant_input_race_takeover", "view_refusal130_grant_input_race_revision", "view_refusal130_grant_input_race_history", "view_refusal130_grant_input_race_time", "renewal_unknown133_grant_before", "renewal_unknown133_grant_pause", "renewal_unknown133_grant_takeover", "renewal_unknown133_grant_unchanged", "renewal_unknown133_grant_receipt_unknown", "renewal_unknown133_grant_second_read", "renewal_unknown133_grant_stream_before"])
-def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause, initial_unknown=False, initial_ack_attach=False):
+def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause, initial_unknown=False, initial_ack_attach=False, zero_input_retry=None, ordinary_profile=False, ordinary_control=False):
     import asyncio
     import copy
     import json
@@ -4175,6 +4471,253 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     }
                 )
             )
+            if zero_input_retry is not None:
+                # Real run()/Start/Stop, Core, Owner IPC and TLS/WSS. Only the
+                # device preparation/native receipts below are fake; no device worker starts.
+                from types import SimpleNamespace
+                from examples.alohamini.am1_live_teleop import normalized_raw
+
+                phase, pi_now, readers, clients = [0], [10.], [], []
+                started, stops, inputs, preparations = [], [], [], []
+                renewal_failure = TimeoutError("original pre-admission renewal timeout")
+                renewal_failed = asyncio.Event()
+                base = held_command119_workspace()
+                base["workspace_profile"] = m.ORDINARY_ARMS_PROFILE
+                policy = None
+                if ordinary_profile:
+                    from tests.robots.test_am1_live_phase_coordinator import ordinary_admission
+                    base = copy.deepcopy(ordinary_admission()[1]["snapshot"]["run"]["live_input"]["workspace"])
+                    policy = {"profile": m.ORDINARY_AM1_ARMS_PROFILE, "right_elbow_p": 16}
+                native = [copy.deepcopy(base)]
+                e.desired = "hold"
+                a.run = a.controller = a.connection = None
+                a.clock = e.clock = lambda: pi_now[0]
+
+                native_ack_state = [None]
+                def native_evidence():
+                    value = copy.deepcopy(recovery_state()["evidence"])
+                    revision = a.run["intent_revision"] if a.run else 0
+                    active = e.desired == "active"
+                    marker = (e.run_id, revision, active)
+                    if marker != native_ack_state[0]:
+                        epoch[0] += 1
+                        native_ack_state[0] = marker
+                    cursor = {**native[0]["reference"], "arm_left_shoulder_lift.pos": 100.}
+                    target = e._live_target
+                    live = dict(state="active" if active else "held", workspace=copy.deepcopy(native[0]),
+                        reference=copy.deepcopy(native[0]["reference"]), cursor=cursor,
+                        accepted_target=dict(target["target"] if target else cursor), body=dict(m.ZERO_BODY),
+                        cursor_intent_revision=revision, cursor_feedback_sequence=1,
+                        live_admitted_at_monotonic_s=pi_now[0], live_deadline_monotonic_s=pi_now[0]+300,
+                        last_input_seq=target["seq"] if target else -1)
+                    if target:
+                        live.update(source=copy.deepcopy(target["source"]), body=copy.deepcopy(target["body"]))
+                    value.update(source="protected-physical-provider", live_input=live,
+                        lifecycle=copy.deepcopy(e._lifecycle), feedback=True, required_observation=True,
+                        pose_aligned=True, native_ack=True, hold_acknowledged=not active,
+                        active_acknowledged=active, acknowledged_intent_revision=revision,
+                        measured_positions=copy.deepcopy(native[0]["reference"]),
+                        accepted_host_action=dict(run_id=e.run_id, host_incarnation=e.host_incarnation,
+                            intent_revision=revision, state="active" if active else "paused", epoch=epoch[0],
+                            acquired_at_monotonic_s=pi_now[0],
+                            accepted_action={"mode": "raw_goal_hold", "body_velocity": 0.}))
+                    e.sample = dict(at=pi_now[0], sequence=1, positions=value["measured_positions"],
+                        ack=dict(run_id=e.run_id, host_incarnation=e.host_incarnation, intent_revision=revision,
+                                 state="active" if active else "paused", epoch=epoch[0], live_input=live))
+                    return value
+
+                def begin_without_devices(recipe):
+                    e._lifecycle.update(phase="startup" if phase[0] == 0 and zero_input_retry != "view" else "live", native_live_at=pi_now[0],
+                        native_deadline_monotonic_s=pi_now[0]+300, backend_incarnation=e.host_incarnation)
+                    return True
+
+                def finish_without_devices(status):
+                    uncertain = zero_input_retry == "uncertain" and phase[0] == 0
+                    e.desired = "hold"
+                    e._lifecycle.update(phase="terminal", terminal_status=status,
+                        cleanup="physical_cleanup_unknown" if uncertain else "physical_readback_verified",
+                        uncertain=uncertain)
+                    return copy.deepcopy(e._lifecycle)
+
+                e.evidence, e.begin, e.finish = native_evidence, begin_without_devices, finish_without_devices
+                native_dispatches = [0]
+                def dispatch_then_ack(recipe):
+                    e.desired = "active"
+                    native_dispatches[0] += 1
+                    return native_dispatches[0] > 1
+                e.dispatch = dispatch_then_ack
+                actual_handle = a.handle
+                def retry_handle(command, device):
+                    # The original fixture's paused-only Connect assertion is for
+                    # recovery, while this branch starts from genuine Core idle.
+                    result = real_handle(command, device)
+                    if command["op"] == "start" and result.get("accepted") is True:
+                        started.append(copy.deepcopy(a.run))
+                    elif command["op"] == "stop":
+                        stops.append(copy.deepcopy(command))
+                    elif command["op"] == "input" and result.get("accepted") is True:
+                        inputs.append(copy.deepcopy(command))
+                    return result
+                a.handle = retry_handle
+                actual_reader = m.VirtualIntentReader
+                class Reader(actual_reader):
+                    def start(self):
+                        readers.append(self)
+                        if phase[0] == 0:
+                            # An acquired but now expired first-attempt intention
+                            # must never turn into the explicit retry's sample.
+                            self.receive_line("hold 0.001")
+                    def discard_motion(self, **kwargs):
+                        floor = super().discard_motion(**kwargs)
+                        if ordinary_control and phase[0] == 1 and not kwargs.get("pause"):
+                            if a.run["status"] == "paused" and not getattr(self, "resume_issued", False):
+                                self.resume_issued = True
+                                asyncio.get_running_loop().call_soon(self.receive_line, "resume 5")
+                            elif a.run["status"] == "running" and not getattr(self, "new_move_issued", False):
+                                self.new_move_issued = True
+                                target = native[0]["reference"]["arm_left_elbow_flex.pos"]+.1
+                                asyncio.get_running_loop().call_soon(self.receive_line, f"move 0.1 2 left_elbow_flex={target}")
+                        return floor
+
+                actual_session = m.SessionClient
+                class RunnerSession(actual_session):
+                    def __init__(self, *args):
+                        super().__init__(*args)
+                        clients.append(self)
+                        self.fresh_intent = False
+                        self.lost = False
+                    async def post(self, path, body):
+                        if (phase[0] == 0 and zero_input_retry != "view" and path == "claim"
+                            and "controller_generation" in body and started):
+                            renewal_failed.set()
+                            raise renewal_failure
+                        return await super().post(path, body)
+                    async def wait(self, predicate, timeout):
+                        if phase[0] == 0 and zero_input_retry != "view" and started and not self.lost:
+                            self.lost = True
+                            # Native has reached Live, but that admission has not
+                            # been observed by this PC's WSS reader.
+                            assert (self.snapshot.get("run") or {}).get("native_live_at") is None
+                            e._lifecycle["phase"] = "live"
+                            a.tick()
+                            assert a.run["native_live_at"] == pi_now[0]
+                            for peer in list(gateway.peers):
+                                await peer.ws.close(code=1006)
+                            await asyncio.wait_for(renewal_failed.wait(), 1.)
+                            await asyncio.sleep(0)
+                        result = await super().wait(predicate, timeout)
+                        if phase[0] == 1 and self.snapshot["run"]["status"] == "running" and not self.fresh_intent:
+                            self.fresh_intent = True
+                            joint_key = "arm_left_elbow_flex.pos"
+                            target = native[0]["reference"][joint_key]+.05
+                            readers[-1].receive_line(f"move 0.1 2 {joint_key}={target}")
+                        return result
+                    async def command(self, command, **kwargs):
+                        result = await super().command(command, **kwargs)
+                        if phase[0] == 1 and command["op"] == "input" and result.get("accepted") is True:
+                            if ordinary_control and len(inputs) == 1:
+                                await self.post("pause", {"run_id": a.run["run_id"], "operation_id": str(uuid4())})
+                            else:
+                                readers[-1].receive_line("finish")
+                        return result
+
+                def prepare(args, output):
+                    preparations.append(str(output))
+                    return {"fixture": "local-only prepared native receipts"}
+                monkeypatch.setattr(m, "VirtualIntentReader", Reader)
+                monkeypatch.setattr(m, "SessionClient", RunnerSession)
+                monkeypatch.setattr(m, "prepare_current_rest_invocation", prepare)
+                ticking = True
+                async def native_receipts():
+                    while ticking:
+                        if phase[0] == 1 and a.run:
+                            a._teleop_view = dict(run_id=e.run_id, role="chest", qualified_until=pi_now[0]+.5)
+                        a.tick()
+                        await asyncio.sleep(.01)
+                ticker = asyncio.create_task(native_receipts())
+                args = SimpleNamespace(source="virtual-leaders", workload_segment="ordinary-arms",
+                    virtual_input="interactive", prepare_current_rest=True, bindings="fixture-current-binding",
+                    output_root=str(tmp_path), output=str(tmp_path/"failed"), url=gateway.origin,
+                    ca=cert, storage_state=storage, next_start_seconds=None, duration_seconds=2.,
+                    interrupt_at_seconds=None, interrupt_controller=False)
+                if policy is not None:
+                    args.ordinary_arm_profile = policy
+                    args.prepare_current_rest = False
+                try:
+                    with pytest.raises((TimeoutError, ConnectionError)) as caught:
+                        await m.run(args)
+                    failed_path = tmp_path/"failed"/"summary.json"
+                    failed_bytes = failed_path.read_bytes()
+                    failed = json.loads(failed_bytes)
+                    assert len(started) == 1 and not inputs
+                    if policy is not None:
+                        assert started[0]["ordinary_arm_profile"] == policy
+                        assert failed["ordinary_arm_profile"] == policy
+                    assert failed["frame_count"] == 0 and failed["owned_run_id"] == started[0]["run_id"]
+                    assert failed["failure_type"] == "TimeoutError"
+                    assert len({row["operation_id"] for row in stops}) == 1
+                    assert all(row["run_id"] == started[0]["run_id"] for row in stops)
+                    assert failed["stop_operation_id"] == stops[0]["operation_id"]
+                    assert a.run["status"] == "stopped"
+                    first_terminal = copy.deepcopy(a.run)
+                    assert first_terminal["deadline"] == 310.
+                    if zero_input_retry != "view":
+                        assert caught.value is renewal_failure
+                        assert failed.get("run_id") is None
+                        assert failed.get("workspace") is None and failed.get("original_native_deadline") is None
+                        assert failed["controller_renewal"]["failed"] == 1
+                    else:
+                        assert str(caught.value) == "qualified current native state did not arrive"
+                        assert failed["run_id"] == started[0]["run_id"]
+                    if zero_input_retry == "uncertain":
+                        assert failed["native_cleanup_uncertain"] is True
+                        assert e._lifecycle["uncertain"] is True
+                        phase[0] = 1
+                        args.output = str(tmp_path/"blocked")
+                        with pytest.raises(m.HTTPOutcomeError) as refused:
+                            await m.run(args)
+                        assert refused.value.response["accepted"] is False
+                        assert len(started) == 1 and not inputs
+                        assert a.run["run_id"] == started[0]["run_id"] and a.run["uncertain"] is True
+                        assert failed_path.read_bytes() == failed_bytes
+                        return
+                    assert failed["native_cleanup_uncertain"] is False
+                    assert a.run["cleanup"] == "physical_readback_verified" and a.run["uncertain"] is False
+                    # Explicit caller decision AFTER stopped/certain qualification.
+                    # This is a second normal run(), never an internal Start retry.
+                    phase[0], pi_now[0] = 1, 20.
+                    native[0] = copy.deepcopy(base)
+                    joint_key = "arm_left_elbow_flex.pos"
+                    native[0]["reference"][joint_key] = normalized_raw(1110, native[0]["calibration"][joint_key[:-4]])
+                    args.output = str(tmp_path/"fresh")
+                    fresh = await m.run(args)
+                    assert fresh["finish_qualified"] is True and fresh["frame_count"] >= 1
+                    assert fresh["native_cleanup_uncertain"] is False and fresh["cleanup_errors"] == []
+                    assert len(started) == 2 and len(clients) == len(readers) == len(preparations) == 2
+                    assert started[0]["operation_id"] != started[1]["operation_id"]
+                    assert started[0]["run_id"] != started[1]["run_id"]
+                    assert fresh["original_native_deadline"] == 320. != first_terminal["deadline"]
+                    assert fresh["workspace"]["reference"] == native[0]["reference"] != base["reference"]
+                    assert inputs and all(row["run_id"] == started[1]["run_id"] for row in inputs)
+                    if ordinary_control:
+                        records = [json.loads(line) for line in (tmp_path/"fresh/frames.jsonl").read_text().splitlines()]
+                        controls = [row for row in records if row["event"] in {"virtual_control_paused", "virtual_control_resumed"}]
+                        assert [row["event"] for row in controls] == ["virtual_control_paused", "virtual_control_resumed"]
+                        assert controls[0]["seq"] is None and controls[1]["seq"] == 2
+                        frames = [row for row in records if row["event"] == "leader_frame"]
+                        assert [row["virtual_intent"]["seq"] for row in frames] == [1, 3]
+                        assert len(inputs) == 2 and all(row["body"] == m.ZERO_BODY for row in inputs)
+                        assert inputs[0]["grant_id"] != inputs[1]["grant_id"]
+                        assert inputs[0]["source"]["sample_seq"] < inputs[1]["source"]["sample_seq"]
+                        assert started[1]["ordinary_arm_profile"] == policy == fresh["ordinary_arm_profile"]
+                    assert all(row["source"]["source_id"] == readers[1].intent_channel for row in inputs)
+                    assert readers[0].intent_channel != readers[1].intent_channel
+                    assert failed_path.read_bytes() == failed_bytes
+                finally:
+                    ticking = False
+                    await ticker
+                    a.handle = actual_handle
+                return
             client = m.SessionClient(gateway.origin, cert, storage)
             initial_revision_allowed = [cause not in {"initial_ack_timely", "initial_ack_missing"}]
             if not initial_revision_allowed[0]:
@@ -7960,7 +8503,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
             a.run = None
             await owner.close()
 
-    asyncio.run(asyncio.wait_for(scenario(), 8 if cause == "transport_blackout_long" or normal_raw_close else 5))
+    asyncio.run(asyncio.wait_for(scenario(), 18 if zero_input_retry else 8 if cause == "transport_blackout_long" or normal_raw_close else 5))
 
 
 @pytest.mark.parametrize("count", [3, 4])
@@ -14266,3 +14809,20 @@ def test_old_reader_cannot_publish_after_joining_its_ack_worker_on_a_new_stream(
         assert client.pending == {"new": pending} and not pending.done()
         pending.cancel()
     asyncio.run(asyncio.wait_for(scenario(), 1))
+
+
+@pytest.mark.parametrize("failure", ["view", "pre-admission", "uncertain"])
+def test_normal_entrypoint_zero_input_failure_reconciles_before_explicit_fresh_retry(tmp_path, monkeypatch, failure):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
+        tmp_path, monkeypatch, "zero_input_fresh_retry", zero_input_retry=failure)
+
+
+@pytest.mark.parametrize("failure", ["view", "renewal", "uncertain"])
+def test_new_ordinary_policy_zero_input_prefix_uses_real_core_and_explicit_fresh_retry(tmp_path, monkeypatch, failure):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
+        tmp_path, monkeypatch, "zero_input_fresh_retry", zero_input_retry=failure, ordinary_profile=True)
+
+
+def test_new_ordinary_policy_external_pause_keeps_real_owner_until_fresh_resume_and_new_input(tmp_path, monkeypatch):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
+        tmp_path, monkeypatch, "zero_input_fresh_retry", zero_input_retry="view", ordinary_profile=True, ordinary_control=True)

@@ -1,7 +1,7 @@
 """Authenticated PC leader producer for the existing persistent AM1 owner.
 
-USB is the ordinary source. Virtual input enters before the identical mapping,
-clutch, serialization, grant and native-expiry boundaries. No motor transport is
+USB and virtual inputs enter the same mapping, clutch, serialization, grant and
+native-expiry boundaries. Acquisition is separate from operating policy. No motor transport is
 created here. An enrolled viewer is independent and never claims this input.
 """
 
@@ -27,6 +27,8 @@ from uuid import UUID, uuid4
 from examples.alohamini.am1_live_teleop import (
     LEFT_ENTRY_ENDPOINT_RAW,
     LEFT_ENTRY_WORKSPACE_PROFILE,
+    ORDINARY_AM1_ARMS_PROFILE,
+    validate_ordinary_arm_profile,
     TELEOP_ARM_KEYS,
     TELEOP_RECIPE,
     ZERO_BODY,
@@ -39,6 +41,7 @@ from examples.alohamini.am1_live_teleop import (
 )
 
 ORDINARY_ARMS_PROFILE = "ordinary-arms-left-current-rest-1051-1164"
+ORDINARY_ARM_PROFILES = {ORDINARY_ARMS_PROFILE, ORDINARY_AM1_ARMS_PROFILE}
 SUPPORTED_GRASP_CLOSING_RAW = (2799, 3102)
 EXTENDED_GRASP_CLOSING_RAW = (1886, 3102)
 
@@ -74,7 +77,7 @@ def virtual_input_progress(workload, *, window_started_at, window_deadline, now_
 class VirtualIntentReader:
     """One bounded latest-intent mailbox; stdin never blocks the control loop."""
 
-    def __init__(self, mode, *, stream=None, clock=time.perf_counter, intent_channel=None):
+    def __init__(self, mode, *, stream=None, clock=time.perf_counter, intent_channel=None, allow_controls=False):
         if mode not in {"interactive", "jsonl"}:
             raise ValueError("interactive or jsonl virtual input required")
         self.mode, self.stream, self.clock = mode, sys.stdin if stream is None else stream, clock
@@ -85,12 +88,20 @@ class VirtualIntentReader:
         self.sequence = self.superseded = self.revision = self.taken_revision = 0
         self.closed = self.eof = self.finished = False
         self.read_failed = False
+        self.allow_controls = allow_controls
+        self.controls = []
+        self.control_generation = self.taken_control_generation = 0
+        self._finish_sequence = None
+        self.motion_epoch = self._pending_motion_epoch = 0
+        self.motion_floor_perf = None
 
     def receive_line(self, line):
         if not isinstance(line, str) or len(line) > 4096 or len(line.encode("utf-8")) > 4096:
             raise ValueError("virtual input line exceeds4096UTF8bytes")
         if line and not line.strip():
             return
+        with self.lock:
+            acquisition_epoch = self.motion_epoch
         now = self.clock()  # Actual local text acquisition, never a controller renewal.
         if not line:
             self.eof = True
@@ -119,10 +130,10 @@ class VirtualIntentReader:
                     targets[key] = float(text)
             elif op == "return" and len(parts) == 3:
                 seconds, ttl = float(parts[1]), float(parts[2])
-            elif op == "hold" and len(parts) == 2:
+            elif op in ({"hold", "pause", "resume"} if self.allow_controls else {"hold"}) and len(parts) == 2:
                 ttl = float(parts[1])
             elif op != "finish" or len(parts) != 1:
-                raise ValueError("use move SECONDS VALID_FOR joint=value..., hold VALID_FOR, return SECONDS VALID_FOR, or finish")
+                raise ValueError("use move SECONDS VALID_FOR joint=value..., hold/pause/resume VALID_FOR, return SECONDS VALID_FOR, or finish")
             if (not math.isfinite(ttl) or not 0 < ttl <= 300.
                 or seconds is not None and (not math.isfinite(seconds) or not 0 < seconds <= 300.)
                 or targets is not None and any(not math.isfinite(value) for value in targets.values())):
@@ -136,12 +147,36 @@ class VirtualIntentReader:
             if targets is not None:
                 command["targets"] = targets
         with self.lock:
-            if self.closed:
+            if self.closed or self.allow_controls and self.finished:
+                return
+            control = self.allow_controls and isinstance(command, dict) and command.get("op") in {"pause", "resume", "finish"}
+            if control:
+                from examples.alohamini.am1_teleop_workload import decode_virtual_intent
+                # Reuse the existing closed acquisition envelope; these local
+                # control operations never enter the motor workload/frame wire.
+                decode_virtual_intent(dict(command, op="hold"), intent_channel=self.intent_channel)
+                if len(self.controls) >= 8:
+                    raise ValueError("bounded local control queue is full")
+                if command["op"] == "resume" and self._stale_motion(command, acquisition_epoch):
+                    self.superseded += 1
+                    return
+                if command["op"] == "pause":
+                    self.control_generation += 1
+                    self.pending = None
+                self.controls.append((command, self.control_generation, acquisition_epoch))
+                self.revision += 1
+                if command["op"] == "finish":
+                    self.finished = True
+                    self._finish_sequence = command["seq"]
+                return
+            if self._stale_motion(command, acquisition_epoch):
+                self.superseded += 1
                 return
             if self.pending is not None or self.error is not None:
                 self.superseded += 1
             self.error = None
             self.pending = command
+            self._pending_motion_epoch = acquisition_epoch
             self.revision += 1
             if (not line or isinstance(command, dict) and command.get("op") == "finish"
                     and command.get("intent_channel") == self.intent_channel):
@@ -153,8 +188,41 @@ class VirtualIntentReader:
             if self.error is not None:
                 error, self.error = self.error, None
                 raise error
+            while self.controls:
+                command, generation, epoch = self.controls.pop(0)
+                if command["op"] == "resume" and self._stale_motion(command, epoch):
+                    self.superseded += 1
+                    continue
+                self.taken_control_generation = generation
+                return command
             command, self.pending = self.pending, None
+            if command is not None and self._stale_motion(command, self._pending_motion_epoch):
+                self.superseded += 1
+                return None
             return command
+
+    def _stale_motion(self, command, epoch):
+        issued = command.get("issued_at_perf_counter_s") if isinstance(command, dict) else None
+        return self.allow_controls and (epoch != self.motion_epoch or self.motion_floor_perf is not None
+            and type(issued) in (int, float) and issued < self.motion_floor_perf)
+
+    def discard_motion(self, *, pause=False):
+        """A control boundary discards buffered intentions, never queued barriers."""
+        with self.lock:
+            self.pending = None
+            self.motion_epoch += 1
+            self.motion_floor_perf = self.clock()
+            if pause:
+                self.control_generation += 1
+            self.revision += 1
+            return self.sequence
+
+    def discard_rejected_finish(self, sequence):
+        """Only a rejected original Finish permits a newly acquired correction."""
+        with self.lock:
+            if self.allow_controls and not self.eof and self._finish_sequence == sequence:
+                self.finished = False
+                self._finish_sequence = None
 
     def reject(self, error):
         with self.lock:
@@ -266,6 +334,101 @@ class VirtualIntentReader:
         # The daemon never owns hardware and is not joined before protective cleanup.
 
 
+def _ordinary_policy(args):
+    policy = getattr(args, "ordinary_arm_profile", None)
+    if policy is not None:
+        return validate_ordinary_arm_profile(policy)
+    profile, p = getattr(args, "operating_profile", None), getattr(args, "right_elbow_p", None)
+    if profile is None:
+        if p is not None:
+            raise ValueError("RIGHT elbow P selection requires an explicit ordinary operating profile")
+        return None
+    return validate_ordinary_arm_profile({"profile": profile, "right_elbow_p": 16 if p is None else p})
+
+
+def resolve_ordinary_config(args):
+    """Resolve bounded local configuration only; never contact a controller or hardware."""
+    from tools.am1_session_ipc import strict_json
+
+    name = getattr(args, "ordinary_config", None)
+    if name is None:
+        args.ordinary_arm_profile = _ordinary_policy(args)
+        return
+    if getattr(args, "output", None) is not None:
+        raise ValueError("ordinary config conflicts with explicit output destination")
+    path = Path(name).resolve()
+    if Path(name).is_symlink() or not path.is_file():
+        raise ValueError("ordinary config must be an existing ordinary private file")
+    with path.open("rb") as stream:
+        raw = stream.read(16385)
+    if len(raw) > 16384:
+        raise ValueError("ordinary config exceeds16384bytes")
+    value = strict_json(raw)
+    keys = {"version", "bindings", "url", "ca", "storage_state", "output_root", "duration_seconds",
+            "native_max_seconds", "ordinary_arm_profile"}
+    if (type(value) is not dict or set(value) != keys or type(value["version"]) is not int or value["version"] != 1
+        or type(value["native_max_seconds"]) is not int or value["native_max_seconds"] != 300
+        or type(value["duration_seconds"]) not in (int, float) or not math.isfinite(value["duration_seconds"])
+        or not 0 < value["duration_seconds"] <= 180):
+        raise ValueError("closed ordinary config v1 with prospective input <=180s and native300s required")
+    policy = validate_ordinary_arm_profile(value["ordinary_arm_profile"])
+    binding = value["bindings"]
+    if (type(binding) is not dict or set(binding) != {"path", "sha256"}
+        or type(binding["sha256"]) is not str or re.fullmatch("[0-9a-f]{64}", binding["sha256"]) is None):
+        raise ValueError("ordinary config requires exact matched binding path/SHA256")
+    def existing(name, text, *, directory=False):
+        if type(text) is not str or not text:
+            raise ValueError("ordinary config requires existing " + name)
+        selected = Path(text)
+        selected = selected if selected.is_absolute() else path.parent / selected
+        if selected.is_symlink() or not (selected.is_dir() if directory else selected.is_file()):
+            raise ValueError("ordinary config requires existing ordinary " + name)
+        return str(selected.resolve())
+    resolved = {"bindings": existing("bindings", binding["path"])}
+    with Path(resolved["bindings"]).open("rb") as stream:
+        binding_raw = stream.read(1048577)
+    if len(binding_raw) > 1048576 or hashlib.sha256(binding_raw).hexdigest() != binding["sha256"]:
+        raise ValueError("ordinary binding SHA256 differs")
+    for key in ("ca", "storage_state", "output_root"):
+        resolved[key] = existing(key, value[key], directory=key == "output_root")
+    url = value["url"]
+    if type(url) is not str:
+        raise ValueError("ordinary HTTPS origin required")
+    parsed = urlsplit(url)
+    if (parsed.scheme != "https" or not parsed.hostname or parsed.port is not None and not 0 < parsed.port <= 65535 or parsed.username is not None or parsed.password is not None
+        or parsed.path not in ("", "/") or parsed.query or parsed.fragment):
+        raise ValueError("ordinary HTTPS origin without credentials/path required")
+    resolved["url"] = url
+    for key, selected in resolved.items():
+        previous = getattr(args, key, None)
+        if previous is not None and str(previous) != selected:
+            raise ValueError("ordinary config conflicts with explicit " + key)
+        setattr(args, key, selected)
+    duration = getattr(args, "duration_seconds", None)
+    if duration is not None and (type(duration) not in (int, float) or not math.isfinite(duration)
+                                 or not 0 < duration <= value["duration_seconds"]):
+        raise ValueError("ordinary input window may only be chosen prospectively shorter")
+    args.duration_seconds = value["duration_seconds"] if duration is None else duration
+    profile, p = getattr(args, "operating_profile", None), getattr(args, "right_elbow_p", None)
+    if profile is not None and profile != policy["profile"]:
+        raise ValueError("ordinary config conflicts with explicit operating profile")
+    if p is not None:
+        policy = validate_ordinary_arm_profile(dict(policy, right_elbow_p=p))
+    args.ordinary_arm_profile = policy
+    args._ordinary_config_bytes, args._ordinary_binding_sha = raw, binding["sha256"]
+    args.ordinary_config = str(path)
+
+
+def _start_body(args, generation):
+    body = {"operation_id": str(uuid4()), "recipe": TELEOP_RECIPE, "controller_generation": generation}
+    policy = _ordinary_policy(args)
+    if policy is not None:
+        body["ordinary_arm_profile"] = policy
+    if getattr(args, "bench_continuity", False):
+        body["bench_continuity"] = True
+    return body
+
+
 def _selected_grasp_closing_raw(args):
     supported, extended = (getattr(args, name, False) for name in
                            ("supported_grasp_closing", "extended_grasp_closing"))
@@ -276,8 +439,13 @@ def _selected_grasp_closing_raw(args):
 
 def _ordinary_arms_options(args):
     selected = getattr(args, "workload_segment", "full") == "ordinary-arms"
+    policy = _ordinary_policy(args)
+    if policy is not None and (not selected or args.source == "usb-leaders" and getattr(args, "virtual_input", None)
+        or getattr(args, "prepare_current_rest", False)
+        or getattr(args, "left_entry", False) or _selected_grasp_closing_raw(args) is not None):
+        raise ValueError("ordinary AM1 policy requires its normal arm launch without legacy preparation selections")
     if selected and (
-        args.source != "virtual-leaders" or getattr(args, "bench_continuity", False)
+        args.source != "virtual-leaders" and policy is None or getattr(args, "bench_continuity", False)
         or getattr(args, "next_start_seconds", None) is not None
         or getattr(args, "interrupt_at_seconds", None) is not None
         or getattr(args, "interrupt_controller", False)
@@ -310,7 +478,10 @@ def prepare_current_rest_invocation(args, output):
         raw = stream.read(1048577)
     if len(raw) > 1048576:
         raise ValueError("matched binding exceeds bounded local metadata size")
-    config = invocation_config(strict_json(raw), source="virtual-leaders")
+    policy = _ordinary_policy(args)
+    if policy is not None and getattr(args, "_ordinary_binding_sha", hashlib.sha256(raw).hexdigest()) != hashlib.sha256(raw).hexdigest():
+        raise ValueError("ordinary matched binding changed after configuration resolution")
+    config = invocation_config(strict_json(raw), source=args.source if policy is not None else "virtual-leaders")
     context_path = Path(args.bindings).resolve().parent / "audit-context.private.json"
     context_raw = None
     if context_path.exists() or context_path.is_symlink():
@@ -330,6 +501,8 @@ def prepare_current_rest_invocation(args, output):
             or context["BINDING_SHA"] != hashlib.sha256(raw).hexdigest()
             or context["MANIFEST_SHA"] != config["manifestSha256"] or context["MANIFEST"] != config["sourcePinsPath"]):
             raise ValueError("audit context differs from the exact matched binding/manifest")
+    if policy is not None and context_raw is None:
+        raise ValueError("ordinary launch requires its exact frozen current audit context")
     # Freeze originals into the fresh run directory before a future selected binding changes.
     with (output / "bindings.private.json").open("xb") as stream:
         stream.write(raw)
@@ -338,13 +511,21 @@ def prepare_current_rest_invocation(args, output):
             stream.write(context_raw)
     with (output / "invocation-config.private.json").open("x", encoding="utf-8") as stream:
         json.dump(config, stream, sort_keys=True, indent=2, allow_nan=False)
-    receipt = prepare_left_response_p_remote(
-        str(PurePosixPath(config["sourcePinsPath"]).with_name("physical.json")),
-        ssh="am1-pi", ttl_seconds=120, workload_segment="ordinary-arms",
-        workspace_profile=LEFT_ENTRY_WORKSPACE_PROFILE if getattr(args, "left_entry", False) else ORDINARY_ARMS_PROFILE,
-        left_shoulder_startup_degrees=1,
-        **({"left_gripper_raw_interval": list(gripper_interval)} if gripper_interval is not None else {}),
-    )
+    if policy is not None:
+        receipt = {"version": 1, "status": "native-pending", "hardware_qualified": False,
+                   "ordinary_arm_profile": policy, "native_max_seconds": 300,
+                   "input_duration_seconds": args.duration_seconds}
+        if getattr(args, "_ordinary_config_bytes", None) is not None:
+            with (output / "ordinary-config.private.json").open("xb") as stream:
+                stream.write(args._ordinary_config_bytes)
+    else:
+        receipt = prepare_left_response_p_remote(
+            str(PurePosixPath(config["sourcePinsPath"]).with_name("physical.json")),
+            ssh="am1-pi", ttl_seconds=120, workload_segment="ordinary-arms",
+            workspace_profile=LEFT_ENTRY_WORKSPACE_PROFILE if getattr(args, "left_entry", False) else ORDINARY_ARMS_PROFILE,
+            left_shoulder_startup_degrees=1,
+            **({"left_gripper_raw_interval": list(gripper_interval)} if gripper_interval is not None else {}),
+        )
     with (output / "preparation-receipt.private.json").open("x", encoding="utf-8") as stream:
         json.dump(receipt, stream, sort_keys=True, indent=2, allow_nan=False)
     metadata = {"version": 1}
@@ -355,7 +536,7 @@ def prepare_current_rest_invocation(args, output):
             metadata[key] = {"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
     with (output / "launch-metadata.private.json").open("x", encoding="utf-8") as stream:
         json.dump(metadata, stream, sort_keys=True, indent=2, allow_nan=False)
-    if receipt["request"].get("source_head") != config["motorSourceSha"]:
+    if policy is None and receipt["request"].get("source_head") != config["motorSourceSha"]:
         raise ValueError("prepared current-rest source differs from matched motor binding")
     if gripper_interval is not None and (
         type(receipt["request"].get("left_gripper_raw_interval")) is not list
@@ -1484,7 +1665,7 @@ def _initial_connected_phase(snapshot, proof):
                 ("run_id", "recipe", "source", "operation_id", "backend_incarnation", "native_live_at", "deadline", "intent_revision"))
             and str(UUID(current["operation_id"])) == current["operation_id"]
             and live.get("workspace") == before.get("workspace") and live.get("reference") == before.get("reference")
-            and live.get("workspace", {}).get("workspace_profile") == ORDINARY_ARMS_PROFILE
+            and live.get("workspace", {}).get("workspace_profile") in ORDINARY_ARM_PROFILES
             and live.get("required_view", {}).get("required") is True
             and all(live.get("required_view", {}).get(k) == before.get("required_view", {}).get(k) for k in ("required", "role"))
             and type(live.get("last_input_seq")) is int and live["last_input_seq"] == -1
@@ -2538,7 +2719,7 @@ def _ordinary_pause_kinds(client):
     live = _live(state)
     if (getattr(client, "_ordinary_transport_recovery", False) is True
         and (state.get("run") or {}).get("bench_continuity") is False
-        and (live.get("workspace") or {}).get("workspace_profile") == ORDINARY_ARMS_PROFILE
+        and (live.get("workspace") or {}).get("workspace_profile") in ORDINARY_ARM_PROFILES
         and (live.get("required_view") or {}).get("required") is True):
         kinds.add("transport_connection_lost")
     return kinds
@@ -2614,7 +2795,9 @@ class SameRunRecovery:
                     "run": {
                         key: state["run"][key]
                         for key in ("run_id", "recipe", "backend_incarnation", "native_live_at", "deadline")
-                    } | ({"operation_id": state["run"]["operation_id"]} if "operation_id" in state["run"] else {}),
+                    } | ({"operation_id": state["run"]["operation_id"]} if "operation_id" in state["run"] else {})
+                      | ({"ordinary_arm_profile": validate_ordinary_arm_profile(state["run"].get("ordinary_arm_profile"))}
+                         if live["workspace"].get("workspace_profile") == ORDINARY_AM1_ARMS_PROFILE else {}),
                     "service": state["service_incarnation"],
                     "controller": {"device_id": client.device, "controller_generation": client.generation},
                     "workspace": live["workspace"],
@@ -2706,9 +2889,13 @@ class SameRunRecovery:
                      "previous_generation": old, "elapsed_seconds": time.monotonic() - entered,
                      "snapshot": fresh})
 
-    async def finish_owned(self, *, bench, wall_deadline, renewal_check, renewal_reconcile=None):
+    async def finish_owned(self, *, bench, wall_deadline, renewal_check, renewal_reconcile=None,
+                           deliberate=False, observed_pause=None, resumed_pause=None):
         """End finite owned input; a Pause receipt alone never proves Native HOLD."""
         label = "bench" if bench else "normal"
+        if bench and (deliberate or observed_pause is not None):
+            raise RuntimeError("deliberate Pause belongs only to ordinary owned input")
+        purpose = "pause" if deliberate else "finish"
         entered = time.monotonic()
         async with asyncio.timeout(max(0, wall_deadline - entered)):
             before = (await self.client.get("state"))["snapshot"]
@@ -2723,7 +2910,7 @@ class SameRunRecovery:
                 and intent.get("controller_generation") == self.client.generation
                 and intent.get("service_incarnation") == self.original["service"]
                 and intent.get("start_operation_id") == run.get("operation_id")
-            ) if bench else intent is None and view.get("required") is True and view.get("qualified") is True
+            ) if bench else intent is None and view.get("required") is True and (deliberate or view.get("qualified") is True)
             remaining = run.get("remaining_s")
             if ((run.get("bench_continuity") is True) != bench or run.get("status") not in {"running", "paused"}
                 or run.get("recovery") is not None or not owned_intent
@@ -2732,7 +2919,15 @@ class SameRunRecovery:
                 raise RuntimeError(f"current uncancelled {label} finish authority unavailable")
             prior_event = json.loads(json.dumps(_latest_run_event(before, self.client.identities()), allow_nan=False))
             finishing_from_running = run["status"] == "running"
-            if prior_event and prior_event.get("kind") not in {"resumed", "input_expired", "native_input_expired", "required_view_expired"}:
+            observed = observed_pause is not None
+            consumed_pause = (isinstance(resumed_pause, dict) and prior_event == resumed_pause.get("pause_event")
+                and run.get("status") == "running" and run.get("intent_revision") == resumed_pause.get("intent_revision")
+                and self.client.connection == resumed_pause.get("connection_generation")
+                and before.get("evidence", {}).get("active_acknowledged") is True)
+            if observed and (prior_event != observed_pause or prior_event.get("kind") != "pause" or run.get("status") != "paused"):
+                raise RuntimeError("explicit current Pause was superseded")
+            if (prior_event and prior_event.get("kind") not in {"resumed", "input_expired", "native_input_expired", "required_view_expired"}
+                    and not observed and not consumed_pause and not (deliberate and prior_event.get("kind") == "pause")):
                 raise RuntimeError(f"current {label} intent was superseded before finishing")
             ceiling = min(wall_deadline, entered + remaining)
             revision, lower = run["intent_revision"] + 1, run["deadline"] - remaining
@@ -2745,12 +2940,20 @@ class SameRunRecovery:
                 if value <= 0:
                     raise TimeoutError(f"original {label} finishing ceiling exhausted")
                 return value
-            self.record({"event": f"{label}_finish_pause_requested", "operation_id": request["operation_id"],
-                         "identity": self.client.identities(), "expected_intent_revision": revision,
-                         "original_ceiling_monotonic_s": ceiling})
+            if not (deliberate and observed):
+                self.record({"event": f"{label}_{purpose}_pause_requested", "operation_id": request["operation_id"],
+                             "identity": self.client.identities(), "expected_intent_revision": revision,
+                             "original_ceiling_monotonic_s": ceiling})
             try:
-                wait_seconds = budget()
-                receipt = await asyncio.wait_for(self.client.post("pause", request), wait_seconds)
+                if deliberate and observed:
+                    # An authenticated current external Pause is data, never an
+                    # automatic Resume permission. Qualify its actual HOLD below.
+                    request, receipt = {"operation_id": None}, None
+                    revision, lower = run["intent_revision"], prior_event["at"]
+                    old_epoch = old_epoch - 1 if type(old_epoch) is int else None
+                else:
+                    wait_seconds = budget()
+                    receipt = await asyncio.wait_for(self.client.post("pause", request), wait_seconds)
             except HTTPOutcomeError as original:
                 unknown = {"accepted": None, "status": "unknown", "uncertain": True,
                            "reason": "owner outcome unknown; inspect state or lookup the same operation",
@@ -2761,17 +2964,17 @@ class SameRunRecovery:
                     or any(type(original.response[k]) is not type(v) or original.response[k] != v
                            for k, v in unknown.items())):
                     raise
-                self.record({"event": f"{label}_finish_pause_receipt_unknown", "operation_id": request["operation_id"],
+                self.record({"event": f"{label}_{purpose}_pause_receipt_unknown", "operation_id": request["operation_id"],
                              "http_status": original.http_status, "response": original.response,
                              "original_ceiling_monotonic_s": ceiling})
                 # Pause is a durable mutation: the IDENTICAL body/operation
                 # returns its recorded result, never a new Pause or fresh budget.
                 wait_seconds = budget()
                 receipt = await asyncio.wait_for(self.client.post("pause", request), wait_seconds)
-            if (receipt.get("accepted") is not True or receipt.get("status") != "paused"
+            if not (deliberate and observed) and (receipt.get("accepted") is not True or receipt.get("status") != "paused"
                 or receipt.get("uncertain", False) is not False or receipt.get("effect_admitted") is not False):
                 raise RuntimeError(f"own {label} Pause did not receive a definite paused acknowledgement")
-            self.record({"event": f"{label}_finish_pause_acknowledged", "operation_id": request["operation_id"],
+            self.record({"event": f"{label}_{purpose}_pause_acknowledged", "operation_id": request["operation_id"],
                          "receipt": receipt, "expected_intent_revision": revision})
             # This closure exists only after THIS request has a definite Pause
             # receipt. It is not an ordinary-recovery permission to adopt Pause.
@@ -2872,7 +3075,7 @@ class SameRunRecovery:
                         raise RuntimeError("current native held zero body command unavailable")
                     if (all(evidence.get(key) is True for key in
                             ("feedback", "native_ack", "hold_acknowledged", "pose_aligned", "required_observation"))
-                        and evidence.get("active_acknowledged") is False and _view_admitted(state)
+                        and evidence.get("active_acknowledged") is False and (deliberate or _view_admitted(state))
                         and (bench or (_live(state).get("required_view") or {}).get("required") is True)):
                         measured = evidence.get("measured_body") or {}
                         if not all(type(measured.get(key)) in (int, float) and math.isfinite(measured[key]) for key in ZERO_BODY):
@@ -2880,10 +3083,48 @@ class SameRunRecovery:
                         proof = {"snapshot": state, "pause_operation_id": request["operation_id"], "pause_receipt": receipt,
                                  "native_held_qualified": True, "zero_body_command": True,
                                  "measured_body_exact_zero": all(measured[key] == 0 for key in ZERO_BODY)}
-                        self.record({"event": f"{label}_finish_hold_qualified", **proof,
+                        if deliberate:
+                            proof.update(pause_event=dict(event), intent_revision=revision,
+                                         connection_generation=self.client.connection)
+                        self.record({"event": f"{label}_{purpose}_hold_qualified", **proof,
                                      "original_ceiling_monotonic_s": ceiling})
                         return proof
                 await asyncio.sleep(min(.03, await held_budget()))
+
+    async def resume_paused(self, proof, *, wall_deadline, renewal_check, control_check):
+        """One explicit fresh local Resume; automatic recovery still rejects Pause."""
+        event = proof["pause_event"]
+        revision, connection = proof["intent_revision"], proof["connection_generation"]
+        if event.get("kind") != "pause":
+            raise RuntimeError("explicit Resume requires its qualified current Pause")
+        def current(state):
+            control_check()
+            renewal_check()
+            self.check(state)
+            run = state["run"]
+            latest = _latest_run_event(state, self.client.identities())
+            if self.client.connection != connection:
+                generation = self.client.connection
+                if type(generation) is not str or str(UUID(generation)) != generation or self.client.sequence != 0:
+                    raise RuntimeError("explicit Resume fresh connection unavailable")
+            expected = revision + int(self.client.connection != connection)
+            if run.get("status") == "paused":
+                if latest != event or run.get("intent_revision") != expected:
+                    raise RuntimeError("explicit Resume current Pause was superseded")
+            elif (run.get("status") not in {"running", "resuming"}
+                  or run.get("intent_revision") != expected + 1
+                  or latest != event and (latest.get("kind") != "resumed"
+                      or type(latest.get("at")) not in (int, float) or latest["at"] < event["at"])):
+                raise RuntimeError("explicit Resume was superseded by newer control")
+        async with asyncio.timeout_at(wall_deadline):
+            control_check()
+            renewal_check()
+            self.client.snapshot = (await self.client.get("state"))["snapshot"]
+            current(self.client.snapshot)
+            await self.client.resume(check=current, qualification_ceiling=wall_deadline)
+        current(self.client.snapshot)
+        return {"pause_event": dict(event), "intent_revision": self.client.snapshot["run"]["intent_revision"],
+                "connection_generation": self.client.connection}
 
     def history_qualified(self, state):
         run = state.get("run") or {}
@@ -2891,7 +3132,7 @@ class SameRunRecovery:
 
     def check(self, state, *, history=True):
         run, evidence, live = state.get("run") or {}, state.get("evidence", {}), _live(state)
-        if self.original["workspace"].get("workspace_profile") in {ORDINARY_ARMS_PROFILE, LEFT_ENTRY_WORKSPACE_PROFILE} and (
+        if self.original["workspace"].get("workspace_profile") in {*ORDINARY_ARM_PROFILES, LEFT_ENTRY_WORKSPACE_PROFILE} and (
             run.get("bench_continuity") is not False
             or (live.get("required_view") or {}).get("required") is not True
         ):
@@ -3018,7 +3259,7 @@ class SameRunRecovery:
                     if (run.get("source") != "protected-physical-provider"
                         or before.get("evidence", {}).get("source") != run["source"]
                         or run.get("bench_continuity") is True
-                        or live.get("workspace", {}).get("workspace_profile") != ORDINARY_ARMS_PROFILE
+                        or live.get("workspace", {}).get("workspace_profile") not in ORDINARY_ARM_PROFILES
                         or live.get("required_view", {}).get("required") is not True
                         or context["source"].get("kind") != "virtual-leaders"):
                         raise RuntimeError("ordinary physical current-rest Input authority unavailable")
@@ -4038,7 +4279,7 @@ class SameRunRecovery:
                     times = [event.get("at") for event in own]
                     expiry, remaining = (snapshot.get("controller") or {}).get("presence_expires"), run.get("remaining_s")
                     return (run.get("recipe") == TELEOP_RECIPE and run.get("source") == "protected-physical-provider"
-                        and run.get("bench_continuity") is False and self.original["workspace"].get("workspace_profile") == ORDINARY_ARMS_PROFILE
+                        and run.get("bench_continuity") is False and self.original["workspace"].get("workspace_profile") in ORDINARY_ARM_PROFILES
                         and run.get("first_cause") is None and run.get("native_first_cause") is None
                         and run.get("recovery_episodes") == 0 and type(run.get("intent_revision")) is int
                         and run["intent_revision"] in (0, 1) and type(live.get("last_input_seq")) is int
@@ -4469,6 +4710,7 @@ async def run(args):
     from examples.alohamini.am1_teleop_workload import TeleopWorkload, VirtualIntentWorkload
 
     ordinary_arms = _ordinary_arms_options(args)
+    ordinary_policy = _ordinary_policy(args)
     changing_input = getattr(args, "virtual_input", None)
     left_entry = getattr(args, "left_entry", False)
     left_reach_cycles = _left_reach_cycles(args)
@@ -4479,7 +4721,7 @@ async def run(args):
     terminal_budget = 12. if bench else 2.
     peer = _peer_options(segment, getattr(args, "peer_side", None), getattr(args, "peer_direction", None),
                          getattr(args, "peer_raw_step", None), bench=bench, next_start=getattr(args, "next_start_seconds", None), active_p=getattr(args, "peer_active_p", None))
-    if (bench or segment != "full") and args.source != "virtual-leaders" or controller_gap and not bench:
+    if (bench or segment != "full" and ordinary_policy is None) and args.source != "virtual-leaders" or controller_gap and not bench:
         raise ValueError("predetermined virtual bench mode required")
 
     output = Path(args.output)
@@ -4504,6 +4746,7 @@ async def run(args):
     cleanup_errors = []
     summary = {
         "source": args.source,
+        **({"ordinary_arm_profile": ordinary_policy} if ordinary_policy is not None else {}),
         "producer_program_complete": False,
         "frame_count": 0,
         "native_execution_complete": False,
@@ -4543,7 +4786,8 @@ async def run(args):
         if changing_input:
             # Read and timestamp actual input before cold imports, preparation or Start.
             # A queued pre-admission line keeps this original acquisition/expiry.
-            intent_reader = VirtualIntentReader(changing_input, intent_channel=intent_channel)
+            intent_reader = VirtualIntentReader(changing_input, intent_channel=intent_channel,
+                **({"allow_controls": True} if ordinary_arms and not left_entry else {}))
             record({"event": "virtual_input_opened", "intent_channel": intent_channel,
                     "output": str(output.resolve()), "clock": "PC time.perf_counter"})
             intent_reader.start()
@@ -4571,7 +4815,7 @@ async def run(args):
         )
         from tools.am1_physical_executor import body_recipe_action
 
-        if args.source == "usb-leaders" and not args.no_keyboard:
+        if args.source == "usb-leaders" and not args.no_keyboard and ordinary_policy is None:
             from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop, KeyboardTeleopConfig
 
             keyboard = KeyboardTeleop(KeyboardTeleopConfig(id="am1-persistent-leader-keyboard"))
@@ -4592,13 +4836,7 @@ async def run(args):
         }
         import aiohttp
 
-        start_body = {
-            "operation_id": str(uuid4()),
-            "recipe": TELEOP_RECIPE,
-            "controller_generation": client.generation,
-        }
-        if bench:
-            start_body["bench_continuity"] = True
+        start_body = _start_body(args, client.generation)
         summary.update(
             start_operation_id=start_body["operation_id"],
             start_outcome_uncertain=True,
@@ -4608,6 +4846,7 @@ async def run(args):
         record(
             {"event": "start_requested", "operation_id": start_body["operation_id"], "recipe": TELEOP_RECIPE,
              "bench_continuity": bench, "view_policy": summary["view_policy"], "workload_segment": segment,
+             **({"ordinary_arm_profile": ordinary_policy} if ordinary_policy is not None else {}),
              **({"left_reach_cycles": left_reach_cycles} if left_reach_cycles > 1 else {}),
              **({"peer_selection": peer} if peer else {}),
              **({"peer_baseline_qualification_budget_seconds": 2.} if peer and "fixed_start_raw" in peer else {}),
@@ -4859,6 +5098,11 @@ async def run(args):
                 raise admission_first_error from qualification_error
             raise
         workspace = validate_workspace(_live(client.snapshot)["workspace"])
+        if ordinary_policy is not None and (client.snapshot["run"].get("ordinary_arm_profile") != ordinary_policy
+            or workspace.get("workspace_profile") != ordinary_policy["profile"]
+            or client.snapshot["run"].get("bench_continuity") is not False
+            or (_live(client.snapshot).get("required_view") or {}).get("required") is not True):
+            raise RuntimeError("native admitted ordinary policy/profile differs from requested normal authority")
         run_id, deadline = client.snapshot["run"]["run_id"], client.snapshot["run"]["deadline"]
         summary.update(run_id=run_id, original_native_deadline=deadline, workspace=workspace)
         record({"event": "native_admitted", "snapshot": client.snapshot})
@@ -4881,7 +5125,7 @@ async def run(args):
                 raise TimeoutError("LEFT entry original Live wall budget exhausted")
         if args.source == "virtual-leaders":
             if ordinary_arms:
-                if (workspace.get("workspace_profile") != (LEFT_ENTRY_WORKSPACE_PROFILE if left_entry else ORDINARY_ARMS_PROFILE)
+                if (workspace.get("workspace_profile") != (ordinary_policy["profile"] if ordinary_policy is not None else LEFT_ENTRY_WORKSPACE_PROFILE if left_entry else ORDINARY_ARMS_PROFILE)
                     or client.snapshot["run"].get("bench_continuity") is not False
                     or (_live(client.snapshot).get("required_view") or {}).get("required") is not True):
                     raise RuntimeError("ordinary-arms requires its exact qualified native normal required-view profile")
@@ -4898,7 +5142,7 @@ async def run(args):
                                 "proposed_entry_endpoint": workload.entry_endpoint} if left_entry else {}),
                             "command_reference": commands, "bounds": workspace["bounds"], "units": workspace["units"],
                             "controls": ("move SECONDS VALID_FOR left_elbow_flex="+str(workload.entry_endpoint)+" | hold VALID_FOR | finish"
-                                         if left_entry else "move SECONDS VALID_FOR joint=value... | hold VALID_FOR | return SECONDS VALID_FOR | finish")})
+                                         if left_entry else "move SECONDS VALID_FOR joint=value... | hold VALID_FOR | return SECONDS VALID_FOR | pause VALID_FOR | resume VALID_FOR | finish")})
             elif segment in SelectedLeftWorkload.DURATIONS:
                 selected_kwargs = {"peer_side": peer["side"], "peer_direction": peer["direction_raw"], "peer_raw_step": peer["raw_step"],
                                    **({"peer_active_p": peer["active_p"]} if "active_p" in peer else {})} if peer else {}
@@ -4918,14 +5162,33 @@ async def run(args):
         client._ordinary_transport_recovery = ordinary_input_rearm
         recovery = SameRunRecovery(client, record)
         applied_intent_revision = None
+        pending_control = deliberate_pause = resumed_pause_context = None
+        explicit_controls = bool(changing_input and ordinary_arms and not left_entry)
 
         def refresh_intent():
-            nonlocal applied_intent_revision
+            nonlocal applied_intent_revision, pending_control
+            if pending_control is not None:
+                workload.invalidate()
+                return
+            command = None
             try:
                 command = intent_reader.take()
                 applied_intent_revision = getattr(intent_reader, "taken_revision", None)
                 if command is not None:
+                    if explicit_controls and command.get("op") in {"pause", "resume"}:
+                        pending_control = (command, getattr(intent_reader, "taken_control_generation", 0))
+                        workload.invalidate()
+                        return
+                    if deliberate_pause is not None and command.get("op") != "finish":
+                        workload.invalidate()
+                        record({"event": "virtual_intent_discarded", "seq": command["seq"], "op": command["op"],
+                                "reason": "deliberate Pause requires explicit Resume and a later new movement intention"})
+                        return
                     accepted = workload.submit(command)
+                    if not accepted and command["op"] == "finish":
+                        discard = getattr(intent_reader, "discard_rejected_finish", None)
+                        if discard is not None:
+                            discard(command["seq"])
                     record({"event": "virtual_intent_accepted" if accepted else "virtual_intent_discarded",
                             "seq": command["seq"], "op": command["op"], "intent_channel": intent_channel,
                             "issued_at_perf_counter_s": command["issued_at_perf_counter_s"],
@@ -4934,6 +5197,10 @@ async def run(args):
             except ValueError as error:
                 if changing_input != "interactive" or getattr(intent_reader, "read_failed", False):
                     raise
+                if command is not None and command.get("op") == "finish":
+                    discard = getattr(intent_reader, "discard_rejected_finish", None)
+                    if discard is not None:
+                        discard(command["seq"])
                 workload.invalidate()
                 record({"event": "virtual_intent_rejected", "reason": str(error)[:240],
                         "meaning": "current intent invalidated; wait for new valid input in HOLD"})
@@ -4985,6 +5252,75 @@ async def run(args):
                 record(virtual_input_progress(workload, window_started_at=active_at,
                     window_deadline=activity_ceiling, now_monotonic=now, now_perf_counter=workload.clock()))
                 last_input_progress_at = now
+
+        async def pause_current(command=None, *, observed=None):
+            nonlocal deliberate_pause, resumed_pause_context
+            workload.invalidate()
+            proof = await recovery.finish_owned(bench=False, wall_deadline=activity_ceiling,
+                renewal_check=renewal_healthy, renewal_reconcile=restart_qualified_renewal,
+                deliberate=True, observed_pause=observed)
+            proof["control_seq_floor"] = intent_reader.discard_motion()
+            deliberate_pause = proof
+            resumed_pause_context = None
+            record({"event": "virtual_control_paused", "op": "pause", "seq": command["seq"] if command else None,
+                    "pause_event": proof["pause_event"], "intent_revision": proof["intent_revision"],
+                    "native_held_qualified": True, "zero_body_command": True,
+                    "control_generation": getattr(intent_reader, "control_generation", 0),
+                    "window_deadline_monotonic_s": activity_ceiling})
+
+        async def control_current():
+            nonlocal pending_control, deliberate_pause, resumed_pause_context
+            command, generation = pending_control
+            pending_control = None
+            op = command["op"]
+            def fresh():
+                from examples.alohamini.am1_teleop_workload import decode_virtual_intent
+                decode_virtual_intent(dict(command, op="hold"), intent_channel=intent_channel)
+                if not command["issued_at_perf_counter_s"] <= workload.clock() < command["expires_at_perf_counter_s"]:
+                    raise ValueError("local control original acquisition expired or is in the future")
+                if op == "resume" and (getattr(intent_reader, "control_generation", 0) != generation
+                        or getattr(intent_reader, "finished", False)):
+                    raise ValueError("explicit Resume superseded by newer local Pause/Finish")
+            try:
+                fresh()
+                if op == "pause":
+                    await pause_current(command)
+                    return
+                if (deliberate_pause is None or deliberate_pause["pause_event"] is None
+                        or command["seq"] <= deliberate_pause["control_seq_floor"]):
+                    raise ValueError("Resume requires a fresh acquisition after current qualified Pause")
+                remaining = command["expires_at_perf_counter_s"] - workload.clock()
+                try:
+                    resumed_pause_context = await recovery.resume_paused(deliberate_pause,
+                        wall_deadline=min(activity_ceiling, time.monotonic()+remaining),
+                        renewal_check=renewal_healthy, control_check=fresh)
+                except (TimeoutError, ConnectionError, CommandRefusedError, RuntimeError, ValueError) as error:
+                    # An unknown/late Resume never authorizes a sample. Restore
+                    # explicit HOLD through the existing owned Pause operation.
+                    recovery.check(client.snapshot)
+                    current = (await client.get("state"))["snapshot"]
+                    recovery.check(current)
+                    client.snapshot = current
+                    event = _latest_run_event(current, client.identities())
+                    await pause_current(observed=event if current["run"]["status"] == "paused" and event.get("kind") == "pause" else None)
+                    record({"event": "virtual_control_rejected", "op": op, "seq": command["seq"],
+                            "reason": str(error)[:240], "error_type": type(error).__name__, "input_replayed": False})
+                    return
+                producer.native_cursor = validate_target(_live(client.snapshot)["cursor"], workspace=workspace)
+                producer.reacquire = True
+                workload.cursor = dict(producer.native_cursor)
+                workload.invalidate()
+                floor = intent_reader.discard_motion()
+                deliberate_pause = None
+                record({"event": "virtual_control_resumed", "op": op, "seq": command["seq"],
+                        "new_movement_sequence_floor": floor, "fresh_movement_required": True,
+                        "new_movement_acquired_not_before_perf_counter_s": getattr(intent_reader, "motion_floor_perf", None),
+                        "window_deadline_monotonic_s": activity_ceiling})
+            except ValueError as error:
+                workload.invalidate()
+                if op == "pause" and deliberate_pause is None:
+                    deliberate_pause = {"pause_event": None, "control_seq_floor": intent_reader.discard_motion()}
+                record({"event": "virtual_control_rejected", "op": op, "seq": command["seq"], "reason": str(error)[:240]})
 
         record_input_progress(force=True)
 
@@ -5146,17 +5482,35 @@ async def run(args):
                 raise TimeoutError("peer baseline original qualification ceiling exhausted")
             if bench and await ensure_authority(until=peer_baseline_until):
                 await rejoin(until=peer_baseline_until)
+            if explicit_controls:
+                refresh_intent()
             try:
                 renewal_healthy()
             except HTTPOutcomeError as original:
                 if bench or not _owner_unknown_renewal(original):
                     raise
+                if deliberate_pause is not None:
+                    await pause_current(observed=deliberate_pause["pause_event"])
+                    continue
+                if pending_control is not None:
+                    raise  # A local Pause must never enter automatic Resume recovery.
                 await rejoin(until=peer_baseline_until)
                 continue
             state = acquisition_state()
             if changing_input:
                 latest = _latest_run_event(state, client.identities())
-                if latest.get("kind") in {"pause", "stop", "handoff", "released", "revoked"}:
+                if latest.get("kind") in {"stop", "handoff", "released", "revoked"}:
+                    raise RuntimeError("changing input held: explicit control intent was superseded")
+                consumed_pause = (resumed_pause_context is not None and latest == resumed_pause_context["pause_event"]
+                    and state["run"]["status"] == "running"
+                    and state["run"]["intent_revision"] == resumed_pause_context["intent_revision"]
+                    and client.connection == resumed_pause_context["connection_generation"])
+                if latest.get("kind") == "pause" and not consumed_pause and (ordinary_policy is not None or deliberate_pause is not None):
+                    if deliberate_pause is None or latest != deliberate_pause["pause_event"]:
+                        workload.invalidate()
+                        intent_reader.discard_motion(pause=True)
+                        await pause_current(observed=latest)
+                elif latest.get("kind") == "pause" and not consumed_pause:
                     raise RuntimeError("changing input held: explicit control intent was superseded")
                 refresh_intent()
                 record_input_progress()
@@ -5170,6 +5524,13 @@ async def run(args):
                     summary["clean_input_end"] = "duration_elapsed"
                     record({"event": "virtual_input_finished", "reason": "original_session_budget_elapsed"})
                     break
+                if pending_control is not None:
+                    await control_current()
+                    continue
+                if deliberate_pause is not None:
+                    workload.invalidate()
+                    await asyncio.sleep(.03)
+                    continue
                 if not workload.active:
                     workload.freeze()
                     if not intent_waiting:
@@ -5323,6 +5684,19 @@ async def run(args):
                     continue
                 mailbox = mailbox_input_refusal(error)
                 view = selected_view_refusal(error)
+                if explicit_controls and ordinary_policy is not None and (recovery_grant_refusal(error) or mailbox or view):
+                    # A manual Pause may win after the sent snapshot but before
+                    # Grant/Input admission. Observe that exact owner decision;
+                    # it is never a permission for automatic rejoin/Resume.
+                    current = (await client.get("state"))["snapshot"]
+                    recovery.check(current)
+                    event = _latest_run_event(current, client.identities())
+                    if current["run"]["status"] == "paused" and event.get("kind") == "pause":
+                        client.snapshot = current
+                        workload.invalidate()
+                        intent_reader.discard_motion(pause=True)
+                        await pause_current(observed=event)
+                        continue
                 if not (recovery_grant_refusal(error) or mailbox or view):
                     raise
                 await rejoin(require_episode=True, refusal_identity=error.identity,
@@ -5410,7 +5784,9 @@ async def run(args):
             # Own Pause cancels that intent; only current Native HOLD proof can
             # qualify finishing. Ordinary Stop/readback remains separate below.
             proof = await recovery.finish_owned(bench=bench, wall_deadline=qualification_ceiling,
-                                                renewal_check=renewal_healthy, renewal_reconcile=restart_qualified_renewal)
+                                                renewal_check=renewal_healthy, renewal_reconcile=restart_qualified_renewal,
+                                                **({"observed_pause": deliberate_pause["pause_event"]} if deliberate_pause is not None else {}),
+                                                **({"resumed_pause": resumed_pause_context} if resumed_pause_context is not None else {}))
             final = proof["snapshot"]
             summary.update({key: proof[key] for key in
                             ("pause_operation_id", "pause_receipt", "native_held_qualified",
@@ -5709,10 +6085,13 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", choices=("usb-leaders", "virtual-leaders"))
     for name in ("url", "ca", "storage-state"):
-        parser.add_argument("--" + name, required=True)
-    destination = parser.add_mutually_exclusive_group(required=True)
+        parser.add_argument("--" + name)
+    destination = parser.add_mutually_exclusive_group()
     destination.add_argument("--output")
     destination.add_argument("--output-root", help="existing private directory; create one fresh UUID run beneath it")
+    parser.add_argument("--ordinary-config", help="existing stable private ordinary-use JSON v1")
+    parser.add_argument("--operating-profile", choices=(ORDINARY_AM1_ARMS_PROFILE,))
+    parser.add_argument("--right-elbow-p", type=int, choices=(16, 32), help="explicit ordinary session RIGHT P16/P32; baseline16")
     parser.add_argument("--bindings", help="existing matched component binding for routine invocation metadata")
     parser.add_argument("--prepare-current-rest", action="store_true",
                         help="prepare the explicit ordinary-arms LEFT-P32 request once before Claim/Start")
@@ -5744,16 +6123,28 @@ def main(argv=None):
         "--no-keyboard", action="store_true", help="USB stationary probe/arm-only operation; body stays zero"
     )
     args = parser.parse_args(argv)
+    try:
+        resolve_ordinary_config(args)
+    except (ValueError, OSError) as error:
+        parser.error(str(error))
+    policy = args.ordinary_arm_profile
+    if not all((args.url, args.ca, args.storage_state)):
+        parser.error("--url, --ca and --storage-state are required without ordinary config")
+    if not (args.output or args.output_root):
+        parser.error("--output or --output-root required")
     if args.duration_seconds is None:
         args.duration_seconds = 60. if args.left_entry else 180.
     frontdoor = args.prepare_current_rest or args.bindings is not None or args.output_root is not None
-    if frontdoor and not (args.prepare_current_rest and args.bindings and args.output_root):
+    if policy is not None and not (args.bindings and args.output_root):
+        parser.error("ordinary AM1 policy requires matched --bindings and an existing --output-root")
+    if frontdoor and not (args.bindings and args.output_root and (policy is not None or args.prepare_current_rest)):
         parser.error("routine launch requires --bindings, --output-root and --prepare-current-rest together")
     args.source = args.source or ("virtual-leaders" if frontdoor else "usb-leaders")
     args.workload_segment = args.workload_segment or ("ordinary-arms" if frontdoor else "full")
     if frontdoor:
         root = Path(args.output_root).resolve()
-        if not root.is_dir() or args.source != "virtual-leaders" or args.workload_segment != "ordinary-arms":
+        if (not root.is_dir() or args.workload_segment != "ordinary-arms"
+            or args.source != "virtual-leaders" and policy is None):
             parser.error("routine launch requires an existing private output root and ordinary virtual-arms profile")
         args.output = str(root / ("am1-virtual-" + str(uuid4())))
     try:
@@ -5767,7 +6158,7 @@ def main(argv=None):
         (args.left_port, args.right_port, args.leader_id, args.calibration_dir)
     ):
         parser.error("USB requires existing explicit ports, leader ID and calibration directory")
-    if ((args.bench_continuity or args.workload_segment != "full") and args.source != "virtual-leaders"
+    if ((args.bench_continuity or args.workload_segment != "full" and policy is None) and args.source != "virtual-leaders"
         or args.interrupt_controller and not args.bench_continuity):
         parser.error("bench continuity/controller gap requires predetermined virtual source")
     if not 0 < args.duration_seconds <= 180 or not 0.3 <= args.interruption_seconds <= (12 if args.interrupt_controller else 2):
