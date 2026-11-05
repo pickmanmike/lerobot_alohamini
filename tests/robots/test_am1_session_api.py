@@ -2019,3 +2019,178 @@ def test_bootstrap_grace_bounded_existing_journal_tags_never_change_close(monkey
         rendered=calls[0][0] % calls[0][1]
         assert len(rendered)<=160 and "PRIVATE-TICKET-SENTINEL" not in rendered
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure,reason", [
+    ("timeout", "send_timeout"), ("connection", "send_connection"), ("runtime", "send_runtime"),
+])
+@pytest.mark.parametrize("logger_fails", [False, True])
+def test_wss_close_trace_keeps_sender_cause_public_generation_and_redacts(failure, reason, logger_fails):
+    from types import SimpleNamespace
+    from tools import am1_session_service as service
+
+    async def scenario():
+        calls = []
+        sentinel = "PRIVATE-PAYLOAD-COOKIE-TOKEN-MESSAGE"
+        class Socket(_PeerQueueSocket):
+            close_code = None
+            async def send_str(self, value):
+                if failure == "timeout":
+                    return await super().send_str(value)
+                raise (ConnectionError if failure == "connection" else RuntimeError)(sentinel)
+            async def close(self, *, code):
+                self.close_code = code
+                await super().close(code=code)
+        def warning(template, *args):
+            calls.append(template % args)
+            if logger_fails:
+                raise RuntimeError(sentinel)
+        ws = Socket()
+        peer = service.Peer(ws, sentinel, sentinel)
+        generation = oid()+":41"
+        peer.revision = generation
+        peer.diagnostic_generation = generation
+        peer.close_logger = SimpleNamespace(warning=warning)
+        try:
+            assert peer.put({"kind": "snapshot", "revision": generation, "snapshot": {"private": sentinel}}, True)
+            await asyncio.wait_for(peer.sender, 1.)
+            assert ws.close_codes == [1013] and peer.closed and ws.sent == []
+            assert calls, "bounded sender close currently loses its diagnostic origin"
+            first = calls[0]
+            assert "generation="+generation in first and "first_origin=sender" in first
+            assert "first_reason="+reason in first and "attempted_code=1013" in first
+            assert "send_elapsed_s=" in first
+            assert ("TimeoutError" if failure == "timeout" else "ConnectionError" if failure == "connection" else "RuntimeError") in first
+            peer.revision = oid()+":42"
+            peer._trace_close("receiver", "stream_end")
+            last = calls[-1]
+            assert "generation="+generation in last and "first_origin=sender" in last
+            assert "first_reason="+reason in last and "observed_code=1013" in last
+            assert all(len(row) <= 512 and sentinel not in row for row in calls)
+        finally:
+            await peer.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("logger_fails", [False, True])
+def test_wss_close_trace_reply_overflow_is_distinct_from_optional_snapshot_pressure(logger_fails):
+    from types import SimpleNamespace
+    from tools import am1_session_service as service
+
+    async def scenario():
+        calls = []
+        def warning(template, *args):
+            calls.append(template % args)
+            if logger_fails:
+                raise RuntimeError("private logger error")
+        ws = _PeerQueueSocket()
+        peer = service.Peer(ws, "PRIVATE-DEVICE", "PRIVATE-TOKEN")
+        peer.diagnostic_generation = oid()+":43"
+        peer.close_logger = SimpleNamespace(warning=warning)
+        try:
+            assert peer.put(_peer_queue_snapshot(36870), True)
+            await asyncio.wait_for(ws.entered.wait(), .2)
+            assert peer.put(_peer_queue_snapshot(36870), True) is False
+            assert not calls and not peer.closed
+            assert peer.put({"kind": "result", "private": "PRIVATE-COOKIE", "data": "x"*36870}) is False
+            await asyncio.wait_for(ws.closed.wait(), .2)
+            assert peer.closed and ws.close_codes == [1013]
+            assert calls and "first_origin=queue" in calls[0] and "first_reason=reply_overflow" in calls[0]
+            assert "attempted_code=1013" in calls[0] and "send_elapsed_s=None" in calls[0]
+            assert all(len(row) <= 512 and "PRIVATE" not in row for row in calls)
+        finally:
+            await peer.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("logger_fails", [False, True])
+def test_wss_close_trace_receive_end_correlates_only_initial_public_revision(monkeypatch, logger_fails):
+    from types import SimpleNamespace
+    from tools import am1_session_service as service
+
+    async def scenario():
+        calls, sockets = [], []
+        sentinel = "PRIVATE-TICKET-COOKIE-TOKEN"
+        class Socket(_PeerQueueSocket):
+            close_code = None
+            async def prepare(self, request):
+                return None
+            async def receive(self):
+                return SimpleNamespace(type=WSMsgType.TEXT, data=json.dumps({"ticket": sentinel}))
+            def __aiter__(self):
+                return self
+            async def __anext__(self):
+                await asyncio.sleep(.01)
+                raise StopAsyncIteration
+            def exception(self):
+                return None
+            async def close(self, *, code):
+                self.close_code = code
+                await super().close(code=code)
+        def warning(template, *args):
+            calls.append(template % args)
+            if logger_fails:
+                raise RuntimeError(sentinel)
+        gateway = service.Gateway.__new__(service.Gateway)
+        gateway.pending_ws, gateway.peers, gateway.revision = 0, set(), 0
+        gateway.incarnation = oid()
+        gateway.auth = SimpleNamespace(resolve=lambda _: {"id": "PRIVATE-DEVICE", "control": True})
+        async def current():
+            return {"private": sentinel}
+        gateway.current = current
+        for index in (1, 2):
+            ws = Socket()
+            ws.release.set()
+            sockets.append(ws)
+            gateway.tickets = {service.digest(sentinel): ("PRIVATE-DEVICE", time.monotonic()+10)}
+            monkeypatch.setattr(service.web, "WebSocketResponse", lambda **_: ws)
+            class Request(dict):
+                pass
+            request = Request(token=sentinel, device={"id": "PRIVATE-DEVICE"})
+            request.app = SimpleNamespace(logger=SimpleNamespace(warning=warning))
+            request.transport = SimpleNamespace(set_write_buffer_limits=lambda **_: None,
+                get_extra_info=lambda _: SimpleNamespace(setsockopt=lambda *args: None), abort=ws.abort)
+            await gateway.websocket(request)
+            assert gateway.pending_ws == 0 and gateway.peers == set() and ws.close_codes == [1000]
+            revision = ws.sent[0]["revision"]
+            assert revision == gateway.incarnation+":"+str(index)
+            correlated = [row for row in calls if "generation="+revision in row]
+            assert correlated, "receive-end journal has no per-transport public correlation"
+            assert any("first_origin=receiver" in row and "first_reason=stream_end" in row for row in correlated)
+            assert any("origin=final" in row and "attempted_code=1000" in row
+                       and "observed_code=1000" in row for row in correlated)
+        assert all(len(row) <= 512 and sentinel not in row and "PRIVATE-DEVICE" not in row for row in calls)
+    asyncio.run(scenario())
+
+
+def test_wss_close_trace_existing_close_abort_keeps_sender_first_cause():
+    from types import SimpleNamespace
+    from tools import am1_session_service as service
+
+    async def scenario():
+        calls = []
+        class Socket(_PeerQueueSocket):
+            close_code = None
+            async def send_str(self, value):
+                raise ConnectionError("PRIVATE-EXCEPTION-MESSAGE")
+            async def close(self, *, code):
+                self.close_codes.append(code)
+                self.close_code = code
+                await asyncio.Event().wait()
+        ws = Socket()
+        peer = service.Peer(ws, "PRIVATE-DEVICE", "PRIVATE-TOKEN")
+        peer.diagnostic_generation = oid()+":44"
+        peer.close_logger = SimpleNamespace(warning=lambda template, *args: calls.append(template % args))
+        try:
+            assert peer.put({"kind": "snapshot", "snapshot": {}}, True)
+            await asyncio.wait_for(peer.sender, 1.)
+            assert ws.aborted and ws.close_codes == [1013] and peer.closed
+            aborts = [row for row in calls if "origin=close" in row and "reason=abort" in row]
+            assert aborts, "close abort remains invisible"
+            assert "exception=TimeoutError" in aborts[0] and "attempted_code=1013" in aborts[0]
+            assert "first_exception=ConnectionError" in aborts[0]
+            assert all("first_origin=sender" in row and "first_reason=send_connection" in row for row in calls)
+            assert all(len(row) <= 512 and "PRIVATE" not in row for row in calls)
+        finally:
+            await peer.close()
+    asyncio.run(scenario())
