@@ -4264,7 +4264,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
 
 
 @pytest.mark.parametrize("cause", ["grant_native_renewal_before", "grant_native_renewal_pause", "grant_native_renewal_stop", "grant_native_renewal_takeover", "grant_native_renewal_deadline", "grant_native_renewal_descriptor", "initial_view_refusal", "initial_view_refusal_pause", "initial_connect_loss_pre", "initial_connect_loss_post", "initial_connect_loss_late", "initial_connect_loss_late_pause", "initial_connect_loss_contract", "initial_connect_loss_qualified_pause", "initial_connect_loss_bound_pause", "feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "resume_reporting_pause", "resume_reporting_renewal", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_unknown_receipt", "ordinary_input_unknown_pre", "ordinary_input_unknown_post", "ordinary_input_unknown_transport", "grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_transport", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_budget_post_create", "normal_finish_budget_get_create", "normal_finish_unknown_budget_create", "normal_finish_unknown_pre", "normal_finish_unknown_post", "normal_finish_unknown_twice", "normal_finish_unknown_wrong_status", "normal_finish_unknown_wrong_shape", "normal_finish_unknown_wrong_type", "normal_finish_unknown_refused", "normal_finish_unknown_new_pause", "normal_finish_unknown_new_stop", "normal_finish_unknown_new_owner", "normal_finish_unknown_new_service", "normal_finish_unknown_cancel", "normal_finish_unknown_view_lost", "normal_finish_unknown_ceiling", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal", "peer_start_normal", "peer_start_bench", "peer_bench_unqualified_view", "peer_bench_local_loss", "peer_normal_unqualified_view", "held_command120_view_later", "held_command120_view_never", "held_command120_local_loss", "view_refusal122_input_before", "view_refusal122_input_after", "view_refusal122_grant_before", "view_refusal122_grant_after", "view_refusal122_never", "view_refusal122_pause", "view_refusal122_stop", "view_refusal122_takeover", "view_refusal122_grant_connect_preflight_before", "view_refusal122_grant_connect_preflight_pending", "view_refusal122_grant_connect_preflight_queue", "view_refusal122_grant_connect_preflight_sent", "view_refusal122_grant_connect_preflight_pause", "view_refusal122_grant_connect_preflight_stop", "view_refusal122_grant_connect_preflight_takeover", "view_refusal122_grant_connect_preflight_reboot", "view_refusal122_grant_connect_preflight_lease", "view_refusal122_grant_connect_preflight_deadline", "view_refusal122_grant_connect_preflight_cancel", "view_refusal130_grant_input_race_before", "view_refusal130_grant_input_race_never", "view_refusal130_grant_input_race_pause", "view_refusal130_grant_input_race_stop", "view_refusal130_grant_input_race_takeover", "view_refusal130_grant_input_race_revision", "view_refusal130_grant_input_race_history", "view_refusal130_grant_input_race_time", "renewal_unknown133_grant_before", "renewal_unknown133_grant_pause", "renewal_unknown133_grant_takeover", "renewal_unknown133_grant_unchanged", "renewal_unknown133_grant_receipt_unknown", "renewal_unknown133_grant_second_read", "renewal_unknown133_grant_stream_before"])
-def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause, initial_unknown=False, initial_ack_attach=False, zero_input_retry=None, ordinary_profile=False, ordinary_control=False, inactive_recovery=None):
+def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause, initial_unknown=False, initial_ack_attach=False, zero_input_retry=None, ordinary_profile=False, ordinary_control=False, inactive_recovery=None, renewal_profile_p=None):
     import asyncio
     import copy
     import json
@@ -4283,6 +4283,14 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
     a.run.update(backend_incarnation=e.host_incarnation, recovery_episodes=0, status="paused")
     a._teleop_view = {"run_id": e.run_id, "qualified_until": 10.5, "role": "chest"}
     healthy, epoch, commands = [True], [0], []
+    renewal_workspace = None
+    if renewal_profile_p is not None:
+        from tests.robots.test_am1_live_phase_coordinator import ordinary_admission
+        renewal_workspace = copy.deepcopy(ordinary_admission()[1]["snapshot"]["run"]["live_input"]["workspace"])
+        a.run.update(ordinary_arm_profile={"profile": m.ORDINARY_AM1_ARMS_PROFILE,
+                                          "right_elbow_p": renewal_profile_p},
+                     bench_continuity=False, accepted_at=8., startup_deadline=188.)
+        e.sample["ack"]["live_input"]["workspace"] = copy.deepcopy(renewal_workspace)
     initial_connect = cause.startswith("initial_connect_loss_")
     initial_view = cause.startswith("initial_view_refusal")
     initial_phase = initial_connect or initial_view or initial_unknown
@@ -4362,6 +4370,14 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 value["pose_aligned"] = False
             if cause == "held_command120_local_loss":
                 value["required_observation"] = False
+        if renewal_workspace is not None:
+            live.update(workspace=copy.deepcopy(renewal_workspace),
+                        reference=copy.deepcopy(renewal_workspace["reference"]),
+                        cursor=copy.deepcopy(renewal_workspace["reference"]),
+                        accepted_target=copy.deepcopy(renewal_workspace["reference"]), body=dict(m.ZERO_BODY))
+            value.update(source="protected-physical-provider",
+                         measured_positions=copy.deepcopy(renewal_workspace["reference"]))
+            value["accepted_host_action"]["accepted_action"] = {"mode": "raw_goal_hold", "body_velocity": 0.}
         if not cursor_ready[0]:
             for key in ("cursor", "cursor_intent_revision", "cursor_feedback_sequence"):
                 live.pop(key, None)
@@ -7039,7 +7055,15 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                             error = (await asyncio.gather(renewal, return_exceptions=True))[0]
                             assert m._owner_unknown_renewal(error)
                             renewal_errors.append(error)
-                            if mode == "pause":
+                            if renewal_profile_p is not None:
+                                assert error.renewal_context["run"] == guard.original["run"]
+                                assert guard.original["run"]["ordinary_arm_profile"] == {
+                                    "profile": m.ORDINARY_AM1_ARMS_PROFILE, "right_elbow_p": renewal_profile_p}
+                            if mode == "policy":
+                                a.run["ordinary_arm_profile"]["right_elbow_p"] = 32 if renewal_profile_p == 16 else 16
+                            elif mode == "missing_policy":
+                                a.run.pop("ordinary_arm_profile")
+                            elif mode == "pause":
                                 assert a.handle({"op": "pause", "run_id": e.run_id,
                                                  "operation_id": str(uuid4())}, enrolled["device_id"])["accepted"]
                             elif mode == "stop":
@@ -15263,3 +15287,12 @@ def test_run_keeps_bounded_called_process_error_streams_privately_before_api(tmp
             assert retained == dict(text=raw[:4096].decode("utf-8", errors="replace"),
                 captured_bytes=len(raw), retained_bytes=4096, truncated=True)
     assert len(json.dumps(detail).encode()) < 32768
+
+
+@pytest.mark.parametrize("right_elbow_p", [16, 32])
+@pytest.mark.parametrize("mode", ["hold", "unknown", "pause", "stop", "takeover", "reboot", "policy", "missing_policy"])
+def test_ordinary_profile_unknown_renewal_retains_exact_policy_after_owned_pause(
+    tmp_path, monkeypatch, right_elbow_p, mode
+):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
+        tmp_path, monkeypatch, "normal_finish_renewal_" + mode, renewal_profile_p=right_elbow_p)

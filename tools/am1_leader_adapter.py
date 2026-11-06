@@ -1263,6 +1263,18 @@ class HTTPOutcomeError(RuntimeError):
         super().__init__(reason if isinstance(reason, str) else detail)
 
 
+def _immutable_recovery_run(state):
+    """Freeze the same original run and validated operating policy at both anchors."""
+    run = state["run"]
+    value = {key: run[key] for key in
+             ("run_id", "recipe", "backend_incarnation", "native_live_at", "deadline")}
+    if "operation_id" in run:
+        value["operation_id"] = run["operation_id"]
+    if _live(state)["workspace"].get("workspace_profile") == ORDINARY_AM1_ARMS_PROFILE:
+        value["ordinary_arm_profile"] = validate_ordinary_arm_profile(run.get("ordinary_arm_profile"))
+    return json.loads(json.dumps(value, allow_nan=False))
+
+
 def _normal_renewal_receipt(receipt, generation):
     if (not isinstance(receipt, dict)
         or set(receipt) != {"accepted", "status", "controller_generation", "presence_expires", "lease_seconds", "timing"}
@@ -2256,9 +2268,10 @@ class SessionClient:
             try:
                 previous = self._renewal_ack
                 if _normal_renewal_receipt(previous, self.generation):
+                    # Unknown-renewal repair still requires a recorded Start operation.
+                    self.snapshot["run"]["operation_id"]
                     anchor = {"identity": self.identities(), "device": self.device,
-                              "run": {k: self.snapshot["run"][k] for k in
-                                      ("run_id", "operation_id", "recipe", "backend_incarnation", "native_live_at", "deadline")},
+                              "run": _immutable_recovery_run(self.snapshot),
                               "previous_expiry": previous["presence_expires"], "dispatched": started}
             except (AttributeError, KeyError, TypeError):
                 pass  # No qualified prior receipt means no automatic unknown-renewal reconciliation.
@@ -2814,12 +2827,7 @@ class SameRunRecovery:
         self.original = json.loads(
             json.dumps(
                 {
-                    "run": {
-                        key: state["run"][key]
-                        for key in ("run_id", "recipe", "backend_incarnation", "native_live_at", "deadline")
-                    } | ({"operation_id": state["run"]["operation_id"]} if "operation_id" in state["run"] else {})
-                      | ({"ordinary_arm_profile": validate_ordinary_arm_profile(state["run"].get("ordinary_arm_profile"))}
-                         if live["workspace"].get("workspace_profile") == ORDINARY_AM1_ARMS_PROFILE else {}),
+                    "run": _immutable_recovery_run(state),
                     "service": state["service_incarnation"],
                     "controller": {"device_id": client.device, "controller_generation": client.generation},
                     "workspace": live["workspace"],
