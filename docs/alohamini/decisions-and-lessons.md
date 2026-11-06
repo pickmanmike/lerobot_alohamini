@@ -100,6 +100,8 @@ The explicit candidate correction is limited to powered AM1 live teleoperation: 
 
 ## COMM-02: ordinary pause and ambiguous Start have distinct meanings
 
+- **Inactive input can still encounter a native HOLD:**96ef63b0 reached Live but supplied no movement before a required-input recovery changed history. Retain the exact pre-hold connection/episode while waiting; do not adopt a count alone or Resume automatically. A new, still-current intention must pass the existing same-run authority, sensing/view, original-reference/deadline and executor-ACK qualifier. Discard intent across HOLD/requalification barriers; Pause/Stop/takeover/reboot and intent expiry still prevail. Software reproduction and physical follow-through have separate evidence scopes.
+
 - **Explicit virtual Pause:** the reviewed path holds until explicit fresh Resume and discards movement across both barriers. An accepted Resume need not fabricate a new `resumed` history event: correlate the exact old Pause, fresh connection/release, accepted new revision and native active acknowledgment before consuming only that old Pause locally. A newer Pause/Stop/takeover/reboot still prevails. After a known Grant/Input refusal, reconcile an authenticated same-run Pause instead of treating stale running WSS state as current authority. USB held re-engagement and Quest control acquisition remain separate unvalidated scope.
 
 - **Zero-input failures:** realistic existing Core→IPC→TLS fixtures demonstrate owned certain cleanup followed by an explicitly fresh ordinary Start for initial view qualification timeout and reporting/renewal loss before PC-observed admission. The fresh operation has new identity/reference/deadline/input channel; failed summaries stay immutable. Uncertain cleanup still blocks it. These are software recovery checks, not new powered or physical-leader validation.
@@ -148,6 +150,8 @@ The explicit candidate correction is limited to powered AM1 live teleoperation: 
 
 ## MEDIA-02: default onboard WebRTC has bounded evidence
 
+- **Dark source and dark presentation are scene evidence:** the fresh75-second comparison retained current Chest JPEGs alongside advancing WebRTC; both were nearly black. Decoding is not useful viewing, and advisory low-light P1 cannot silently replace the normal required onboard view. All five configured readers were enabled, while the wrist source remained unavailable; selection cannot create an absent upstream frame, and the cause remains unknown. Reuse that result instead of repeating role checks or unchanged captures. Preserve the separate earlier backend-required-kill failure and later clean release.
+
 - **Loaded page and current qualification:** a trusted GET of the installed asset does not prove an existing page instance uses it. Stage86's same enrolled profile exposed the8-row format after actual reload/reselection; no cache cause was proved. A valid90s visible/offviewport/visible contrast advanced frames throughout, while two earlier invalid tool setups remain separate. Keep the actual selected view visible during useful operation and pass the current tab/file explicitly to observations; do not repeat camera-only qualification as a routine gate. Fresh2e5c had zero view-expiry transitions, but its input/native-input holds and fine-view limits remain.
 
 - **Apply now / interruption evidence:** keep the selected required view visible while sampling existing diagnostics. Retain callback/presentation, specific report dispatch/settlement and original Pi qualification-floor clocks separately; latest-only receipts and isolated one-second samples cannot locate a subsecond gap. A bounded per-report history preserves the intervening event clocks; its row/drop counts define actual retained coverage. The selectedb752view hold regained qualification within48ms but lasted954ms including protective rearm. Do not equate full held time with missing-video duration or infer that fresh Pi source proves timely presentation/reporting.
@@ -183,6 +187,8 @@ Virtual changing input remains at the existing acquisition/mapping/transport/exe
 - **Reopen:** concrete task evidence changing product priorities or proving a shared-path gap. Do not substitute more per-joint menus or precision scores for the representative combined workload.
 
 ## PROCESS-02: one lean runner, focused informative checks
+
+- **Keep component launch context explicit:** reuse the shared PC environment including its HTTP overlay. Administrative launch context does not supply the full Motor interpreter's imports: execute it under the installed Motor root/source path, then let the guarded Runtime proof reader qualify its own files. A missing import or wrong state-envelope assumption is a tool-context error; correct that invocation before rebuilding an environment or changing an operating guard. Start source collectors inside the finite capture window.
 
 - **Current foundation scope:** continue changing twelve-target virtual input through the same acquisition/mapping/transport/execution boundary, with one closed normal profile and finite declared activity. Close ordinary Pause/re-engagement, Finish and fresh reuse without turning separate fixed elbow routines, test counts or source integration into completion. A supported explicit tool-argument correction is a tool-error retry, not a new robot hypothesis or approval cycle.
 
@@ -314,7 +320,7 @@ The practical-use continuation supersedes earlier experiment-specific retry/dura
 
 ## EVIDENCE-01: retain success, first cause and limits
 
-- **Late release is separate evidence:** a verified motor shutdown and an incomplete camera release are separate obligations. Preserve the original camera receipt; qualify later process/device release through fresh source/boot/owner-bound completion evidence and durable ACK. A genuine missing lift status packet still ends the attempt; a secondary startup-identity parser error must not replace that native cause.
+- **Late release is separate evidence:** a verified motor shutdown and an incomplete camera release are separate obligations. Preserve the original camera receipt; qualify later process/device release through fresh source/boot/owner-bound completion evidence and durable ACK. A genuine missing lift status packet still ends the attempt; a secondary startup-identity parser error must not replace that native cause. Canonical-owner completion holds the existing private viewer lock and rechecks known owners plus readable configured-device holders; unrelated protected descriptors remain explicitly uninspected. It is not a global assertion that every process descriptor was readable.
 
 - **Read the emitted cleanup schema:** the ordinary profile uses the native aggregate restoration obligation plus its full restored receipt; do not invent a required sibling flag. Pure proof readers used by the HTTP-only runtime must remain independent of hardware-package imports. An outer classification failure does not rewrite original evidence or clear uncertainty: bind the original deployment and require fresh stopped proof with a durable reconciliation ACK before reuse.
 

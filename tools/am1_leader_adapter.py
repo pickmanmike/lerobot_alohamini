@@ -2808,6 +2808,7 @@ class SameRunRecovery:
         )
         self.episodes, self.completed_episodes, self.cause, self.pause_recoveries = 0, 0, None, 0
         self.connect_rebindings = 0
+        self._inactive_anchor, self._inactive_episode = None, None
         self.check(state)
 
     async def reacquire(self, *, until=None):
@@ -3130,6 +3131,33 @@ class SameRunRecovery:
         run = state.get("run") or {}
         return run.get("first_cause") == self.cause and run.get("recovery_episodes") == self.episodes
 
+    def observe_inactive(self, state, *, inactive):
+        """Retain an exact waiting-input episode without adopting history or issuing Resume."""
+        self.check(state, history=False)
+        if self.history_qualified(state) and self._inactive_episode is None:
+            if inactive and state["run"]["status"] == "running":
+                self._inactive_anchor = json.loads(json.dumps(
+                    {"identity": self.client.identities(), "snapshot": state}, allow_nan=False))
+            return False
+        if self._inactive_anchor is None:
+            self.check(state, history=state["run"]["status"] != "recovering")
+            return False  # The existing active-input qualifier still owns ordinary active recovery.
+        if self.client.connection != self._inactive_anchor["identity"]["connection_generation"]:
+            raise RuntimeError("inactive native recovery original connection changed")
+        episode = self._grant_episode(state, self._inactive_anchor,
+            pending=self._inactive_episode["qualified"] if self._inactive_episode is not None else None)
+        phase = state["run"]["status"]
+        changed = self._inactive_episode is None or self._inactive_episode["phase"] != phase
+        if self._inactive_episode is None:
+            self._inactive_episode = {"recovery": episode, "phase": phase, "qualified": None}
+        else:
+            if self._inactive_episode["recovery"] != episode:
+                raise RuntimeError("inactive native recovery original descriptor changed")
+            self._inactive_episode["phase"] = phase
+        # Clear intentions acquired before/during HOLD and at its requalification
+        # barrier. A later intention alone may enter the existing Resume qualifier.
+        return changed or phase == "recovering"
+
     def check(self, state, *, history=True):
         run, evidence, live = state.get("run") or {}, state.get("evidence", {}), _live(state)
         if self.original["workspace"].get("workspace_profile") in {*ORDINARY_ARM_PROFILES, LEFT_ENTRY_WORKSPACE_PROFILE} and (
@@ -3424,6 +3452,7 @@ class SameRunRecovery:
                 if (self.client.snapshot["run"].get("status") == "running"
                     and self.client.snapshot.get("evidence", {}).get("active_acknowledged") is True):
                     self.completed_episodes = self.episodes
+                    self._inactive_anchor, self._inactive_episode = None, None
                 return recovered or bool(deferred)
 
             except (Exception, asyncio.CancelledError) as error:
@@ -3721,6 +3750,14 @@ class SameRunRecovery:
             raise RuntimeError("original mailbox input refusal/current ordinary pause unavailable")
         recovered, local_ceiling, episode = False, wall_deadline, None
         retained = None
+        inactive_episode = (self._inactive_episode if grant_context is None and pending_recovery is None
+                            and resume_context is None else None)
+        if inactive_episode is not None:
+            if self.client.connection != self._inactive_anchor["identity"]["connection_generation"]:
+                raise RuntimeError("inactive native recovery original connection changed before Resume")
+            retained = self._grant_episode(state, self._inactive_anchor, pending=inactive_episode["qualified"])
+            if retained != inactive_episode["recovery"]:
+                raise RuntimeError("inactive native recovery original descriptor changed before Resume")
         if pending_recovery is not None:
             context = pending_recovery.context
             if self.client.connection != context["identity"]["connection_generation"]:
@@ -3816,7 +3853,8 @@ class SameRunRecovery:
                 <= min(episode["started"] + 10, run["deadline"])
                 or run["recovery_episodes"] != self.episodes + (0 if (pending_recovery is not None and pending_recovery.pending_episode is not None
                     or resume_context is not None and resume_context["pending_episode"] is not None
-                    or pending_grant_episode is not None) else 1)
+                    or pending_grant_episode is not None
+                    or inactive_episode is not None and inactive_episode["qualified"] is not None) else 1)
                 or run.get("first_cause")
                 not in {"feedback_loss", "native_active_ack_loss", "required_proof_loss"}
             ):
@@ -3897,6 +3935,8 @@ class SameRunRecovery:
                         and _view_admitted(state)
                     ):
                         self.episodes, self.cause, recovered = count, cause, True
+                        if inactive_episode is not None:
+                            inactive_episode["qualified"] = {"recovery": dict(episode), "count": count, "cause": cause}
                         if grant_context is not None:
                             # Presence reconciliation may interrupt before Resume.
                             # Retain this qualified source episode until its fresh
@@ -5330,6 +5370,19 @@ async def run(args):
         async def rejoin(*, require_episode=False, refusal_identity=None, expected_pause=None, until=None, grant_error=None,
                          input_error=None):
             ceiling = until if until is not None else wall_deadline()
+            inactive_rejoin = bool(changing_input and
+                (recovery._inactive_anchor is not None or recovery._inactive_episode is not None))
+            inactive_intent = workload.command if inactive_rejoin else None
+            def rejoin_healthy():
+                if inactive_rejoin:
+                    refresh_intent()
+                    if (pending_control is not None or deliberate_pause is not None
+                        or not producer.intent_is_current(inactive_intent)):
+                        renewal_healthy()  # Preserve an earlier actual presence failure as the first error.
+                        raise RuntimeError("inactive native recovery requires the same fresh movement intention")
+                renewal_healthy()
+            if inactive_rejoin:
+                rejoin_healthy()  # Presence reconciliation alone cannot authorize a waiting-input Resume.
             if bench:
                 remaining = (client.snapshot or {}).get("run", {}).get("remaining_s")
                 if type(remaining) not in (int, float) or not math.isfinite(remaining) or remaining <= 0:
@@ -5376,7 +5429,7 @@ async def run(args):
                         require_episode=require_episode,
                         refusal_identity=refusal_identity,
                         expected_pause=expected_pause,
-                        renewal_check=renewal_healthy, grant_error=grant_error,
+                        renewal_check=rejoin_healthy, grant_error=grant_error,
                         renewal_reconcile=None if bench else restart_qualified_renewal,
                         input_error=input_error if ordinary_input_rearm else None,
                     )
@@ -5445,7 +5498,15 @@ async def run(args):
             state = client.snapshot
             if state["run"]["run_id"] != run_id or state["run"]["deadline"] != deadline:
                 raise RuntimeError("original run identity/deadline changed")
-            recovery.check(state, history=state["run"]["status"] != "recovering")
+            if changing_input:
+                if recovery.observe_inactive(state, inactive=not workload.active):
+                    workload.invalidate()
+                    floor = intent_reader.discard_motion()
+                    record({"event": "inactive_native_recovery_held", "original_recovery": recovery._inactive_episode["recovery"],
+                            "phase": state["run"]["status"], "new_movement_sequence_floor": floor,
+                            "fresh_movement_required": True, "window_deadline_monotonic_s": activity_ceiling})
+            else:
+                recovery.check(state, history=state["run"]["status"] != "recovering")
             return state
 
         async def qualify_acquisition(state, *, until=None):
@@ -5454,6 +5515,9 @@ async def run(args):
             if state["run"]["status"] == "recovering":
                 await rejoin(require_episode=True, until=until)
                 return False
+            if recovery._inactive_episode is not None:
+                await rejoin(require_episode=True, until=until)
+                return True
             cause = _latest_run_event(state, client.identities()).get("kind")
             if (
                 state["run"]["status"] != "paused"
@@ -5692,6 +5756,11 @@ async def run(args):
                     # Grant/Input admission. Observe that exact owner decision;
                     # it is never a permission for automatic rejoin/Resume.
                     current = (await client.get("state"))["snapshot"]
+                    if recovery._inactive_anchor is not None:
+                        client.snapshot = current
+                        acquisition_state()
+                        if recovery._inactive_episode is not None:
+                            continue  # A rejected acquisition is not fresh intent for its newly observed HOLD.
                     recovery.check(current)
                     event = _latest_run_event(current, client.identities())
                     if current["run"]["status"] == "paused" and event.get("kind") == "pause":
@@ -5715,6 +5784,7 @@ async def run(args):
                 continue  # Normal run/deadline/status/rejoin checks precede a new acquisition.
             grant, frame, result = sent
             if changing_input:
+                recovery._inactive_anchor = None  # The waiting anchor cannot authorize recovery after accepted movement.
                 captured_intent = producer.last_capture_intent
                 phase = f"intent-{captured_intent['seq']}-{captured_intent['op']}"
             if producer.last_clutch:
