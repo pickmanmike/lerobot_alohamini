@@ -4264,7 +4264,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
 
 
 @pytest.mark.parametrize("cause", ["grant_native_renewal_before", "grant_native_renewal_pause", "grant_native_renewal_stop", "grant_native_renewal_takeover", "grant_native_renewal_deadline", "grant_native_renewal_descriptor", "initial_view_refusal", "initial_view_refusal_pause", "initial_connect_loss_pre", "initial_connect_loss_post", "initial_connect_loss_late", "initial_connect_loss_late_pause", "initial_connect_loss_contract", "initial_connect_loss_qualified_pause", "initial_connect_loss_bound_pause", "feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "resume_reporting_pause", "resume_reporting_renewal", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_unknown_receipt", "ordinary_input_unknown_pre", "ordinary_input_unknown_post", "ordinary_input_unknown_transport", "grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_transport", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_budget_post_create", "normal_finish_budget_get_create", "normal_finish_unknown_budget_create", "normal_finish_unknown_pre", "normal_finish_unknown_post", "normal_finish_unknown_twice", "normal_finish_unknown_wrong_status", "normal_finish_unknown_wrong_shape", "normal_finish_unknown_wrong_type", "normal_finish_unknown_refused", "normal_finish_unknown_new_pause", "normal_finish_unknown_new_stop", "normal_finish_unknown_new_owner", "normal_finish_unknown_new_service", "normal_finish_unknown_cancel", "normal_finish_unknown_view_lost", "normal_finish_unknown_ceiling", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal", "peer_start_normal", "peer_start_bench", "peer_bench_unqualified_view", "peer_bench_local_loss", "peer_normal_unqualified_view", "held_command120_view_later", "held_command120_view_never", "held_command120_local_loss", "view_refusal122_input_before", "view_refusal122_input_after", "view_refusal122_grant_before", "view_refusal122_grant_after", "view_refusal122_never", "view_refusal122_pause", "view_refusal122_stop", "view_refusal122_takeover", "view_refusal122_grant_connect_preflight_before", "view_refusal122_grant_connect_preflight_pending", "view_refusal122_grant_connect_preflight_queue", "view_refusal122_grant_connect_preflight_sent", "view_refusal122_grant_connect_preflight_pause", "view_refusal122_grant_connect_preflight_stop", "view_refusal122_grant_connect_preflight_takeover", "view_refusal122_grant_connect_preflight_reboot", "view_refusal122_grant_connect_preflight_lease", "view_refusal122_grant_connect_preflight_deadline", "view_refusal122_grant_connect_preflight_cancel", "view_refusal130_grant_input_race_before", "view_refusal130_grant_input_race_never", "view_refusal130_grant_input_race_pause", "view_refusal130_grant_input_race_stop", "view_refusal130_grant_input_race_takeover", "view_refusal130_grant_input_race_revision", "view_refusal130_grant_input_race_history", "view_refusal130_grant_input_race_time", "renewal_unknown133_grant_before", "renewal_unknown133_grant_pause", "renewal_unknown133_grant_takeover", "renewal_unknown133_grant_unchanged", "renewal_unknown133_grant_receipt_unknown", "renewal_unknown133_grant_second_read", "renewal_unknown133_grant_stream_before"])
-def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause, initial_unknown=False, initial_ack_attach=False, zero_input_retry=None, ordinary_profile=False, ordinary_control=False, inactive_recovery=None, renewal_profile_p=None):
+def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause, initial_unknown=False, initial_ack_attach=False, zero_input_retry=None, ordinary_profile=False, ordinary_control=False, inactive_recovery=None, renewal_profile_p=None, reporting_payload=None):
     import asyncio
     import copy
     import json
@@ -4511,6 +4511,13 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
             )
             if cause.startswith("upgrade_attach_"):
                 mode = cause.removeprefix("upgrade_attach_")
+                expected_reporting_snapshot = None
+                if mode == "compression":
+                    if reporting_payload is not None:
+                        async def retained_current():
+                            return copy.deepcopy(reporting_payload)
+                        gateway.current = retained_current
+                    expected_reporting_snapshot = await gateway.current()
                 client = m.SessionClient(gateway.origin, cert, storage)
                 client.record = record
                 real_upgrade, real_post = client.http.ws_connect, client.post
@@ -4526,7 +4533,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     assert client.ws is None
                     if mode == "refusal":
                         return await real_upgrade(*args, **dict(kwargs, headers={"Origin": "https://foreign.invalid"}))
-                    if mode.startswith("post_"):
+                    if mode.startswith("post_") or mode == "compression":
                         return await real_upgrade(*args, **kwargs)
                     if len(upgrades) == 1:
                         if mode == "stop":
@@ -4541,13 +4548,22 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     assert len(upgrades) == len(tickets) == 1 and client.ws is None
                 else:
                     await client.attach()
-                    if mode.startswith("post_"):
+                    if mode == "compression":
+                        assert len(upgrades) == len(tickets) == 1
+                        assert client.ws.compress == 15
+                        extensions = client.ws._response.headers["Sec-WebSocket-Extensions"]
+                        assert "server_no_context_takeover" in extensions and "client_no_context_takeover" in extensions
+                        assert client.ws._writer.notakeover is True
+                        assert client.snapshot == expected_reporting_snapshot
+                        assert json.dumps(client.snapshot, sort_keys=True) == json.dumps(expected_reporting_snapshot, sort_keys=True)
+                    elif mode.startswith("post_"):
                         assert len(upgrades) == len(tickets) == len(attach_snapshot_failures) == 1
                         assert len(gateway.tickets) == 1  # Only the undelivered first ticket remains, bounded by its5s expiry.
                         assert tuple(gateway.tickets) == attach_snapshot_failures[0]
                     else:
                         assert len(upgrades) == len(tickets) == 2 and tickets[0] != tickets[1]
-                    assert client.snapshot["run"]["status"] == ("finishing" if mode in {"stop", "post_stop"} else "paused")
+                    if mode != "compression":
+                        assert client.snapshot["run"]["status"] == ("finishing" if mode in {"stop", "post_stop"} else "paused")
                     if mode in {"stop", "post_stop"}: assert client.snapshot["run"]["requested_terminal"] == "stopped"
                     assert client.generation is client.connection is None and client.sequence == 0
                     assert len(gateway.peers) == 1
@@ -15219,7 +15235,7 @@ def test_attach_retries_only_one_unassigned_bare_upgrade_timeout(monkeypatch, mo
         async def upgrade(*args, **kwargs):
             upgrades.append(kwargs)
             assert client.ws is None
-            assert kwargs == dict(ssl=client.tls, heartbeat=6, max_msg_size=65536, compress=0)
+            assert kwargs == dict(ssl=client.tls, heartbeat=6, max_msg_size=65536, compress=15)
             if mode == "refusal": raise refusal
             if mode == "tls": raise tls
             if mode == "subclass": raise specific
@@ -15426,3 +15442,8 @@ def test_attach_replaces_only_exact_unknown_ticket_with_shared_attempt_budget(mo
 def test_reporting_attach_unknown_replacement_uses_fresh_real_tls_ticket_without_control(tmp_path, monkeypatch, mode):
     test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
         tmp_path, monkeypatch, "upgrade_attach_post_" + mode)
+
+
+def test_session_client_negotiates_deflate_without_changing_snapshot_or_control(tmp_path, monkeypatch):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
+        tmp_path, monkeypatch, "upgrade_attach_compression")

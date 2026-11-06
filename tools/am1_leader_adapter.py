@@ -1833,7 +1833,7 @@ class SessionClient:
                         ssl=self.tls,
                         heartbeat=6,
                         max_msg_size=65536,
-                        compress=0,
+                        compress=15,
                     )
                 except TimeoutError as error:
                     if type(error) is not TimeoutError or attempt:
