@@ -1810,10 +1810,23 @@ class SessionClient:
         if device.get("control") is not True:
             raise ValueError("existing enrolled PC control capability required")
         self.csrf, self.device = device["csrf"], device["device_id"]
-        first_upgrade_timeout = None
+        first_reporting_error = None
         for attempt in range(2):
             try:
-                attached = await self.post("attach", {})  # A replacement always needs its own fresh reporting ticket.
+                try:
+                    attached = await self.post("attach", {})  # Each attempt needs its own fresh reporting ticket.
+                except HTTPOutcomeError as error:
+                    if attempt or not _owner_unknown_http(error):
+                        raise
+                    first_reporting_error = error
+                    with contextlib.suppress(Exception):
+                        record = getattr(self, "record", None)
+                        if record is not None:
+                            record({"event": "reporting_attachment_retry", "phase": "ticket_request",
+                                    "next_attachment_attempt": 2, "maximum_attachment_attempts": 2,
+                                    "error_type": "HTTPOutcomeError", "http_status": 503, "control_request": False,
+                                    "new_motor_authority": False})
+                    continue
                 try:
                     self.ws = await self.http.ws_connect(
                         self.origin.replace("https:", "wss:") + "/api/ws",
@@ -1825,7 +1838,7 @@ class SessionClient:
                 except TimeoutError as error:
                     if type(error) is not TimeoutError or attempt:
                         raise  # Connection/TLS-specific subclasses and a second timeout cannot retry.
-                    first_upgrade_timeout = error
+                    first_reporting_error = error
                     with contextlib.suppress(Exception):
                         record = getattr(self, "record", None)
                         if record is not None:
@@ -1835,8 +1848,8 @@ class SessionClient:
                     continue
                 break
             except Exception as error:
-                if first_upgrade_timeout is not None and error is not first_upgrade_timeout:
-                    raise first_upgrade_timeout from error
+                if first_reporting_error is not None and error is not first_reporting_error:
+                    raise first_reporting_error from error
                 raise
         # Existing per-request 3s limits and enclosing caller ceilings still apply;
         # no authority, input, native clock, or post-upgrade qualification is retried here.

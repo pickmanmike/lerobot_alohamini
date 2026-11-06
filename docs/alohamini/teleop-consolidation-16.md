@@ -720,6 +720,8 @@ Deliberate Pause/Resume support is being verified for the virtual changing-input
 
 The single existing coordinator can supply a representative changing-input session using `--ordinary-config` and `--plan ordinary-arms`; it does not create a new Pi trajectory or motor protocol. Its fixed endpoints are derived once from the admitted run, and refusal to fit the full declared excursion is reported instead of silently shrinking or recentering it. Normal pause/re-engagement and fresh reuse are separate results from phase completion.
 
+For a finite ordinary elbows/grippers activity, the same coordinator accepts `--plan ordinary-short --window-seconds 90 --intent-ttl-seconds 60` with the same `--ordinary-config`. It streams full4° elbow and20-point closing intentions, holds the other eight admitted targets, then uses owned Pause2s, explicit Resume, a newly acquired original Return/reopen and Finish:15 active seconds planned. All twelve feedback/mapping/source/reference checks remain required. This separate composition can fit ordinary wrist midpoints without imposing the full plan's relative3° wrist task; it neither changes the fixed workspace nor passes that original45-second comparison. Current physical qualification remains in the canonical current state.
+
 The declared initial qualification envelope is below. Positioning values use `normalized_arm`; grippers use opening percentage. Raw counts show the exact fixed boundaries for the accepted calibration, not URDF angles. The region is not a claim that every joint combination is clear or that every endpoint has been achieved.
 
 | Joint | LEFT normalized bounds (raw counts) | RIGHT normalized bounds (raw counts) |

@@ -1114,7 +1114,8 @@ def test_control_phase_commands_and_held_pacing_wait_for_explicit_ack():
 
 
 @pytest.mark.parametrize("external", [False, True])
-def test_ordinary_coordinator_real_relay_waits_for_pause_ack_and_fresh_resume_before_new_move(tmp_path, monkeypatch, external):
+@pytest.mark.parametrize("plan_name", ["ordinary-arms", "ordinary-short"])
+def test_ordinary_coordinator_real_relay_waits_for_pause_ack_and_fresh_resume_before_new_move(tmp_path, monkeypatch, external, plan_name):
     from types import SimpleNamespace
     from uuid import uuid4
 
@@ -1123,8 +1124,8 @@ def test_ordinary_coordinator_real_relay_waits_for_pause_ack_and_fresh_resume_be
 
     ready, admitted = ordinary_admission()
     native = admitted["snapshot"]["run"]["live_input"]["workspace"]
-    options = ordinary_options()
-    plan = coordinator.fresh_ordinary_targets(ready, admitted, ramp_seconds=3., gripper_direction="closing")
+    options = ordinary_options() if plan_name == "ordinary-arms" else ordinary_short_options()
+    plan = coordinator.fresh_ordinary_targets(ready, admitted, ramp_seconds=3., gripper_direction="closing", short=plan_name == "ordinary-short")
     phases = coordinator.phases_for(plan, options, admitted=admitted)
     root, trial = tmp_path/"repo", tmp_path/"repo/trial"
     trial.mkdir(parents=True)
@@ -1188,11 +1189,12 @@ def test_ordinary_coordinator_real_relay_waits_for_pause_ack_and_fresh_resume_be
     monkeypatch.setattr(coordinator, "ROOT", root)
     monkeypatch.setattr(coordinator, "time", SimpleNamespace(monotonic=lambda: now[0]))
     monkeypatch.setattr(coordinator.subprocess, "Popen", Process)
-    assert coordinator.main(["--plan", "ordinary-arms", "--operating-profile", "ordinary-am1-arms-v1",
+    assert coordinator.main(["--plan", plan_name, "--operating-profile", "ordinary-am1-arms-v1",
                              "--bindings", str(root/"bindings.json"), "--window-seconds", "90"]) == 0
     assert all(frame["body"] == ZERO_BODY and set(frame["target"]) == set(plan["origin"]) for frame in frames)
     if not external:
-        assert [command.split()[0] for command in commands] == ["move", "return", "move", "return", "move", "pause", "resume", "move", "move", "move", "return", "finish"]
+        assert [command.split()[0] for command in commands] == (["move", "move", "pause", "resume", "return", "finish"] if plan_name == "ordinary-short" else
+            ["move", "return", "move", "return", "move", "pause", "resume", "move", "move", "move", "return", "finish"])
         assert frames[-1]["target"] == pytest.approx(plan["origin"])
 
 
@@ -1389,3 +1391,111 @@ def test_ordinary_normal_start_first_move_uses_only_exact_qualified_legal_origin
         assert plan["origin"]==commands and plan["workspace"]["reference"]["arm_left_shoulder_lift.pos"]>100
         assert coordinator.phases_for(plan,ordinary_options())[0]["targets"]["arm_left_shoulder_lift.pos"]==100.
     assert (ready,admitted)==original
+
+
+
+SHORT_KEYS={"arm_left_elbow_flex.pos","arm_right_elbow_flex.pos","arm_left_gripper.pos","arm_right_gripper.pos"}
+
+
+def ordinary_short_options(*extra):
+    return coordinator.parse_args(["--plan","ordinary-short","--operating-profile","ordinary-am1-arms-v1",
+        "--bindings","unused-current.json",*extra])
+
+
+def ordinary_wrist_midpoint_admission():
+    ready,admitted=ordinary_admission();state=admitted["snapshot"];current=state["run"]["live_input"]
+    key="arm_right_wrist_flex.pos";q=normalized_raw(3134,current["workspace"]["calibration"][key[:-4]])
+    for values in (current["reference"],current["workspace"]["reference"],current["cursor"],current["accepted_target"],ready["command_reference"]):values[key]=q
+    state["evidence"]["accepted_host_action"]["arm_feedback"]["positions"][key].update(raw=3134,normalized=q)
+    return ready,admitted
+
+
+def test_ordinary_short_cli_defaults_are_explicit_existing_profile_and_no_native_mode():
+    options=ordinary_short_options()
+    assert options.ramp_seconds==3. and options.dwell_seconds==2. and options.window_seconds==90.
+    assert options.ordinary_arm_profile=={"profile":"ordinary-am1-arms-v1","right_elbow_p":16}
+    command=coordinator.adapter_command(options)
+    assert "--plan" not in command and "--prepare-current-rest" not in command
+    assert command[command.index("--operating-profile")+1]=="ordinary-am1-arms-v1"
+
+
+def test_ordinary_short_keeps_all12_validation_but_only_four_full_excursions():
+    ready,admitted=ordinary_wrist_midpoint_admission();before=copy.deepcopy((ready,admitted))
+    with pytest.raises(ValueError):coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing")
+    plan=coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing",short=True)
+    assert set(plan["initial_feedback"])==set(plan["origin"]) and len(plan["origin"])==12
+    assert set(plan["excursions"])==SHORT_KEYS
+    for key in plan["origin"]:
+        if key in SHORT_KEYS:
+            assert plan["excursions"][key]["amount"]==(20. if "gripper" in key else 4.)
+        else:assert plan["targets"][key]==plan["origin"][key]
+    assert (ready,admitted)==before
+
+
+def test_ordinary_short_declares_15active_2paused_original_return_after_fresh_resume():
+    ready,admitted=ordinary_wrist_midpoint_admission();options=ordinary_short_options()
+    plan=coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing",short=True)
+    phases=coordinator.phases_for(plan,options,admitted=admitted)
+    assert [p["op"] for p in phases]==["move","move","pause","resume","return","finish"]
+    assert sum(p.get("ramp",0)+p.get("dwell",0) for p in phases if p["op"] not in {"pause","resume"})==15.
+    assert phases[2]["dwell"]==2.
+    for key in plan["origin"]:
+        assert phases[0]["targets"][key]==(plan["targets"][key] if "elbow_flex" in key else plan["origin"][key])
+        assert phases[1]["targets"][key]==plan["targets"][key]
+    assert all(p.get("complete_before_advance") is True for p in phases if p["op"] in {"move","return"})
+    reader=VirtualIntentReader("interactive",clock=lambda:1.,allow_controls=True)
+    for phase in phases:
+        reader.receive_line(coordinator.phase_command(phase,60.));command=reader.take()
+        assert command["op"]==phase["op"]
+        if command["op"]=="move":assert set(command["targets"])==set(plan["origin"])
+
+
+@pytest.mark.parametrize("fault",["unselected_mapping","unselected_identity","source","owner","hold","view","deadline","elbow_rate","gripper_rate","gripper_fit"])
+def test_ordinary_short_preserves_all_joint_feedback_and_normal_authority_guards(fault):
+    ready,admitted=ordinary_wrist_midpoint_admission();state=admitted["snapshot"];native=state["run"]["live_input"]["workspace"]
+    points=state["evidence"]["accepted_host_action"]["arm_feedback"]["positions"]
+    if fault=="unselected_mapping":points["arm_right_wrist_flex.pos"]["normalized"]+=.1
+    elif fault=="unselected_identity":points["arm_right_wrist_flex.pos"]["raw"]=True
+    elif fault=="source":state["evidence"]["source"]="foreign"
+    elif fault=="owner":state["controller"]["device_id"]=None
+    elif fault=="hold":state["evidence"]["hold_acknowledged"]=False
+    elif fault=="view":state["run"]["live_input"]["required_view"]["required"]=False
+    elif fault=="deadline":state["run"]["deadline"]+=301.
+    elif fault=="elbow_rate":native["bounds"]["arm_right_elbow_flex.pos"]["rate_per_s"]=.0001
+    elif fault=="gripper_rate":native["bounds"]["arm_right_gripper.pos"]["rate_per_s"]=.0001
+    else:
+        key="arm_right_gripper.pos";q=native["bounds"][key]["min"]
+        for values in (native["reference"],state["run"]["live_input"]["reference"],state["run"]["live_input"]["cursor"],state["run"]["live_input"]["accepted_target"],ready["command_reference"]):values[key]=q
+        points[key].update(raw=2118,normalized=q)
+    with pytest.raises((ValueError,RuntimeError)):
+        coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing",short=True)
+
+
+@pytest.mark.parametrize("extra",[["--side","right"],["--workpose","admitted-span"],["--degrees","3"],["--gripper-cycle"],["--gripper-direction","opening"],["--approach-from-below"]])
+def test_ordinary_short_rejects_legacy_selectors_and_nonclosing_task(extra):
+    with pytest.raises(SystemExit):ordinary_short_options(*extra)
+
+
+def test_ordinary_short_preserves_distinct_measured_reference_and_legal_held_goals():
+    ready,admitted=ordinary_wrist_midpoint_admission();current=admitted["snapshot"]["run"]["live_input"]
+    key="arm_left_shoulder_lift.pos";commands=dict(ready["command_reference"]);commands[key]+=.01
+    current.update(cursor=dict(commands),accepted_target=dict(commands));ready["command_reference"]=commands
+    original=copy.deepcopy(current["workspace"]["reference"])
+    plan=coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing",short=True)
+    assert plan["origin"]==commands and plan["workspace"]["reference"]==original
+    assert plan["targets"][key]==commands[key]
+
+
+@pytest.mark.parametrize("short",[True,False])
+def test_ordinary_short_and_full_composition_cannot_be_mixed(short):
+    ready,admitted=ordinary_admission()
+    plan=coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing",short=short)
+    options=ordinary_options() if short else ordinary_short_options()
+    with pytest.raises(ValueError):coordinator.phases_for(plan,options,admitted=admitted)
+
+
+
+def test_ordinary_short_requires_ordinary_profile_and_a_closed_boolean_composition():
+    with pytest.raises(SystemExit):coordinator.parse_args(["--plan","ordinary-short","--bindings","unused.json"])
+    ready,admitted=ordinary_admission()
+    with pytest.raises(ValueError):coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing",short=1)

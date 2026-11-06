@@ -17,6 +17,8 @@ from tools.am1_leader_adapter import (
     EXTENDED_GRASP_CLOSING_RAW, SUPPORTED_GRASP_CLOSING_RAW, _qualified_command_reference, resolve_ordinary_config,
 )
 
+ORDINARY_PLANS = ("ordinary-arms", "ordinary-short")
+
 KEY = "arm_left_elbow_flex.pos"
 GRIP = "arm_left_gripper.pos"
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,7 +34,7 @@ def finite(value, *, zero=False):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--side", choices=("left", "right"), default="left", help="selected elbow/gripper; RIGHT uses relative or admitted-span out-return")
-    parser.add_argument("--plan", choices=("out-return", "bidirectional-midpoint", "lower-return-gripper", "grasp-return", "gripper-close-return", "gripper-open-finish", "ordinary-arms"), default="out-return")
+    parser.add_argument("--plan", choices=("out-return", "bidirectional-midpoint", "lower-return-gripper", "grasp-return", "gripper-close-return", "gripper-open-finish", *ORDINARY_PLANS), default="out-return")
     parser.add_argument("--workpose", choices=("relative", "midpoint", "admitted-span"), default="relative")
     parser.add_argument("--approach-from-below", action="store_true")
     parser.add_argument("--gripper-cycle", action="store_true", help="out-return: same elbow workpose, declared10-point gripper excursion then original")
@@ -68,7 +70,7 @@ def parse_args(argv=None):
     except (ValueError, OSError) as error:
         parser.error(str(error))
     args.window_seconds = args.duration_seconds if args.duration_seconds is not None else 90.
-    args.ramp_seconds = args.ramp_seconds if args.ramp_seconds is not None else 3. if args.plan == "ordinary-arms" else 10.
+    args.ramp_seconds = args.ramp_seconds if args.ramp_seconds is not None else 3. if args.plan in ORDINARY_PLANS else 10.
     if args.bindings is None:
         parser.error("--bindings or --ordinary-config required")
     args.bindings = Path(args.bindings)
@@ -77,12 +79,14 @@ def parse_args(argv=None):
                           ("output_root", ".cache/am1-teleop-consolidation-16/physical-runs")):
         if getattr(args, name) is None:
             setattr(args, name, default)
-    if args.plan == "ordinary-arms" and (args.ordinary_arm_profile is None or args.side != "left"
+    if args.plan in ORDINARY_PLANS and (args.ordinary_arm_profile is None or args.side != "left"
         or args.workpose != "relative" or args.degrees is not None or args.direction is not None
         or args.approach_from_below or args.gripper_cycle or args.supported_grasp_closing or args.extended_grasp_closing
         or args.gripper_closed_opening is not None or args.gripper_open_opening is not None
         or args.gripper_direction not in ("opening", "closing")):
-        parser.error("ordinary-arms requires the ordinary AM1 policy and its full declared two-arm amplitudes, without legacy selectors")
+        parser.error(args.plan+" requires the ordinary AM1 policy and its full declared two-arm amplitudes, without legacy selectors")
+    if args.plan == "ordinary-short" and args.gripper_direction != "closing":
+        parser.error("ordinary-short requires full20-point closing followed by original Return")
     args.degrees_explicit, args.direction_explicit = args.degrees is not None, args.direction is not None
     if args.degrees is None:
         args.degrees = 4.
@@ -95,7 +99,7 @@ def parse_args(argv=None):
             parser.error(str(error))
     opening_only = args.plan == "gripper-open-finish"
     if args.dwell_seconds is None:
-        args.dwell_seconds = 2. if opening_only or args.plan == "ordinary-arms" else 3.
+        args.dwell_seconds = 2. if opening_only or args.plan in ORDINARY_PLANS else 3.
     if max(args.ramp_seconds, args.window_seconds, args.intent_ttl_seconds) > 300:
         parser.error("existing input/native durations are bounded by300seconds")
     if (args.workpose == "midpoint" or args.approach_from_below) and not (
@@ -198,8 +202,10 @@ def fresh_target(ready, admitted, *, degrees, direction, ramp_seconds, side="lef
     return dict(q0=q0, target=target, targets=targets, origin=dict(commands), calibration=list(cal), workspace=workspace, side=side)
 
 
-def fresh_ordinary_targets(ready, admitted, *, ramp_seconds, gripper_direction):
-    """Plan full prospective amplitudes from the original qualified measured reference."""
+def fresh_ordinary_targets(ready, admitted, *, ramp_seconds, gripper_direction, short=False):
+    """Qualify all12 joints; plan full amplitudes for the declared composition."""
+    if type(short) is not bool or short and gripper_direction != "closing":
+        raise ValueError("ordinary short composition requires explicit full closing")
     # Reuse the same held ownership/ACK/workspace/reference/deadline qualifications.
     base = fresh_target(ready, admitted, degrees=0., direction="increasing", ramp_seconds=ramp_seconds)
     state, workspace, origin = admitted["snapshot"], base["workspace"], base["origin"]
@@ -218,6 +224,8 @@ def fresh_ordinary_targets(ready, admitted, *, ramp_seconds, gripper_direction):
         raise ValueError("ordinary activity requires its original qualified held command")
     points = state["evidence"]["accepted_host_action"]["arm_feedback"]["positions"]
     targets, excursions = dict(origin), {}
+    selected = ({"arm_"+side+"_"+joint+".pos" for side in ("left", "right")
+                 for joint in ("elbow_flex", "gripper")} if short else set(TELEOP_ARM_KEYS))
     for key in TELEOP_ARM_KEYS:
         point, cal = points[key], workspace["calibration"][key[:-4]]
         grip = key.endswith("gripper.pos")
@@ -231,6 +239,8 @@ def fresh_ordinary_targets(ready, admitted, *, ramp_seconds, gripper_direction):
             or not math.isfinite(point["normalized"])
             or abs(normalized_raw(point["raw"], cal, gripper=grip)-point["normalized"]) > 1e-7):
             raise ValueError("ordinary original measured mapping differs")
+        if key not in selected:
+            continue  # Its original feedback remains qualified; its command stays at the admitted hold.
         amount = 20. if grip else 3. if "wrist_flex" in key else 4.
         delta = amount if grip else amount*PRACTICAL_ELBOW_COUNTS_PER_REVOLUTION/360*200/(cal[4]-cal[3])
         bounds = workspace["bounds"][key]
@@ -245,14 +255,15 @@ def fresh_ordinary_targets(ready, admitted, *, ramp_seconds, gripper_direction):
         targets[key] = endpoint
         excursions[key] = dict(amount=amount, units="opening_points" if grip else "encoder_degrees", direction=direction,
                                original=origin[key], target=endpoint)
-    return dict(base, targets=targets, excursions=excursions, initial_feedback=points, ordinary_arms=True)
+    return dict(base, targets=targets, excursions=excursions, initial_feedback=points, ordinary_arms=True,
+                **({"ordinary_short": True} if short else {}))
 
 
 def phases_for(plan, options, *, admitted=None):
     ramp, dwell = options.ramp_seconds, options.dwell_seconds
-    if options.plan == "ordinary-arms":
-        if not plan.get("ordinary_arms"):
-            raise ValueError("ordinary-arms requires its full fresh qualified plan")
+    if options.plan in ORDINARY_PLANS:
+        if not plan.get("ordinary_arms") or plan.get("ordinary_short", False) is not (options.plan == "ordinary-short"):
+            raise ValueError("ordinary composition requires its matching full fresh qualified plan")
         origin, all_targets = plan["origin"], plan["targets"]
         arm_targets = {k: origin[k] if k.endswith("gripper.pos") else all_targets[k] for k in TELEOP_ARM_KEYS}
         phases = []
@@ -261,13 +272,19 @@ def phases_for(plan, options, *, admitted=None):
             return dict(name=name, op="move", targets=dict(targets), ramp=ramp, dwell=dwell, complete_before_advance=True)
         def original(name):
             return dict(name=name, op="return", ramp=ramp, dwell=dwell, complete_before_advance=True)
-        for side in ("left", "right"):
-            key = f"arm_{side}_elbow_flex.pos"
-            phases += [move(side+"_elbow", dict(origin, **{key: all_targets[key]})), original(side+"_return_original")]
-        phases += [move("ordinary_both_arms", arm_targets),
-                   dict(name="ordinary_pause", op="pause", dwell=2.), dict(name="ordinary_resume", op="resume"),
-                   move("ordinary_reengaged_arms", arm_targets), move("ordinary_both_grippers", all_targets),
-                   move("ordinary_grippers_return", arm_targets), original("return_original"), dict(name="finish", op="finish")]
+        if options.plan == "ordinary-short":
+            elbows = dict(origin, **{key: all_targets[key] for key in origin if "elbow_flex" in key})
+            phases = [move("ordinary_both_elbows", elbows), move("ordinary_both_grippers", all_targets),
+                      dict(name="ordinary_pause", op="pause", dwell=2.), dict(name="ordinary_resume", op="resume"),
+                      original("return_original"), dict(name="finish", op="finish")]
+        else:
+            for side in ("left", "right"):
+                key = f"arm_{side}_elbow_flex.pos"
+                phases += [move(side+"_elbow", dict(origin, **{key: all_targets[key]})), original(side+"_return_original")]
+            phases += [move("ordinary_both_arms", arm_targets),
+                       dict(name="ordinary_pause", op="pause", dwell=2.), dict(name="ordinary_resume", op="resume"),
+                       move("ordinary_reengaged_arms", arm_targets), move("ordinary_both_grippers", all_targets),
+                       move("ordinary_grippers_return", arm_targets), original("return_original"), dict(name="finish", op="finish")]
         previous = origin
         for phase in phases[:-1]:
             if phase["op"] in {"pause", "resume"}:
@@ -656,7 +673,7 @@ def adapter_command(options):
 
 def main(argv=None):
     options = parse_args(argv)
-    ordinary = options.plan == "ordinary-arms"
+    ordinary = options.plan in ORDINARY_PLANS
     opening_only = options.plan == "gripper-open-finish"
     timed_span = options.side == "right" and options.workpose == "admitted-span"
     grip = f"arm_{options.side}_gripper.pos"
@@ -749,7 +766,7 @@ def main(argv=None):
                             and tail.admitted["snapshot"]["run"].get("ordinary_arm_profile") != options.ordinary_arm_profile):
                             raise ValueError("native admitted ordinary policy differs from the requested immutable policy")
                         plan = (fresh_ordinary_targets(ready, tail.admitted, ramp_seconds=options.ramp_seconds,
-                                                       gripper_direction=options.gripper_direction) if ordinary else
+                                                       gripper_direction=options.gripper_direction, short=options.plan == "ordinary-short") if ordinary else
                                 fresh_target(ready, tail.admitted, degrees=options.degrees if relative_workpose else 0.,
                                              direction=options.direction, ramp_seconds=options.ramp_seconds,
                                              side=options.side, workpose=options.workpose))
