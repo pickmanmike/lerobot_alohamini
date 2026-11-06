@@ -35,7 +35,7 @@ The explicit candidate correction is limited to powered AM1 live teleoperation: 
 
 ## MOTOR-02: retain role-specific settings and units
 
-- **Ordinary profile installed at Stage104; broader physical qualification pending:** `ordinary-am1-arms-v1` captures verified OFF originals and restores them durably. Its intentional settings are LEFT P32/I0/D32/Acceleration254 and explicitly selected RIGHT P16 or temporary P32/I0/D32/Acceleration0; other joints retain baseline. RIGHT dead zones/Max_Torque_Limit must come from actual sole-owner startup reads, not historical defaults. The fixed declared qualification region is separate from calibrated full travel or proof of every combined pose. See the canonical current state for deployment and physical scope.
+- **Ordinary profile installed at Stage105; broader physical qualification pending:** `ordinary-am1-arms-v1` captures verified OFF originals and restores them durably. Its intentional settings are LEFT P32/I0/D32/Acceleration254 and explicitly selected RIGHT P16 or temporary P32/I0/D32/Acceleration0; other joints retain baseline. RIGHT dead zones/Max_Torque_Limit must come from actual sole-owner startup reads, not historical defaults. The fixed declared qualification region is separate from calibrated full travel or proof of every combined pose. See the canonical current state for deployment and physical scope.
 
 - **Do not transfer LEFT conditions to RIGHT:** current RIGHT baseline is P16/I0/D32/Acceleration0.2f sparse right-bus ID3 samples show175.5mA, signed Present_Load−260,11.7V/status0 at Goal1945/PP1883; these are real effort indicators, not calibrated torque, proven saturation or a supply diagnosis. The historical selected500mA host ceiling is not established for this ordinary path.
 
@@ -313,6 +313,8 @@ The practical-use continuation supersedes earlier experiment-specific retry/dura
 - **Completed builds, missing wrapper closure:** Stage57 built the exact full13/full22 projections, then the final local wrapper refused five retained115 originals absent from its upload list. Keep the successful bundles and original refusal; repair the existing exact-case common wrapper, verify the real artifact-to-audit path, and finish only missing metadata. The reviewed correction passed10 focused checks; no rebuild or extra native attempt was needed. Browser-control tool reconnection is separate from source/decoder behavior: reuse the enrolled open-only launcher/profile, not new pairing or a new streaming stack.
 
 ## EVIDENCE-01: retain success, first cause and limits
+
+- **Late release is separate evidence:** a verified motor shutdown and an incomplete camera release are separate obligations. Preserve the original camera receipt; qualify later process/device release through fresh source/boot/owner-bound completion evidence and durable ACK. A genuine missing lift status packet still ends the attempt; a secondary startup-identity parser error must not replace that native cause.
 
 - **Read the emitted cleanup schema:** the ordinary profile uses the native aggregate restoration obligation plus its full restored receipt; do not invent a required sibling flag. Pure proof readers used by the HTTP-only runtime must remain independent of hardware-package imports. An outer classification failure does not rewrite original evidence or clear uncertainty: bind the original deployment and require fresh stopped proof with a durable reconciliation ACK before reuse.
 

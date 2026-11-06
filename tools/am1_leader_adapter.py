@@ -4979,7 +4979,6 @@ async def run(args):
             if (
                 startup_anchor is None
                 or not admission_identity(state)
-                or startup_times(state) != startup_anchor
             ):
                 raise RuntimeError(
                     "original native admission ownership/startup timestamps changed or unavailable"
@@ -5000,6 +4999,10 @@ async def run(args):
                         or evidence.get("fault")
                         or run.get("status")
                     )
+                )
+            if startup_times(state) != startup_anchor:
+                raise RuntimeError(
+                    "original native admission ownership/startup timestamps changed or unavailable"
                 )
 
         async def authenticated_startup_times():

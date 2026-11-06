@@ -962,9 +962,403 @@ def validate_ordinary_startup_stop_origin(run, receipt, *, motor_files):
     return True
 
 
+def validate_camera_completion_resources(resources, devices):
+    """Accept only a complete OS metadata inventory with no remaining camera owner."""
+    keys = {"backend_pid_absent", "camera_pid_absent", "camera_unit_main_pid", "camera_unit_control_pid", "camera_unit_job",
+            "camera_unit_active_state", "camera_process_pids", "backend_process_pids", "device_owner_pids"}
+    require(isinstance(resources, dict) and set(resources) == keys
+            and resources["backend_pid_absent"] is True
+            and resources["camera_pid_absent"] is True
+            and type(resources["camera_unit_main_pid"]) is int and resources["camera_unit_main_pid"] == 0
+            and type(resources["camera_unit_control_pid"]) is int and resources["camera_unit_control_pid"] == 0
+            and resources["camera_unit_job"] in ("", "0")
+            and resources["camera_unit_active_state"] in ("inactive", "failed")
+            and resources["camera_process_pids"] == resources["backend_process_pids"] == []
+            and resources["device_owner_pids"] == {row["resolved_path"]: [] for row in devices.values()},
+            "actual camera backend/unit/process/device release required")
+    return True
+
+
+def validate_camera_completion_runtime_origin(runtime_root, runtime_files, *, motor_root=None):
+    """Bind the cleanup consumer and cached shared imports to the reviewed source copies.
+
+    A copied issuer is independently sealed by its caller. The installed Runtime
+    file map supplied here can therefore be the old map during stopped staging.
+    Never import the native package merely to inspect its shared source file.
+    """
+    import importlib.util
+    from importlib.machinery import PathFinder, SourceFileLoader
+    import sys
+
+    paths = ("tools/am1_physical_reconciliation.py", "tools/am1_physical_executor.py",
+             "examples/alohamini/am1_live_teleop.py", "src/lerobot/robots/alohamini/am1_elbow_integral.py")
+    require(isinstance(runtime_files, dict) and set(runtime_files) == set(paths)
+            and all(type(value) is str and re.fullmatch("[0-9a-f]{64}", value) for value in runtime_files.values()),
+            "exact four reconciliation proof dependencies required")
+    runtime = Path(runtime_root).resolve()
+    require(runtime.is_dir(), "actual Runtime source root required")
+    allowed, verified = {}, {}
+    for path in paths:
+        expected = runtime / path
+        raw = expected.read_bytes()
+        require(expected.resolve() == expected and sha(raw) == runtime_files[path], "actual Runtime proof dependency bytes changed")
+        allowed[path] = {expected.resolve()}
+        verified[expected] = raw
+    if motor_root is not None:
+        motor = Path(motor_root).resolve()
+        for path in paths[2:]:
+            expected = motor / path
+            raw = expected.read_bytes()
+            require(expected.resolve() == expected and sha(raw) == runtime_files[path], "both Motor/Runtime shared proof copies must match")
+            allowed[path].add(expected.resolve())
+            verified[expected] = raw
+    roots = {runtime} | ({motor} if motor_root is not None else set())
+    modules = (("examples.alohamini.am1_live_teleop", paths[2], "validate_ordinary_arm_profile_receipt"),
+               ("tools.am1_physical_executor", paths[1], "qualified_cleanup_receipt"),
+               ("lerobot.robots.alohamini.am1_elbow_integral", paths[3], None))
+    for name, path, reader_name in modules:
+        module = sys.modules.get(name)
+        if module is None and reader_name is None:
+            continue
+        if module is None:
+            # Resolve namespace parents without executing package initializers.
+            # These project parents are namespaces in both installed owners.
+            search = None
+            parts = name.split(".")
+            parent = None
+            for length in range(1, len(parts)):
+                prefix = ".".join(parts[:length])
+                package = sys.modules.get(prefix)
+                spec = getattr(package, "__spec__", None) if package is not None else PathFinder.find_spec(prefix, search)
+                locations = getattr(package, "__path__", None) if package is not None else getattr(spec, "submodule_search_locations", None)
+                expected_parents = {root.joinpath(*parts[:length]) for root in roots}
+                require(spec is not None and spec.origin is None and locations is not None
+                        and (package is None or getattr(package, "__file__", None) is None)
+                        and all(Path(value).resolve() in expected_parents for value in locations),
+                        "cleanup proof import namespace has a foreign source origin")
+                if package is None:
+                    package = importlib.util.module_from_spec(spec)
+                    sys.modules[prefix] = package
+                    if parent is not None:
+                        setattr(parent, parts[length - 1], package)
+                parent, search = package, list(locations)
+            spec = PathFinder.find_spec(name, search)
+            require(spec is not None and type(spec.origin) is str
+                    and type(spec.loader) is SourceFileLoader and Path(spec.origin).resolve() in allowed[path],
+                    "uncached cleanup proof module has a foreign source origin")
+            # Compile precisely the captured SHA-verified bytes, never let an
+            # import loader reread a changed source between checking and use.
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            try:
+                exec(compile(verified[Path(spec.origin).resolve()], spec.origin, "exec", dont_inherit=True), vars(module))
+            except BaseException:
+                if sys.modules.get(name) is module:
+                    sys.modules.pop(name)
+                raise
+            setattr(parent, parts[-1], module)
+        file = getattr(module, "__file__", None)
+        origin = getattr(getattr(module, "__spec__", None), "origin", None)
+        require(type(file) is str and type(origin) is str
+                and Path(file).resolve() in allowed[path] and Path(origin).resolve() == Path(file).resolve()
+                and sha(Path(file).read_bytes()) == runtime_files[path],
+                "cached cleanup proof module has a foreign source origin")
+        if reader_name is not None:
+            reader = getattr(module, reader_name, None)
+            require(getattr(reader, "__module__", None) == name
+                    and getattr(reader, "__globals__", None) is vars(module)
+                    and getattr(reader, "__code__", None) is not None
+                    and Path(reader.__code__.co_filename).resolve() == Path(file).resolve(),
+                    "cached cleanup proof reader has a foreign source origin")
+    return True
+
+
+def validate_late_camera_completion_origin(run, receipt, camera_release):
+    """Pure eligibility for separately proving camera release, never a motor/Start permission."""
+    from tools.am1_physical_executor import qualified_cleanup_receipt
+
+    require(isinstance(run, dict) and isinstance(receipt, dict) and isinstance(camera_release, dict),
+            "original motor/run/camera objects required")
+    lifecycle = run.get("physical_result") or {}
+    incarnation = lifecycle.get("backend_incarnation")
+    rb = (receipt or {}).get("readback") or {}
+    require(run.get("status") in {"stopped", "completed", "faulted", "interrupted"}
+            and run.get("uncertain") is True and run.get("cleanup") == "physical_cleanup_unknown"
+            and run.get("source") == "protected-physical-provider"
+            and lifecycle.get("phase") == "terminal" and lifecycle.get("cleanup") == "physical_cleanup_unknown"
+            and lifecycle.get("uncertain") is True and lifecycle.get("cleanup_errors") == []
+            and lifecycle.get("run_id") == run.get("run_id") and isinstance(incarnation, str)
+            and receipt == lifecycle.get("readback")
+            and qualified_cleanup_receipt(receipt, run["run_id"], incarnation,
+                                          ordinary_arm_profile=run.get("ordinary_arm_profile"))
+            and type(receipt.get("version")) is int
+            and receipt.get("provenance") == "protected-host/actual-motor-readback"
+            and receipt.get("cleanup_errors") == [] and rb.get("buses_closed") is True
+            and rb.get("verified") is True
+            and rb.get("selected_gain_restore_required") is False
+            and receipt.get("first_cause") == lifecycle.get("first_cause") == run.get("native_first_cause"),
+            "original full native OFF/restoration and unchanged first fault required")
+    started, completed, emitted = (rb.get("started_at_monotonic_s"), rb.get("completed_at_monotonic_s"),
+                                   receipt.get("completed_at_monotonic_s"))
+    require(all(number(value) for value in (started, completed, emitted))
+            and 0 <= started <= completed <= emitted, "original native cleanup acquisition clocks required")
+    for row in rb["readbacks"]:
+        _timed_row(row, started, completed)
+    for value in (run["run_id"], incarnation):
+        require(type(value) is str and str(uuid.UUID(value)) == value, "canonical original motor identities required")
+    for key in ("left_response_p_trial", "right_response_p_trial", "right_p20_trial", "elbow_integral"):
+        if key in rb:
+            trial = rb[key]
+            require(isinstance(trial, dict) and trial.get("state") == "restored"
+                    and trial.get("restore_required") is False,
+                    "original selected settings restoration must be complete")
+            if key in ("left_response_p_trial", "right_response_p_trial"):
+                original = trial.get("original_registers") or {}
+                require(type(trial.get("restored_p_readback")) is int
+                        and trial["restored_p_readback"] == original.get("P_Coefficient")
+                        and ("selected_acceleration_profile" not in trial
+                             or type(trial.get("restored_acceleration_readback")) is int
+                             and trial["restored_acceleration_readback"] == original.get("Acceleration"))
+                        and (trial.get("binding") or {}).get("run_id") == run["run_id"]
+                        and (trial.get("binding") or {}).get("host_incarnation") == incarnation
+                        and ((trial.get("binding") or {}).get("request") or {}).get("source_head")
+                            == (run.get("backend_contract") or {}).get("host_head"),
+                        "original selected P/acceleration restoration binding required")
+    evidence = (camera_release or {}).get("release_evidence") or {}
+    require(camera_release == lifecycle.get("camera_release")
+            and type(camera_release.get("version")) is int and camera_release["version"] == 1
+            and camera_release.get("session_id") == run["run_id"] and camera_release.get("state") == "release-incomplete"
+            and camera_release.get("runtime_failed") is False
+            and camera_release.get("errors") == ["backend-stop:TimeoutExpired", "backend-not-exited"]
+            and evidence.get("backend_exited") is False and evidence.get("backend_returncode") is None
+            and type(evidence.get("backend_pid")) is int and evidence["backend_pid"] > 0
+            and all(evidence.get(key) is True for key in ("readers_joined", "viewer_socket_closed", "runtime_config_removed")),
+            "only original backend-timeout camera release may complete separately")
+    return True
+
+
+def validate_camera_completion(config, run, proof):
+    """Qualify separate late release evidence; never amend the original failed release."""
+    require(isinstance(config, dict) and isinstance(proof, dict)
+            and (proof.get("source") or {}).get("backend_contract") == config,
+            "exact protected camera completion backend binding required")
+    completion = proof.get("camera_completion")
+    keys = {"version", "kind", "run_id", "host_incarnation", "boot_id", "original_terminal_run_sha256",
+            "original_cleanup_sha256", "original_camera_release_sha256", "camera_config_sha256", "backend_pid",
+            "original_camera_lease_sha256", "camera_pid", "started_at_monotonic_s", "completed_at_monotonic_s",
+            "devices", "resources_before", "resources_after"}
+    require(isinstance(completion, dict) and set(completion) == keys
+            and type(completion["version"]) is int and completion["version"] == 1
+            and completion["kind"] == "am1-late-camera-release-completion"
+            and proof.get("original_cleanup_origin") is None,
+            "closed generic camera completion required")
+    for key in ("run_id", "host_incarnation", "boot_id", "original_terminal_run_sha256", "original_cleanup_sha256"):
+        require(completion[key] == proof.get(key), "camera completion original binding changed")
+    require(completion["run_id"] == run.get("run_id")
+            and completion["original_terminal_run_sha256"] == terminal_run_hash(run)
+            and completion["original_camera_release_sha256"] == proof.get("camera_release_sha256")
+            and type(completion["camera_config_sha256"]) is str
+            and re.fullmatch("[0-9a-f]{64}", completion["camera_config_sha256"]) is not None,
+            "camera completion original run/release/config binding required")
+    lifecycle = run.get("physical_result") or {}
+    receipt = lifecycle.get("readback")
+    release = proof.get("camera_release") or {}
+    validate_late_camera_completion_origin(run, receipt, release)
+    evidence = release.get("release_evidence") or {}
+    require(lifecycle.get("backend_incarnation") == proof.get("host_incarnation")
+            and receipt.get("first_cause") == proof.get("original_first_cause")
+            and type(completion["backend_pid"]) is int and completion["backend_pid"] == evidence["backend_pid"]
+            and type(completion["camera_pid"]) is int and completion["camera_pid"] > 0
+            and completion["camera_pid"] != completion["backend_pid"]
+            and type(completion["original_camera_lease_sha256"]) is str
+            and re.fullmatch("[0-9a-f]{64}", completion["original_camera_lease_sha256"]) is not None,
+            "same original native fault/backend and separate camera lease PID required")
+    start, end = completion["started_at_monotonic_s"], completion["completed_at_monotonic_s"]
+    require(all(number(value) for value in (start, end, release.get("released_at"), receipt.get("completed_at_monotonic_s")))
+            and receipt["completed_at_monotonic_s"] <= release["released_at"] <= start <= end
+            and proof["started_at_monotonic_s"] <= start <= end <= proof["completed_at_monotonic_s"],
+            "late camera evidence must use original clocks inside the fresh stopped proof")
+    devices = completion["devices"]
+    require(isinstance(devices, dict) and devices
+            and set(devices) <= {"forward", "backward", "chest", "wrist_left", "wrist_right"},
+            "configured camera device identities required")
+    for role, row in devices.items():
+        require(isinstance(row, dict) and set(row) == {"path", "resolved_path", "device_rdev", "device_inode"}
+                and type(row["path"]) is str
+                and (row["path"] == "/dev/am_camera_" + role
+                     or re.fullmatch(r"/dev/v4l/by-path/[A-Za-z0-9_.:-]+-video-index0", row["path"]))
+                and type(row["resolved_path"]) is str and re.fullmatch(r"/dev/video[0-9]+", row["resolved_path"])
+                and type(row["device_rdev"]) is int and row["device_rdev"] > 0
+                and type(row["device_inode"]) is int and row["device_inode"] > 0,
+                "literal resolved character device rdev/inode binding required")
+    require(len({row["resolved_path"] for row in devices.values()}) == len(devices)
+            and len({row["device_rdev"] for row in devices.values()}) == len(devices)
+            and proof.get("original_markers") == dict.fromkeys(MARKERS),
+            "distinct camera nodes and unchanged absent original motor markers required")
+    for key in ("resources_before", "resources_after"):
+        validate_camera_completion_resources(completion[key], devices)
+    return True
+
+
+def read_camera_completion_devices(config):
+    """Native producer only: bind all configured full-namespace character nodes, without opening them."""
+    raw = _private_bytes(config["camera_config"])
+    value = _json(raw)
+    require(isinstance(value, dict) and type(value.get("version")) is int and value["version"] == 1
+            and set(value) <= {"version", "bind", "port", "cameras", "rotations"}
+            and isinstance(value.get("cameras"), dict) and value["cameras"]
+            and set(value["cameras"]) <= {"forward", "backward", "chest", "wrist_left", "wrist_right"},
+            "actual semantic-role camera configuration required")
+    devices = {}
+    for role, path in value["cameras"].items():
+        require(type(path) is str and (path == "/dev/am_camera_" + role
+                or re.fullmatch(r"/dev/v4l/by-path/[A-Za-z0-9_.:-]+-video-index0", path)),
+                "configured role camera alias/by-path required")
+        resolved = Path(path).resolve(strict=True)
+        info = resolved.stat()
+        require(re.fullmatch(r"/dev/video[0-9]+", resolved.as_posix()) is not None and stat.S_ISCHR(info.st_mode)
+                and info.st_rdev > 0 and info.st_ino > 0, "actual resolved video character node required")
+        devices[role] = dict(path=path, resolved_path=resolved.as_posix(), device_rdev=info.st_rdev, device_inode=info.st_ino)
+    require(len({row["device_rdev"] for row in devices.values()}) == len(devices), "distinct actual camera devices required")
+    return sha(raw), devices
+
+
+def read_camera_completion_resources(config, run_id, backend_pid, devices, *, camera_pid):
+    """OS metadata only, including same-UID fd targets outside PrivateDevices' /dev view.
+
+    The native producer additionally proves the full-namespace character nodes and
+    fuser result. This resident recheck never treats missing private /dev nodes as
+    release, opens devices, or changes the mount namespace.
+    """
+    require(type(backend_pid) is int and backend_pid > 0, "original camera backend PID required")
+    require(type(camera_pid) is int and camera_pid > 0 and camera_pid != backend_pid, "original camera lease PID required")
+    proc = Path("/proc")
+    require(proc.is_dir(), "native process inventory required")
+    owners = {row["resolved_path"]: [] for row in devices.values()}
+    by_device = {row["device_rdev"]: row["resolved_path"] for row in devices.values()}
+    camera_pids, backend_pids = [], []
+    camera_script = str(Path(config["camera_repository"]) / "tools/am1_camera_viewer.py")
+    seen = 0
+    for process in proc.iterdir():
+        if not process.name.isdecimal():
+            continue
+        try:
+            if process.stat().st_uid != os.getuid():
+                continue
+            pid = int(process.name)
+            args = (process / "cmdline").read_bytes().split(b"\0")
+            if os.fsencode(config["camera_binary"]) in args:
+                backend_pids.append(pid)
+            if any(arg in (os.fsencode(camera_script), b"tools/am1_camera_viewer.py", b"tools.am1_camera_viewer") for arg in args):
+                camera_pids.append(pid)
+            for descriptor in (process / "fd").iterdir():
+                seen += 1
+                require(seen <= 65536, "bounded camera descriptor inventory exceeded")
+                try:
+                    info = descriptor.stat()
+                except FileNotFoundError:
+                    continue  # A descriptor closed after enumeration; other errors remain refusals.
+                if stat.S_ISCHR(info.st_mode) and info.st_rdev in by_device:
+                    path = by_device[info.st_rdev]
+                    if pid not in owners[path]:
+                        owners[path].append(pid)
+        except FileNotFoundError:
+            continue  # A process exited after enumeration; unreadable live same-UID processes refuse.
+    result = subprocess.run(["systemctl", "--user", "show", "am1-pa01-camera-" + str(uuid.UUID(run_id)),
+                             "--no-pager", "-p", "MainPID", "-p", "ControlPID", "-p", "Job", "-p", "ActiveState"],
+                            capture_output=True, text=True, timeout=2)
+    require(result.returncode == 0 and not result.stderr.strip(), "owned camera unit inventory unavailable")
+    unit = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    absent = []
+    for pid in (backend_pid, camera_pid):
+        try:
+            proc.joinpath(str(pid)).stat()
+            absent.append(False)
+        except FileNotFoundError:
+            absent.append(True)
+    return dict(backend_pid_absent=absent[0], camera_pid_absent=absent[1], camera_unit_main_pid=int(unit.get("MainPID", "-1")),
+                camera_unit_control_pid=int(unit.get("ControlPID", "-1")), camera_unit_job=unit.get("Job"),
+                camera_unit_active_state=unit.get("ActiveState"), camera_process_pids=sorted(camera_pids),
+                backend_process_pids=sorted(backend_pids), device_owner_pids={key: sorted(value) for key, value in owners.items()})
+
+
+def _recheck_camera_completion(config, proof):
+    completion = proof["camera_completion"]
+    run_id = proof["run_id"]
+    retained = {}
+    source = proof["source"]
+    current_manifest = Path(config["source_pins"])
+    original_manifest = current_manifest.parent.parent / source["original_manifest_sha256"][:16] / "manifest.json"
+    for key, path, digest in (("native", Path(config["run_root"]) / run_id[:8] / "cleanup.json", completion["original_cleanup_sha256"]),
+                             ("camera", Path(config["camera_state"]) / ("release-" + run_id + ".json"), completion["original_camera_release_sha256"]),
+                             ("lease", Path(config["camera_state"]) / ("lease-" + run_id + ".json"), completion["original_camera_lease_sha256"]),
+                             ("original_manifest", original_manifest, source["original_manifest_sha256"]),
+                             ("current_manifest", current_manifest, source["manifest_sha256"])):
+        retained[key] = _private_bytes(path)
+        require(sha(retained[key]) == digest, "original motor/camera receipt changed before camera completion ACK")
+    lease = _json(retained["lease"])
+    release = proof["camera_release"]
+    require(lease.get("session_id") == run_id and type(lease.get("camera_pid")) is int
+            and lease["camera_pid"] == completion["camera_pid"]
+            and all(number(lease.get(key)) for key in ("started_at", "deadline", "source_budget_seconds"))
+            and 1 <= lease["source_budget_seconds"] <= 900
+            and lease["deadline"] == release.get("deadline")
+            and lease["deadline"] == lease["started_at"] + lease["source_budget_seconds"]
+            and lease["started_at"] <= release["released_at"], "immutable original finite camera lease required")
+    raw = _private_bytes(config["camera_config"])
+    require(sha(raw) == completion["camera_config_sha256"]
+            and (_json(raw).get("cameras")) == {role: row["path"] for role, row in completion["devices"].items()},
+            "all actual configured camera devices must match the completion proof")
+    validate_camera_completion_resources(read_camera_completion_resources(config, run_id, completion["backend_pid"],
+        completion["devices"], camera_pid=completion["camera_pid"]), completion["devices"])
+
+
+def _validate_camera_completion_sources(config, run, proof):
+    """A Runtime-only successor keeps the failed run's complete Motor source unchanged."""
+    source, original = proof["source"], run.get("backend_contract") or {}
+    digest = source.get("original_manifest_sha256")
+    require(type(digest) is str and re.fullmatch("[0-9a-f]{64}", digest) is not None,
+            "literal original deployment manifest hash required")
+    current_path = Path(config["source_pins"])
+    old_path = Path(original.get("source_pins", ""))
+    require(old_path == current_path.parent.parent / digest[:16] / "manifest.json",
+            "original/current manifests must retain their distinct literal deployment paths")
+    old_raw, current_raw = _private_bytes(old_path), _private_bytes(current_path)
+    old, current = _json(old_raw), _json(current_raw)
+    require(sha(old_raw) == digest and sha(current_raw) == source.get("manifest_sha256")
+            and type(old.get("version")) is int and old["version"] == 2
+            and type(current.get("version")) is int and current["version"] == 2
+            and old.get("executor_head") == source.get("original_executor_head")
+            and current.get("executor_head") == source.get("executor_head")
+            and all(type(source.get(key)) is str and re.fullmatch("[0-9a-f]{40}", source[key]) is not None
+                    for key in ("original_executor_head", "executor_head", "motor_head")),
+            "original Runtime source must remain separate from the active reconciliation Runtime")
+    maps = []
+    for manifest in (old, current):
+        motor = manifest.get("motor") or {}
+        rows = motor.get("files")
+        require(motor.get("head") == original.get("host_head") == config.get("host_head") == source["motor_head"]
+                and isinstance(rows, list) and len(rows) == 13
+                and all(isinstance(row, dict) and type(row.get("path")) is str and row["path"]
+                        and type(row.get("sha256")) is str and re.fullmatch("[0-9a-f]{64}", row["sha256"])
+                        for row in rows), "the original full thirteen Motor source rows must remain installed")
+        maps.append({row["path"]: row["sha256"] for row in rows})
+    require(len(maps[0]) == len(maps[1]) == 13 and maps[0] == maps[1], "camera completion cannot change any Motor source")
+    ordinary = (((run.get("physical_result") or {}).get("readback") or {}).get("readback") or {}).get("ordinary_arm_profile")
+    if ordinary is not None:
+        require(all(maps[0].get(path) == digest for path, digest in ordinary["source_files_sha256"].items()),
+                "original ordinary native dependencies must match the unchanged full Motor source")
+    require(all(original.get(key) == config.get(key) for key in
+                ("camera_config", "camera_state", "camera_repository", "camera_head", "camera_binary")),
+            "original camera source/config identity must remain unchanged")
+
+
 def validate_cleanup_origin(run, proof, receipt):
     """Qualify an explicit incomplete origin without promoting its old lift proof."""
     origin = proof.get("original_cleanup_origin")
+    if "camera_completion" in proof:
+        validate_camera_completion((proof.get("source") or {}).get("backend_contract"), run, proof)
+        return True  # Native motors were verified; the separate camera proof never rewrites their history.
     if origin == ORDINARY_STARTUP_STOP_ORIGIN:
         original = run.get("backend_contract") or {}
         head, digest = proof.get("original_motor_head"), proof.get("original_motor_manifest_sha256")
@@ -1618,7 +2012,10 @@ def validate_stopped_proof(config, run, proof, *, now, boot_id=None, durable_ack
         "actual thermal peak slot provenance/freshness failed",
     )
     camera = proof.get("camera_release") or {}
-    require(
+    if "camera_completion" in proof:
+        validate_camera_completion(config, run, proof)
+    else:
+        require(
         camera.get("state") == "released"
         and camera.get("session_id") == run["run_id"]
         and not camera.get("errors")
@@ -1627,7 +2024,7 @@ def validate_stopped_proof(config, run, proof, *, now, boot_id=None, durable_ack
             for k in ("backend_exited", "readers_joined", "viewer_socket_closed", "runtime_config_removed")
         ),
         "actual same-run camera release required",
-    )
+        )
     if run.get("run_id") == RESPONSE_GOAL_RUN or proof.get("original_cleanup_origin") == RESPONSE_GOAL_RESTORE_ORIGIN:
         _validate_stopped_response_completion(run, proof)
     else:
@@ -1859,6 +2256,9 @@ def _validate_sources(config, proof):
         not dirty and head == proof["source"].get("executor_head"),
         "actual clean reconciliation executor source pin required",
     )
+    if "camera_completion" in proof:
+        validate_camera_completion_runtime_origin(repository, proof["source"].get("runtime_proof_files_sha256"),
+                                                  motor_root=config["host_repository"])
     for path, digest in config["calibration_files"].items():
         data = _calibration_bytes(path)
         require(sha(data) == digest, "preserved actual calibration changed")
@@ -1938,8 +2338,13 @@ def load_qualified_proof(config, run):
             "existing durable reconciliation ACK mismatch",
         )
         uuid.UUID(old_ack["operation_id"])
+    if "camera_completion" in proof:
+        _validate_sources(config, proof)  # Qualify cached/imported cleanup code before its first invocation.
     proof = validate_stopped_proof(config, run, proof, now=time.monotonic(), durable_ack=old_ack is not None)
-    _validate_sources(config, proof)
+    if "camera_completion" not in proof:
+        _validate_sources(config, proof)
+    if "camera_completion" in proof:
+        _validate_camera_completion_sources(config, run, proof)
     if proof.get("original_cleanup_origin") == RESPONSE_GOAL_RESTORE_ORIGIN:
         require(_load_selected_restoration(config, proof) == run["physical_result"]["readback"]["readback"]["left_response_p_trial"],
                 "original selected snapshot differs from failed cleanup history")
@@ -2001,6 +2406,8 @@ def load_qualified_proof(config, run):
             require(data == original, "original unknown latch must match immutable receipt bytes")
         originals[name] = data
     assert_no_owner(config, run_id)
+    if "camera_completion" in proof:
+        _recheck_camera_completion(config, proof)
     return proof, raw, originals
 
 
@@ -2008,6 +2415,8 @@ def archive_and_ack(config, proof, raw, originals, operation_id):
     """Called only by the guarded worker after an explicit distinct ACK request."""
     state = Path(config["physical_state_directory"])
     assert_no_owner(config, proof["run_id"])
+    if "camera_completion" in proof:
+        _recheck_camera_completion(config, proof)
     require(
         _private_bytes(state / ("reconciliation-" + proof["run_id"] + ".json")) == raw,
         "immutable proof changed before ACK",
@@ -2084,6 +2493,8 @@ def archive_and_ack(config, proof, raw, originals, operation_id):
             time.monotonic() - proof["completed_at_monotonic_s"] <= 180.0,
             "stopped proof expired before durable new ACK",
         )
+        if "camera_completion" in proof:
+            _recheck_camera_completion(config, proof)
         _write_new_or_same(acknowledgment_path, canonical(ack) + b"\n")
     if proof.get("original_cleanup_origin") == RESPONSE_GOAL_RESTORE_ORIGIN:
         _load_selected_restoration(config, proof)
@@ -2109,6 +2520,11 @@ def archive_and_ack(config, proof, raw, originals, operation_id):
     if proof.get("original_cleanup_origin") == ORDINARY_STARTUP_STOP_ORIGIN:
         require(sha(_private_bytes(Path(config["run_root"]) / proof["run_id"][:8] / "cleanup.json"))
                 == proof["original_cleanup_sha256"], "original ordinary restored cleanup changed during ACK")
+    if "camera_completion" in proof:
+        _recheck_camera_completion(config, proof)
+        require(originals == dict.fromkeys(MARKERS)
+                and all(not (state / name).exists() and not (state / name).is_symlink() for name in MARKERS),
+                "both original motor markers must remain absent through camera completion ACK")
     _fsync_directory(state)
     return ack
 

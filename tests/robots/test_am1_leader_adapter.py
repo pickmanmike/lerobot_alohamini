@@ -8606,6 +8606,7 @@ def test_fourth_ordinary_pause_still_requires_qualified_held_ack_before_resume()
         "later_terminal",
         "later_uncertain",
         "later_native_fault",
+        "core_terminal", "core_finishing", "core_foreign_operation", "core_changed_startup_clock",
     ],
 )
 def test_runner_starting_transport_reattaches_once_to_exact_owned_admission(tmp_path, monkeypatch, change):
@@ -8623,14 +8624,39 @@ def test_runner_starting_transport_reattaches_once_to_exact_owned_admission(tmp_
         m, "time", SimpleNamespace(monotonic=lambda: clock[0], perf_counter=time.perf_counter)
     )
     owned = str(uuid4())
+    core_projection = change in {"core_terminal", "core_finishing", "core_foreign_operation", "core_changed_startup_clock"}
+    native_cause = "ComparisonRefusal: live: grouped feedback failed: [TxRxResult] There is no status packet!"
+    if core_projection:
+        from urllib.parse import parse_qsl, urlsplit
+        from tests.robots.test_am1_live_teleop_executor import authority_lane
+        from tools.am1_session_service import Gateway
+
+        authority, executor, _ = authority_lane(tmp_path / "core")
+        authority.run = None
+        begins = []
+        monkeypatch.setattr(executor, "begin", lambda recipe: begins.append(recipe.name) or True)
+        gateway = object.__new__(Gateway)
+        async def core_call(command, _device):
+            return authority.snapshot_detail(command) if "reference" in command else {"snapshot": authority.snapshot()}
+        gateway.call = core_call
 
     class Session:
-        wait = actual_wait
+        async def wait(self, predicate, timeout):
+            if core_projection:
+                self.waits += 1
+                if self.waits == 2:
+                    self.pending.append(asyncio.create_task(self.publish_live()))
+            return await actual_wait(self, predicate, timeout)
 
         def __init__(self, *args):
             self.device, self.generation, self.connection = "device", "control", None
             self.snapshot = recovery_state()
             self.snapshot["run"] = None
+            if core_projection:
+                self.device = "pc"
+                self.generation = authority.controller["generation"]
+                self.snapshot = authority.snapshot()
+            self.waits = 0
             self.transport_close = self.transport_error = self.reader = None
             self.ws = SimpleNamespace(closed=False)
             self.changed = asyncio.Event()
@@ -8638,6 +8664,19 @@ def test_runner_starting_transport_reattaches_once_to_exact_owned_admission(tmp_
             self.renewing, self.closed = False, False
             self.pending = []
             instances.append(self)
+
+        async def core_state(self):
+            response = await Gateway.state(gateway, SimpleNamespace(query={}))
+            state = json.loads(response.body)["snapshot"]
+            assert state["status_projection"] == {"kind": "am1-essential-status", "version": 1}
+            assert "accepted_at" not in state["run"]
+            return state
+
+        def complete_core_fault(self):
+            executor._lifecycle.update(phase="terminal", run_id=owned, backend_incarnation=executor.host_incarnation,
+                native_live_at=None, cleanup="physical_readback_verified", uncertain=False,
+                terminal_status="faulted", first_cause=native_cause, cleanup_errors=[])
+            authority.tick()
 
         def starting(self):
             state = recovery_state()
@@ -8689,8 +8728,10 @@ def test_runner_starting_transport_reattaches_once_to_exact_owned_admission(tmp_
                 clock[0] += 180.0
             if change == "stale_attach":
                 return
-            self.snapshot = self.starting()
-            if change is None or change.startswith("later_"):
+            self.snapshot = await self.core_state() if core_projection else self.starting()
+            if core_projection:
+                pass  # Publish only once the next wait begins, after qualified reattachment.
+            elif change is None or change.startswith("later_"):
                 self.pending.append(asyncio.create_task(self.publish_live()))
             else:
                 self.mutate(change)
@@ -8716,6 +8757,19 @@ def test_runner_starting_transport_reattaches_once_to_exact_owned_admission(tmp_
 
         async def publish_live(self):
             await asyncio.sleep(0)
+            if core_projection:
+                assert self.attaches == 2 and self.renewing
+                if change == "core_foreign_operation":
+                    authority.run["operation_id"] = str(uuid4())
+                elif change == "core_changed_startup_clock":
+                    authority.run["startup_deadline"] += .01
+                else:
+                    authority._finish("faulted", "protected host exited during startup")
+                    if change == "core_terminal":
+                        self.complete_core_fault()
+                self.snapshot = await self.core_state()
+                self.changed.set()
+                return
             self.snapshot["run"].update(
                 native_live_at=1009.0,
                 deadline=1309.0,
@@ -8741,18 +8795,33 @@ def test_runner_starting_transport_reattaches_once_to_exact_owned_admission(tmp_
                 self.renewing = False
 
         async def post(self, path, body):
+            nonlocal owned
             if path == "start":
                 self.starts.append(copy.deepcopy(body))
-                self.snapshot = self.starting()
+                if core_projection:
+                    receipt = authority.handle(dict(body, op="start"), self.device)
+                    assert receipt["accepted"] and receipt["effect_admitted"] is False
+                    owned = receipt["run_id"]
+                    self.snapshot = await self.core_state()
+                else:
+                    self.snapshot = self.starting()
                 if change == "missing_anchor":
                     del self.snapshot["run"]["accepted_at"]
                 self.pending.append(asyncio.create_task(self.lose()))
-                return {"accepted": True, "run_id": owned, "operation_id": body["operation_id"]}
+                return receipt if core_projection else {"accepted": True, "run_id": owned, "operation_id": body["operation_id"]}
             assert path == "stop"
             self.stops.append(copy.deepcopy(body))
+            if core_projection:
+                receipt = authority.handle(dict(body, op="stop"), self.device)
+                assert receipt["accepted"]
+                self.complete_core_fault()
+                return receipt
             return {"accepted": True, "status": "finishing"}
 
         async def get(self, path):
+            if core_projection:
+                response = await Gateway.state(gateway, SimpleNamespace(query=dict(parse_qsl(urlsplit(path).query))))
+                return json.loads(response.body)
             assert path == "state"
             state = self.starting()
             if self.stops:
@@ -8763,6 +8832,10 @@ def test_runner_starting_transport_reattaches_once_to_exact_owned_admission(tmp_
             for task in self.pending:
                 await task
             self.closed = True
+            if core_projection:
+                self.final_core_run = copy.deepcopy(authority.run)
+                authority.run = None
+                authority.close()
 
     def live_boundary(value):
         live_entries.append(copy.deepcopy(instances[0].snapshot))
@@ -8784,7 +8857,8 @@ def test_runner_starting_transport_reattaches_once_to_exact_owned_admission(tmp_
     summary = json.loads((tmp_path / "run" / "summary.json").read_text())
     rows = [json.loads(row) for row in (tmp_path / "run" / "frames.jsonl").read_text().splitlines()]
     assert len(session.starts) == 1 and session.claims == 1
-    assert [row["run_id"] for row in session.stops] == [owned]
+    # Existing cleanup skips a redundant Stop when the actual native terminal is already clean.
+    assert [row["run_id"] for row in session.stops] == ([] if change == "core_terminal" else [owned])
     assert session.closed and not session.renewing
     assert summary["frame_count"] == 0 and summary["cleanup_errors"] == []
     refused_without_attach = change in {
@@ -8799,7 +8873,24 @@ def test_runner_starting_transport_reattaches_once_to_exact_owned_admission(tmp_
     assert session.attaches == (1 if refused_without_attach else 2)
     assert len(live_entries) == (1 if change is None else 0)
     assert not any(row["event"] == "native_admitted" for row in rows)
-    if change is None:
+    if core_projection:
+        assert begins == ["physical-live-teleop"] and not live_entries
+        assert len([row for row in rows if row["event"] == "native_admission_reattached"]) == 1
+        assert summary["failure_type"] == "RuntimeError"
+        assert executor._live_target is None and session.final_core_run["native_live_at"] is None
+        assert session.final_core_run["deadline"] is None
+        if change in {"core_terminal", "core_finishing"}:
+            assert session.final_core_run["accepted_at"] == 10. and session.final_core_run["startup_deadline"] == 190.
+        if change == "core_terminal":
+            assert summary["native_admission_terminal"]["run"]["native_first_cause"] == native_cause
+            assert native_cause in summary["failure"]
+        elif change == "core_finishing":
+            assert summary["failure"] == "native admission reattachment unsafe: protected host exited during startup"
+        else:
+            assert summary["failure"] == "original native admission ownership/startup timestamps changed or unavailable"
+            assert "native_admission_terminal" not in summary
+        assert summary["native_terminal"]["run"]["native_first_cause"] == native_cause
+    elif change is None:
         assert summary["failure"] == "synthetic reached existing Live entrypoint"
         assert live_entries[0]["run"]["operation_id"] == session.starts[0]["operation_id"]
         assert live_entries[0]["run"]["recovery_episodes"] == 0
