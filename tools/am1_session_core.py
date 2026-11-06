@@ -2269,6 +2269,26 @@ class SessionAuthority:
                     marks["core_deferred_checkpoint_started"] = _input_diagnostic_monotonic()
                 self._save()
                 self.last_checkpoint = deferred_checkpoint
+            if (command.get("op") == "input" and command.get("request_next_grant") is True
+                    and result.get("accepted") is True and result.get("effect_admitted") is True):
+                # The admitted sample keeps its ORIGINAL expiry. A checkpoint
+                # or native handoff may have consumed its remaining lifetime.
+                admitted = dict(self.applied_input or {})
+                self.tick()
+                if (self._physical_interactive() and self.run["recipe"] == TELEOP_RECIPE
+                        and self.run["run_id"] == command.get("run_id")
+                        and self._connection_valid(command, device_id)
+                        and self.run["intent_revision"] == command.get("intent_revision")
+                        and self.executor.host_incarnation == command.get("host_incarnation")
+                        and self.applied_input == admitted and admitted.get("seq") == command.get("seq")
+                        and self.clock() < admitted.get("expires", 0)):
+                    permission = self._handle({**command, "op": "grant"}, device_id)
+                    if (permission.get("accepted") is True and self.clock() < admitted["expires"]
+                            and self._connection_valid(command, device_id)
+                            and self.run["intent_revision"] == command["intent_revision"]):
+                        result = dict(result, next_grant=permission)
+                    elif self.grant and self.grant["id"] == permission.get("grant_id"):
+                        self.grant = None
             if marks is not None:
                 marks["core_returned"] = _input_diagnostic_monotonic()
                 result = _input_diagnostic_result(result, marks)
@@ -2893,8 +2913,12 @@ class SessionAuthority:
                 "grant_id": self.grant["id"],
                 "issued": now,
                 "expires": now + 0.25,
+                **({"next_grant_supported": True} if self._physical_interactive() and self.run["recipe"] == TELEOP_RECIPE else {}),
             }
         if op == "input":
+            if "request_next_grant" in c and (not self._physical_interactive()
+                    or self.run["recipe"] != TELEOP_RECIPE or c["request_next_grant"] is not True):
+                return self._refuse("unsupported next grant request")
             seq = c.get("seq")
             target = c.get("target")
             if not self.grant or c.get("grant_id") != self.grant["id"] or now >= self.grant["expires"]:
@@ -2910,7 +2934,7 @@ class SessionAuthority:
                     "host_incarnation", "intent_revision", "grant_id", "seq", "target",
                 }
                 if teleop:
-                    allowed |= {"body", "source"}
+                    allowed |= {"body", "source", "request_next_grant"}
                 if (set(c) - allowed or type(c.get("intent_revision")) is not int
                         or c["intent_revision"] != self.run["intent_revision"]
                         or c.get("host_incarnation") != self.executor.host_incarnation):

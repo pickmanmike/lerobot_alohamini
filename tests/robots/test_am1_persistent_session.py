@@ -2076,3 +2076,156 @@ def test_command_checkpoint_failure_keeps_original_error_and_default_tick_has_no
     finally:
         monkeypatch.undo()
         a.close()
+
+@pytest.fixture
+def next_grant_teleop_lane(tmp_path):
+    from tests.robots.test_am1_live_teleop_executor import KEYS, authority_lane, source
+
+    a, e, ids = authority_lane(tmp_path)
+    clock = Clock()
+    clock.now = 10.
+    a.clock = e.clock = clock
+    # authority_lane is a lower-handler fixture; qualify its retained epoch-0
+    # active ACK for the real public tick rather than bypassing that tick.
+    e._epoch, e._epoch_mode, e._epoch_revision, e._dispatch_ack = 0, "active", 0, True
+    a.run["recovery_episodes"] = 0
+    live = e.sample["ack"]["live_input"]
+    live["reference"] = dict(live["workspace"]["reference"])
+    a._teleop_view = {"run_id": e.run_id, "qualified_until": 10.5}
+
+    def frame(grant, seq=1):
+        return command("input", **ids, grant_id=grant["grant_id"], seq=seq,
+                       target=dict.fromkeys(KEYS, 5.), source=source(seq, grant=grant["grant_id"]),
+                       body=dict.fromkeys(("x.vel", "y.vel", "theta.vel", "lift_axis.vel"), 0))
+
+    try:
+        yield a, e, ids, clock, frame
+    finally:
+        a.run = None
+        a.close()
+
+
+def test_next_grant_capability_is_explicit_on_physical_teleop(next_grant_teleop_lane):
+    a, _, ids, _, _ = next_grant_teleop_lane
+    grant = a.handle(command("grant", **ids), "pc")
+    assert {k:v for k,v in grant.items() if k != "diagnostic_timing"} == {"accepted": True, "status": "granted", "grant_id": a.grant["id"],
+                     "issued": 10., "expires": 10.25, "next_grant_supported": True}
+
+
+@pytest.mark.parametrize("opt_in", [False, True], ids=["legacy-absence", "explicit-next-grant"])
+def test_next_grant_never_extends_the_applied_sample(next_grant_teleop_lane, opt_in):
+    a, e, ids, clock, frame = next_grant_teleop_lane
+    old = a.handle(command("grant", **ids), "pc")
+    clock.advance(.05)
+    request = frame(old)
+    if opt_in:
+        request["request_next_grant"] = True
+    result = a.handle(request, "pc")
+    assert result["accepted"] is True and result["effect_admitted"] is True
+    assert a.applied_input == {"expires": old["expires"], "seq": 1, "intent_revision": 0}
+    assert e._live_target["valid_until_monotonic_s"] == old["expires"]
+    assert e._live_target["source"]["grant_id"] == old["grant_id"]
+    if opt_in:
+        new = result["next_grant"]
+        assert set(new) == {"accepted", "status", "grant_id", "issued", "expires", "next_grant_supported"}
+        assert new["accepted"] is True and new["status"] == "granted" and new["next_grant_supported"] is True
+        assert str(uuid.UUID(new["grant_id"])) == new["grant_id"] and new["grant_id"] != old["grant_id"]
+        assert new["issued"] == clock.now and new["expires"] == pytest.approx(clock.now + .25)
+        assert a.grant["id"] == new["grant_id"]
+    else:
+        assert "next_grant" not in result and a.grant["id"] == old["grant_id"]
+    clock.now = old["expires"] + .001
+    a._expire_controls(clock())
+    assert a.applied_input is None and a.run["intent"] is None
+    assert a.run["status"] == "paused" and e.desired == "hold"
+
+
+@pytest.mark.parametrize("flag", [False, None, 0, 1, "true", {}])
+def test_next_grant_flag_requires_literal_true(next_grant_teleop_lane, flag):
+    a, e, ids, _, frame = next_grant_teleop_lane
+    grant = a.handle(command("grant", **ids), "pc")
+    result = a.handle(dict(frame(grant), request_next_grant=flag), "pc")
+    assert result["accepted"] is False and result["effect_admitted"] is False
+    assert "next_grant" not in result and e._live_target is None and a.applied_input is None
+    assert a.connection["seq"] == -1 and a.grant["id"] == grant["grant_id"]
+
+
+@pytest.mark.parametrize("changed", ["expired", "controller", "connection", "intent", "view", "deadline", "status"])
+def test_next_grant_rechecks_fresh_authority_after_apply(next_grant_teleop_lane, monkeypatch, changed):
+    a, e, ids, clock, frame = next_grant_teleop_lane
+    old = a.handle(command("grant", **ids), "pc")
+    apply = e.apply
+
+    def changed_after_apply(*args, **kwargs):
+        admitted = apply(*args, **kwargs)
+        assert admitted is True
+        if changed == "expired":
+            clock.now = old["expires"] + .001
+        elif changed == "controller":
+            a.controller["generation"] = str(uuid.uuid4())
+        elif changed == "connection":
+            a.connection["generation"] = str(uuid.uuid4())
+        elif changed == "intent":
+            a.run["intent_revision"] += 1
+        elif changed == "view":
+            a._teleop_view["qualified_until"] = clock.now
+        elif changed == "deadline":
+            a.run["deadline"] = clock.now
+        else:
+            a.run["status"] = "paused"
+        return admitted
+
+    monkeypatch.setattr(e, "apply", changed_after_apply)
+    result = a.handle(dict(frame(old), request_next_grant=True), "pc")
+    assert result["accepted"] is True and result["effect_admitted"] is True
+    assert "next_grant" not in result
+    if e._live_target is not None:
+        assert e._live_target["valid_until_monotonic_s"] == old["expires"]
+    assert a.applied_input is None or a.applied_input["expires"] == old["expires"]
+    assert a.grant is None or a.grant["id"] == old["grant_id"]
+
+
+@pytest.mark.parametrize("changed", ["expired", "controller"])
+def test_next_grant_rechecks_after_deferred_checkpoint(next_grant_teleop_lane, monkeypatch, changed):
+    a, e, ids, clock, frame = next_grant_teleop_lane
+    old = a.handle(command("grant", **ids), "pc")
+    a.last_checkpoint = clock.now - 5.01  # Existing normal TELEOP checkpoint cadence.
+    save = a._save
+    saved = []
+
+    def delayed_save():
+        saved.append(e._live_target is not None)
+        if changed == "expired":
+            clock.now = old["expires"] + .001
+        else:
+            a.controller["generation"] = str(uuid.uuid4())
+        return save()
+
+    monkeypatch.setattr(a, "_save", delayed_save)
+    result = a.handle(dict(frame(old), request_next_grant=True), "pc")
+    assert saved and saved[0] is True, "the periodic checkpoint must follow actual input admission"
+    assert result["accepted"] is True and result["effect_admitted"] is True
+    assert "core_deferred_checkpoint_started" in result["diagnostic_timing"]
+    assert "next_grant" not in result
+    if e._live_target is not None:
+        assert e._live_target["valid_until_monotonic_s"] == old["expires"]
+    assert a.applied_input is None or a.applied_input["expires"] == old["expires"]
+    assert a.grant is None or a.grant["id"] == old["grant_id"]
+
+
+def test_next_grant_fake_compatibility_omits_capability_and_rejects_opt_in(tmp_path):
+    clock = Clock()
+    a = SessionAuthority(tmp_path, clock=clock)
+    try:
+        run = start(a, "fake-interactive")
+        base = interactive_controls(a, run)
+        grant = a.handle(command("grant", **base), "owner")
+        assert "next_grant_supported" not in grant
+        first = a.handle(command("input", **base, grant_id=grant["grant_id"], seq=1, target=[.2]), "owner")
+        assert first["accepted"] is True and "next_grant" not in first
+        rejected = a.handle(command("input", **base, grant_id=grant["grant_id"], seq=2,
+                                    target=[.3], request_next_grant=True), "owner")
+        assert rejected["accepted"] is False and rejected["effect_admitted"] is False
+        assert "next_grant" not in rejected and a.run["intent"] == [.2]
+    finally:
+        a.close()

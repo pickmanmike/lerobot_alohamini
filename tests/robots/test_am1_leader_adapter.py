@@ -4509,6 +4509,90 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     }
                 )
             )
+            if cause.startswith("next_grant_"):
+                mode = cause.removeprefix("next_grant_")
+                client = m.SessionClient(gateway.origin, cert, storage)
+                await client.attach()
+                client.generation, client.connection = ids["controller_generation"], ids["connection_generation"]
+                connected = await client.command(dict(op="connect", **client.identities()))
+                client.connection = connected["connection_generation"]
+                client.snapshot = (await client.get("state"))["snapshot"]
+                await client.command(dict(op="release_input", **client.identities()))
+                client.snapshot = (await client.get("state"))["snapshot"]
+                await client.command(dict(op="resume", **client.identities(),
+                    expected_intent_revision=client.snapshot["run"]["intent_revision"], operation_id=str(uuid4())))
+                now = [10.]
+                a.clock = e.clock = lambda: now[0]
+                a.controller["expires"] = 30.
+                a._teleop_view["qualified_until"] = 30.
+                client.snapshot = (await client.get("state"))["snapshot"]
+                class Input:
+                    kind = "virtual-leaders"
+                    def get_action(self):
+                        return {key.removeprefix("arm_"): 1. for key in KEYS}
+                producer = m.FrameProducer(Input())
+                producer.workspace = workspace()
+                producer.native_cursor = dict(workspace()["reference"])
+                original_call, wire, applied = gateway.call, [], []
+                one_way = .075 if mode == "piggyback150" else .05
+                async def next_grant_delay(command, device):
+                    if command.get("op") not in {"grant", "input"}:
+                        return await original_call(command, device)
+                    wire.append(copy.deepcopy(command))
+                    await asyncio.sleep(one_way);now[0] += one_way
+                    result = await original_call(command, device)
+                    if command["op"] == "grant" and mode == "serial100":
+                        result.pop("next_grant_supported", None)  # Exact old-server capability absence.
+                    if command["op"] == "input" and result.get("accepted") is True:
+                        applied.append(copy.deepcopy(e._live_target))
+                        if mode == "lost":
+                            raise TimeoutError("lost original Input receipt")
+                    await asyncio.sleep(one_way);now[0] += one_way
+                    a.tick()
+                    return result
+                gateway.call = next_grant_delay
+                if mode == "lost":
+                    with pytest.raises(m.CommandRefusedError):
+                        await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="fixed", progress_s=0.)
+                    assert len(applied) == 1 and producer.sequence == 1 and client._next_grant is None
+                    assert [x["op"] for x in wire] == ["grant", "input"]
+                    return
+                first = await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="fixed", progress_s=0.)
+                assert len(applied) == 1 and applied[0]["valid_until_monotonic_s"] == first[0]["expires"]
+                if mode == "serial100":
+                    assert "request_next_grant" not in next(x for x in wire if x["op"] == "input")
+                    try:
+                        assert await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="fixed", progress_s=.1) is None
+                    except m.CommandRefusedError:
+                        pass
+                    assert len(applied) == 1 and a.run["status"] == "paused"
+                elif mode == "piggyback100":
+                    assert first[2].get("next_grant") is not None
+                    assert client._next_grant is not None, {"binding":client._next_grant_binding(), "identity":client.identities(), "result":first[2], "timing":client.last_command_timing}
+                    for progress in (.1, .2):
+                        current = await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="fixed", progress_s=progress)
+                        assert current is not None, {"wire":wire,"status":a.run["status"],"events":a.events,"records":records[-3:]}
+                        assert current[0]["grant_id"] == wire[-1]["grant_id"]
+                    assert len(applied) == 3 and [x["op"] for x in wire] == ["grant", "input", "input", "input"]
+                    assert all(x["request_next_grant"] is True for x in wire if x["op"] == "input")
+                    assert all(x["source"]["grant_received_at_monotonic_s"] <= x["source"]["acquired_at_monotonic_s"] for x in wire if x["op"] == "input")
+                    assert a.run["status"] == "running" and a.run["deadline"] == 309.
+                elif mode == "piggyback150":
+                    assert first[2].get("next_grant") is not None
+                    original_expiry = applied[0]["valid_until_monotonic_s"]
+                    try:
+                        assert await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="fixed", progress_s=.1) is None
+                    except m.CommandRefusedError:
+                        pass
+                    assert len(applied) == 1 and now[0] >= original_expiry and a.run["status"] == "paused"
+                    assert any(x["kind"] == "input_expired" for x in a.events)
+                elif mode == "stop":
+                    await client.post("stop", {"run_id":e.run_id,"operation_id":str(uuid4())})
+                    client.snapshot = (await client.get("state"))["snapshot"]
+                    with pytest.raises(m.CommandRefusedError):
+                        await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="fixed", progress_s=.1)
+                    assert len(applied) == 1 and len([op for op, _ in commands if op == "resume"]) == 1
+                return
             if cause.startswith("upgrade_attach_"):
                 mode = cause.removeprefix("upgrade_attach_")
                 expected_reporting_snapshot = None
@@ -15447,3 +15531,84 @@ def test_reporting_attach_unknown_replacement_uses_fresh_real_tls_ticket_without
 def test_session_client_negotiates_deflate_without_changing_snapshot_or_control(tmp_path, monkeypatch):
     test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
         tmp_path, monkeypatch, "upgrade_attach_compression")
+
+
+@pytest.mark.parametrize("mode", ["serial100", "piggyback100", "piggyback150", "stop", "lost"])
+def test_optional_next_grant_uses_real_core_ipc_tls_and_original_input_deadline(tmp_path, monkeypatch, mode):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
+        tmp_path, monkeypatch, "next_grant_" + mode)
+
+
+@pytest.mark.parametrize("change", [None,"service","run","host","controller","connection","revision","deadline",
+    "operation","pause","stop","feedback","view","transport","late","newer_control","malformed",
+    "missing_operation","missing_live","missing_deadline","invalid_operation","boolean_live","infinite_deadline","boolean_revision","null_host","opaque_host"])
+def test_optional_next_grant_cache_is_one_use_original_age_and_full_identity(monkeypatch, change):
+    from types import SimpleNamespace
+    m = adapter()
+    client = object.__new__(m.SessionClient)
+    client.ws, client.reader = SimpleNamespace(closed=False), None
+    client.device, client.generation, client.connection = "device", str(uuid4()), str(uuid4())
+    client.transport_error = None
+    client._next_grant, client._next_grant_epoch = None, 0
+    client.snapshot = {"service_incarnation":str(uuid4()),
+        "controller":{"device_id":client.device,"controller_generation":client.generation},
+        "run":{"run_id":str(uuid4()),"backend_incarnation":str(uuid4()),"intent_revision":3,"operation_id":str(uuid4()),
+               "status":"running","uncertain":False,"recovery":None,"native_live_at":9.,"deadline":309.},
+        "evidence":{"feedback":True,"required_observation":True}}
+    now = [100.1]
+    monkeypatch.setattr(m.time, "perf_counter", lambda:now[0])
+    unqualified = change in {"missing_operation","missing_live","missing_deadline","invalid_operation",
+                            "boolean_live","infinite_deadline","boolean_revision","null_host"}
+    if change in {"missing_operation","missing_live","missing_deadline"}:
+        client.snapshot["run"].pop({"missing_operation":"operation_id","missing_live":"native_live_at","missing_deadline":"deadline"}[change])
+    elif change == "invalid_operation":client.snapshot["run"]["operation_id"] = "not-an-operation-uuid"
+    elif change == "boolean_live":client.snapshot["run"]["native_live_at"] = True
+    elif change == "infinite_deadline":client.snapshot["run"]["deadline"] = float("inf")
+    elif change == "boolean_revision":client.snapshot["run"]["intent_revision"] = True
+    elif change == "null_host":client.snapshot["run"]["backend_incarnation"] = None
+    elif change == "opaque_host":client.snapshot["run"]["backend_incarnation"] = "opaque-host-identity"
+    identity = client.identities()
+    command = {"op":"input",**identity,"request_next_grant":True}
+    grant = {"accepted":True,"status":"granted","grant_id":str(uuid4()),"issued":10.,"expires":10.25,"next_grant_supported":True}
+    result = {"accepted":True,"status":"input","effect_admitted":True,"next_grant":grant}
+    timing = {"request_started_at_monotonic_s":100.,"response_observed_at_monotonic_s":100.1}
+    if change == "newer_control":
+        client._discard_next_grant()
+    if change == "malformed":
+        grant["expires"] = 11.
+    client._remember_next_grant(command,result,timing,0)
+    if unqualified or change in {"newer_control","malformed"}:
+        assert client._next_grant is None
+        return
+    assert client._next_grant is not None
+    if change in {"run","host","revision","deadline","operation"}:
+        field={"run":"run_id","host":"backend_incarnation","revision":"intent_revision","deadline":"deadline","operation":"operation_id"}[change]
+        client.snapshot["run"][field] = 4 if change=="revision" else 310. if change=="deadline" else str(uuid4())
+    elif change == "service":client.snapshot["service_incarnation"] = str(uuid4())
+    elif change == "controller":client.snapshot["controller"]["controller_generation"] = str(uuid4())
+    elif change == "connection":client.connection = str(uuid4())
+    elif change in {"pause","stop"}:client.snapshot["run"]["status"] = "paused" if change=="pause" else "stopped"
+    elif change in {"feedback","view"}:client.snapshot["evidence"]["feedback" if change=="feedback" else "required_observation"] = False
+    elif change == "transport":client.transport_error = "lost reporting"
+    elif change == "late":now[0] = 100.25
+    retained = client._take_next_grant(identity)
+    if change in {None,"opaque_host"}:
+        assert retained["grant"] == grant and retained["received"] == 100.1 and retained["ceiling"] == 100.25
+    else:assert retained is None
+    assert client._take_next_grant(identity) is None
+
+
+@pytest.mark.parametrize("operation", ["state", "renewal"])
+def test_optional_next_grant_reporting_error_discards_cache(monkeypatch, operation):
+    import asyncio
+    m = adapter()
+    client = object.__new__(m.SessionClient)
+    client._next_grant, client._next_grant_epoch = {"previous":"permission"}, 0
+    client.origin, client.csrf = "https://127.0.0.1:8443", "fixture"
+    class HTTP:
+        def get(self,*args,**kwargs):raise TimeoutError("original reporting timeout")
+        def post(self,*args,**kwargs):raise TimeoutError("original reporting timeout")
+    client.http = HTTP()
+    with pytest.raises(TimeoutError, match="original reporting timeout"):
+        asyncio.run(client.get("state") if operation == "state" else client.post("claim", {"controller_generation":"same"}))
+    assert client._next_grant is None

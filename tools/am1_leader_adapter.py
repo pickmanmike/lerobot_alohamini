@@ -1743,6 +1743,8 @@ class SessionClient:
         self.snapshot = None
         self.csrf = self.device = self.generation = self.connection = None
         self.sequence = 0
+        self._next_grant = None
+        self._next_grant_epoch = 0
         self.changed = asyncio.Event()
         self.transport_error = None
         self.transport_close = None
@@ -1752,57 +1754,69 @@ class SessionClient:
         self._ack_changed = asyncio.Event()
 
     async def get(self, path):
-        from aiohttp import ContentTypeError
+        try:
+            from aiohttp import ContentTypeError
 
-        async with self.http.get(self.origin + "/api/" + path, allow_redirects=False) as response:
-            try:
-                result = await response.json()
-            except (ValueError, UnicodeError, ContentTypeError) as error:
-                raise HTTPOutcomeError(response.status, None, detail="invalid HTTP JSON outcome") from error
-            if response.status != 200:
-                raise HTTPOutcomeError(response.status, result)
-            return result
+            async with self.http.get(self.origin + "/api/" + path, allow_redirects=False) as response:
+                try:
+                    result = await response.json()
+                except (ValueError, UnicodeError, ContentTypeError) as error:
+                    raise HTTPOutcomeError(response.status, None, detail="invalid HTTP JSON outcome") from error
+                if response.status != 200:
+                    raise HTTPOutcomeError(response.status, result)
+                return result
+        except BaseException:
+            SessionClient._discard_next_grant(self)
+            raise
 
     async def post(self, path, body):
-        from aiohttp import ContentTypeError
+        try:
+            from aiohttp import ContentTypeError
 
-        async with self.http.post(
-            self.origin + "/api/" + path,
-            json=body,
-            headers={"X-AM1-CSRF": self.csrf or ""},
-            allow_redirects=False,
-        ) as response:
-            try:
-                result = await response.json()
-            except (ValueError, UnicodeError, ContentTypeError) as error:
-                raise HTTPOutcomeError(response.status, None, detail="invalid HTTP JSON outcome") from error
-            if (
-                response.status != 200
-                or not isinstance(result, dict)
-                or result.get("accepted") is False
-                or result.get("status") == "unknown"
-                or result.get("accepted") is None
-                and result.get("uncertain") is True
-            ):
-                raise HTTPOutcomeError(response.status, result)
-            if path == "start":
-                run_id = result.get("run_id")
+            if path in {"start", "pause", "stop", "handoff", "release", "reconcile"} or path == "claim" and set(body) != {"controller_generation"}:
+                SessionClient._discard_next_grant(self)
+
+            async with self.http.post(
+                self.origin + "/api/" + path,
+                json=body,
+                headers={"X-AM1-CSRF": self.csrf or ""},
+                allow_redirects=False,
+            ) as response:
                 try:
-                    owned = (
-                        result.get("accepted") is True
-                        and type(run_id) is str
-                        and str(UUID(run_id)) == run_id
-                        and result.get("operation_id") == body["operation_id"]
-                    )
-                except (TypeError, ValueError):
-                    owned = False
-                if not owned:
-                    raise HTTPOutcomeError(
-                        response.status, result, detail="unqualified Start receipt identity"
-                    )
-            return result
+                    result = await response.json()
+                except (ValueError, UnicodeError, ContentTypeError) as error:
+                    raise HTTPOutcomeError(response.status, None, detail="invalid HTTP JSON outcome") from error
+                if (
+                    response.status != 200
+                    or not isinstance(result, dict)
+                    or result.get("accepted") is False
+                    or result.get("status") == "unknown"
+                    or result.get("accepted") is None
+                    and result.get("uncertain") is True
+                ):
+                    raise HTTPOutcomeError(response.status, result)
+                if path == "start":
+                    run_id = result.get("run_id")
+                    try:
+                        owned = (
+                            result.get("accepted") is True
+                            and type(run_id) is str
+                            and str(UUID(run_id)) == run_id
+                            and result.get("operation_id") == body["operation_id"]
+                        )
+                    except (TypeError, ValueError):
+                        owned = False
+                    if not owned:
+                        raise HTTPOutcomeError(
+                            response.status, result, detail="unqualified Start receipt identity"
+                        )
+                return result
+        except BaseException:
+            SessionClient._discard_next_grant(self)
+            raise
 
     async def attach(self):
+        SessionClient._discard_next_grant(self)
         self.transport_error = None
         self.transport_close = None
         self._detaching = False
@@ -1944,6 +1958,7 @@ class SessionClient:
                     if ack_changed is not None:
                         ack_changed.set()
                     exception = ws.exception()
+                    SessionClient._discard_next_grant(self)
                     self.transport_close = {
                         "reason": reason,
                         "expected": self._detaching,
@@ -2018,7 +2033,76 @@ class SessionClient:
                     raise
                 raise self._ack_error from error
 
+    def _discard_next_grant(self):
+        try:
+            self._next_grant = None
+            self._next_grant_epoch = getattr(self, "_next_grant_epoch", 0) + 1
+        except AttributeError:
+            pass  # Legacy unbound helpers may have no private cache storage.
+
+    def _next_grant_binding(self):
+        state = getattr(self, "snapshot", None) or {}
+        run, controller = state.get("run") or {}, state.get("controller") or {}
+        if (self.transport_error or self.ws is None or self.ws.closed
+                or self.reader is not None and self.reader.done()
+                or run.get("status") != "running" or run.get("uncertain") is not False
+                or run.get("recovery") is not None or controller.get("controller_generation") != self.generation
+                or controller.get("device_id") != self.device
+                or any((state.get("evidence") or {}).get(key) is not True for key in ("feedback", "required_observation"))):
+            return None
+        operation = run.get("operation_id")
+        live, deadline = run.get("native_live_at"), run.get("deadline")
+        try:
+            if type(operation) is not str or str(UUID(operation)) != operation:
+                return None
+            identity = self.identities()
+        except (KeyError, TypeError, ValueError):
+            return None
+        if (set(identity) != {"run_id", "service_incarnation", "controller_generation", "connection_generation", "host_incarnation", "intent_revision"}
+                or any(type(value) is not str or not value for key, value in identity.items() if key != "intent_revision")
+                or type(identity["intent_revision"]) is not int or identity["intent_revision"] < 0
+                or type(self.device) is not str or not self.device
+                or any(type(value) not in (int, float) or not math.isfinite(value) for value in (live, deadline))
+                or not live < deadline):
+            return None
+        return (self.ws, identity, operation, live, deadline)
+
+    def _take_next_grant(self, identity):
+        retained, self._next_grant = getattr(self, "_next_grant", None), None
+        if (retained is not None and retained["binding"] == self._next_grant_binding()
+                and retained["binding"][1] == identity and time.perf_counter() < retained["ceiling"]):
+            return retained
+        return None
+
+    def _remember_next_grant(self, command, result, timing, epoch):
+        if command.get("request_next_grant") is not True or epoch is None or epoch != self._next_grant_epoch:
+            return
+        grant = result.get("next_grant")
+        binding = self._next_grant_binding()
+        if (command.get("request_next_grant") is not True or result.get("accepted") is not True
+                or result.get("effect_admitted") is not True or result.get("status") != "input"
+                or binding is None or any(command.get(key) != value for key, value in binding[1].items())
+                or type(grant) is not dict or set(grant) != {"accepted", "status", "grant_id", "issued", "expires", "next_grant_supported"}
+                or grant.get("accepted") is not True or grant.get("status") != "granted"
+                or grant.get("next_grant_supported") is not True
+                or any(type(grant.get(key)) not in (int, float) or not math.isfinite(grant[key]) for key in ("issued", "expires"))
+                or abs(grant["expires"] - grant["issued"] - .25) > 1e-9):
+            return
+        try:
+            if type(grant.get("grant_id")) is not str or str(UUID(grant["grant_id"])) != grant["grant_id"]:
+                return
+        except ValueError:
+            return
+        # A delayed reply cannot restart this permission's age. Request start
+        # is conservative because the owner can issue it only afterward.
+        ceiling = timing["request_started_at_monotonic_s"] + .25
+        if time.perf_counter() < ceiling:
+            self._next_grant = {"binding": binding, "grant": dict(grant), "ceiling": ceiling,
+                "requested": timing["request_started_at_monotonic_s"], "received": timing["response_observed_at_monotonic_s"]}
+
     async def command(self, command, *, check=None):
+        SessionClient._discard_next_grant(self)
+        next_grant_epoch = getattr(self, "_next_grant_epoch", None)
         observed = command.get("op") in {"grant", "input"}
         if observed:
             with contextlib.suppress(Exception):
@@ -2117,8 +2201,11 @@ class SessionClient:
                     outcome = "refused"
                 raise CommandRefusedError(result, timing=timing)
             phase, outcome = "complete", "accepted"
+            if command.get("op") == "input":
+                SessionClient._remember_next_grant(self, command, result, timing, next_grant_epoch)
             return result
         except BaseException as error:
+            SessionClient._discard_next_grant(self)
             original_error = error
             if isinstance(error, (TimeoutError, ConnectionError)) and command.get("op") == "input":
                 error.input_command_timing = dict(timing, outcome_observed_at_monotonic_s=time.perf_counter())
@@ -2293,9 +2380,11 @@ class SessionClient:
             try:
                 result = await self.post("claim", {"controller_generation": self.generation})
             except asyncio.CancelledError:
+                SessionClient._discard_next_grant(self)
                 detail["outcome"] = "cancelled"
                 raise
             except Exception as error:
+                SessionClient._discard_next_grant(self)
                 if type(error) is HTTPOutcomeError and anchor is not None:
                     error.renewal_context = anchor
                 detail.update(outcome="failed", error_type=type(error).__name__, message=str(error))
@@ -2708,6 +2797,7 @@ class SessionClient:
         return run.get("status") == "running" and self.snapshot["evidence"].get("active_acknowledged") is True
 
     async def detach(self):
+        SessionClient._discard_next_grant(self)
         self._detaching = True
         ws, reader = self.ws, self.reader
         close_error, close_started = None, time.monotonic()
@@ -4601,8 +4691,10 @@ async def send_leader_sample(client, producer, body, record, *, phase, progress_
         with contextlib.suppress(TypeError, ValueError):
             grant_context = {"identity": dict(identity), "snapshot": json.loads(json.dumps(snapshot, allow_nan=False)),
                              "requested": requested}
+    take_next_grant = getattr(client, "_take_next_grant", None)
+    retained = take_next_grant(identity) if callable(take_next_grant) else None
     try:
-        grant = await client.command(dict(op="grant", **identity))
+        grant = retained["grant"] if retained is not None else await client.command(dict(op="grant", **identity))
     except CommandRefusedError as error:
         error.operation = "grant"
         error.identity = dict(identity)
@@ -4624,8 +4716,10 @@ async def send_leader_sample(client, producer, body, record, *, phase, progress_
         if grant_context is not None:
             error.grant_context = grant_context
         raise
-    received = time.perf_counter()
-    grant_timing = _copy_pc_command_timing(client, "grant", grant)
+    received = retained["received"] if retained is not None else time.perf_counter()
+    if retained is not None:
+        grant_started = retained["requested"]
+    grant_timing = _copy_pc_command_timing(client, "grant", grant) if retained is None else None
     from examples.alohamini.am1_teleop_workload import InputUnavailable
 
     try:
@@ -4743,6 +4837,8 @@ async def send_leader_sample(client, producer, body, record, *, phase, progress_
         if captured_intent is not None:
             current_intent()
         command = dict(op="input", **identity, grant_id=grant["grant_id"], seq=client.sequence, **frame)
+        if grant.get("next_grant_supported") is True:
+            command["request_next_grant"] = True
         result = await client.command(command, check=current_intent) if captured_intent is not None else await client.command(command)
     except InputUnavailable:
         record({"event": "virtual_intent_expired", "phase": phase,
