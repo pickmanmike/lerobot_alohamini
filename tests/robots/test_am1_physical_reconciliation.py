@@ -874,7 +874,9 @@ def late_camera_fixture(tmp_path, monkeypatch):
                           manifest_sha256=new_sha)
     resources = dict(backend_pid_absent=True, camera_pid_absent=True, camera_unit_main_pid=0, camera_unit_control_pid=0,
                      camera_unit_job="", camera_unit_active_state="inactive", camera_process_pids=[],
-                     backend_process_pids=[], device_owner_pids={d["resolved_path"]: [] for d in devices.values()})
+                     backend_process_pids=[], device_owner_pids={d["resolved_path"]: [] for d in devices.values()},
+                     camera_owner_lock=dict(path=str(Path(config["camera_state"]) / "viewer.lock"), device=1, inode=19),
+                     uninspected_fd_pids=[])
     proof["camera_completion"] = dict(version=1, kind="am1-late-camera-release-completion",
         run_id=run["run_id"], host_incarnation=proof["host_incarnation"], boot_id=proof["boot_id"],
         original_terminal_run_sha256="pending", original_cleanup_sha256="pending",
@@ -899,8 +901,13 @@ def publish_late_camera(config, run, proof, state):
     return raw
 
 
-def test_late_camera_completion_uses_fresh_proof_and_distinct_ack_without_rewriting_history(tmp_path, monkeypatch):
+@pytest.mark.parametrize("protected_fds", [False, True])
+def test_late_camera_completion_uses_fresh_proof_and_distinct_ack_without_rewriting_history(tmp_path, monkeypatch, protected_fds):
     m, config, run, proof, state = late_camera_fixture(tmp_path, monkeypatch)
+    if protected_fds:
+        for name in ("resources_before", "resources_after"):
+            proof["camera_completion"][name]["uninspected_fd_pids"] = [1336]
+        monkeypatch.setattr(m, "read_camera_completion_resources", lambda *_, **__: copy.deepcopy(proof["camera_completion"]["resources_after"]))
     raw = publish_late_camera(config, run, proof, state)
     before = copy.deepcopy(run)
     native_path = Path(config["run_root"]) / run["run_id"][:8] / "cleanup.json"
@@ -942,7 +949,8 @@ def test_late_camera_origin_requires_the_original_twenty_readback_clocks(tmp_pat
     "release_error", "release_reader", "release_socket", "release_config", "release_runtime", "backend_pid",
     "completion_run", "completion_host", "completion_boot", "completion_native", "completion_camera", "completion_run_hash",
     "clock_before_release", "clock_outside_proof", "extra", "missing_devices", "duplicate_device", "device_rdev_bool",
-    "device_inode_bool", "device_path", "device_resolved", "owner", "unit", "backend_process", "camera_process", "marker"])
+    "device_inode_bool", "device_path", "device_resolved", "owner", "unit", "backend_process", "camera_process", "marker",
+    "lock_path", "lock_missing", "lock_changed", "lock_bool", "visibility_bool", "visibility_duplicate", "visibility_original"])
 def test_late_camera_completion_rejects_incomplete_foreign_or_unreleased_evidence(tmp_path, monkeypatch, broken):
     m, config, run, proof, state = late_camera_fixture(tmp_path, monkeypatch)
     publish_late_camera(config, run, proof, state)
@@ -977,6 +985,15 @@ def test_late_camera_completion_rejects_incomplete_foreign_or_unreleased_evidenc
     elif broken == "unit": c["resources_after"]["camera_unit_main_pid"] = 77
     elif broken == "backend_process": c["resources_after"]["backend_process_pids"] = [77]
     elif broken == "camera_process": c["resources_before"]["camera_process_pids"] = [77]
+    elif broken == "lock_path":
+        for name in ("resources_before", "resources_after"):
+            c[name]["camera_owner_lock"]["path"] = str(tmp_path / "foreign" / "viewer.lock")
+    elif broken == "lock_missing": del c["resources_before"]["camera_owner_lock"]
+    elif broken == "lock_changed": c["resources_after"]["camera_owner_lock"]["inode"] += 1
+    elif broken == "lock_bool": c["resources_before"]["camera_owner_lock"]["device"] = True
+    elif broken == "visibility_bool": c["resources_after"]["uninspected_fd_pids"] = [True]
+    elif broken == "visibility_duplicate": c["resources_after"]["uninspected_fd_pids"] = [77, 77]
+    elif broken == "visibility_original": c["resources_after"]["uninspected_fd_pids"] = [c["camera_pid"]]
     elif broken == "marker": proof["original_markers"]["physical-in-progress.json"] = {"sha256": "a" * 64}
     if broken.startswith(("native_", "release_")):
         run["physical_result"]["camera_release"] = copy.deepcopy(release)
@@ -987,7 +1004,7 @@ def test_late_camera_completion_rejects_incomplete_foreign_or_unreleased_evidenc
     assert run == before
 
 
-@pytest.mark.parametrize("changed", ["native", "camera", "lease", "config", "device_owner", "backend_pid", "camera_pid", "unit"])
+@pytest.mark.parametrize("changed", ["native", "camera", "lease", "config", "device_owner", "backend_pid", "camera_pid", "unit", "lock_identity", "lock_lost"])
 def test_late_camera_completion_rechecks_live_resources_and_original_bytes_before_ack(tmp_path, monkeypatch, changed):
     m, config, run, proof, state = late_camera_fixture(tmp_path, monkeypatch)
     raw = publish_late_camera(config, run, proof, state)
@@ -1004,8 +1021,13 @@ def test_late_camera_completion_rechecks_live_resources_and_original_bytes_befor
         elif changed == "backend_pid": resources["backend_pid_absent"] = False
         elif changed == "camera_pid": resources["camera_pid_absent"] = False
         elif changed == "unit": resources["camera_unit_main_pid"] = 22
-        monkeypatch.setattr(m, "read_camera_completion_resources", lambda *_, **__: resources)
-    with pytest.raises((ValueError, RuntimeError)):
+        elif changed == "lock_identity": resources["camera_owner_lock"]["inode"] += 1
+        if changed == "lock_lost":
+            def busy(*args, **kwargs): raise BlockingIOError("canonical viewer lock has a current owner")
+            monkeypatch.setattr(m, "read_camera_completion_resources", busy)
+        else:
+            monkeypatch.setattr(m, "read_camera_completion_resources", lambda *_, **__: resources)
+    with pytest.raises((ValueError, RuntimeError, OSError)):
         m.archive_and_ack(config, proof, raw, markers, str(uuid.uuid4()))
     assert not list(state.glob("reconciliation-ack-*.json"))
 
@@ -1209,9 +1231,11 @@ def test_late_camera_completion_keeps_original_and_current_runtime_sources_separ
 
 
 @pytest.mark.parametrize("condition", ["clear", "owner", "backend_process", "camera_process", "backend_pid", "camera_pid",
-    "unreadable_process", "unreadable_fd", "gone_process", "gone_fd", "unit"])
-def test_late_camera_proc_recheck_uses_same_uid_character_device_targets_and_fails_closed(tmp_path, monkeypatch, condition):
+    "unreadable_process", "protected_fd", "protected_directory", "mixed_owner", "unknown_identity", "relevant_protected", "camera_protected",
+    "gone_process", "gone_fd", "unit", "lock_busy", "lock_mode", "lock_owner", "lock_redirect", "lock_replaced", "lock_missing", "lock_hardlink", "lock_nonregular"])
+def test_late_camera_proc_recheck_uses_canonical_owner_lock_and_reports_protected_visibility(tmp_path, monkeypatch, condition):
     import stat
+    import sys
     from types import SimpleNamespace
     from tools import am1_physical_reconciliation as m
 
@@ -1219,25 +1243,56 @@ def test_late_camera_proc_recheck_uses_same_uid_character_device_targets_and_fai
     proc.mkdir()
     process = proc / "77"
     (process / "fd").mkdir(parents=True)
-    config = dict(camera_repository="/private/camera", camera_binary="/private/go2rtc")
-    args = {"backend_process": b"/private/go2rtc\0", "camera_process": os.fsencode(str(Path(config["camera_repository"]) / "tools/am1_camera_viewer.py")) + b"\0"}.get(condition, b"/usr/bin/python\0ordinary\0")
+    config = dict(camera_repository="/private/camera", camera_binary="/private/go2rtc", camera_state=str(tmp_path / "camera"))
+    lock_path = Path(config["camera_state"]) / "viewer.lock"
+    args = {"backend_process": b"/private/go2rtc\0", "relevant_protected": b"/private/go2rtc\0",
+            "unknown_identity": b"", "camera_process": os.fsencode(str(Path(config["camera_repository"]) / "tools/am1_camera_viewer.py")) + b"\0",
+            "camera_protected": b"python\0tools/am1_camera_viewer.py\0"}.get(condition, b"/usr/lib/systemd/systemd\0--user\0")
     (process / "cmdline").write_bytes(args)
     descriptor = process / "fd" / "5"
     descriptor.write_bytes(b"")
+    if condition == "mixed_owner": (process / "fd" / "6").write_bytes(b"")
     if condition in ("backend_pid", "camera_pid"):
         other = proc / ("12345" if condition == "backend_pid" else "12344")
         (other / "fd").mkdir(parents=True)
         (other / "cmdline").write_bytes(b"unrelated PID reuse\0")
     real_path = Path
-    monkeypatch.setattr(m, "Path", lambda value: proc if value == "/proc" else real_path(value))
-    monkeypatch.setattr(m.os, "getuid", lambda: proc.stat().st_uid, raising=False)
+    def visible_path(value):
+        assert not str(value).startswith("/dev/"), "resident PrivateDevices recheck must use producer-bound rdev, not hidden nodes"
+        return proc if value == "/proc" else real_path(value)
+    monkeypatch.setattr(m, "Path", visible_path)
+    uid = proc.stat().st_uid
+    lock_events = []
+    lock_info = SimpleNamespace(st_mode=(stat.S_IFIFO if condition == "lock_nonregular" else stat.S_IFREG) | (0o644 if condition == "lock_mode" else 0o600),
+                                st_uid=uid + (condition == "lock_owner"), st_dev=1, st_ino=19,
+                                st_nlink=2 if condition == "lock_hardlink" else 1)
+    def open_lock(path, flags):
+        assert path == lock_path and flags == 0x20800, "existing lock opens read-only/NOFOLLOW/NONBLOCK, including a refused FIFO"
+        if condition == "lock_missing": raise FileNotFoundError()
+        lock_events.append("open")
+        return 999
+    def flock(descriptor, operation):
+        assert descriptor == 999 and operation == 6
+        if condition == "lock_busy": raise BlockingIOError()
+        lock_events.append("held")
+    monkeypatch.setitem(sys.modules, "fcntl", SimpleNamespace(LOCK_EX=2, LOCK_NB=4, flock=flock))
+    monkeypatch.setattr(m, "_private_directory", lambda path: None)
+    monkeypatch.setattr(m, "os", SimpleNamespace(getuid=lambda: uid, fsencode=os.fsencode,
+        open=open_lock, fstat=lambda _: lock_info, close=lambda _: lock_events.append("close"),
+        O_RDONLY=os.O_RDONLY, O_RDWR=os.O_RDWR, O_NOFOLLOW=0x20000, O_NONBLOCK=0x800))
     original_stat = real_path.stat
     def metadata(path, **kwargs):
         if path == process and condition == "gone_process": raise FileNotFoundError()
+        if path == lock_path:
+            return SimpleNamespace(st_mode=stat.S_IFLNK if condition == "lock_redirect" else lock_info.st_mode,
+                st_uid=uid, st_dev=1, st_ino=20 if condition == "lock_replaced" else 19, st_nlink=lock_info.st_nlink)
         if path == descriptor:
-            if condition == "unreadable_fd": raise PermissionError("unreadable same-UID fd")
+            if condition in ("protected_fd", "mixed_owner", "unknown_identity", "relevant_protected", "camera_protected"):
+                raise PermissionError("protected same-UID fd")
             if condition == "gone_fd": raise FileNotFoundError()
             return SimpleNamespace(st_mode=stat.S_IFCHR if condition == "owner" else stat.S_IFREG, st_rdev=20740)
+        if path == process / "fd" / "6" and condition == "mixed_owner":
+            return SimpleNamespace(st_mode=stat.S_IFCHR, st_rdev=20740)
         return original_stat(path, **kwargs)
     monkeypatch.setattr(real_path, "stat", metadata)
     original_read = real_path.read_bytes
@@ -1245,19 +1300,32 @@ def test_late_camera_proc_recheck_uses_same_uid_character_device_targets_and_fai
         if path == process / "cmdline" and condition == "unreadable_process": raise PermissionError("unreadable same-UID process")
         return original_read(path)
     monkeypatch.setattr(real_path, "read_bytes", contents)
+    original_iterdir = real_path.iterdir
+    def inventory(path):
+        if path == process / "fd" and condition == "protected_directory": raise PermissionError("protected fd directory")
+        return iter(sorted(original_iterdir(path)))
+    monkeypatch.setattr(real_path, "iterdir", inventory)
     def unit(args, **kwargs):
         assert args[:3] == ["systemctl", "--user", "show"]
+        assert lock_events[-1] == "held", "existing viewer lock must cover the complete inventory"
         return SimpleNamespace(returncode=0, stdout="MainPID=" + ("77" if condition == "unit" else "0") + "\nControlPID=0\nJob=\nActiveState=inactive\n", stderr="")
     monkeypatch.setattr(m.subprocess, "run", unit)
     devices = {"chest": dict(path="/dev/am_camera_chest", resolved_path="/dev/video4", device_rdev=20740, device_inode=77)}
-    if condition.startswith("unreadable"):
+    if condition == "unreadable_process":
         with pytest.raises(PermissionError): m.read_camera_completion_resources(config, str(uuid.uuid4()), 12345, devices, camera_pid=12344)
+    elif condition.startswith("lock_") or condition in ("unknown_identity", "relevant_protected", "camera_protected"):
+        with pytest.raises((ValueError, OSError)):
+            m.read_camera_completion_resources(config, str(uuid.uuid4()), 12345, devices, camera_pid=12344)
     else:
         resources = m.read_camera_completion_resources(config, str(uuid.uuid4()), 12345, devices, camera_pid=12344)
-        if condition in ("clear", "gone_process", "gone_fd"):
+        assert resources["camera_owner_lock"] == dict(path=str(lock_path), device=1, inode=19)
+        assert resources["uninspected_fd_pids"] == ([77] if condition in ("protected_fd", "protected_directory", "mixed_owner") else [])
+        if condition in ("clear", "gone_process", "gone_fd", "protected_fd", "protected_directory"):
             assert m.validate_camera_completion_resources(resources, devices) is True
         else:
             with pytest.raises(ValueError): m.validate_camera_completion_resources(resources, devices)
+    if lock_events:
+        assert lock_events[-1] == "close"
 
 
 def incomplete_preactivation_fixture(tmp_path, monkeypatch):

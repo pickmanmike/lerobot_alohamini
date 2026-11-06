@@ -963,9 +963,10 @@ def validate_ordinary_startup_stop_origin(run, receipt, *, motor_files):
 
 
 def validate_camera_completion_resources(resources, devices):
-    """Accept only a complete OS metadata inventory with no remaining camera owner."""
+    """Qualify the original canonical owner; protected unrelated FDs are not globally certified free."""
     keys = {"backend_pid_absent", "camera_pid_absent", "camera_unit_main_pid", "camera_unit_control_pid", "camera_unit_job",
-            "camera_unit_active_state", "camera_process_pids", "backend_process_pids", "device_owner_pids"}
+            "camera_unit_active_state", "camera_process_pids", "backend_process_pids", "device_owner_pids",
+            "camera_owner_lock", "uninspected_fd_pids"}
     require(isinstance(resources, dict) and set(resources) == keys
             and resources["backend_pid_absent"] is True
             and resources["camera_pid_absent"] is True
@@ -975,7 +976,16 @@ def validate_camera_completion_resources(resources, devices):
             and resources["camera_unit_active_state"] in ("inactive", "failed")
             and resources["camera_process_pids"] == resources["backend_process_pids"] == []
             and resources["device_owner_pids"] == {row["resolved_path"]: [] for row in devices.values()},
-            "actual camera backend/unit/process/device release required")
+            "original canonical camera owner remains active or a readable device owner exists")
+    lock, uninspected = resources["camera_owner_lock"], resources["uninspected_fd_pids"]
+    require(isinstance(lock, dict) and set(lock) == {"path", "device", "inode"}
+            and type(lock["path"]) is str and Path(lock["path"]).is_absolute() and Path(lock["path"]).name == "viewer.lock"
+            and type(lock["device"]) is int and lock["device"] >= 0
+            and type(lock["inode"]) is int and lock["inode"] > 0
+            and isinstance(uninspected, list) and len(uninspected) <= 65536
+            and all(type(pid) is int and pid > 0 for pid in uninspected)
+            and sorted(set(uninspected)) == uninspected,
+            "held canonical camera lock and truthful protected descriptor visibility required")
     return True
 
 
@@ -1205,6 +1215,11 @@ def validate_camera_completion(config, run, proof):
             "distinct camera nodes and unchanged absent original motor markers required")
     for key in ("resources_before", "resources_after"):
         validate_camera_completion_resources(completion[key], devices)
+        require(completion[key]["camera_owner_lock"]["path"] == str(Path(config["camera_state"]) / "viewer.lock")
+                and not {completion["backend_pid"], completion["camera_pid"]}.intersection(completion[key]["uninspected_fd_pids"]),
+                "the original canonical owner cannot be uninspected")
+    require(completion["resources_before"]["camera_owner_lock"] == completion["resources_after"]["camera_owner_lock"],
+            "canonical camera lock identity changed during completion")
     return True
 
 
@@ -1232,19 +1247,43 @@ def read_camera_completion_devices(config):
 
 
 def read_camera_completion_resources(config, run_id, backend_pid, devices, *, camera_pid):
-    """OS metadata only, including same-UID fd targets outside PrivateDevices' /dev view.
+    """Hold the existing canonical viewer lock throughout this metadata-only inventory.
 
-    The native producer additionally proves the full-namespace character nodes and
-    fuser result. This resident recheck never treats missing private /dev nodes as
-    release, opens devices, or changes the mount namespace.
+    This closes the original owner's obligation, not universal device freedom.
+    The producer separately proves actual nodes/fuser; a new Start still acquires
+    cameras normally. Protected unrelated FDs remain explicitly uninspected.
     """
+    import fcntl
+
+    state = Path(config["camera_state"])
+    _private_directory(state)
+    path = state / "viewer.lock"
+    # NONBLOCK also refuses an unexpected FIFO without waiting before fstat.
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(descriptor)
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1,
+                "existing owned mode 0600 camera lock required")
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = _read_camera_completion_resources_locked(config, run_id, backend_pid, devices, camera_pid=camera_pid)
+        current = path.lstat()
+        require(stat.S_ISREG(current.st_mode) and current.st_uid == info.st_uid and stat.S_IMODE(current.st_mode) == 0o600 and current.st_nlink == 1
+                and (current.st_dev, current.st_ino) == (info.st_dev, info.st_ino), "canonical camera lock replaced during inventory")
+        result["camera_owner_lock"] = dict(path=str(path), device=info.st_dev, inode=info.st_ino)
+        return result
+    finally:
+        os.close(descriptor)
+
+
+def _read_camera_completion_resources_locked(config, run_id, backend_pid, devices, *, camera_pid):
+    """Never use private /dev absence as release, open devices, or change namespaces."""
     require(type(backend_pid) is int and backend_pid > 0, "original camera backend PID required")
     require(type(camera_pid) is int and camera_pid > 0 and camera_pid != backend_pid, "original camera lease PID required")
     proc = Path("/proc")
     require(proc.is_dir(), "native process inventory required")
     owners = {row["resolved_path"]: [] for row in devices.values()}
     by_device = {row["device_rdev"]: row["resolved_path"] for row in devices.values()}
-    camera_pids, backend_pids = [], []
+    camera_pids, backend_pids, uninspected = [], [], set()
     camera_script = str(Path(config["camera_repository"]) / "tools/am1_camera_viewer.py")
     seen = 0
     for process in proc.iterdir():
@@ -1259,17 +1298,27 @@ def read_camera_completion_resources(config, run_id, backend_pid, devices, *, ca
                 backend_pids.append(pid)
             if any(arg in (os.fsencode(camera_script), b"tools/am1_camera_viewer.py", b"tools.am1_camera_viewer") for arg in args):
                 camera_pids.append(pid)
-            for descriptor in (process / "fd").iterdir():
-                seen += 1
-                require(seen <= 65536, "bounded camera descriptor inventory exceeded")
-                try:
-                    info = descriptor.stat()
-                except FileNotFoundError:
-                    continue  # A descriptor closed after enumeration; other errors remain refusals.
-                if stat.S_ISCHR(info.st_mode) and info.st_rdev in by_device:
-                    path = by_device[info.st_rdev]
-                    if pid not in owners[path]:
-                        owners[path].append(pid)
+            try:
+                for descriptor in (process / "fd").iterdir():
+                    seen += 1
+                    require(seen <= 65536, "bounded camera descriptor inventory exceeded")
+                    try:
+                        info = descriptor.stat()
+                    except FileNotFoundError:
+                        continue  # A descriptor closed after enumeration.
+                    except PermissionError:
+                        require(any(args) and pid not in camera_pids and pid not in backend_pids,
+                                "camera-candidate or unknown process descriptor visibility unavailable")
+                        uninspected.add(pid)
+                        continue  # Keep inspecting later readable descriptors, including configured camera owners.
+                    if stat.S_ISCHR(info.st_mode) and info.st_rdev in by_device:
+                        path = by_device[info.st_rdev]
+                        if pid not in owners[path]:
+                            owners[path].append(pid)
+            except PermissionError:
+                require(any(args) and pid not in camera_pids and pid not in backend_pids,
+                        "camera-candidate or unknown process descriptor visibility unavailable")
+                uninspected.add(pid)  # Protected directory visibility, never a claim of globally empty FDs.
         except FileNotFoundError:
             continue  # A process exited after enumeration; unreadable live same-UID processes refuse.
     result = subprocess.run(["systemctl", "--user", "show", "am1-pa01-camera-" + str(uuid.UUID(run_id)),
@@ -1287,7 +1336,8 @@ def read_camera_completion_resources(config, run_id, backend_pid, devices, *, ca
     return dict(backend_pid_absent=absent[0], camera_pid_absent=absent[1], camera_unit_main_pid=int(unit.get("MainPID", "-1")),
                 camera_unit_control_pid=int(unit.get("ControlPID", "-1")), camera_unit_job=unit.get("Job"),
                 camera_unit_active_state=unit.get("ActiveState"), camera_process_pids=sorted(camera_pids),
-                backend_process_pids=sorted(backend_pids), device_owner_pids={key: sorted(value) for key, value in owners.items()})
+                backend_process_pids=sorted(backend_pids), device_owner_pids={key: sorted(value) for key, value in owners.items()},
+                uninspected_fd_pids=sorted(uninspected))
 
 
 def _recheck_camera_completion(config, proof):
@@ -1317,8 +1367,11 @@ def _recheck_camera_completion(config, proof):
     require(sha(raw) == completion["camera_config_sha256"]
             and (_json(raw).get("cameras")) == {role: row["path"] for role, row in completion["devices"].items()},
             "all actual configured camera devices must match the completion proof")
-    validate_camera_completion_resources(read_camera_completion_resources(config, run_id, completion["backend_pid"],
-        completion["devices"], camera_pid=completion["camera_pid"]), completion["devices"])
+    resources = read_camera_completion_resources(config, run_id, completion["backend_pid"],
+        completion["devices"], camera_pid=completion["camera_pid"])
+    validate_camera_completion_resources(resources, completion["devices"])
+    require(resources["camera_owner_lock"] == completion["resources_after"]["camera_owner_lock"],
+            "canonical camera lock identity changed before completion ACK")
 
 
 def _validate_camera_completion_sources(config, run, proof):
