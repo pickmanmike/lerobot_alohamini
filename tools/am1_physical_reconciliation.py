@@ -1034,13 +1034,21 @@ def validate_camera_completion_runtime_origin(runtime_root, runtime_files, *, mo
                 expected_parents = {root.joinpath(*parts[:length]) for root in roots}
                 require(spec is not None and spec.origin is None and locations is not None
                         and (package is None or getattr(package, "__file__", None) is None)
-                        and all(Path(value).resolve() in expected_parents for value in locations),
+                        and any(Path(value).resolve() in expected_parents for value in locations),
                         "cleanup proof import namespace has a foreign source origin")
                 if package is None:
                     package = importlib.util.module_from_spec(spec)
                     sys.modules[prefix] = package
                     if parent is not None:
                         setattr(parent, parts[length - 1], package)
+                # Namespace packages may merge duplicate repository paths and
+                # unrelated installed portions. An extra portion must not
+                # contribute the next proof package/leaf, even without an init.
+                child = ".".join(parts[:length + 1])
+                for value in locations:
+                    if Path(value).resolve() not in expected_parents:
+                        require(PathFinder.find_spec(child, [value]) is None,
+                                "foreign namespace portion contributes a cleanup proof module")
                 parent, search = package, list(locations)
             spec = PathFinder.find_spec(name, search)
             require(spec is not None and type(spec.origin) is str

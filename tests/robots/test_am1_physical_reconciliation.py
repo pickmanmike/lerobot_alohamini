@@ -1139,6 +1139,55 @@ def test_late_camera_runtime_guard_never_executes_unverified_consumer_bytes(tmp_
     assert getattr(builtins, marker) is False
 
 
+@pytest.mark.parametrize("fragment_kind", ["harmless", "leaf_shadow", "package_shadow"])
+def test_late_camera_real_repository_guard_qualifies_only_the_proof_subtree_in_a_merged_namespace(tmp_path, fragment_kind):
+    import subprocess
+    import sys
+    from tools import am1_physical_reconciliation as m
+
+    runtime = Path(m.__file__).resolve().parent.parent
+    fragment = tmp_path / "namespace-fragment"
+    (fragment / "examples").mkdir(parents=True)
+    if fragment_kind != "harmless":
+        package = fragment / "examples" / "alohamini"
+        package.mkdir()
+        leaf = package / ("am1_live_teleop.py" if fragment_kind == "leaf_shadow" else "__init__.py")
+        leaf.write_text("import builtins\nbuiltins._am1_unverified_namespace_executed = True\n")
+    # A fresh interpreter uses the actual repository and shared environment,
+    # rather than fixture packages/cached leaves that hide namespace merging.
+    script = r'''
+import builtins, hashlib, json, pathlib, sys
+from importlib.machinery import PathFinder
+runtime, fragment = map(pathlib.Path, sys.argv[1:3])
+sys.path[:0] = [str(fragment), str(runtime), str(runtime)]
+builtins._am1_unverified_namespace_executed = False
+from tools.am1_physical_reconciliation import validate_camera_completion_runtime_origin
+paths = ('tools/am1_physical_reconciliation.py','tools/am1_physical_executor.py',
+         'examples/alohamini/am1_live_teleop.py','src/lerobot/robots/alohamini/am1_elbow_integral.py')
+files = {path:hashlib.sha256((runtime/path).read_bytes()).hexdigest() for path in paths}
+parent = PathFinder.find_spec('examples')
+assert parent.origin is None
+locations = list(parent.submodule_search_locations)
+assert str(fragment/'examples') in locations
+assert sum(pathlib.Path(value).resolve() == runtime/'examples' for value in locations) >= 2
+try:
+    qualified = validate_camera_completion_runtime_origin(runtime, files)
+    rejected = False
+except ValueError:
+    qualified, rejected = False, True
+assert builtins._am1_unverified_namespace_executed is False
+assert not any(name == 'draccus' or name.startswith(('draccus.','torch','scservo_sdk','lerobot.robots.alohamini')) for name in sys.modules)
+print(json.dumps(dict(qualified=qualified,rejected=rejected,namespace_locations=locations,unverified_executed=False)))
+'''
+    result = subprocess.run([sys.executable, "-B", "-c", script, str(runtime), str(fragment)],
+                            cwd=runtime, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    observed = json.loads(result.stdout)
+    assert observed["qualified"] is (fragment_kind == "harmless")
+    assert observed["rejected"] is (fragment_kind != "harmless")
+    assert observed["unverified_executed"] is False
+
+
 @pytest.mark.parametrize("changed", ["old_runtime", "current_runtime", "old_hash", "old_motor", "current_motor", "motor_map"])
 def test_late_camera_completion_keeps_original_and_current_runtime_sources_separate(tmp_path, monkeypatch, changed):
     m, config, run, proof, state = late_camera_fixture(tmp_path, monkeypatch)
