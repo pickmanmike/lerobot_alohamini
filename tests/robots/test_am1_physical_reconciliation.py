@@ -13,6 +13,7 @@ import pytest
 
 from tests.robots.test_am1_persistent_session import Clock, command, start
 from tests.robots.test_am1_physical_authority import DelayedPhysicalExecutor
+from tests.robots.test_am1_pre_activation import activation as activation
 from tools.am1_session_core import SessionAuthority
 
 
@@ -3473,3 +3474,165 @@ def test_follower_baseline_expired_origin_rejects_rehashed_incomplete_original(t
     publish_incomplete_fixture(config, run, proof, state)
     with pytest.raises((ValueError, RuntimeError)):
         m.load_qualified_proof(config, run)
+
+
+# Actual271d shape: the native emitter restored a configured profile before Live;
+# the outer provider kept uncertainty because it expected a nonexistent sibling flag.
+
+
+def ordinary_startup_stop_fixture(tmp_path, monkeypatch, activation, right_p=16):
+    from tests.robots.test_am1_teleop_settings import ordinary_configured_robot
+
+    m, config, run, proof, state, _, _ = loader_fixture(tmp_path, monkeypatch)
+    directory = tmp_path / "ordinary"
+    directory.mkdir(mode=0o700)
+
+    def identities(robot):
+        for key in ("_am1_teleop_binding", "_am1_ordinary_arm_profile_binding"):
+            getattr(robot, key).update(run_id=run["run_id"], host_incarnation=proof["host_incarnation"])
+
+    robot = ordinary_configured_robot(activation, directory, right_p=right_p, change=identities)
+    ordinary = robot._am1_ordinary_arm_profile
+    assert ordinary.receipt["active_registers"] is None
+    ordinary.restore(robot)
+    native = ordinary.receipt
+    # Replay the real emitter's receipt on the existing stopped_proof fixture clock.
+    native.update(prepared_at_monotonic_s=97.8, configured_at_monotonic_s=97.9, restored_at_monotonic_s=98.)
+    policy = {"profile": "ordinary-am1-arms-v1", "right_elbow_p": right_p}
+    run.update(source="protected-physical-provider", recipe="physical-live-teleop", mode="interactive",
+               status="stopped", requested_terminal="stopped", cleanup="physical_cleanup_unknown",
+               native_live_at=None, deadline=None, progress_s=0., first_cause=None, native_first_cause=None,
+               recovery_episodes=0, intent=None, ordinary_arm_profile=policy,
+               execution={"complete": False, "fault": None, "progress_s": 0., "input_transport_trace": {
+                   "recent": [], "invalid_rows": 0, "dropped_rows": 0, "first_native_expiry": None}})
+    rows = copy.deepcopy(proof["readback"]["readbacks"])
+    for row in rows:
+        row.update(read_started_at_monotonic_s=98., read_completed_at_monotonic_s=98.001)
+    old = dict(version=1, run_id=run["run_id"], host_incarnation=proof["host_incarnation"],
+               cleanup="physical_readback_verified", uncertain=False, first_cause=None, first_error_chain=[],
+               provenance="protected-host/actual-motor-readback", cleanup_errors=[],
+               expected_stop={"signal": "SIGINT", "interruption": [{"cause": "KeyboardInterrupt: ", "notes": []}]},
+               readback=dict(verified=True, buses_closed=True, lift_readback="qualified", cleanup_errors=[],
+                             selected_gain_restore_required=False, ordinary_arm_profile=native,
+                             started_at_monotonic_s=98., completed_at_monotonic_s=98.1, readbacks=rows))
+    run["physical_result"].update(phase="terminal", terminal_status="stopped", run_id=run["run_id"],
+                                  native_live_at=None, first_cause=None, cleanup="physical_cleanup_unknown",
+                                  uncertain=True, cleanup_errors=[], readback=old)
+    proof.update(original_first_cause=None, original_cleanup_origin="preactivation-ordinary-restored-expected-stop",
+                 original_markers=dict.fromkeys(m.MARKERS))
+    (state / "cleanup-uncertain.json").unlink()
+    manifest = {"motor": {"head": "a" * 40, "files": [
+        {"path": key, "sha256": value} for key, value in native["source_files_sha256"].items()] + [
+        {"path": "preserved/component" + str(n) + ".py", "sha256": "b" * 64} for n in range(8)]}}
+    config.update(host_head=manifest["motor"]["head"], source_pins=str(tmp_path / "manifest.json"))
+    Path(config["source_pins"]).write_bytes(canonical(manifest))
+    original_hash = hashlib.sha256(canonical(manifest)).hexdigest()
+    original_path = tmp_path / "deployments" / original_hash[:16] / "manifest.json"
+    original_path.parent.mkdir(parents=True)
+    original_path.write_bytes(canonical(manifest))
+    run["backend_contract"] = dict(config, source_pins=str(original_path))
+    proof.update(original_motor_head=manifest["motor"]["head"], original_motor_manifest_sha256=original_hash)
+    proof["source"]["manifest_sha256"] = original_hash
+    return m, config, run, proof, state, manifest
+
+
+@pytest.mark.parametrize("right_p", [16, 32])
+def test_ordinary_startup_stop_restored_origin_requires_fresh_proof_and_durable_ack(tmp_path, monkeypatch, activation, right_p):
+    m, config, run, proof, state, manifest = ordinary_startup_stop_fixture(tmp_path, monkeypatch, activation, right_p)
+    raw = publish_incomplete_fixture(config, run, proof, state)
+    before = copy.deepcopy(run)
+    old_path = Path(config["run_root"]) / run["run_id"][:8] / "cleanup.json"
+    original = old_path.read_bytes()
+    actual, received, inventory = m.load_qualified_proof(config, run)
+    assert m.validate_ordinary_startup_stop_origin(run, run["physical_result"]["readback"],
+        motor_files={row["path"]: row["sha256"] for row in manifest["motor"]["files"]}) is True
+    assert actual == proof and received == raw and inventory == dict.fromkeys(m.MARKERS)
+    operation = str(uuid.uuid4())
+    assert not m.acknowledged_receipt(actual, run, operation)
+    ack = m.archive_and_ack(config, actual, received, inventory, operation)
+    receipt = {**actual, "acknowledgment": {**ack, "consumed_operation_id": operation}}
+    assert m.acknowledged_receipt(receipt, run, operation)
+    assert run == before and run["uncertain"] is True and old_path.read_bytes() == original
+    assert m.load_qualified_proof(config, run)[2] == inventory
+
+
+@pytest.mark.parametrize("broken", [
+    "origin", "live", "progress", "intent", "trace", "fault", "signal", "interruption", "cause",
+    "policy", "policy-extra", "host", "receipt-host", "ordinary-missing", "ordinary-active", "restore",
+    "aggregate", "ordinary-source", "motor-source", "motor-head", "manifest-hash", "duplicate-source",
+    "original-off", "original-lift", "original-timing", "camera", "fresh-off", "fresh-lift", "fresh-age", "locks",
+])
+def test_ordinary_startup_stop_origin_refuses_faults_obligations_sources_and_unqualified_new_proof(tmp_path, monkeypatch, activation, broken):
+    m, config, run, proof, state, manifest = ordinary_startup_stop_fixture(tmp_path, monkeypatch, activation)
+    old = run["physical_result"]["readback"]
+    native = old["readback"]["ordinary_arm_profile"]
+    if broken == "origin": proof["original_cleanup_origin"] = None
+    elif broken == "live": run["native_live_at"] = 97.
+    elif broken == "progress": run["progress_s"] = .1
+    elif broken == "intent": run["intent"] = {"accepted": True}
+    elif broken == "trace": run["execution"]["input_transport_trace"]["recent"].append({"accepted": True})
+    elif broken == "fault": run["execution"]["fault"] = "real fault"
+    elif broken == "signal": old["expected_stop"]["signal"] = "SIGTERM"
+    elif broken == "interruption": old["expected_stop"]["interruption"][0]["cause"] = "RuntimeError: failed"
+    elif broken == "cause": run["native_first_cause"] = proof["original_first_cause"] = old["first_cause"] = "real fault"
+    elif broken == "policy": run["ordinary_arm_profile"]["right_elbow_p"] = 32
+    elif broken == "policy-extra": run["ordinary_arm_profile"]["extra"] = False
+    elif broken == "host": run["physical_result"]["backend_incarnation"] = str(uuid.uuid4())
+    elif broken == "receipt-host": native["binding"]["host_incarnation"] = str(uuid.uuid4())
+    elif broken == "ordinary-missing": old["readback"].pop("ordinary_arm_profile")
+    elif broken == "ordinary-active": native["state"] = "active"
+    elif broken == "restore": native["restore_required"] = True
+    elif broken == "aggregate": old["readback"]["selected_gain_restore_required"] = True
+    elif broken == "ordinary-source": native["source_files_sha256"][next(iter(native["source_files_sha256"]))] = "f" * 64
+    elif broken == "motor-source": manifest["motor"]["files"][0]["sha256"] = "f" * 64
+    elif broken == "motor-head": manifest["motor"]["head"] = "f" * 40
+    elif broken == "manifest-hash": proof["original_motor_manifest_sha256"] = "f" * 64
+    elif broken == "duplicate-source": manifest["motor"]["files"][0] = dict(manifest["motor"]["files"][1])
+    elif broken == "original-off": old["readback"]["readbacks"][0]["value"] = 1
+    elif broken == "original-lift": old["readback"]["lift_readback"] = "unavailable-or-failed"
+    elif broken == "original-timing": old["readback"]["readbacks"][0]["read_completed_at_monotonic_s"] = 200.
+    elif broken == "camera": proof["camera_release"]["state"] = "active"
+    elif broken == "fresh-off": proof["readback"]["readbacks"][0]["value"] = 1
+    elif broken == "fresh-lift": proof["readback"]["lift_stationary"]["samples"][0]["status"] = 4
+    elif broken == "fresh-age": monkeypatch.setattr(m.time, "monotonic", lambda: 500.)
+    elif broken == "locks": proof["admission"]["both_locks_held"] = False
+    Path(run["backend_contract"]["source_pins"]).write_bytes(canonical(manifest))
+    if broken != "manifest-hash": proof["original_motor_manifest_sha256"] = hashlib.sha256(canonical(manifest)).hexdigest()
+    publish_incomplete_fixture(config, run, proof, state)
+    with pytest.raises((ValueError, KeyError, TypeError)):
+        m.load_qualified_proof(config, run)
+    assert not m._ack_path(state, run["run_id"]).exists()
+
+
+@pytest.mark.parametrize("changed", ["marker-before", "marker-during", "original-before", "original-during"])
+def test_ordinary_startup_stop_changed_original_or_new_marker_never_qualifies_ack(tmp_path, monkeypatch, activation, changed):
+    m, config, run, proof, state, _ = ordinary_startup_stop_fixture(tmp_path, monkeypatch, activation)
+    publish_incomplete_fixture(config, run, proof, state)
+    actual, raw, inventory = m.load_qualified_proof(config, run)
+    original = Path(config["run_root"]) / run["run_id"][:8] / "cleanup.json"
+    target = state / m.MARKERS[0] if changed.startswith("marker") else original
+    if changed.endswith("before"):
+        target.write_bytes(b"changed")
+    else:
+        publish = m._write_new_or_same
+        def changed_during_ack(path, data):
+            publish(path, data)
+            if path.name.startswith("reconciliation-ack-"): target.write_bytes(b"changed")
+        monkeypatch.setattr(m, "_write_new_or_same", changed_during_ack)
+    with pytest.raises(ValueError):
+        m.archive_and_ack(config, actual, raw, inventory, str(uuid.uuid4()))
+    assert target.read_bytes() == b"changed"
+
+
+def test_ordinary_startup_stop_original_motor_proof_is_separate_from_current_source_closure(tmp_path, monkeypatch, activation):
+    m, config, run, proof, state, manifest = ordinary_startup_stop_fixture(tmp_path, monkeypatch, activation)
+    original = copy.deepcopy(run["backend_contract"])
+    current = copy.deepcopy(manifest)
+    current["motor"]["head"] = config["host_head"] = "c" * 40
+    for row in current["motor"]["files"][:3]: row["sha256"] = "e" * 64
+    Path(config["source_pins"]).write_bytes(canonical(current))
+    proof["source"]["manifest_sha256"] = hashlib.sha256(canonical(current)).hexdigest()
+    publish_incomplete_fixture(config, run, proof, state)
+    assert m.load_qualified_proof(config, run)[0] == proof
+    assert run["backend_contract"] == original and original["host_head"] != config["host_head"]
+    assert proof["source"]["backend_contract"] == config

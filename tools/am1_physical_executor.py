@@ -1777,8 +1777,11 @@ def qualified_cleanup_receipt(receipt, run_id, incarnation, *, ordinary_arm_prof
     if ordinary_arm_profile is not None or ordinary is not None or "ordinary_arm_profile_restore_required" in readback:
         try:
             from examples.alohamini.am1_live_teleop import validate_ordinary_arm_profile
-            from lerobot.robots.alohamini.am1_elbow_integral import validate_ordinary_arm_profile_receipt
-            if readback.get("ordinary_arm_profile_restore_required") is not False:
+            from examples.alohamini.am1_live_teleop import validate_ordinary_arm_profile_receipt
+            if readback.get("selected_gain_restore_required") is not False or (
+                "ordinary_arm_profile_restore_required" in readback
+                and readback["ordinary_arm_profile_restore_required"] is not False
+            ):
                 return False
             proof = validate_ordinary_arm_profile_receipt(ordinary, run_id=run_id,
                                                         host_incarnation=incarnation, restored=True)

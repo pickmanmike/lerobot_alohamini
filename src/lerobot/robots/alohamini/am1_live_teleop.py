@@ -13,26 +13,7 @@ from contextlib import suppress
 from uuid import UUID
 
 RECIPE = "physical-live-teleop"
-STATIC = (
-    "ID",
-    "Model_Number",
-    "Firmware_Major_Version",
-    "Firmware_Minor_Version",
-    "Min_Position_Limit",
-    "Max_Position_Limit",
-    "Homing_Offset",
-    "Phase",
-    "P_Coefficient",
-    "I_Coefficient",
-    "D_Coefficient",
-    "Acceleration",
-    "Maximum_Acceleration",
-    "Protection_Current",
-    "Max_Temperature_Limit",
-    "Min_Voltage_Limit",
-    "Max_Voltage_Limit",
-    "Operating_Mode",
-)
+from examples.alohamini.am1_live_teleop import ORDINARY_ARM_STATIC as STATIC
 HEALTH = ("Status", "Present_Temperature", "Present_Voltage", "Torque_Enable", "Lock")
 LIVE_HEALTH = (*HEALTH, "Operating_Mode")
 

@@ -7,6 +7,8 @@ Pi grant supplies the conservative native deadline; reception never renews it.
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import math
 from dataclasses import dataclass
 from uuid import UUID
@@ -290,3 +292,127 @@ def validate_workspace(workspace):
         if raw[1] - raw[0] > maximum_span + 1e-9 or bounds["rate_per_s"] > maximum_rate + 1e-9:
             raise ValueError("native workspace exceeds role-specific bench travel/rate")
     return copy.deepcopy(workspace)
+
+
+# Ordinary settings proof is shared by the native owner and HTTP-only readers.
+ORDINARY_ARM_STATIC = (
+    "ID",
+    "Model_Number",
+    "Firmware_Major_Version",
+    "Firmware_Minor_Version",
+    "Min_Position_Limit",
+    "Max_Position_Limit",
+    "Homing_Offset",
+    "Phase",
+    "P_Coefficient",
+    "I_Coefficient",
+    "D_Coefficient",
+    "Acceleration",
+    "Maximum_Acceleration",
+    "Protection_Current",
+    "Max_Temperature_Limit",
+    "Min_Voltage_Limit",
+    "Max_Voltage_Limit",
+    "Operating_Mode",
+)
+
+
+def _ordinary_settings_json(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+
+
+def validate_ordinary_arm_profile_binding(value):
+    fields = {"version", "profile", "workload_segment", "right_elbow_p", "run_id", "host_incarnation", "recipe"}
+    if (type(value) is not dict or set(value) != fields or type(value["version"]) is not int
+            or value["version"] != 1 or value["workload_segment"] != "ordinary-arms"
+            or value["recipe"] != "physical-live-teleop"):
+        raise ValueError("exact ordinary arm run/profile binding required")
+    validate_ordinary_arm_profile({key: value[key] for key in ("profile", "right_elbow_p")})
+    try:
+        if any(type(value[key]) is not str or str(UUID(value[key])) != value[key]
+               for key in ("run_id", "host_incarnation")):
+            raise ValueError
+    except (TypeError, ValueError, AttributeError):
+        raise ValueError("ordinary arm run/host identity differs") from None
+    return dict(value)
+
+
+_ORDINARY_EXTRA = ("CW_Dead_Zone", "CCW_Dead_Zone", "Max_Torque_Limit", "Torque_Limit")
+_ORDINARY_STATE = ("Torque_Enable", "Lock", "Present_Position", "Goal_Position", "Present_Current", "Present_Voltage", "Status")
+_ORDINARY_SOURCE_PATHS = (
+    "examples/alohamini/am1_live_teleop.py", "src/lerobot/robots/alohamini/am1_live_teleop.py",
+    "src/lerobot/robots/alohamini/am1_elbow_integral.py", "src/lerobot/robots/alohamini/alohamini.py",
+    "src/lerobot/robots/alohamini/alohamini_host.py",
+)
+
+
+def validate_ordinary_arm_profile_receipt(value, *, run_id, host_incarnation, restored=False):
+    """Pure common proof for the settings emitter, cleanup reader and private audit."""
+    STATIC = ORDINARY_ARM_STATIC
+
+    fields = {"version", "kind", "binding", "calibration", "source_files_sha256", "original_registers",
+              "active_registers", "restored_registers", "original_settings_sha256", "prepared_at_monotonic_s",
+              "configured_at_monotonic_s", "restored_at_monotonic_s", "restore_required", "state"}
+    def require(condition):
+        if not condition:
+            raise ValueError("ordinary arm settings/profile/restoration proof differs")
+    require(type(value) is dict and set(value) == fields and type(value["version"]) is int
+            and value["version"] == 1 and value["kind"] == "ordinary-arm-profile")
+    binding = validate_ordinary_arm_profile_binding(value["binding"])
+    require(binding["run_id"] == run_id and binding["host_incarnation"] == host_incarnation)
+    require(type(value["calibration"]) is dict
+            and value["calibration"] == {key: list(cal) for key, cal in ORDINARY_AM1_ARM_CALIBRATION.items()}
+            and all(type(cal) is list and all(type(raw) is int for raw in cal) for cal in value["calibration"].values()))
+    hashes = value["source_files_sha256"]
+    require(type(hashes) is dict and set(hashes) == set(_ORDINARY_SOURCE_PATHS)
+            and all(type(h) is str and len(h) == 64 and set(h) <= set("0123456789abcdef") for h in hashes.values()))
+    originals = value["original_registers"]
+    require(type(originals) is dict and set(originals) == {"left", "right"})
+    registers = {*STATIC, *_ORDINARY_EXTRA, *_ORDINARY_STATE}
+    def check_rows(rows, phase):
+        require(type(rows) is dict and set(rows) == {"left", "right"})
+        for side in ("left", "right"):
+            row, original = rows[side], originals[side]
+            require(type(row) is dict and set(row) == registers
+                    and all(type(raw) is int for raw in row.values()))
+            cal = ORDINARY_AM1_ARM_CALIBRATION["arm_" + side + "_elbow_flex"]
+            require(row["ID"] == 3 and row["Model_Number"] == 777
+                    and row["Firmware_Major_Version"] == 3 and row["Firmware_Minor_Version"] == 10 and row["Phase"] == 12
+                    and row["Min_Position_Limit"] == cal[3] and row["Max_Position_Limit"] == cal[4]
+                    and row["Homing_Offset"] == cal[2] and row["Operating_Mode"] == 0
+                    and row["I_Coefficient"] == 0 and row["D_Coefficient"] == 32
+                    and row["Protection_Current"] > 0 and 0 < row["Max_Temperature_Limit"] <= 100
+                    and 0 < row["Min_Voltage_Limit"] <= row["Present_Voltage"] <= row["Max_Voltage_Limit"]
+                    and abs(row["Present_Current"]) < row["Protection_Current"] and row["Status"] == 0
+                    and 0 <= row["CW_Dead_Zone"] <= 255 and 0 <= row["CCW_Dead_Zone"] <= 255
+                    and 0 < row["Torque_Limit"] <= row["Max_Torque_Limit"] <= 1000)
+            if phase == "original":
+                require(row["P_Coefficient"] == 16 and row["Torque_Enable"] == 0 and row["Lock"] in (0, 1)
+                        and row["Maximum_Acceleration"] == 254
+                        and row["Acceleration"] in ((0, 254) if side == "left" else (0,)))
+            else:
+                expected = dict(original)
+                if phase == "active":
+                    expected.update(P_Coefficient=32 if side == "left" else binding["right_elbow_p"],
+                                    Acceleration=254 if side == "left" else 0)
+                require(all(row[key] == expected[key] for key in (*STATIC, *_ORDINARY_EXTRA)))
+                require(row["Torque_Enable"] == (1 if phase == "active" else 0)
+                        and row["Lock"] == (1 if phase == "active" else original["Lock"]))
+    check_rows(originals, "original")
+    require(value["original_settings_sha256"] == hashlib.sha256(_ordinary_settings_json(originals)).hexdigest())
+    prepared, configured, finished = (value[key] for key in
+        ("prepared_at_monotonic_s", "configured_at_monotonic_s", "restored_at_monotonic_s"))
+    require(type(prepared) in (int, float) and math.isfinite(prepared) and prepared >= 0)
+    require(configured is None or type(configured) in (int, float) and math.isfinite(configured) and configured >= prepared)
+    if value["active_registers"] is not None:
+        require(configured is not None)
+        check_rows(value["active_registers"], "active")
+    if restored:
+        require(value["state"] == "restored" and value["restore_required"] is False
+                and type(finished) in (int, float) and math.isfinite(finished)
+                and finished >= (prepared if configured is None else configured))
+        check_rows(value["restored_registers"], "restored")
+    else:
+        require(value["state"] == "active" and value["restore_required"] is True
+                and value["active_registers"] is not None and value["restored_registers"] is None and finished is None)
+    return copy.deepcopy(value)

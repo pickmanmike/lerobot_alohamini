@@ -2679,3 +2679,40 @@ def test_normal_rest_goal0_keeps_actual_position_off_and_quiet_guards(activation
     assert not [row for row in activation.events if row[0]=="write" and row[2]=="Torque_Enable" and row[3].startswith("arm_") and row[4]==1]
     robot.left_bus.on_read=None
     robot._safe_shutdown(close_buses=True)
+
+
+@pytest.mark.parametrize("right_p", [16, 32])
+def test_ordinary_restored_proof_and_cleanup_reader_need_only_standard_library(activation, tmp_path, right_p):
+    import json
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    robot = ordinary_configured_robot(activation, tmp_path, right_p=right_p)
+    assert robot._safe_shutdown(close_buses=False) == []
+    readback = dict(robot._am1_shutdown_evidence)
+    # The fixture has no physical lift; its separately tested qualified result is
+    # supplied here to isolate the dependency boundary of the ordinary reader.
+    readback["lift_readback"] = "qualified"
+    identity = {key: robot._am1_teleop_binding[key] for key in ("run_id", "host_incarnation")}
+    payload = dict(version=1, **identity, cleanup="physical_readback_verified", uncertain=False,
+                   cleanup_errors=[], readback=readback)
+    path = tmp_path / "native-emitted-restored-cleanup.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    code = """
+import json, sys
+from examples.alohamini.am1_live_teleop import validate_ordinary_arm_profile_receipt
+from tools.am1_physical_executor import qualified_cleanup_receipt
+value = json.loads(open(sys.argv[1], encoding='utf-8').read())
+identity = {key: value[key] for key in ('run_id', 'host_incarnation')}
+proof = validate_ordinary_arm_profile_receipt(value['readback']['ordinary_arm_profile'], **identity, restored=True)
+policy = {key: proof['binding'][key] for key in ('profile', 'right_elbow_p')}
+assert 'ordinary_arm_profile_restore_required' not in value['readback']
+assert qualified_cleanup_receipt(value, identity['run_id'], identity['host_incarnation'], ordinary_arm_profile=policy)
+assert 'draccus' not in sys.modules and not any(key.startswith('lerobot') for key in sys.modules)
+"""
+    repo = Path(__file__).resolve().parents[2]
+    result = subprocess.run([sys.executable, "-S", "-c", code, str(path)], cwd=repo,
+                            env={**os.environ, "PYTHONPATH": str(repo)}, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr

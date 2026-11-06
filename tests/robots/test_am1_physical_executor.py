@@ -4025,15 +4025,24 @@ def test_ordinary_profile_native_host_launch_has_no_experiment_request_dependenc
 
 
 
-@pytest.mark.parametrize("fault", [None,"missing","wrong_policy","host","restoration","obligation","body_off"])
-def test_ordinary_profile_cleanup_requires_exact_settings_restoration_in_addition_to_all_off(activation,tmp_path,fault):
+@pytest.mark.parametrize("fault", [None,"partial_startup","dedicated_false","missing","wrong_policy","host",
+    "foreign_run","restoration","obligation","proof_obligation","missing_aggregate","aggregate_none",
+    "aggregate_true","aggregate_zero","dedicated_none","dedicated_zero","body_off","missing_off","bool_off"])
+def test_ordinary_profile_cleanup_requires_exact_settings_restoration_in_addition_to_all_off(
+    activation,tmp_path,fault,
+):
     from tests.robots.test_am1_teleop_settings import ordinary_configured_robot
-    robot=ordinary_configured_robot(activation,tmp_path,right_p=32)
+    right_p=16 if fault=="partial_startup" else 32
+    robot=ordinary_configured_robot(activation,tmp_path,right_p=right_p)
+    if fault=="partial_startup":
+        # This real fixture configures settings without entering native activation.
+        assert robot._am1_ordinary_arm_profile.receipt["active_registers"] is None
+        assert robot._am1_ordinary_arm_profile.receipt["configured_at_monotonic_s"] is not None
     ordinary=robot._am1_ordinary_arm_profile
     ordinary.restore(robot)
     binding=robot._am1_teleop_binding;run,host=binding["run_id"],binding["host_incarnation"]
     proof=ordinary.receipt
-    policy={"profile":"ordinary-am1-arms-v1","right_elbow_p":32}
+    policy={"profile":"ordinary-am1-arms-v1","right_elbow_p":right_p}
     m=module()
     readbacks=[{"bus":"left" if "_left_" in key else "right","motor":key[:-4],
                 "register":"Torque_Enable","value":0} for key in JOINT_KEYS]
@@ -4042,11 +4051,25 @@ def test_ordinary_profile_cleanup_requires_exact_settings_restoration_in_additio
     receipt={"version":1,"run_id":run,"host_incarnation":host,"cleanup":"physical_readback_verified",
              "uncertain":False,"cleanup_errors":[],"readback":{"verified":True,"lift_readback":"qualified",
              "selected_gain_restore_required":False,"readbacks":readbacks,
-             "ordinary_arm_profile":proof,"ordinary_arm_profile_restore_required":False}}
+             "ordinary_arm_profile":proof}}
+    # Native cleanup emits the aggregate flag and full receipt, without a dedicated flag.
     if fault=="missing":receipt["readback"].pop("ordinary_arm_profile")
     elif fault=="wrong_policy":policy["right_elbow_p"]=16
     elif fault=="host":proof["binding"]["host_incarnation"]=str(__import__("uuid").uuid4())
+    elif fault=="foreign_run":proof["binding"]["run_id"]=str(__import__("uuid").uuid4())
     elif fault=="restoration":proof["restored_registers"]["right"]["P_Coefficient"]=32
     elif fault=="obligation":receipt["readback"]["ordinary_arm_profile_restore_required"]=True
+    elif fault=="dedicated_false":receipt["readback"]["ordinary_arm_profile_restore_required"]=False
+    elif fault=="dedicated_none":receipt["readback"]["ordinary_arm_profile_restore_required"]=None
+    elif fault=="dedicated_zero":receipt["readback"]["ordinary_arm_profile_restore_required"]=0
+    elif fault=="proof_obligation":proof["restore_required"]=True
+    elif fault=="missing_aggregate":receipt["readback"].pop("selected_gain_restore_required")
+    elif fault=="aggregate_none":receipt["readback"]["selected_gain_restore_required"]=None
+    elif fault=="aggregate_true":receipt["readback"]["selected_gain_restore_required"]=True
+    elif fault=="aggregate_zero":receipt["readback"]["selected_gain_restore_required"]=0
     elif fault=="body_off":readbacks[-1]["value"]=1
-    assert m.qualified_cleanup_receipt(receipt,run,host,ordinary_arm_profile=policy) is (fault is None)
+    elif fault=="missing_off":readbacks.pop()
+    elif fault=="bool_off":readbacks[-1]["value"]=False
+    assert m.qualified_cleanup_receipt(receipt,run,host,ordinary_arm_profile=policy) is (
+        fault in (None,"partial_startup","dedicated_false")
+    )
