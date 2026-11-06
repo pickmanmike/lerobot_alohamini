@@ -1956,17 +1956,58 @@ class AM1OrdinaryArmProfile(AM1ElbowIntegralTrial):
     def qualify_normal_activation(self, robot, all_goals):
         from examples.alohamini.am1_live_teleop import ORDINARY_AM1_RAW_BOUNDS
         self.require_normal_activation_owner(robot)
+        robot._require_am1_activation_fresh("after_home")
         if len(all_goals) != 2:
             raise RuntimeError("ordinary arm startup needs both complete qualified owners")
+        rows = robot._am1_activation_readbacks
+        measured, legal, caps, vectors = {}, {}, {}, {}
+        now = time.monotonic()
         for side in ("left", "right"):
             matching = [values for bus, values in all_goals if bus is self._buses[side]]
             if len(matching) != 1 or set(matching[0]) != set(getattr(robot, side + "_arm_motors")):
                 raise RuntimeError("ordinary arm startup needs the complete fresh measured vector")
-            for name, raw in matching[0].items():
+            vectors[side] = matching[0]
+            for name, seed in matching[0].items():
+                self.require_normal_activation_owner(robot)
+                positions = [row for row in rows if row.get("phase") == "after_home"
+                             and row.get("motor") == name and row.get("register") == "Present_Position"]
+                torque = [row for row in rows if row.get("phase") == "after_home"
+                          and row.get("motor") == name and row.get("register") == "Torque_Enable"]
                 low, high = ORDINARY_AM1_RAW_BOUNDS[name + ".pos"]
-                if type(raw) is not int or not low <= raw <= high:
-                    raise RuntimeError("ordinary arm fresh measured seed is outside its fixed region")
-        return AM1LeftResponseProportionalTrial.qualify_normal_activation(self, robot, all_goals)
+                if len(positions) != 1 or len(torque) != 1:
+                    raise RuntimeError("ordinary startup original raw/OFF acquisition missing: " + name)
+                position, off = positions[0], torque[0]
+                raw = position.get("raw")
+                if (type(seed) is not int or type(raw) is not int or off.get("raw") != 0
+                    or any("unavailable" in row or any(type(row.get(k)) not in (int, float) or not math.isfinite(row[k])
+                           for k in ("read_started_at", "read_completed_at")) for row in (position, off))
+                    or not 0 <= off["read_started_at"] <= off["read_completed_at"] <= position["read_started_at"] <= position["read_completed_at"] <= now
+                    or now-position["read_started_at"] >= robot.AM1_ACTIVATION_MAX_RAW_AGE_S):
+                    raise RuntimeError("ordinary startup original raw/OFF acquisition stale or invalid: " + name)
+                cal = robot._am1_activation_calibration(self._buses[side], name)
+                if seed != raw:
+                    rest = [row for row in robot._am1_teleop_rest_evidence if row.get("phase") == "after_home"
+                            and row.get("qualified") is True and row.get("seed_raw") == seed and row.get("measured_raw") == raw]
+                    if name != "arm_left_shoulder_lift" or not rest:
+                        raise RuntimeError("ordinary startup legal calibration seed differs from original measurement: " + name)
+                goal = low if seed < low else high if seed > high else seed
+                cap = robot._am1_relative_target_cap(name + ".pos")
+                cap_raw = math.floor(cap * (cal[4]-cal[3]) / (100 if name.endswith("gripper") else 200)) if type(cap) in (int, float) and math.isfinite(cap) and cap > 0 else -1
+                if (name.endswith("elbow_flex") and not low <= raw == goal <= high
+                    or abs(raw-goal) > min(math.floor(self.normal_rest_startup_degrees(robot)*4096/360), cap_raw)):
+                    raise RuntimeError(f"ordinary startup acquisition refused: {name} measured={raw} legalGoal={goal} fixed={low}..{high} displacement exceeds1degree/relative cap or elbow corridor")
+                measured[name], legal[name], caps[name] = raw, goal, cap
+        evidence = AM1LeftResponseProportionalTrial.qualify_normal_activation(self, robot, all_goals)
+        robot._require_am1_activation_fresh("after_home")
+        evidence["startup_acquisition"] = {"version": 1, "displacement_bound_degrees": 1.,
+            "measured_raw": measured, "legal_goals_raw": legal, "relative_target_caps": caps,
+            "goal_writes": {}, "goal_readbacks": {},
+            "original_readbacks": copy.deepcopy([row for row in rows if row.get("phase") == "after_home"])}
+        # Only after the entire original vector qualifies, the ordinary owner
+        # seeds these explicit legal Goals. Original measured readbacks stay intact.
+        for side in ("left", "right"):
+            vectors[side].update({name: legal[name] for name in vectors[side]})
+        return evidence
 
     def verify_active(self, robot):
         self.require_normal_activation_owner(robot)

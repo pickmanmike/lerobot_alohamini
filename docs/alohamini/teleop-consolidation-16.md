@@ -695,7 +695,7 @@ One stopped format inventory found all five roles advertise MJPEG/YUYV, includin
 
 ### Ordinary two-arm profile and input boundary
 
-The [canonical current-state record](current-state.md#current-operation-and-installation) identifies the actual installed profile, component bindings, rollback and physical qualification. The new `ordinary-am1-arms-v1` procedure below is implemented; broader useful physical qualification remains outstanding. Windows is unlocked and the enrolled viewer is available. Relit camera-only source/display evidence restores coarse Chest usability; physical changing-input follow-through after the shared reporting repair remains outstanding. Do not infer movement from software/staging checks. Earlier LEFT response-experiment invocations below are historical; their nonce is not the normal profile's permission token.
+The [canonical current-state record](current-state.md#current-operation-and-installation) identifies the actual installed profile, component bindings, rollback and physical qualification. The new `ordinary-am1-arms-v1` procedure below is implemented; broader useful physical qualification remains outstanding. Use the existing enrolled viewer. Relit source/display evidence restores coarse Chest usability; the canonical current-state record tracks the completed entry and pending ordinary startup correction. Do not infer movement from software/staging checks. Earlier LEFT response-experiment invocations below are historical; their nonce is not the normal profile's permission token.
 
 Use the existing enrolled Edge profile through `tools/run_am1_console.ps1 -SoftwareVideoDecode` and leave the actual **Working camera** visible. Normal operation requires useful current onboard imagery, not only frame counters or advisory P1. P1 images use the owner's exact 180° orientation; physical USB-leader connection remains deferred.
 
@@ -711,6 +711,8 @@ uv run --no-sync --project $env:AM1_PROJECT_ROOT python -u -B -m tools.am1_leade
   --ordinary-config '.cache/am1-knowledge-reuse-18/ordinary-am1-arms.private.json' `
   --virtual-input interactive
 ```
+
+The normal-start acquisition distinguishes three values: original after-home measurement, legal seeded Goal and fresh Live measured reference. A nearby non-elbow rest may acquire its nearest fixed-region endpoint within the existing one-encoder-degree startup budget and per-joint relative-target cap; both elbows must already satisfy their supported corridors. This is startup qualification, not expanded task travel. The published `startup_acquisition` records that distinction; later targets still use the unchanged fixed bounds and the original admitted legal command origin. Keep the measured reference and actual residual for reporting.
 
 Wait for actual admission/ready before acquiring a movement intention. The existing input accepts `move SECONDS VALID_FOR joint=value...`, `hold VALID_FOR`, `return SECONDS VALID_FOR` and `finish`; targets may change any subset of the twelve published keys, with omitted joints retaining their admitted command. `SECONDS` is a rate-checked transition and `VALID_FOR` bounds that acquired intention; neither extends the original run deadline. Published keys are `arm_{left,right}_{shoulder_pan,shoulder_lift,elbow_flex,wrist_flex,wrist_roll,gripper}.pos`; interactive input also accepts the shorter names without `arm_`/`.pos`. Read actual bounds/reference/current command from the fresh admission, rather than copying old raw poses. A timed transition or hold is not evidence of physical arrival.
 

@@ -2117,6 +2117,8 @@ def _run_host(args):
                 routine_writer.submit("[AM1 TELEOP REST] ", {
                     "binding": robot._am1_teleop_binding,
                     "acquisitions": robot._am1_teleop_rest_evidence,
+                    **({"ordinary_startup_acquisition": robot._am1_ordinary_arm_profile._snapshot["normal_activation"]["startup_acquisition"]}
+                       if getattr(robot, "_am1_ordinary_arm_profile", None) is not None else {}),
                 })
         # One final same-owner startup boundary before ordinary loop timing.
         # Only a due genuine read can refresh the retained original thermal slots.

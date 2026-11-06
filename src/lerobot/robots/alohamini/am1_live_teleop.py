@@ -1513,6 +1513,11 @@ def workspace(robot, identity, measured, *, goals=None):
             raise RuntimeError("ordinary arm profile cannot share an experimental workspace")
         profile = ordinary["binding"]["profile"]
         result["workspace_profile"] = profile
+        acquisition = robot._am1_ordinary_arm_profile._snapshot.get("normal_activation", {}).get("startup_acquisition")
+        if not isinstance(acquisition, dict):
+            raise RuntimeError("ordinary arm original normal-start acquisition is unavailable")
+        result["startup_acquisition"] = {"version": 1, "displacement_bound_degrees": 1.,
+                                         "measured_reference": {}, "command_reference": {}}
     if receipt is not None:
         side = "left" if receipt["kind"] == "left-response-p" else "right"
         trial = getattr(robot, "_am1_" + side + "_response_p_trial")
@@ -1550,9 +1555,15 @@ def workspace(robot, identity, measured, *, goals=None):
                 if tuple(cal) != ORDINARY_AM1_ARM_CALIBRATION[name]:
                     raise RuntimeError("ordinary arm calibrated region changed")
                 low, high = ORDINARY_AM1_RAW_BOUNDS[key]
-                lower, upper = sorted(normalized_raw(raw, cal, gripper=gripper) for raw in (low, high))
-                if not low <= seed <= high or not lower <= q0 <= upper:
-                    raise RuntimeError("ordinary arm fresh measured rest/held Goal is outside its fixed region")
+                cap = robot._am1_relative_target_cap(key)
+                if (type(cap) not in (int, float) or not math.isfinite(cap) or cap <= 0
+                    or abs(q0-normalized_raw(seed, cal, gripper=gripper)) > cap + 1e-9):
+                    raise RuntimeError("ordinary arm current measured/held Goal exceeds its relative cap: " + name)
+                if (not low <= seed <= high or acquisition["legal_goals_raw"].get(name) != seed
+                    or type(acquisition["measured_raw"].get(name)) is not int):
+                    raise RuntimeError("ordinary arm original legal startup Goal changed: " + name)
+                result["startup_acquisition"]["measured_reference"][key] = normalized_raw(acquisition["measured_raw"][name], cal, gripper=gripper)
+                result["startup_acquisition"]["command_reference"][key] = normalized_raw(seed, cal, gripper=gripper)
             elif profile == LEFT_ENTRY_WORKSPACE_PROFILE:
                 if name == "arm_left_elbow_flex":
                     if not LEFT_ENTRY_START_MIN_RAW <= seed <= LEFT_ENTRY_START_MAX_RAW:

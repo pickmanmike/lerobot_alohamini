@@ -199,6 +199,19 @@ def validate_ordinary_arm_profile(value):
 
 def validate_workspace(workspace):
     fields = {"version", "units", "bounds", "reference", "calibration", "raw_bounds"}
+    acquisition = workspace.get("startup_acquisition") if isinstance(workspace, dict) else None
+    if isinstance(workspace, dict) and "startup_acquisition" in workspace:
+        if workspace.get("workspace_profile") != ORDINARY_AM1_ARMS_PROFILE:
+            raise ValueError("startup acquisition requires the ordinary AM1 profile")
+        fields.add("startup_acquisition")
+        if (type(acquisition) is not dict or set(acquisition) != {"version", "displacement_bound_degrees",
+                "measured_reference", "command_reference"}
+            or type(acquisition["version"]) is not int or acquisition["version"] != 1
+            or not number(acquisition["displacement_bound_degrees"]) or acquisition["displacement_bound_degrees"] != 1.
+            or any(type(acquisition[name]) is not dict or set(acquisition[name]) != set(TELEOP_ARM_KEYS)
+                   or not all(number(v) for v in acquisition[name].values())
+                   for name in ("measured_reference", "command_reference"))):
+            raise ValueError("closed ordinary normal-start acquisition required")
     if isinstance(workspace, dict) and "workspace_profile" in workspace:
         if workspace["workspace_profile"] not in (*CURRENT_REST_WORKSPACE_PROFILES.values(), *_LEFT_ENTRY_WORKSPACE_DESCRIPTORS, ORDINARY_AM1_ARMS_PROFILE):
             raise ValueError("unknown native workspace profile")
@@ -261,9 +274,26 @@ def validate_workspace(workspace):
             raise ValueError("native raw/normalized workspace roundtrip differs")
         if ordinary:
             if (tuple(cal) != ORDINARY_AM1_ARM_CALIBRATION[key.removesuffix(".pos")]
-                    or tuple(raw) != ORDINARY_AM1_RAW_BOUNDS[key]
-                    or not bounds["min"] <= workspace["reference"][key] <= bounds["max"]):
-                raise ValueError("ordinary AM1 fixed region/calibration/reference differs")
+                    or tuple(raw) != ORDINARY_AM1_RAW_BOUNDS[key]):
+                raise ValueError("ordinary AM1 fixed region/calibration differs")
+            reference = workspace["reference"][key]
+            if acquisition is None:
+                if not bounds["min"] <= reference <= bounds["max"]:
+                    raise ValueError("ordinary AM1 fixed region/reference differs")
+            else:
+                measured, command = (acquisition[name][key] for name in ("measured_reference", "command_reference"))
+                if not bounds["min"] <= command <= bounds["max"]:
+                    raise ValueError("ordinary startup Goal left fixed task bounds: " + key)
+                if key.endswith("elbow_flex.pos"):
+                    if not bounds["min"] <= measured <= bounds["max"] or command != measured or not bounds["min"] <= reference <= bounds["max"]:
+                        raise ValueError("ordinary startup elbow left its original corridor: " + key)
+                else:
+                    expected = bounds["min"] if measured < bounds["min"] else bounds["max"] if measured > bounds["max"] else measured
+                    allowance = math.floor(4096 / 360) * (100 if gripper else 200) / (cal[4] - cal[3])
+                    if (command != expected or any(abs(value-command) > allowance + 1e-9 for value in (measured, reference))
+                        or any(not (0 if gripper else -100) <= value <= 100
+                           and not (key == "arm_left_shoulder_lift.pos" and value > 100) for value in (measured, reference))):
+                        raise ValueError("ordinary bounded normal-start reference/Goal differs: " + key)
         elif entry:
             if key == "arm_left_elbow_flex.pos":
                 if (list(cal) != [3, 0, 1845, 864, 3073] or raw[0] != entry_descriptor[0]

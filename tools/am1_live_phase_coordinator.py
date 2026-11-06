@@ -221,7 +221,13 @@ def fresh_ordinary_targets(ready, admitted, *, ramp_seconds, gripper_direction):
     for key in TELEOP_ARM_KEYS:
         point, cal = points[key], workspace["calibration"][key[:-4]]
         grip = key.endswith("gripper.pos")
-        if (type(point["raw"]) is not int or not cal[3] <= point["raw"] <= cal[4]
+        calibrated = type(point["raw"]) is int and cal[3] <= point["raw"] <= cal[4]
+        acquisition = workspace.get("startup_acquisition")
+        if (not calibrated and key == "arm_left_shoulder_lift.pos" and type(point["raw"]) is int
+            and point["raw"] > cal[4] and acquisition is not None
+            and acquisition["command_reference"] == origin and point["normalized"] == workspace["reference"][key]):
+            calibrated = True  # validate_workspace already binds this exact normal-start reference/Goal envelope.
+        if (not calibrated
             or not math.isfinite(point["normalized"])
             or abs(normalized_raw(point["raw"], cal, gripper=grip)-point["normalized"]) > 1e-7):
             raise ValueError("ordinary original measured mapping differs")

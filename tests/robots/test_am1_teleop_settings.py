@@ -125,6 +125,132 @@ def test_ordinary_profile_activation_produces_common_motor_only_proof_and_fixed_
     validate_ordinary_arm_profile_receipt(robot._am1_ordinary_arm_profile.receipt, **identity, restored=True)
 
 
+@pytest.mark.parametrize("home", [False, True])
+def test_ordinary_start_acquires_saved_pose_without_relabeling_measured_reference(activation, tmp_path, monkeypatch, home):
+    import copy
+    from examples.alohamini.am1_live_teleop import validate_target
+    from examples.alohamini.am1_teleop_workload import VirtualIntentWorkload
+    from lerobot.robots.alohamini import alohamini_host as host
+    from tests.robots.test_am1_live_teleop_native import frame
+    from tests.robots.test_am1_live_phase_coordinator import ordinary_admission, ordinary_options
+    from tools import am1_leader_adapter as adapter, am1_live_phase_coordinator as coordinator
+
+    # Literal retained3e9 held pose, with its achieved elbow1150; not a requested reset.
+    measured_raw = dict(arm_left_shoulder_pan=2757, arm_left_shoulder_lift=3229,
+        arm_left_elbow_flex=1150, arm_left_wrist_flex=2760, arm_left_wrist_roll=2502, arm_left_gripper=2902,
+        arm_right_shoulder_pan=2879, arm_right_shoulder_lift=3253, arm_right_elbow_flex=1853,
+        arm_right_wrist_flex=3126, arm_right_wrist_roll=3141, arm_right_gripper=2982)
+    def change(robot):
+        for name, raw in measured_raw.items():
+            bus = robot.left_bus if name.startswith("arm_left") else robot.right_bus
+            bus.registers["Present_Position", name] = raw
+            bus.registers["Goal_Position", name] = 3223 if name == "arm_left_shoulder_lift" else raw
+    robot = ordinary_configured_robot(activation, tmp_path, change=change)
+    robot.config.max_relative_target = 3.
+    robot._joint_hold_goal, robot._gripper_hold_goal = {}, {}
+    monkeypatch.setattr("time.sleep", lambda seconds: setattr(activation.clock, "now", activation.clock.now + seconds))
+    robot.activate_motors(home_lift=home)
+    expected = dict(measured_raw, arm_left_shoulder_lift=3223, arm_left_wrist_flex=2762, arm_right_wrist_flex=3127)
+    for name, raw in expected.items():
+        bus = robot.left_bus if name.startswith("arm_left") else robot.right_bus
+        assert bus.registers["Goal_Position", name] == raw
+        assert bus.registers["Present_Position", name] == measured_raw[name]
+    proof = robot._am1_ordinary_arm_profile._snapshot["normal_activation"]["startup_acquisition"]
+    assert proof["measured_raw"] == measured_raw and proof["legal_goals_raw"] == expected
+    assert proof["displacement_bound_degrees"] == 1.
+    assert set(proof["goal_writes"]) == set(proof["goal_readbacks"]) == set(expected)
+    for name, raw in expected.items():
+        write, readback = proof["goal_writes"][name], proof["goal_readbacks"][name]
+        assert write["value"] == readback["raw"] == raw
+        assert write["started_at_monotonic_s"] <= write["completed_at_monotonic_s"] <= readback["read_started_at"] <= readback["read_completed_at"]
+    output = bytearray()
+    writer = host.AM1RoutineRecordWriter(write=lambda data: output.extend(data) or len(data))
+    assert writer.submit("[AM1 TELEOP REST] ", {"binding": robot._am1_teleop_binding,
+        "acquisitions": robot._am1_teleop_rest_evidence, "ordinary_startup_acquisition": proof})
+    writer.close()
+    import json
+    retained = json.loads(bytes(output).decode().split("] ", 1)[1])
+    assert retained["ordinary_startup_acquisition"] == proof and len(output) <= 32768
+    robot.get_observation = lambda: {name+".pos": value for bus, names in ((robot.left_bus, robot.left_arm_motors),
+        (robot.right_bus, robot.right_arm_motors)) for name, value in robot._normalize_arm_feedback(
+            bus, {name: bus.registers["Present_Position", name] for name in names}).items()}
+    robot.stop_motion = robot.hold_follower_arms = lambda: None
+    identity = {k:robot._am1_teleop_binding[k] for k in ("run_id", "host_incarnation")}
+    owner = {k:str(uuid4()) for k in ("service_incarnation", "controller_generation", "connection_generation")}
+    control = host.AM1LocalControl(**identity, live=True, live_recipe="physical-live-teleop", clock=lambda:activation.clock.now)
+    assert control.apply(robot, frame(identity, owner, 1))
+    held = control.live_snapshot(); workspace = held["workspace"]
+    assert workspace["reference"]["arm_left_shoulder_lift.pos"] == pytest.approx(100.50526315789475)
+    assert held["cursor"]["arm_left_shoulder_lift.pos"] == 100.
+    assert workspace["raw_bounds"]["arm_left_wrist_flex.pos"] == [2762, 2881]
+    assert workspace["raw_bounds"]["arm_right_wrist_flex.pos"] == [3127, 3167]
+    now = [10.]
+    source = VirtualIntentWorkload(workspace, command_reference=held["cursor"], clock=lambda:now[0])
+    assert not source.active and source.origin == held["cursor"] and source.measured_reference == held["reference"]
+    producer = adapter.FrameProducer(source, clock=lambda:now[0], source_id=source.intent_channel)
+    producer.workspace, producer.native_cursor = workspace, dict(held["cursor"])
+    def submit(seq, op, **extra):
+        source.submit(dict(seq=seq, op=op, intent_channel=source.intent_channel,
+            issued_at_perf_counter_s=now[0], expires_at_perf_counter_s=now[0]+10., **extra))
+        source.admit(now[0])
+    submit(1, "hold")
+    first = producer.capture({"grant_id":str(uuid4())})
+    assert first["target"] == held["cursor"] and producer.clutch.last_clamps == {}
+    ready, admitted = ordinary_admission(); current = admitted["snapshot"]["run"]["live_input"]
+    current.update(workspace=copy.deepcopy(workspace), reference=dict(held["reference"]),
+                   cursor=dict(held["cursor"]), accepted_target=dict(held["cursor"]))
+    admitted["snapshot"]["evidence"]["accepted_host_action"]["arm_feedback"]["positions"] = {
+        key:dict(raw=measured_raw[key[:-4]], normalized=value) for key,value in held["reference"].items()}
+    ready.update(command_reference=dict(held["cursor"]), bounds=copy.deepcopy(workspace["bounds"]), units=dict(workspace["units"]))
+    plan = coordinator.fresh_ordinary_targets(ready, admitted, ramp_seconds=3., gripper_direction="closing")
+    phase = coordinator.phases_for(plan, ordinary_options())[0]
+    assert plan["origin"] == held["cursor"] and workspace["reference"] == held["reference"]
+    submit(2, "move", transition_seconds=3., targets=phase["targets"])
+    for _ in range(46):  # Actual producer cadence advances the finite ramp; a timer jump is not progress.
+        now[0] += 1/15
+        source.advance(now[0])
+        moved = producer.capture({"grant_id":str(uuid4())})
+        source.accepted(moved["target"])
+    assert moved["target"] == phase["targets"] and validate_target(moved["target"], workspace=workspace)
+    assert producer.clutch.last_clamps == {}
+    if not home:  # The reused fake lift models startup, not subsequent live thermal history.
+        assert control.apply(robot, frame(identity, owner, 2))
+        paused = control.live_snapshot()
+        for key in ("workspace", "reference", "live_deadline_monotonic_s"):
+            assert paused[key] == held[key]
+    robot._am1_ordinary_arm_profile.restore(robot)
+
+
+@pytest.mark.parametrize("fault", ["degree", "relative", "left-elbow", "right-elbow", "stale", "off", "calibration", "stop", "thermal"])
+def test_ordinary_start_acquisition_preserves_finite_role_and_owner_refusals(activation, tmp_path, monkeypatch, fault):
+    from tests.robots.test_am1_pre_activation import energizing, goals
+    robot = ordinary_configured_robot(activation, tmp_path)
+    robot.config.max_relative_target = .01 if fault == "relative" else 3.
+    robot._joint_hold_goal, robot._gripper_hold_goal = {}, {}
+    robot.left_bus.registers["Present_Position", "arm_left_wrist_flex"] = 2760
+    if fault == "degree": robot.right_bus.registers["Present_Position", "arm_right_shoulder_pan"] = 3007
+    elif fault == "left-elbow": robot.left_bus.registers["Present_Position", "arm_left_elbow_flex"] = 1165
+    elif fault == "right-elbow": robot.right_bus.registers["Present_Position", "arm_right_elbow_flex"] = 1846
+    elif fault == "stale":
+        def delay(register, name):
+            if register == "Present_Position" and name == "arm_right_gripper" and any(row.get("phase") == "after_home" for row in robot._am1_activation_readbacks):
+                activation.clock.now += 1.1
+        robot.right_bus.on_read = delay
+    elif fault == "off": robot.right_bus.registers["Torque_Enable", "arm_right_wrist_flex"] = 1
+    elif fault == "calibration": robot.right_bus.calibration["arm_right_wrist_flex"].homing_offset += 1
+    elif fault == "stop": robot._am1_shutdown_in_progress = True
+    elif fault == "thermal": robot._am1_teleop_first_error = RuntimeError("original thermal qualification failure")
+    monkeypatch.setattr("time.sleep", lambda seconds: setattr(activation.clock, "now", activation.clock.now + seconds))
+    activation.events.clear()
+    with pytest.raises(RuntimeError, match="motor activation failed") as caught:
+        robot.activate_motors(home_lift=False)
+    assert not goals(activation.events) and not energizing(activation.events)
+    if fault in {"degree", "relative", "left-elbow", "right-elbow"}:
+        name = {"degree":"arm_right_shoulder_pan", "relative":"arm_left_wrist_flex",
+                "left-elbow":"arm_left_elbow_flex", "right-elbow":"arm_right_elbow_flex"}[fault]
+        assert name in str(caught.value.__cause__) and "measured=" in str(caught.value.__cause__)
+
+
 def test_ordinary_profile_partial_apply_restores_durable_originals(activation, tmp_path):
     robot = activation.robot
     original_write = robot.left_bus.write
@@ -231,11 +357,11 @@ def test_ordinary_profile_shutdown_keeps_both_setting_obligations_locked_until_r
     validate_ordinary_arm_profile_receipt(robot._am1_shutdown_evidence["ordinary_arm_profile"], **identity, restored=True)
 
 
-def test_ordinary_profile_rejects_another_joint_outside_fixed_region_before_power(activation, tmp_path, monkeypatch):
+def test_ordinary_profile_rejects_another_joint_beyond_start_acquisition_before_power(activation, tmp_path, monkeypatch):
     from tests.robots.test_am1_pre_activation import energizing, goals
 
     def change(robot):
-        robot.right_bus.registers["Present_Position", "arm_right_shoulder_pan"] = 3000
+        robot.right_bus.registers["Present_Position", "arm_right_shoulder_pan"] = 3007
     robot = ordinary_configured_robot(activation, tmp_path, change=change)
     robot.config.max_relative_target = 20.
     robot._joint_hold_goal, robot._gripper_hold_goal = {}, {}

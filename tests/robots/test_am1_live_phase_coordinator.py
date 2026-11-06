@@ -1360,3 +1360,32 @@ def test_ordinary_plan_preserves_distinct_qualified_goal_and_measured_reference(
     assert plan["origin"] == command and plan["workspace"]["reference"] == measured
     assert plan["origin"][key] != plan["workspace"]["reference"][key]
     assert coordinator.phases_for(plan, ordinary_options(), admitted=admitted)[-2]["op"] == "return"
+
+
+@pytest.mark.parametrize("fault",[None,"metadata-absent","raw-identity","wrong-key","foreign-meta"])
+def test_ordinary_normal_start_first_move_uses_only_exact_qualified_legal_origin(fault):
+    from tests.robots.test_am1_live_teleop_contract import ordinary_start_workspace
+    ready,admitted=ordinary_admission();state=admitted["snapshot"]
+    workspace=ordinary_start_workspace();current=state["run"]["live_input"]
+    commands=dict(workspace["startup_acquisition"]["command_reference"])
+    current.update(workspace=workspace,reference=dict(workspace["reference"]),cursor=dict(commands),accepted_target=dict(commands))
+    points={}
+    for key,q in workspace["reference"].items():
+        cal=workspace["calibration"][key[:-4]];grip=key.endswith("gripper.pos")
+        raw=round(cal[3]+(q+(0 if grip else 100))*(cal[4]-cal[3])/(100 if grip else 200))
+        points[key]=dict(raw=raw,normalized=q)
+        workspace["bounds"][key]["rate_per_s"]=20. if grip else 5*4096/360*200/(cal[4]-cal[3])
+    state["evidence"]["accepted_host_action"]["arm_feedback"]["positions"]=points
+    ready.update(command_reference=commands,bounds=copy.deepcopy(workspace["bounds"]),units=dict(workspace["units"]))
+    if fault == "metadata-absent":workspace.pop("startup_acquisition")
+    elif fault == "raw-identity":points["arm_left_shoulder_lift.pos"]["raw"]+=1
+    elif fault == "wrong-key":points["arm_right_shoulder_lift.pos"]["raw"]=3265
+    elif fault == "foreign-meta":workspace["startup_acquisition"]["extra"]=True
+    original=copy.deepcopy((ready,admitted))
+    if fault:
+        with pytest.raises((ValueError,RuntimeError)):coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing")
+    else:
+        plan=coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing")
+        assert plan["origin"]==commands and plan["workspace"]["reference"]["arm_left_shoulder_lift.pos"]>100
+        assert coordinator.phases_for(plan,ordinary_options())[0]["targets"]["arm_left_shoulder_lift.pos"]==100.
+    assert (ready,admitted)==original

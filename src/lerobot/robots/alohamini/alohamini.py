@@ -1053,6 +1053,7 @@ class AlohaMini(Robot):
         self._require_am1_activation_fresh("after_home")
         current_rest = self._am1_current_rest_activation_trial()
         activation = None if current_rest is None else current_rest.qualify_normal_activation(self, all_goals)
+        startup_acquisition = None if activation is None else activation.get("startup_acquisition")
         # Both buses qualify before the first measured-q Goal write. A Goal may
         # change observed torque state; this is ordinary owned activation, not
         # a promise of continuous Torque0 through the seed batch. The protected
@@ -1067,8 +1068,12 @@ class AlohaMini(Robot):
                 started = time.monotonic() if protected else None
                 selected = current_rest is not None and bus is self.left_bus and name == current_rest.motor
                 row = None
-                if selected:
-                    row = activation["goal_write"] = {"value": present, "started_at_monotonic_s": time.monotonic()}
+                if selected or startup_acquisition is not None:
+                    row = {"value": present, "started_at_monotonic_s": time.monotonic()}
+                    if selected:
+                        activation["goal_write"] = row
+                    if startup_acquisition is not None:
+                        startup_acquisition["goal_writes"][name] = row
                 try:
                     write_register(bus, "Goal_Position", name, present)
                 except BaseException as error:
@@ -1092,6 +1097,8 @@ class AlohaMini(Robot):
                 finally:
                     if current_rest is not None and bus is self.left_bus and name == current_rest.motor:
                         activation["goal_readback"] = dict(self._am1_activation_readbacks[-1])
+                    if startup_acquisition is not None:
+                        startup_acquisition["goal_readbacks"][name] = dict(self._am1_activation_readbacks[-1])
                 if actual != expected:
                     raise RuntimeError(
                         f"AM1 arm activation refused: '{name}' measured goal readback {actual} differs from {expected}."
