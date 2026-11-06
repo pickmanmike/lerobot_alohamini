@@ -1798,14 +1798,36 @@ class SessionClient:
         if device.get("control") is not True:
             raise ValueError("existing enrolled PC control capability required")
         self.csrf, self.device = device["csrf"], device["device_id"]
-        attached = await self.post("attach", {})
-        self.ws = await self.http.ws_connect(
-            self.origin.replace("https:", "wss:") + "/api/ws",
-            ssl=self.tls,
-            heartbeat=6,
-            max_msg_size=65536,
-            compress=0,
-        )
+        first_upgrade_timeout = None
+        for attempt in range(2):
+            try:
+                attached = await self.post("attach", {})  # A replacement always needs its own fresh reporting ticket.
+                try:
+                    self.ws = await self.http.ws_connect(
+                        self.origin.replace("https:", "wss:") + "/api/ws",
+                        ssl=self.tls,
+                        heartbeat=6,
+                        max_msg_size=65536,
+                        compress=0,
+                    )
+                except TimeoutError as error:
+                    if type(error) is not TimeoutError or attempt:
+                        raise  # Connection/TLS-specific subclasses and a second timeout cannot retry.
+                    first_upgrade_timeout = error
+                    with contextlib.suppress(Exception):
+                        record = getattr(self, "record", None)
+                        if record is not None:
+                            record({"event": "reporting_upgrade_retry", "phase": "http_upgrade",
+                                    "next_upgrade_attempt": 2, "maximum_upgrade_attempts": 2,
+                                    "error_type": "TimeoutError", "control_effect": False})
+                    continue
+                break
+            except Exception as error:
+                if first_upgrade_timeout is not None and error is not first_upgrade_timeout:
+                    raise first_upgrade_timeout from error
+                raise
+        # Existing per-request 3s limits and enclosing caller ceilings still apply;
+        # no authority, input, native clock, or post-upgrade qualification is retried here.
         self._ack_ws = self.ws
         self._ack_task = self._ack_slot = None
         self._ack_revision = self._acked_revision = self._ack_error = None
@@ -5972,6 +5994,21 @@ async def run(args):
             summary["peer_baseline_qualification_seconds"] = time.monotonic() - peer_baseline_started
         summary["failure"] = str(error)
         summary["failure_type"] = type(error).__name__
+        import subprocess
+        if isinstance(error, subprocess.CalledProcessError):
+            detail = {"returncode": error.returncode}
+            for name in ("stdout", "stderr"):
+                value = getattr(error, name, None)
+                if value is None:
+                    detail[name] = None
+                elif isinstance(value, (str, bytes)):
+                    raw = value.encode("utf-8", errors="replace") if isinstance(value, str) else value
+                    retained = raw[:4096]
+                    detail[name] = dict(text=retained.decode("utf-8", errors="replace"), captured_bytes=len(raw),
+                                        retained_bytes=len(retained), truncated=len(raw) > len(retained))
+                else:
+                    detail[name] = {"unavailable_type": type(value).__name__[:64]}
+            summary["subprocess_failure"] = detail  # Private run summary only; never emit captured streams to the console.
         summary["last_raw_leaders"] = getattr(source, "last_raw", None)
         if workload:
             workload.freeze()

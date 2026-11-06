@@ -4471,6 +4471,45 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     }
                 )
             )
+            if cause.startswith("upgrade_attach_"):
+                mode = cause.removeprefix("upgrade_attach_")
+                client = m.SessionClient(gateway.origin, cert, storage)
+                client.record = record
+                real_upgrade, real_post = client.http.ws_connect, client.post
+                upgrades, tickets = [], []
+                first = TimeoutError("first reporting HTTP upgrade timeout")
+                original_deadline = a.run["deadline"]
+                async def ticket(path, body):
+                    result = await real_post(path, body)
+                    if path == "attach": tickets.append(result["ticket"])
+                    return result
+                async def upgrade(*args, **kwargs):
+                    upgrades.append(True)
+                    assert client.ws is None
+                    if mode == "refusal":
+                        return await real_upgrade(*args, **dict(kwargs, headers={"Origin": "https://foreign.invalid"}))
+                    if len(upgrades) == 1:
+                        if mode == "stop":
+                            a.handle(dict(op="stop", run_id=a.run["run_id"], operation_id=str(uuid4())), enrolled["device_id"])
+                        raise first
+                    return await real_upgrade(*args, **kwargs)
+                client.post, client.http.ws_connect = ticket, upgrade
+                if mode == "refusal":
+                    from aiohttp import WSServerHandshakeError
+                    with pytest.raises(WSServerHandshakeError):
+                        await client.attach()
+                    assert len(upgrades) == len(tickets) == 1 and client.ws is None
+                else:
+                    await client.attach()
+                    assert len(upgrades) == len(tickets) == 2 and tickets[0] != tickets[1]
+                    assert client.snapshot["run"]["status"] == ("finishing" if mode == "stop" else "paused")
+                    if mode == "stop": assert client.snapshot["run"]["requested_terminal"] == "stopped"
+                    assert client.generation is client.connection is None and client.sequence == 0
+                    assert len(gateway.peers) == 1
+                assert a.run["deadline"] == original_deadline
+                assert not any(op in {"claim", "start", "connect", "release_input", "resume", "grant", "input"} for op, _ in commands)
+                assert all(ticket not in json.dumps(records) for ticket in tickets)
+                return
             if zero_input_retry is not None:
                 # Real run()/Start/Stop, Core, Owner IPC and TLS/WSS. Only the
                 # device preparation/native receipts below are fake; no device worker starts.
@@ -15092,3 +15131,135 @@ def test_inactive_runner_retains_native_episode_until_new_movement_intent(tmp_pa
 def test_inactive_native_episode_cannot_countermand_newer_authority_or_source(tmp_path, monkeypatch, mode):
     test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
         tmp_path, monkeypatch, "zero_input_fresh_retry", zero_input_retry="view", ordinary_profile=True, inactive_recovery=mode)
+
+
+@pytest.mark.parametrize("mode", ["success", "twice", "ticket", "refusal", "tls", "subclass", "cancel", "cancel_second",
+                                  "outer", "session", "post", "snapshot", "auth", "logger"])
+def test_attach_retries_only_one_unassigned_bare_upgrade_timeout(monkeypatch, mode):
+    import asyncio
+    import json
+    import ssl
+    from types import SimpleNamespace
+    from aiohttp import WSServerHandshakeError
+
+    m = adapter()
+    first, second = TimeoutError("first private upgrade detail"), TimeoutError("second upgrade timeout")
+    refusal = WSServerHandshakeError(None, (), status=403, message="private refusal")
+    tls = ssl.SSLError("private TLS failure")
+    class ConnectorTimeout(TimeoutError): pass
+    specific = ConnectorTimeout("connection-specific timeout")
+    requests, upgrades, sent, records = [], [], [], []
+    async def scenario():
+        async def get(path):
+            requests.append(("get", path))
+            if mode == "session": raise first
+            return dict(control=True, csrf="private-csrf", device_id="existing-device")
+        async def post(path, body):
+            requests.append(("post", path))
+            if mode == "post" or mode == "ticket" and len(upgrades) == 1:
+                raise second
+            return dict(ticket="private-ticket-" + str(len(requests)))
+        class Socket:
+            async def send_json(self, value):
+                sent.append(value)
+                if mode == "auth": raise second
+        async def upgrade(*args, **kwargs):
+            upgrades.append(kwargs)
+            assert client.ws is None
+            assert kwargs == dict(ssl=client.tls, heartbeat=6, max_msg_size=65536, compress=0)
+            if mode == "refusal": raise refusal
+            if mode == "tls": raise tls
+            if mode == "subclass": raise specific
+            if mode == "cancel" or mode == "cancel_second" and len(upgrades) == 2:
+                raise asyncio.CancelledError()
+            if mode not in {"snapshot", "auth"} and len(upgrades) == 1:
+                raise first
+            if mode == "twice": raise second
+            if mode == "outer": await asyncio.Event().wait()
+            return Socket()
+        async def read():
+            await asyncio.Event().wait()
+        async def wait(predicate, timeout):
+            assert timeout == 3
+            if mode == "snapshot": raise second
+            client.snapshot = {"reporting": "fresh"}
+        def record(value):
+            records.append(value)
+            if mode == "logger": raise OSError("private record unavailable")
+        client = SimpleNamespace(get=get, post=post, origin="https://example.invalid", tls=object(), ws=None,
+            reader=None, snapshot=None, _read=read, wait=wait, record=record,
+            generation="original-owner", connection="original-connection", sequence=17)
+        client.http = SimpleNamespace(ws_connect=upgrade)
+        try:
+            if mode in {"success", "logger"}:
+                await m.SessionClient.attach(client)
+                assert len(upgrades) == 2 and client.snapshot == {"reporting": "fresh"}
+                assert sent == [{"ticket": "private-ticket-3"}]
+            elif mode in {"cancel", "cancel_second"}:
+                with pytest.raises(asyncio.CancelledError): await m.SessionClient.attach(client)
+                assert len(upgrades) == (1 if mode == "cancel" else 2)
+            elif mode == "outer":
+                with pytest.raises(TimeoutError) as caught:
+                    async with asyncio.timeout(.04): await m.SessionClient.attach(client)
+                assert caught.value is not first and len(upgrades) == 2 and client.ws is None
+            else:
+                expected = {"twice": first, "ticket": first, "refusal": refusal, "tls": tls, "subclass": specific,
+                            "session": first, "post": second, "snapshot": second, "auth": second}[mode]
+                with pytest.raises(type(expected)) as caught: await m.SessionClient.attach(client)
+                assert caught.value is expected
+                assert len(upgrades) == (2 if mode == "twice" else 0 if mode in {"session", "post"} else 1)
+                if mode in {"twice", "ticket"}: assert caught.value.__cause__ is second
+            assert client.generation == "original-owner" and client.connection == "original-connection" and client.sequence == 17
+            assert not any(path not in {"session", "attach"} for _, path in requests)
+            assert len(upgrades) <= 2
+            assert len(json.dumps(records).encode()) <= 2048
+            assert not any(secret in json.dumps(records) for secret in ("private-ticket", "private-csrf", "private upgrade detail"))
+        finally:
+            if client.reader is not None:
+                client.reader.cancel()
+                await asyncio.gather(client.reader, return_exceptions=True)
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("mode", ["success", "stop", "refusal"])
+def test_reporting_upgrade_retry_uses_fresh_real_tls_gateway_ticket_without_control(tmp_path, monkeypatch, mode):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
+        tmp_path, monkeypatch, "upgrade_attach_" + mode)
+
+
+@pytest.mark.parametrize("streams", ["text", "bytes", "missing"])
+def test_run_keeps_bounded_called_process_error_streams_privately_before_api(tmp_path, monkeypatch, streams):
+    import asyncio
+    import json
+    import subprocess
+    from types import SimpleNamespace
+
+    m = adapter()
+    output = "stdout-private-" + "é" * 6000
+    stderr = "actual remote refusal\n" + "界" * 6000
+    if streams == "bytes": output, stderr = output.encode(), stderr.encode()
+    if streams == "missing": output = stderr = None
+    original = subprocess.CalledProcessError(1, ["ssh", "fixture-preparer"], output=output, stderr=stderr)
+    def prepare(*args): raise original
+    def forbidden(*args): raise AssertionError("failed preparation must not create an API client")
+    monkeypatch.setattr(m, "prepare_current_rest_invocation", prepare)
+    monkeypatch.setattr(m, "SessionClient", forbidden)
+    args = SimpleNamespace(source="virtual-leaders", workload_segment="full", duration_seconds=1.,
+        output=str(tmp_path/"private-run"), bindings="fixture", url="unused", ca="unused", storage_state="unused",
+        next_start_seconds=None, interrupt_at_seconds=None, interrupt_controller=False)
+    with pytest.raises(subprocess.CalledProcessError) as caught: asyncio.run(m.run(args))
+    assert caught.value is original
+    summary = json.loads((tmp_path/"private-run/summary.json").read_bytes())
+    detail = summary["subprocess_failure"]
+    assert detail["returncode"] == 1 and summary["failure_type"] == "CalledProcessError"
+    assert summary["failure"] == str(original) and summary["frame_count"] == 0
+    assert "owned_run_id" not in summary and "start_operation_id" not in summary
+    for name, value in (("stdout", output), ("stderr", stderr)):
+        retained = detail[name]
+        if value is None:
+            assert retained is None
+        else:
+            raw = value if isinstance(value, bytes) else value.encode()
+            assert retained == dict(text=raw[:4096].decode("utf-8", errors="replace"),
+                captured_bytes=len(raw), retained_bytes=4096, truncated=True)
+    assert len(json.dumps(detail).encode()) < 32768
