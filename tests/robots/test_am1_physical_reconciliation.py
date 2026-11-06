@@ -820,7 +820,7 @@ def test_literal_loader_binds_original_unknown_receipt_camera_and_markers(tmp_pa
     assert markers == {"cleanup-uncertain.json": original, "physical-in-progress.json": None}
 
 
-def late_camera_fixture(tmp_path, monkeypatch):
+def late_camera_fixture(tmp_path, monkeypatch, *, backend_required_kill=False):
     m, config, run, proof, state, _, _ = loader_fixture(tmp_path, monkeypatch)
     old = run["physical_result"]["readback"]
     old.update(cleanup="physical_readback_verified", uncertain=False, cleanup_errors=[],
@@ -839,6 +839,9 @@ def late_camera_fixture(tmp_path, monkeypatch):
             backend_exited=False, backend_pid=12345, backend_returncode=None,
             readers_joined=True, viewer_socket_closed=True, runtime_config_removed=True,
             device_fuser_checked=False))
+    if backend_required_kill:
+        release["errors"] = ["backend-required-kill"]
+        release["release_evidence"].update(backend_exited=True, backend_returncode=0)
     run["physical_result"]["camera_release"] = copy.deepcopy(release)
     camera_raw = canonical(release) + b"\n"
     (Path(config["camera_state"]) / ("release-" + run["run_id"] + ".json")).write_bytes(camera_raw)
@@ -902,8 +905,9 @@ def publish_late_camera(config, run, proof, state):
 
 
 @pytest.mark.parametrize("protected_fds", [False, True])
-def test_late_camera_completion_uses_fresh_proof_and_distinct_ack_without_rewriting_history(tmp_path, monkeypatch, protected_fds):
-    m, config, run, proof, state = late_camera_fixture(tmp_path, monkeypatch)
+@pytest.mark.parametrize("backend_required_kill", [False, True])
+def test_late_camera_completion_uses_fresh_proof_and_distinct_ack_without_rewriting_history(tmp_path, monkeypatch, protected_fds, backend_required_kill):
+    m, config, run, proof, state = late_camera_fixture(tmp_path, monkeypatch, backend_required_kill=backend_required_kill)
     if protected_fds:
         for name in ("resources_before", "resources_after"):
             proof["camera_completion"][name]["uninspected_fd_pids"] = [1336]
@@ -923,8 +927,9 @@ def test_late_camera_completion_uses_fresh_proof_and_distinct_ack_without_rewrit
     assert run["native_first_cause"] and "original_cleanup_origin" not in proof
 
 
-def test_late_camera_origin_eligibility_is_pure_and_is_not_a_reconciliation_ack(tmp_path, monkeypatch):
-    m, config, run, proof, state = late_camera_fixture(tmp_path, monkeypatch)
+@pytest.mark.parametrize("backend_required_kill", [False, True])
+def test_late_camera_origin_eligibility_is_pure_and_is_not_a_reconciliation_ack(tmp_path, monkeypatch, backend_required_kill):
+    m, config, run, proof, state = late_camera_fixture(tmp_path, monkeypatch, backend_required_kill=backend_required_kill)
     publish_late_camera(config, run, proof, state)
     before = copy.deepcopy(run)
     assert m.validate_late_camera_completion_origin(run, run["physical_result"]["readback"], proof["camera_release"]) is True
@@ -951,8 +956,9 @@ def test_late_camera_origin_requires_the_original_twenty_readback_clocks(tmp_pat
     "clock_before_release", "clock_outside_proof", "extra", "missing_devices", "duplicate_device", "device_rdev_bool",
     "device_inode_bool", "device_path", "device_resolved", "owner", "unit", "backend_process", "camera_process", "marker",
     "lock_path", "lock_missing", "lock_changed", "lock_bool", "visibility_bool", "visibility_duplicate", "visibility_original"])
-def test_late_camera_completion_rejects_incomplete_foreign_or_unreleased_evidence(tmp_path, monkeypatch, broken):
-    m, config, run, proof, state = late_camera_fixture(tmp_path, monkeypatch)
+@pytest.mark.parametrize("backend_required_kill", [False, True])
+def test_late_camera_completion_rejects_incomplete_foreign_or_unreleased_evidence(tmp_path, monkeypatch, broken, backend_required_kill):
+    m, config, run, proof, state = late_camera_fixture(tmp_path, monkeypatch, backend_required_kill=backend_required_kill)
     publish_late_camera(config, run, proof, state)
     c = proof["camera_completion"]
     native = run["physical_result"]["readback"]
@@ -1005,8 +1011,9 @@ def test_late_camera_completion_rejects_incomplete_foreign_or_unreleased_evidenc
 
 
 @pytest.mark.parametrize("changed", ["native", "camera", "lease", "config", "device_owner", "backend_pid", "camera_pid", "unit", "lock_identity", "lock_lost"])
-def test_late_camera_completion_rechecks_live_resources_and_original_bytes_before_ack(tmp_path, monkeypatch, changed):
-    m, config, run, proof, state = late_camera_fixture(tmp_path, monkeypatch)
+@pytest.mark.parametrize("backend_required_kill", [False, True])
+def test_late_camera_completion_rechecks_live_resources_and_original_bytes_before_ack(tmp_path, monkeypatch, changed, backend_required_kill):
+    m, config, run, proof, state = late_camera_fixture(tmp_path, monkeypatch, backend_required_kill=backend_required_kill)
     raw = publish_late_camera(config, run, proof, state)
     _, _, markers = m.load_qualified_proof(config, run)
     if changed in ("native", "camera", "lease", "config"):
@@ -4144,3 +4151,30 @@ def test_ordinary_startup_stop_original_motor_proof_is_separate_from_current_sou
     assert m.load_qualified_proof(config, run)[0] == proof
     assert run["backend_contract"] == original and original["host_head"] != config["host_head"]
     assert proof["source"]["backend_contract"] == config
+
+
+@pytest.mark.parametrize("broken", ["extra_error", "empty_error", "unknown_error", "not_exited",
+    "return_bool", "return_float", "return_nonzero", "return_negative", "return_missing",
+    "reader", "socket", "config", "runtime_failed"])
+def test_late_camera_completed_kill_origin_refuses_ambiguous_original_release(tmp_path, monkeypatch, broken):
+    m, _, run, proof, _ = late_camera_fixture(tmp_path, monkeypatch, backend_required_kill=True)
+    release = proof["camera_release"]
+    evidence = release["release_evidence"]
+    if broken == "extra_error": release["errors"].append("reader-not-stopped:chest")
+    elif broken == "empty_error": release["errors"] = []
+    elif broken == "unknown_error": release["errors"] = ["backend-unreviewed"]
+    elif broken == "not_exited": evidence["backend_exited"] = False
+    elif broken == "return_bool": evidence["backend_returncode"] = False
+    elif broken == "return_float": evidence["backend_returncode"] = 0.
+    elif broken == "return_nonzero": evidence["backend_returncode"] = 1
+    elif broken == "return_negative": evidence["backend_returncode"] = -9
+    elif broken == "return_missing": del evidence["backend_returncode"]
+    elif broken == "reader": evidence["readers_joined"] = False
+    elif broken == "socket": evidence["viewer_socket_closed"] = False
+    elif broken == "config": evidence["runtime_config_removed"] = False
+    elif broken == "runtime_failed": release["runtime_failed"] = True
+    run["physical_result"]["camera_release"] = copy.deepcopy(release)
+    before = copy.deepcopy(run)
+    with pytest.raises(ValueError):
+        m.validate_late_camera_completion_origin(run, run["physical_result"]["readback"], release)
+    assert run == before

@@ -1147,11 +1147,14 @@ def validate_late_camera_completion_origin(run, receipt, camera_release):
             and type(camera_release.get("version")) is int and camera_release["version"] == 1
             and camera_release.get("session_id") == run["run_id"] and camera_release.get("state") == "release-incomplete"
             and camera_release.get("runtime_failed") is False
-            and camera_release.get("errors") == ["backend-stop:TimeoutExpired", "backend-not-exited"]
-            and evidence.get("backend_exited") is False and evidence.get("backend_returncode") is None
+            and ((camera_release.get("errors") == ["backend-stop:TimeoutExpired", "backend-not-exited"]
+                  and evidence.get("backend_exited") is False and evidence.get("backend_returncode") is None)
+                 or (camera_release.get("errors") == ["backend-required-kill"]
+                     and evidence.get("backend_exited") is True
+                     and type(evidence.get("backend_returncode")) is int and evidence["backend_returncode"] == 0))
             and type(evidence.get("backend_pid")) is int and evidence["backend_pid"] > 0
             and all(evidence.get(key) is True for key in ("readers_joined", "viewer_socket_closed", "runtime_config_removed")),
-            "only original backend-timeout camera release may complete separately")
+            "only original timeout or completed backend-kill camera release may complete separately")
     return True
 
 
