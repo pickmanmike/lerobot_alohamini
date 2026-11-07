@@ -6,9 +6,9 @@
 
 PR62 is integrated into `integrate/am1-local-teleop` at `b3e8a625`; [PR63](https://github.com/pickmanmike/lerobot_alohamini/pull/63) remains draft. The ordinary launcher opens the enrolled regular Edge window. The host prepares without device effects and waits for a current, bounded permit before it connects hardware. The shared input path retains 250 ms movement expiry, 500 ms sensing and required view, the original authority and deadline.
 
-Stage118 reached Native Live and admitted changing input to both elbows under required Chest. Nineteen PC input receipts and 1.707 seconds of producer-active time did not sustain useful motion: sampled elbow travel was 0.44° left and zero right. No planned phase, deliberate Pause, ordinary Finish or fresh reuse completed. Chest was useful for coarse awareness in a current live screenshot during a hold. Native motor shutdown, settings restoration and zero-motion readback verified; the original forced camera release was incomplete. A fresh same-run proof and durable acknowledgment cleared current uncertainty without changing the original result. A later Start was refused before activity because the resident executor reclassified expired feedback from the closed run; a guarded owner-only idle restart preserved Stage118 and the ledger. [Detailed evidence](teleop-consolidation-16.md#stage118-startup-and-ordinary-short).
+Stage118 reached Native Live and admitted changing input to both elbows under required Chest. Nineteen PC input receipts and 1.707 seconds of producer-active time did not sustain useful motion: sampled elbow travel was 0.44° left and zero right. No planned phase, deliberate Pause, ordinary Finish or fresh reuse completed. Chest was useful for coarse awareness in a current live screenshot during a hold. Native motor shutdown, settings restoration and zero-motion readback verified; the original forced camera release was incomplete. A fresh same-run proof and durable acknowledgment cleared current uncertainty without changing the original result. A later Start was refused before activity because the resident executor reclassified expired feedback from the closed run; a guarded owner-only idle restart preserved Stage118 and the ledger without starting a task. The exact resident post-reconciliation fix is verified motor-free and has not been installed. [Detailed evidence](teleop-consolidation-16.md#stage118-startup-and-ordinary-short).
 
-**Next action:** use the existing short routine with the reviewed PC Resume fix, then qualify useful two-arm movement, ordinary Finish and fresh reuse. The closed-run Start guard needs its focused correction. Use the [ordinary launch and Quest input handoff](teleop-consolidation-16.md#verification-and-ordinary-use). AM1 is wireless, P1 advisory, THETA paused and physical USB leaders owner-deferred. Individual interruption causes remain separate from the owner-reported network incident.
+**Next action:** when the normal AM1 endpoint responds, verify the ordinary idle state and use the existing short routine with the reviewed PC Resume fix. Useful two-arm movement, ordinary Finish and fresh reuse are still open. The console and SSH timed out after the verified idle restart; no new Start was issued. Use the [ordinary launch and Quest input handoff](teleop-consolidation-16.md#verification-and-ordinary-use). AM1 is wireless, P1 advisory, THETA paused and physical USB leaders owner-deferred. Individual interruption causes remain separate from the owner-reported network incident.
 
 ## Retained Stage104–107 context
 
@@ -245,9 +245,11 @@ Current installed ownership policy is 3s for an admitted normal teleop Start and
 
 The reviewed PC correction at bdcd61a0 shares finishing after a completed declared virtual program or a deliberate timed/local-quit USB end. USB script-program completion remains false; clean input end, finish qualification and actual movement are separate. No extra input or Resume is sent merely to finish. Normal viewing must remain required and qualified before and after Pause; changed owner, takeover, external Pause/Stop, reboot, unresolved Pause outcome, faults or original ceiling expiry refuse qualification and preserve ordinary cleanup. Partial virtual/HOLD diagnostics retain their earlier comparison.39 affected Core/TLS/actual-runner checks pass, with unchanged lint baseline and historical assertions; Actual79 physically exercised the normal required-view path below. USB timed/local-quit behavior is software-tested; actual USB acquisition remains owner-deferred. That PC-only finishing repair required no native deployment or timer change; later normal ownership changes are recorded separately below.
 
-## Published, tested and deployed are separate
+## Historical Stage102 identities
 
-| Identity | Recorded current state |
+Published, tested and installed source are separate. This table is the Stage102 checkpoint; see [current operation and installation](#current-operation-and-installation) for the active identity.
+
+| Identity | Recorded at Stage102 |
 | --- | --- |
 | Repository / integration | PR55–60 merged, in order, into integrate/am1-local-teleop at da04477b2966713315103c3ebec280dec2b9bcff, following PR50–54/edde6872. Every merge is tree-equivalent to its reviewed head. New closeout work uses codex/am1-ordinary-continuity from that tip. Main/AM2 unchanged. |
 | Installed motor | Stage102 Motor53 f13c2144c8da6fd67fca17ba4f99b99a6d265f79. |
@@ -261,7 +263,7 @@ Repository, installed components and physical evidence are separate identities. 
 
 ## Resume work here
 
-Use the [current operation and installation](#current-operation-and-installation), ordinary procedure and existing private Resume row. Stage106/Motor55/Runtime85 is installed;4f reconciliation is complete, and96ef63b0 stopped/certain after zero accepted movement. The inactive-input and shared reporting-upgrade repairs are reviewed/software-qualified, and relit Chest is usable for coarse awareness. Continue fresh entry and ordinary BOTH-arm/gripper activity after publishing the current PC repair. Preserve component-specific rollback, accepted prior actions and all original failures; the older checkpoints below are historical.
+Use [current operation and installation](#current-operation-and-installation), the [ordinary procedure](teleop-consolidation-16.md#verification-and-ordinary-use) and the existing private Resume row. Preserve the recorded component-specific rollback and original operating evidence.
 
 ### Retained operational checkpoints — historical, not current instructions
 
