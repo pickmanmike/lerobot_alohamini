@@ -3582,6 +3582,8 @@ def readiness_gate_case(tmp_path, monkeypatch):
         if "-host-" in name:
             state.host=result
             logpath.write_bytes(state.initial_log)
+            if provider.startup_view is not None and getattr(state, "gate_ready_at_start", True):
+                (run_directory / "startup-view-ready").touch(mode=0o600)
             if state.socket_at_start:
                 socketpath.touch()
         else:
@@ -4114,6 +4116,7 @@ def startup_required_view_case(readiness_gate_case, monkeypatch):
     e.configure_startup_view(binding)
     case.provider.observation = box
     case.provider.startup_view = e.startup_view_ready
+    case.provider.startup_view_deadline = case.deadline
     owner, capture, encode = (str(uuid.uuid4()) for _ in range(3))
 
     def local(sequence=1, *, owned_session=None, new_owner=None, new_capture=None):
@@ -4253,6 +4256,37 @@ def test_startup_required_view_control_cancellation_cannot_be_unblocked(startup_
     assert case.host is None and not case.clients
 
 
+def test_startup_required_view_gap_during_nonactuating_host_preparation(startup_required_view_case, monkeypatch):
+    case = startup_required_view_case
+    case.local()
+    case.e.publish_startup_view(case.binding, case.view())
+    case.gate_ready_at_start = False
+    case.initial_log = b""
+    case.socket_at_start = False
+    sleep = module().time.sleep
+    permission = case.logpath.parent / "startup-view-permit"
+
+    def warmup(seconds):
+        assert case.steps < 3, "fresh view did not release prepared host"
+        assert case.host is not None and not case.clients and not permission.exists()
+        sleep(seconds)
+        if case.steps == 1:
+            case.now = .501  # Original receipt expires during imports.
+            case.local(2)
+            (case.logpath.parent / "startup-view-ready").touch(mode=0o600)
+        else:
+            assert not case.e._startup_view_armed
+            case.local(3)
+            case.e.publish_startup_view(case.binding, case.view(3))
+            case.logpath.write_bytes(b'{"phase":"operational_ready"}')
+            case.socketpath.touch()
+
+    monkeypatch.setattr(module().time, "sleep", warmup)
+    case.start()
+    assert case.steps == 2 and len(case.clients) == 1
+    assert case.e._startup_view_armed and float(permission.read_text()) == pytest.approx(case.now + .5)
+
+
 def test_startup_required_view_loss_after_host_launch_cancels_before_client(startup_required_view_case,monkeypatch):
     case=startup_required_view_case
     case.local()
@@ -4272,6 +4306,78 @@ def test_startup_required_view_loss_after_host_launch_cancels_before_client(star
     with pytest.raises(RuntimeError):
         case.start()
     assert case.camera is not None and case.host is not None and not case.clients
+
+
+@pytest.mark.parametrize("contrast", ["clean", "unconfirmed", "issued", "foreign_cause", "bad_camera", "live"])
+def test_startup_required_view_prepermission_exit_allows_fresh_start_without_readback(
+    startup_required_view_case, contrast,
+):
+    import json
+    from pathlib import Path
+
+    case = startup_required_view_case
+    case.local()
+    case.e.publish_startup_view(case.binding, case.view())
+    case.gate_ready_at_start = False
+    case.fault = "stop"
+    case.fault_step = 1
+    with pytest.raises(module().StartupCancelledError):
+        case.start()
+    assert not (case.logpath.parent / "startup-view-permit").exists()
+    exited = contrast != "unconfirmed"
+    case.host.actual_exited = lambda: exited
+    case.host.stop = lambda: None
+    def wait_actual_exit(**_):
+        raise TimeoutError("inert host exit unconfirmed")
+    case.host.wait_actual_exit = wait_actual_exit
+    case.camera.actual_exited = lambda: True
+    camera_state = Path(case.provider.config["camera_state"])
+    camera_state.mkdir(exist_ok=True)
+    (camera_state / ("release-" + case.e.run_id + ".json")).write_text(json.dumps({
+        "version": 1, "state": "released", "session_id": case.e.run_id, "errors": [], "runtime_failed": False,
+        "release_evidence": dict(
+            backend_exited=True, readers_joined=True, viewer_socket_closed=True, runtime_config_removed=True,
+            backend_returncode=1 if contrast == "bad_camera" else 0,
+        ),
+    }))
+    result = case.provider.finish("faulted")
+    assert result["readback"] is None and not case.clients
+    certain = exited and contrast != "bad_camera"
+    assert result["uncertain"] is not certain
+    assert result["cleanup"] == ("no_physical_device_effects" if certain else "physical_cleanup_unknown")
+    e = case.e
+    e._fault = "RuntimeError: prepermission startup fault"
+    e._lifecycle.update(result, phase="terminal", run_id=e.run_id)
+    e._startup_view_armed = contrast == "issued"
+    run = {
+        "run_id": e.run_id, "status": "faulted", "cleanup": result["cleanup"],
+        "uncertain": result["uncertain"], "physical_result": copy.deepcopy(e._lifecycle),
+        "first_cause": "foreign cause" if contrast == "foreign_cause" else e._fault,
+        "native_first_cause": None, "native_live_at": case.now if contrast == "live" else None,
+    }
+    assert e.can_start_after_fault(run, observed_fault=e._fault) is (contrast == "clean")
+
+
+@pytest.mark.parametrize("control", ["stop", "pause", "revision", "takeover", "view_superseded"])
+def test_startup_required_view_revocation_removes_granted_permission(startup_required_view_case, control):
+    case = startup_required_view_case
+    case.local()
+    case.e.publish_startup_view(case.binding, case.view())
+    case.start()
+    permission = case.logpath.parent / "startup-view-permit"
+    assert permission.is_file()
+    if control == "stop":
+        case.e.finish("stopped")
+    elif control == "pause":
+        case.e.invalidate_startup_view("Pause")
+    elif control == "revision":
+        case.e.set_intent_revision(1)
+    elif control == "view_superseded":
+        assert case.e.publish_startup_view(case.binding, case.view(qualified_until=0))
+    else:
+        assert case.e.bind_control(**dict(case.identity, controller_generation="new-controller"))
+    assert not permission.exists()
+    assert not case.provider._startup_permission_pending  # Publication remains possible actuation.
 
 
 def test_startup_required_view_legacy_keeps_the_normal_requirement_absent():

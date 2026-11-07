@@ -1678,6 +1678,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--am1-ordinary-arm-profile")
     parser.add_argument("--am1-ordinary-right-elbow-p", type=int)
     parser.add_argument("--am1-admission-fd", type=int)
+    parser.add_argument("--am1-startup-view-deadline", type=float)
     parser.add_argument("--am1-host-runtime-s", type=int, default=480)
     parser.add_argument("--am1-physical-state-directory", default=str(Path.home() / ".local/state/am1-session"))
     return parser
@@ -2015,6 +2016,10 @@ def _run_host(args):
             robot._am1_routine_report = routine_report
             robot._am1_lift_record_writer = routine_writer
         logging.info("Connecting AlohaMini")
+        if (startup_permit := getattr(args, "_am1_startup_view_permit", None)) is not None:
+            current = _read_startup_view_permit(Path(args.am1_protected_run_directory), args.am1_startup_view_deadline)
+            if current != startup_permit or time.monotonic() >= startup_permit:
+                raise RuntimeError("protected startup view permission revoked before motor connection")
         connect_robot(robot, skip_lift_home=args.skip_lift_home)
         if routine_writer is not None:
             routine_writer.raise_if_failed()
@@ -2465,6 +2470,49 @@ def _run_host(args):
             raise error
 
     logging.info("Finished AlohaMini cleanly")
+def _read_startup_view_permit(directory: Path, deadline: float) -> float | None:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    path = directory / "startup-view-permit"
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(descriptor, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= 64
+                or os.name != "nt" and (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600)):
+            raise RuntimeError("invalid protected startup view permission file")
+        raw = stream.read(65)
+        if len(raw) != info.st_size:
+            raise RuntimeError("protected startup view permission changed during read")
+        expires = float(raw)
+    try:
+        current = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+        raise RuntimeError("protected startup view permission was replaced")
+    now = time.monotonic()
+    if not now < expires <= min(deadline, now + .5):
+        raise RuntimeError("protected startup view permission expired or invalid")
+    return expires
+
+
+def _await_startup_view(directory: Path, deadline: float) -> float:
+    """Finish host imports before waiting for a fresh run-owned activation permission."""
+    now = time.monotonic()
+    if not now < deadline <= now + 180:
+        raise RuntimeError("invalid protected startup view deadline")
+    descriptor = os.open(directory / "startup-view-ready", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(descriptor)
+    while time.monotonic() < deadline:
+        expires = _read_startup_view_permit(directory, deadline)
+        if expires is not None:
+            return expires
+        time.sleep(.02)
+    raise RuntimeError("protected startup view deadline expired")
+
+
 def main():
     parser = make_parser()
     args = parser.parse_args()
@@ -2494,6 +2542,11 @@ def main():
             args.am1_host_incarnation = str(UUID(args.am1_host_incarnation))
         except ValueError:
             parser.error("AM1 protected run/host identities must be UUIDs")
+    if args.am1_startup_view_deadline is not None:
+        if not protected or args.am1_ordinary_arm_profile is None:
+            parser.error("AM1 startup view permission requires a protected ordinary run")
+        args._am1_startup_view_permit = _await_startup_view(directory, args.am1_startup_view_deadline)
+
     admission = None
     first_error = None
     original_handlers = {}
