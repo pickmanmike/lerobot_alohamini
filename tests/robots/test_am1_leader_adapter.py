@@ -4509,6 +4509,45 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     }
                 )
             )
+            if cause == "startup_required_view":
+                from tools.am1_local_observation import LocalObservationMailbox
+                client=m.SessionClient(gateway.origin,cert,storage)
+                a.run.update(status="starting",native_live_at=None,deadline=None,accepted_at=10.,startup_deadline=190.,
+                    ordinary_arm_profile={"profile":"ordinary-am1-arms-v1","right_elbow_p":16})
+                e._lifecycle.update(phase="startup",native_live_at=None,startup_deadline=190.)
+                e.ordinary_arm_profile=copy.deepcopy(a.run["ordinary_arm_profile"])
+                e.observation=LocalObservationMailbox(e.observation.source,clock=a.clock,require_owned_session=True)
+                e.observation.begin(e.run_id,300.)
+                binding=dict(run_id=e.run_id,operation_id=a.run["operation_id"],service_incarnation=a.service_incarnation,
+                    host_incarnation=e.host_incarnation,controller_generation=a.controller["generation"],intent_revision=0,
+                    role="chest",startup_deadline=190.,controller_expires=a.controller["expires"],required=True)
+                a._startup_view_binding=copy.deepcopy(binding)
+                e.configure_startup_view(binding)
+                normal_evidence=e.evidence
+                def startup_evidence():
+                    value=normal_evidence();value["lifecycle"]=copy.deepcopy(e._lifecycle);return value
+                e.evidence=startup_evidence
+                request=e.observation.request
+                view_owner,capture,encode=str(uuid4()),str(uuid4()),str(uuid4())
+                e.observation.publish({**request,"owned_session":e.run_id,"qualified":True,"owner_generation":view_owner,
+                    "capture_generation":capture,"sequence":1,"arrived_at":10.,"decoded_at":10.,"frame_sha256":"f"*64})
+                assert e.startup_view_ready() is False
+                await client.attach()
+                assert client.snapshot["run"]["status"]=="starting" and client.snapshot["run"]["native_live_at"] is None
+                progress=dict(op="view_progress",run_id=e.run_id,role="chest",owner_generation=view_owner,capture_generation=capture,
+                    encode_generation=encode,decoded_frames=1,media_time=.1,source_sequence=1,source_fresh=True,
+                    received_at_monotonic_s=10.,request_received_at_monotonic_s=10.)
+                response=await gateway.ipc.request(progress,"gateway-view")
+                assert response["accepted"], response
+                assert e.startup_view_ready() is True and e.worker is None
+                await client.post("pause",{"run_id":e.run_id,"operation_id":str(uuid4())})
+                current=(await client.get("state"))["snapshot"]
+                assert current["run"]["status"]=="finishing" and current["run"]["native_live_at"] is None
+                assert (await gateway.ipc.request(dict(progress,decoded_frames=2,media_time=.2),"gateway-view"))["accepted"]
+                with pytest.raises(RuntimeError,match="cancelled"):
+                    e.startup_view_ready()
+                assert not any(op in {"grant","input","resume","start"} for op,_ in commands)
+                return
             if cause.startswith("next_grant_"):
                 mode = cause.removeprefix("next_grant_")
                 client = m.SessionClient(gateway.origin, cert, storage)
@@ -15612,3 +15651,8 @@ def test_optional_next_grant_reporting_error_discards_cache(monkeypatch, operati
     with pytest.raises(TimeoutError, match="original reporting timeout"):
         asyncio.run(client.get("state") if operation == "state" else client.post("claim", {"controller_generation":"same"}))
     assert client._next_grant is None
+
+
+def test_startup_required_view_core_ipc_tls_has_no_native_live_cycle_and_pause_wins(tmp_path,monkeypatch):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
+        tmp_path,monkeypatch,"startup_required_view")

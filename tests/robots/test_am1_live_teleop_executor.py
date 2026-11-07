@@ -3661,3 +3661,84 @@ def test_ordinary_profile_rejects_body_intent_and_foreign_workspace_without_cons
     assert not e.apply(dict.fromkeys(KEYS,5.),body={"x.vel":0.,"y.vel":0.,"theta.vel":0.,"lift_axis.vel":0},
         source=foreign,valid_until_monotonic_s=10.2,grant_id=foreign["grant_id"],seq=2,**ids)
     assert e._live_target == accepted
+
+
+@pytest.mark.parametrize("bench", [False, True])
+def test_ordinary_startup_view_requirement_is_bound_before_worker(tmp_path, monkeypatch, bench, handoff=False):
+    from tools.am1_session_core import SessionAuthority
+    from tools.am1_local_observation import LocalObservationMailbox
+    e, _ = admitted_executor()
+    now=[10.]
+    e.clock=lambda:now[0]
+    e.observation = LocalObservationMailbox(e.observation.source,clock=e.clock,require_owned_session=True)
+    a = SessionAuthority(tmp_path, clock=e.clock, executor=e)
+    requirements=[]
+    def begin(recipe):
+        value=getattr(e,"_startup_view_requirement",None)
+        assert isinstance(value,dict), "normal ordinary Start must bind startup view before begin"
+        requirements.append(copy.deepcopy(value))
+        return True
+    monkeypatch.setattr(e,"begin",begin)
+    try:
+        claim=a._handle({"op":"claim"},"pc")
+        request={"op":"start","operation_id":str(uuid4()),"recipe":"physical-live-teleop",
+            "controller_generation":claim["controller_generation"],
+            "ordinary_arm_profile":{"profile":"ordinary-am1-arms-v1","right_elbow_p":16},
+            **({"bench_continuity":True} if bench else {})}
+        result=a._handle(request,"pc")
+        if bench:
+            assert result["accepted"] is False and not requirements
+            return  # Existing ordinary+advisory bench combination remains forbidden.
+        assert result["accepted"] and len(requirements)==1, (result,a.run.get("first_cause"))
+        requirement=requirements[0]
+        assert set(requirement)=={"run_id","operation_id","service_incarnation","host_incarnation",
+            "controller_generation","intent_revision","role","startup_deadline","controller_expires","required"}
+        assert requirement==dict(run_id=a.run["run_id"],operation_id=request["operation_id"],
+            service_incarnation=a.service_incarnation,host_incarnation=e.host_incarnation,
+            controller_generation=claim["controller_generation"],intent_revision=0,role="chest",
+            startup_deadline=a.run["startup_deadline"],controller_expires=a.controller["expires"],required=not bench)
+        assert a.run["native_live_at"] is None and a.run["deadline"] is None
+        if not bench:
+            request=e.observation.request
+            owner,capture,encode=str(uuid4()),str(uuid4()),str(uuid4())
+            e.observation.publish({**request,"owned_session":a.run["run_id"],"qualified":True,
+                "owner_generation":owner,"capture_generation":capture,"sequence":1,"arrived_at":10.,"decoded_at":10.,"frame_sha256":"f"*64})
+            progress=dict(op="view_progress",run_id=a.run["run_id"],role="chest",owner_generation=owner,
+                capture_generation=capture,encode_generation=encode,decoded_frames=1,media_time=.1,
+                source_sequence=1,source_fresh=True,received_at_monotonic_s=10.,request_received_at_monotonic_s=10.)
+            assert a.handle(progress,"gateway-view")["accepted"]
+            assert e.startup_view_ready() is True and e.sample is None and e._lifecycle["native_live_at"] is None
+            original=e._startup_view_progress["qualified_until"]
+            now[0]=10.4
+            if handoff:
+                original_handle=a._handle
+                def renewal_then_native_live(command,device):
+                    result=original_handle(command,device)
+                    if command["op"]=="claim":
+                        with e.mutex:
+                            e._lifecycle.update(phase="live",native_live_at=10.4,native_deadline_monotonic_s=310.4)
+                    return result
+                monkeypatch.setattr(a,"_handle",renewal_then_native_live)
+            assert a.handle({"op":"claim","controller_generation":a.controller["generation"]},"pc")["accepted"]
+            if handoff:
+                assert a.run["status"]=="starting" and a.run["native_live_at"] is None
+                assert e._lifecycle["phase"]=="live"
+                assert e._startup_view_progress["qualified_until"]==original
+                return  # Only normal subsequent Core lifecycle admission may promote NativeLive.
+            assert e._startup_view_requirement["controller_expires"]==a.controller["expires"]
+            assert e._startup_view_progress["qualified_until"]==original==10.5
+            assert e._lifecycle["startup_deadline"]==requirement["startup_deadline"]
+            paused=a._handle({"op":"pause","run_id":a.run["run_id"],"operation_id":str(uuid4())},"pc")
+            assert paused["accepted"] and a.run["status"]=="finishing"
+            assert a.run["requested_terminal"]=="stopped" and a.run["native_live_at"] is None
+            now[0]=10.45
+            assert a.handle(dict(progress,decoded_frames=2,media_time=.2,received_at_monotonic_s=10.45,
+                                 request_received_at_monotonic_s=10.45),"gateway-view")["accepted"]
+            with pytest.raises(RuntimeError,match="cancelled"):
+                e.startup_view_ready()
+    finally:
+        a.run=None;a.close()
+
+
+def test_startup_view_exact_live_handoff_after_core_tick_does_not_stop_or_admit(tmp_path,monkeypatch):
+    test_ordinary_startup_view_requirement_is_bound_before_worker(tmp_path,monkeypatch,False,handoff=True)

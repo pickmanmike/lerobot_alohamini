@@ -646,6 +646,8 @@ class SessionAuthority:
         self.released = False
         self._live_rearm = None  # Volatile; restart/reconnect never restores gesture authority.
         self._teleop_view = None
+        self._startup_view_binding = None
+        self._startup_view_cancelled = None
         self._teleop_view_request = None  # Same-run ordering; never renews source freshness.
         self.events = deque(maxlen=64)
         self.last_tick = clock()
@@ -1117,6 +1119,9 @@ class SessionAuthority:
         return 1.5
 
     def _invalidate_control_intent(self, reason):
+        if self._required_startup_view():
+            self._startup_view_cancelled = reason
+            self.executor.invalidate_startup_view(reason)
         intent = self.run.get("control_intent") if self.run else None
         if isinstance(intent, dict) and intent.get("eligible") is True:
             intent.update(eligible=False, invalidated_by=reason)
@@ -1182,6 +1187,7 @@ class SessionAuthority:
             self._clear_input()
             self._event(reason)
             self._save()
+            self._sync_startup_view()
 
     def _live_write_history(self, value, *, retained=False):
         """Bounded native history only; never a current acknowledgement or permission."""
@@ -1347,6 +1353,26 @@ class SessionAuthority:
             return old is None or old == workspace
         except (TypeError, ValueError, KeyError):
             return False
+
+    def _required_startup_view(self):
+        return bool(self.run and self._startup_view_binding and self._startup_view_binding["required"]
+                    and self.run["run_id"] == self._startup_view_binding["run_id"]
+                    and self.run.get("native_live_at") is None)
+
+    def _sync_startup_view(self):
+        if not self._required_startup_view() or self.run["status"] in TERMINAL | {"finishing"}:
+            return
+        binding = self._startup_view_binding
+        if (self._startup_view_cancelled or self.run["status"] != "starting" or not self.controller
+                or self.controller["generation"] != binding["controller_generation"]
+                or self.service_incarnation != binding["service_incarnation"]
+                or self.run["intent_revision"] != binding["intent_revision"]
+                or self.clock() >= self.controller["expires"]):
+            self._finish("stopped")
+            return
+        current = dict(binding, controller_expires=self.controller["expires"])
+        if self.executor.publish_startup_view(current, self._teleop_view) is not True:
+            self._finish("stopped")
 
     def _teleop_view_qualified(self):
         v = self._teleop_view
@@ -2252,6 +2278,7 @@ class SessionAuthority:
                 if marks is not None:
                     marks["core_tick_completed"] = _input_diagnostic_monotonic()
                 result = self._handle(command, device_id)
+                self._sync_startup_view()
                 if protective:
                     self.tick()
                 if oid:
@@ -2632,6 +2659,16 @@ class SessionAuthority:
                         intent_revision=self.run["intent_revision"],
                     ):
                         raise RuntimeError("physical live admission binding refused")
+                    self._startup_view_binding = None
+                    self._startup_view_cancelled = None
+                    if ordinary_profile is not None:
+                        self._startup_view_binding = dict(run_id=self.run["run_id"], operation_id=oid,
+                            service_incarnation=self.service_incarnation, host_incarnation=self.executor.host_incarnation,
+                            controller_generation=self.controller["generation"], intent_revision=self.run["intent_revision"],
+                            role="chest", startup_deadline=self.run["startup_deadline"],
+                            controller_expires=self.controller["expires"], required=not self._bench_continuity())
+                        self.executor.configure_startup_view(self._startup_view_binding,
+                                                             advisory_bench=self._bench_continuity())
                     if not self.executor.begin(recipe):
                         self._finish("faulted", "physical_startup_unaccepted")
                     else:
@@ -2730,6 +2767,7 @@ class SessionAuthority:
                 self._hold()
                 self._event("pause")
                 self._save()
+                self._sync_startup_view()
             return {"accepted": True, "status": self.run["status"], "effect_admitted": not self.asynchronous}
         if self.run["status"] in TERMINAL:
             return self._refuse("terminal")

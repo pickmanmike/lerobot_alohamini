@@ -519,6 +519,10 @@ class PhysicalExecutor:
         self._live_admission_requested = False
         self._live_expired = None
         self._teleop_source = None
+        self._startup_view_requirement = self._startup_view_progress = None
+        self._startup_view_armed = False
+        self._startup_view_invalid = None
+        self._startup_observation_generation = None
         self._reset_input_transport_trace()
 
     def _reset_input_transport_trace(self):
@@ -860,11 +864,134 @@ class PhysicalExecutor:
                 "uncertain": False,
                 "terminal_status": None,
             }
+            self._startup_view_requirement = self._startup_view_progress = None
+            self._startup_view_armed, self._startup_view_invalid = False, None
+            self._startup_observation_generation = None
             self.observation.begin(run_id, self._live_ceiling())
+
+    def configure_startup_view(self, binding, *, advisory_bench=False):
+        """Trusted Core policy, fixed to this Start before any host can launch."""
+        keys = {"run_id", "operation_id", "service_incarnation", "host_incarnation", "controller_generation",
+                "intent_revision", "role", "startup_deadline", "controller_expires", "required"}
+        with self.mutex:
+            if (self.ordinary_arm_profile is None or self.recipe.name != TELEOP_RECIPE
+                    or self._startup_view_requirement is not None or self.worker and self.worker.is_alive()
+                    or type(binding) is not dict or set(binding) != keys or type(advisory_bench) is not bool
+                    or type(binding["required"]) is not bool or binding["required"] == advisory_bench
+                    or binding["run_id"] != self.run_id or binding["host_incarnation"] != self.host_incarnation
+                    or type(binding["intent_revision"]) is not int or binding["intent_revision"] != self.revision
+                    or binding["role"] != "chest"
+                    or any(type(binding[k]) is not str or not binding[k] for k in
+                           ("run_id", "operation_id", "service_incarnation", "host_incarnation", "controller_generation"))
+                    or any(type(binding[k]) not in (int, float) or not math.isfinite(binding[k])
+                           or self.clock() >= binding[k] for k in ("startup_deadline", "controller_expires"))):
+                raise ValueError("exact current ordinary startup view policy required")
+            request = self.observation.request
+            if (not request or request["run_id"] != self.run_id or not request["active"]
+                    or binding["required"] and self.observation.source["role"] != binding["role"]):
+                raise ValueError("ordinary startup view requires its own Chest observation request")
+            self._startup_view_requirement = copy.deepcopy(binding)
+            self._startup_observation_generation = request["generation"]
+            self._lifecycle["startup_deadline"] = min(self._lifecycle["startup_deadline"], binding["startup_deadline"])
+
+    def invalidate_startup_view(self, reason):
+        with self.mutex:
+            required = self._startup_view_requirement
+            if required and required["required"] and self._lifecycle["phase"] == "startup":
+                self._startup_view_invalid = self._startup_view_invalid or str(reason)
+                self._wake.set()
+
+    def publish_startup_view(self, binding, view):
+        """Copy actual authority expiry and original browser clocks; never renew on read."""
+        with self.mutex:
+            required = self._startup_view_requirement
+            if required is None or not required["required"] or self._lifecycle["phase"] not in {"startup", "live"}:
+                return False
+            immutable = set(required) - {"controller_expires"}
+            if (self._startup_view_invalid or self.finish_status or type(binding) is not dict
+                    or set(binding) != set(required) or any(binding[k] != required[k] for k in immutable)
+                    or type(binding["controller_expires"]) not in (int, float)
+                    or not math.isfinite(binding["controller_expires"])
+                    or self.clock() >= required["controller_expires"]
+                    or binding["controller_expires"] < required["controller_expires"]):
+                self._startup_view_invalid = self._startup_view_invalid or "startup authority changed or expired"
+                return False
+            required["controller_expires"] = binding["controller_expires"]
+            self._startup_view_progress = copy.deepcopy(view) if isinstance(view, dict) else None
+            self._wake.set()
+            if self._lifecycle["phase"] == "live":
+                # Exact worker handoff may precede Core's next lifecycle tick.
+                # Acknowledging the mailbox never promotes Core NativeLive.
+                live = self._lifecycle.get("native_live_at")
+                request = self.observation.request or {}
+                owner = self._live_binding or {}
+                return bool(self._startup_view_armed and self.run_id == required["run_id"]
+                    and self.host_incarnation == required["host_incarnation"] and self.revision == required["intent_revision"]
+                    and all(owner.get(k) == required[k] for k in ("service_incarnation", "controller_generation"))
+                    and self._lifecycle.get("run_id") == self.run_id
+                    and type(live) in (int, float) and math.isfinite(live)
+                    and request.get("started_at", float("inf")) <= live < required["startup_deadline"]
+                    and self._startup_view_matches())
+            return True  # Delivery accepted; qualification is checked against current local evidence below.
+
+    def _startup_view_matches(self):
+        required, view = self._startup_view_requirement, self._startup_view_progress
+        if not required or not view:
+            return False
+        local = self.observation.evidence()
+        floor, expiry = view.get("received_at_monotonic_s"), view.get("qualified_until")
+        return bool(local["qualified"] and local.get("owned_session") == self.run_id
+            and local.get("generation") == self._startup_observation_generation
+            and local.get("role") == required["role"] == view.get("role")
+            and local.get("owner_generation") == view.get("owner_generation")
+            and local.get("capture_generation") == view.get("capture_generation")
+            and view.get("run_id") == self.run_id and view.get("source_fresh") is True
+            and type(view.get("decoded_frames")) is int and view["decoded_frames"] > 0
+            and type(view.get("encode_generation")) is str and bool(view["encode_generation"])
+            and all(type(x) in (int, float) and math.isfinite(x) for x in (floor, expiry))
+            and floor <= self.clock() < expiry and abs(expiry - floor - .5) < 1e-9)
+
+    def _check_startup_view(self):
+        with self.mutex:
+            required = self._startup_view_requirement
+            if not required or not required["required"]:
+                return
+            if self.finish_status:
+                raise StartupCancelledError("physical startup cancelled by Stop")
+            if self._lifecycle["phase"] != "startup":
+                return
+            if self.clock() >= self._lifecycle["startup_deadline"]:
+                raise RuntimeError("physical startup deadline expired")
+            owner = self._live_binding or {}
+            if (self._startup_view_invalid or self.revision != required["intent_revision"]
+                    or self.run_id != required["run_id"] or self.host_incarnation != required["host_incarnation"]
+                    or any(owner.get(k) != required[k] for k in ("service_incarnation", "controller_generation"))
+                    or self.clock() >= required["controller_expires"]):
+                self._startup_view_invalid = self._startup_view_invalid or "startup authority changed or expired"
+                self.finish_status = self.finish_status or "stopped"
+                raise StartupCancelledError("physical startup cancelled: " + self._startup_view_invalid)
+            if self._startup_view_armed and not self._startup_view_matches():
+                raise RuntimeError("required owned local/browser view expired during physical startup")
+
+    def startup_view_ready(self):
+        with self.mutex:
+            self._check_startup_view()
+            required = self._startup_view_requirement
+            if required is None:
+                return self.ordinary_arm_profile is None
+            if not required["required"]:
+                return True
+            if self._lifecycle["phase"] != "startup":
+                return False
+            if not self._startup_view_matches():
+                return False
+            self._startup_view_armed = True
+            return True
 
     def begin(self, recipe):
         with self.mutex:
-            if self.recipe != recipe or self.worker and self.worker.is_alive():
+            if (self.recipe != recipe or self.worker and self.worker.is_alive()
+                    or self.ordinary_arm_profile is not None and self._startup_view_requirement is None):
                 return False
             self.worker = threading.Thread(target=self._run, name="am1-protected-native", daemon=False)
             self.worker.start()
@@ -1383,8 +1510,11 @@ class PhysicalExecutor:
                     raise StartupCancelledError("physical startup cancelled by Stop")
                 if self.clock() >= self._lifecycle["startup_deadline"]:
                     raise RuntimeError("physical startup deadline expired")
+                self._check_startup_view()
 
             io.observation = self.observation
+            if self._startup_view_requirement and self._startup_view_requirement["required"]:
+                io.startup_view = self.startup_view_ready
             io.start(
                 self.run_id, self.host_incarnation, self.recipe, cancel,
                 **({"selected_experiment": self.selected_experiment.payload}
@@ -1526,6 +1656,7 @@ class PhysicalExecutor:
                             self._live_admission_requested = True
                             admitted = ack.get("live_input", {})
                             if self._lifecycle["phase"] == "startup" and admitted.get("live_admitted_at_monotonic_s") is not None:
+                                self._check_startup_view()
                                 self._lifecycle.update(phase="live", native_live_at=admitted["live_admitted_at_monotonic_s"],
                                     native_deadline_monotonic_s=admitted["live_deadline_monotonic_s"],
                                     backend_incarnation=self.host_incarnation)
@@ -1815,6 +1946,7 @@ class ProtectedHostRun:
         self.config = config
         self.host = self.camera = self.client = None
         self.observation = None
+        self.startup_view = None
         self.host_log = self.camera_log = None
         self.run_id = self.incarnation = None
         self.recipe = None
@@ -1994,7 +2126,8 @@ class ProtectedHostRun:
             log=self.camera_log,
             camera_route_discovery=True,
         )
-        wait_required_camera(self.camera, self.observation, cancel)
+        wait_required_camera(self.camera, self.observation, cancel,
+                             **({"required_view": self.startup_view} if self.startup_view is not None else {}))
         cancel()
         env["AM1_MOTOR_PYTHON"] = self.config["host_python"]
         env["AM1_LOG_DIRECTORY"] = str(self.run_directory)
@@ -2085,6 +2218,7 @@ class ProtectedHostRun:
             PYTHONDONTWRITEBYTECODE="1",
             PYTHONUNBUFFERED="1",
         )
+        cancel()  # Recheck the original required-view/authority proof at the host-launch boundary.
         self.host = OwnedUnit(
             "am1-pa01-host-" + run_id,
             self.config["host_repository"],
@@ -2420,14 +2554,14 @@ class OwnedUnit:
             raise RuntimeError("owned unit cooperative stop refused")
 
 
-def wait_required_camera(camera, observation, cancel, *, sleep=time.sleep):
+def wait_required_camera(camera, observation, cancel, *, sleep=time.sleep, required_view=None):
     if observation is None:
         raise ValueError("actual required local-camera mailbox unavailable")
     while True:
         cancel()
         if camera.poll() is not None:
             raise RuntimeError("required owned camera exited before physical host launch")
-        if observation.evidence()["qualified"]:
+        if observation.evidence()["qualified"] and (required_view is None or required_view()):
             return
         sleep(0.05)
 
