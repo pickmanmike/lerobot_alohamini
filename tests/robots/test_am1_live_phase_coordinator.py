@@ -1115,17 +1115,19 @@ def test_control_phase_commands_and_held_pacing_wait_for_explicit_ack():
 
 @pytest.mark.parametrize("external", [False, True])
 @pytest.mark.parametrize("plan_name", ["ordinary-arms", "ordinary-short"])
-def test_ordinary_coordinator_real_relay_waits_for_pause_ack_and_fresh_resume_before_new_move(tmp_path, monkeypatch, external, plan_name):
+def test_ordinary_coordinator_real_relay_waits_for_pause_ack_and_fresh_resume_before_new_move(tmp_path, monkeypatch, external, plan_name, _right_wrist_degrees=None):
     from types import SimpleNamespace
     from uuid import uuid4
 
     from examples.alohamini.am1_teleop_workload import VirtualIntentWorkload
     from tools.am1_leader_adapter import FrameProducer, ZERO_BODY
 
-    ready, admitted = ordinary_admission()
+    ready, admitted = ordinary_wrist_midpoint_admission() if _right_wrist_degrees is not None else ordinary_admission()
     native = admitted["snapshot"]["run"]["live_input"]["workspace"]
-    options = ordinary_options() if plan_name == "ordinary-arms" else ordinary_short_options()
-    plan = coordinator.fresh_ordinary_targets(ready, admitted, ramp_seconds=3., gripper_direction="closing", short=plan_name == "ordinary-short")
+    extra=[] if _right_wrist_degrees is None else ["--right-wrist-flex-degrees",str(_right_wrist_degrees)]
+    options = ordinary_options(*extra) if plan_name == "ordinary-arms" else ordinary_short_options()
+    plan = coordinator.fresh_ordinary_targets(ready, admitted, ramp_seconds=3., gripper_direction="closing", short=plan_name == "ordinary-short",
+        right_wrist_flex_degrees=options.right_wrist_flex_degrees or 3.)
     phases = coordinator.phases_for(plan, options, admitted=admitted)
     root, trial = tmp_path/"repo", tmp_path/"repo/trial"
     trial.mkdir(parents=True)
@@ -1190,7 +1192,7 @@ def test_ordinary_coordinator_real_relay_waits_for_pause_ack_and_fresh_resume_be
     monkeypatch.setattr(coordinator, "time", SimpleNamespace(monotonic=lambda: now[0]))
     monkeypatch.setattr(coordinator.subprocess, "Popen", Process)
     assert coordinator.main(["--plan", plan_name, "--operating-profile", "ordinary-am1-arms-v1",
-                             "--bindings", str(root/"bindings.json"), "--window-seconds", "90"]) == 0
+                             "--bindings", str(root/"bindings.json"), "--window-seconds", "90",*extra]) == 0
     assert all(frame["body"] == ZERO_BODY and set(frame["target"]) == set(plan["origin"]) for frame in frames)
     if not external:
         assert [command.split()[0] for command in commands] == (["move", "move", "pause", "resume", "return", "finish"] if plan_name == "ordinary-short" else
@@ -1499,3 +1501,98 @@ def test_ordinary_short_requires_ordinary_profile_and_a_closed_boolean_compositi
     with pytest.raises(SystemExit):coordinator.parse_args(["--plan","ordinary-short","--bindings","unused.json"])
     ready,admitted=ordinary_admission()
     with pytest.raises(ValueError):coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing",short=1)
+
+
+
+def test_explicit_right_wrist_cli_declares_bounded_full_ordinary_option():
+    options=ordinary_options("--right-wrist-flex-degrees","1.5")
+    assert options.right_wrist_flex_degrees==1.5
+    assert ordinary_options().right_wrist_flex_degrees==3.
+    assert ordinary_short_options().right_wrist_flex_degrees is None
+
+
+def test_explicit_right_wrist_plan_fits_retained_midpoint_without_changing_reference():
+    ready,admitted=ordinary_wrist_midpoint_admission();before=copy.deepcopy((ready,admitted))
+    with pytest.raises(ValueError):coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing")
+    plan=coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing",right_wrist_flex_degrees=1.5)
+    key="arm_right_wrist_flex.pos";cal=plan["workspace"]["calibration"][key[:-4]]
+    assert plan["excursions"][key]["amount"]==1.5
+    assert plan["targets"][key]-plan["origin"][key]==pytest.approx(1.5*4096/360*200/(cal[4]-cal[3]))
+    assert (ready,admitted)==before
+
+
+
+@pytest.mark.parametrize("raw",[3127,3134,3147,3150,3167])
+def test_explicit_right_wrist_fixed_corridor_admits_whole_1p5_degree_excursion(raw):
+    ready,admitted=ordinary_wrist_midpoint_admission();state=admitted["snapshot"];current=state["run"]["live_input"]
+    key="arm_right_wrist_flex.pos";cal=current["workspace"]["calibration"][key[:-4]];q=normalized_raw(raw,cal)
+    for values in (current["reference"],current["workspace"]["reference"],current["cursor"],current["accepted_target"],ready["command_reference"]):values[key]=q
+    state["evidence"]["accepted_host_action"]["arm_feedback"]["positions"][key].update(raw=raw,normalized=q)
+    before=copy.deepcopy((ready,admitted))
+    plan=coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing",right_wrist_flex_degrees=1.5)
+    target=cal[3]+(plan["targets"][key]+100)/200*(cal[4]-cal[3])
+    assert 3127<=target<=3167 and abs(target-raw)==pytest.approx(17.0666666667)
+    assert plan["right_wrist_flex_degrees"]==1.5
+    for joint,item in plan["excursions"].items():
+        expected=1.5 if joint==key else 20. if "gripper" in joint else 3. if "wrist_flex" in joint else 4.
+        assert item["amount"]==expected
+    assert (ready,admitted)==before
+
+
+@pytest.mark.parametrize("plan",["ordinary-short","out-return","grasp-return"])
+def test_explicit_right_wrist_cli_refuses_all_other_compositions(plan):
+    with pytest.raises(SystemExit):coordinator.parse_args(["--plan",plan,"--bindings","unused.json","--right-wrist-flex-degrees","1.5"])
+
+
+@pytest.mark.parametrize("value",["0","2","nan","inf"])
+def test_explicit_right_wrist_cli_refuses_unsupported_or_nonfinite_choice(value):
+    with pytest.raises(SystemExit):ordinary_options("--right-wrist-flex-degrees",value)
+
+
+@pytest.mark.parametrize("value",[True,False,float("nan"),float("inf"),2.,None])
+def test_explicit_right_wrist_planner_requires_typed_bounded_value(value):
+    ready,admitted=ordinary_wrist_midpoint_admission()
+    with pytest.raises(ValueError):coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing",right_wrist_flex_degrees=value)
+
+
+def test_explicit_right_wrist_short_cannot_select_wrist_even_through_planner_api():
+    ready,admitted=ordinary_wrist_midpoint_admission()
+    with pytest.raises(ValueError):coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing",short=True,right_wrist_flex_degrees=1.5)
+
+
+@pytest.mark.parametrize("fault",["default_options","selected_options","metadata","target"])
+def test_explicit_right_wrist_plan_and_options_must_match(fault):
+    ready,admitted=ordinary_admission()
+    amount=3. if fault=="selected_options" else 1.5
+    plan=coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing",right_wrist_flex_degrees=amount)
+    options=ordinary_options() if fault in ("default_options","metadata") else ordinary_options("--right-wrist-flex-degrees","1.5")
+    if fault=="metadata":plan["right_wrist_flex_degrees"]=3.
+    elif fault=="target":
+        key="arm_right_wrist_flex.pos";cal=plan["workspace"]["calibration"][key[:-4]]
+        plan["targets"][key]=plan["origin"][key]+3.*4096/360*200/(cal[4]-cal[3])
+    with pytest.raises(ValueError):coordinator.phases_for(plan,options,admitted=admitted)
+
+
+@pytest.mark.parametrize("fault",["bounds","rate","reference"])
+def test_explicit_right_wrist_keeps_existing_workspace_rate_and_original_reference_guards(fault):
+    ready,admitted=ordinary_wrist_midpoint_admission();current=admitted["snapshot"]["run"]["live_input"];key="arm_right_wrist_flex.pos"
+    if fault=="bounds":current["workspace"]["raw_bounds"][key][0]+=1
+    elif fault=="rate":
+        current["workspace"]["bounds"][key]["rate_per_s"]=.0001
+        ready["bounds"][key]["rate_per_s"]=.0001
+    else:ready["command_reference"][key]+=.01
+    with pytest.raises((ValueError,RuntimeError)):coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing",right_wrist_flex_degrees=1.5)
+
+
+@pytest.mark.parametrize("external",[False,True])
+def test_explicit_right_wrist_main_declares_before_start_and_uses_existing_pause_resume_relay(tmp_path,monkeypatch,external):
+    test_ordinary_coordinator_real_relay_waits_for_pause_ack_and_fresh_resume_before_new_move(tmp_path,monkeypatch,external,"ordinary-arms",_right_wrist_degrees=1.5)
+    console=next((tmp_path/"repo/.cache/am1-knowledge-reuse-18").glob("*.console.jsonl"))
+    records=[json.loads(line) for line in console.read_text().splitlines()]
+    declared=next(row for row in records if row["event"]=="local_activity_declared")
+    assert declared["right_wrist_flex_degrees"]==1.5 and declared["view"]=="normal required Chest"
+    assert records.index(declared)<next(i for i,row in enumerate(records) if row["event"]=="virtual_input_opened")
+    fresh=next(row for row in records if row["event"]=="local_fresh_targets")
+    assert fresh["right_wrist_flex_degrees"]==1.5 and fresh["ordinary_excursions"]["arm_right_wrist_flex.pos"]["amount"]==1.5
+    assert fresh["planned_active_seconds"]==45. and fresh["planned_paused_seconds"]==2.
+    assert "--right-wrist-flex-degrees" not in coordinator.adapter_command(ordinary_options("--right-wrist-flex-degrees","1.5"))

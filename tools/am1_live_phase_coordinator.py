@@ -48,6 +48,8 @@ def parse_args(argv=None):
                         help="explicit absolute gripper opening percentage; requires extended grasp closing")
     parser.add_argument("--gripper-open-opening", type=lambda v: finite(v, zero=True),
                         help="explicit absolute opening percentage; requires gripper-open-finish and extended grasp closing")
+    parser.add_argument("--right-wrist-flex-degrees", type=float, choices=(1.5, 3.0),
+                        help="ordinary-arms only: prospectively declared RIGHT wrist-flex excursion (default 3)")
     parser.add_argument("--degrees", type=lambda v: finite(v), help="relative out-return encoder degrees (default4)")
     parser.add_argument("--direction", choices=("decreasing", "increasing"), default=None,
                         help="normalized-coordinate direction; explicit for grasp-return, otherwise defaults to decreasing")
@@ -64,6 +66,10 @@ def parse_args(argv=None):
     parser.add_argument("--storage-state")
     parser.add_argument("--output-root")
     args = parser.parse_args(argv)
+    if args.right_wrist_flex_degrees is not None and args.plan != "ordinary-arms":
+        parser.error("right-wrist-flex-degrees is only supported by ordinary-arms")
+    if args.plan == "ordinary-arms" and args.right_wrist_flex_degrees is None:
+        args.right_wrist_flex_degrees = 3.
     args.duration_seconds = args.window_seconds
     try:
         resolve_ordinary_config(args)
@@ -202,10 +208,13 @@ def fresh_target(ready, admitted, *, degrees, direction, ramp_seconds, side="lef
     return dict(q0=q0, target=target, targets=targets, origin=dict(commands), calibration=list(cal), workspace=workspace, side=side)
 
 
-def fresh_ordinary_targets(ready, admitted, *, ramp_seconds, gripper_direction, short=False):
+def fresh_ordinary_targets(ready, admitted, *, ramp_seconds, gripper_direction, short=False, right_wrist_flex_degrees=3.):
     """Qualify all12 joints; plan full amplitudes for the declared composition."""
     if type(short) is not bool or short and gripper_direction != "closing":
         raise ValueError("ordinary short composition requires explicit full closing")
+    if (type(right_wrist_flex_degrees) not in (int, float) or not math.isfinite(right_wrist_flex_degrees)
+        or right_wrist_flex_degrees not in (1.5, 3.) or short and right_wrist_flex_degrees != 3.):
+        raise ValueError("RIGHT wrist-flex excursion must be explicitly 1.5 or 3 degrees on ordinary-arms only")
     # Reuse the same held ownership/ACK/workspace/reference/deadline qualifications.
     base = fresh_target(ready, admitted, degrees=0., direction="increasing", ramp_seconds=ramp_seconds)
     state, workspace, origin = admitted["snapshot"], base["workspace"], base["origin"]
@@ -241,7 +250,8 @@ def fresh_ordinary_targets(ready, admitted, *, ramp_seconds, gripper_direction, 
             raise ValueError("ordinary original measured mapping differs")
         if key not in selected:
             continue  # Its original feedback remains qualified; its command stays at the admitted hold.
-        amount = 20. if grip else 3. if "wrist_flex" in key else 4.
+        amount = (20. if grip else right_wrist_flex_degrees if key == "arm_right_wrist_flex.pos"
+                  else 3. if "wrist_flex" in key else 4.)
         delta = amount if grip else amount*PRACTICAL_ELBOW_COUNTS_PER_REVOLUTION/360*200/(cal[4]-cal[3])
         bounds = workspace["bounds"][key]
         if grip:
@@ -256,6 +266,7 @@ def fresh_ordinary_targets(ready, admitted, *, ramp_seconds, gripper_direction, 
         excursions[key] = dict(amount=amount, units="opening_points" if grip else "encoder_degrees", direction=direction,
                                original=origin[key], target=endpoint)
     return dict(base, targets=targets, excursions=excursions, initial_feedback=points, ordinary_arms=True,
+                right_wrist_flex_degrees=None if short else float(right_wrist_flex_degrees),
                 **({"ordinary_short": True} if short else {}))
 
 
@@ -265,6 +276,17 @@ def phases_for(plan, options, *, admitted=None):
         if not plan.get("ordinary_arms") or plan.get("ordinary_short", False) is not (options.plan == "ordinary-short"):
             raise ValueError("ordinary composition requires its matching full fresh qualified plan")
         origin, all_targets = plan["origin"], plan["targets"]
+        declared = getattr(options, "right_wrist_flex_degrees", None)
+        if options.plan == "ordinary-arms":
+            declared = 3. if declared is None else declared
+            key = "arm_right_wrist_flex.pos"
+            cal = plan["workspace"]["calibration"][key[:-4]]
+            if (type(declared) not in (int, float) or declared not in (1.5, 3.)
+                or plan.get("right_wrist_flex_degrees") != declared or plan["excursions"][key]["amount"] != declared
+                or abs(abs(all_targets[key]-origin[key])-declared*PRACTICAL_ELBOW_COUNTS_PER_REVOLUTION/360*200/(cal[4]-cal[3])) > 1e-7):
+                raise ValueError("ordinary RIGHT wrist-flex plan differs from its declared amplitude")
+        elif declared is not None or plan.get("right_wrist_flex_degrees") is not None:
+            raise ValueError("ordinary-short cannot select a RIGHT wrist-flex excursion")
         arm_targets = {k: origin[k] if k.endswith("gripper.pos") else all_targets[k] for k in TELEOP_ARM_KEYS}
         phases = []
         def move(name, targets):
@@ -712,6 +734,7 @@ def main(argv=None):
               workpose=options.workpose if options.plan == "out-return" else None,
               approach_from_below=options.approach_from_below,
               degrees=options.degrees if relative_workpose else None,
+              right_wrist_flex_degrees=options.right_wrist_flex_degrees,
               direction=options.direction if relative_workpose else None, ramp_seconds=options.ramp_seconds, dwell_seconds=options.dwell_seconds,
               window_elapsed_seconds=options.window_seconds, intent_ttl_seconds=options.intent_ttl_seconds,
               comparison_dwell_seconds=options.comparison_dwell_seconds if not timed_span else None,
@@ -766,7 +789,8 @@ def main(argv=None):
                             and tail.admitted["snapshot"]["run"].get("ordinary_arm_profile") != options.ordinary_arm_profile):
                             raise ValueError("native admitted ordinary policy differs from the requested immutable policy")
                         plan = (fresh_ordinary_targets(ready, tail.admitted, ramp_seconds=options.ramp_seconds,
-                                                       gripper_direction=options.gripper_direction, short=options.plan == "ordinary-short") if ordinary else
+                                                       gripper_direction=options.gripper_direction, short=options.plan == "ordinary-short",
+                                                       right_wrist_flex_degrees=(3. if options.right_wrist_flex_degrees is None else options.right_wrist_flex_degrees)) if ordinary else
                                 fresh_target(ready, tail.admitted, degrees=options.degrees if relative_workpose else 0.,
                                              direction=options.direction, ramp_seconds=options.ramp_seconds,
                                              side=options.side, workpose=options.workpose))
@@ -778,7 +802,8 @@ def main(argv=None):
                               gripper_direction_resolved=next((p["gripper_direction"] for p in phases if "gripper_direction" in p), None),
                               gripper_target=next((p["targets"][grip] for p in phases if "gripper_direction" in p), None),
                               gripper_calibration=plan["workspace"]["calibration"][grip[:-4]] if uses_gripper else None,
-                              **(dict(ordinary_excursions=plan["excursions"], original_command_reference=plan["origin"],
+                              **(dict(ordinary_excursions=plan["excursions"], right_wrist_flex_degrees=plan["right_wrist_flex_degrees"],
+                                      original_command_reference=plan["origin"],
                                       original_measured_reference=plan["workspace"]["reference"],
                                       original_measured_feedback=plan["initial_feedback"],
                                       phase_completion_policy="accepted intention and active ramp/dwell; actual endpoints reported separately") if ordinary else {}),
