@@ -2726,6 +2726,12 @@ class SessionClient:
             if isinstance(error, _NativeRecoveryPendingError):
                 error.held_view_ceiling = phase_ceiling
             if first_refusal is not None and error is not first_refusal:
+                # A previous nonadmission says nothing about the result of a
+                # later sent operation. Let the existing exact-outcome guard
+                # reconcile it within this phase, without replaying it.
+                context = getattr(error, "resume_result_context", None)
+                if isinstance(context, dict) and context.get("operation_id") is not None:
+                    raise error from first_refusal
                 raise first_refusal from error
             raise
 

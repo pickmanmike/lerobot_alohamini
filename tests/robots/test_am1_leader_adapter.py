@@ -12614,7 +12614,7 @@ def test_same_open_native_episode_retains_source_and_original_phase(monkeypatch,
     "manual", "foreign", "fault", "uncertain", "revision", "running", "stale_ack", "phase_expired",
     "phase_extended", "caller_expired", "renewal", "later_error", "reporting", "persistent_view",
     "held_wait", "held_foreign", "held_wrong_type", "held_phase_expired", "held_renewal", "held_reporting",
-    "reply_foreign", "reply_phase_expired", "reply_nested",
+    "reply_foreign", "reply_phase_expired", "reply_nested", "reply_after_view_refusal",
     "transport_post", "transport_release", "transport_pause", "transport_stop", "transport_owner",
     "transport_host", "transport_reboot", "transport_usb", "transport_expired",
 ])
@@ -12693,12 +12693,17 @@ def test_unknown_resume_result_keeps_authority_original_phase_and_error(monkeypa
             if op == "release_input":
                 return {"accepted": True, "status": "released", "effect_admitted": False}
             assert op == "resume"
+            if change == "reply_after_view_refusal" and sum(c["op"] == "resume" for c in commands) == 1:
+                raise m.CommandRefusedError({"accepted": False, "status": "refused", "effect_admitted": False,
+                                             "reason": "current required selected view must advance before Resume"})
             if not failures or change == "twice" and len(failures) < 2 or change == "reply_nested":
                 self.fresh = held(copy.deepcopy(self.snapshot), command["intent_revision"],
                                   100.375 if not failures else 100.625)
-                if change == "post":
+                if change in {"post", "reply_after_view_refusal"}:
                     self.fresh = held(self.fresh, command["intent_revision"] + 2, 100.5)
-                    self.fresh["events"].append({"kind": "transport_connection_lost" if transport_change else "native_input_expired", "at": 100.375,
+                    pause = ("required_view_expired" if change == "reply_after_view_refusal"
+                             else "transport_connection_lost" if transport_change else "native_input_expired")
+                    self.fresh["events"].append({"kind": pause, "at": 100.375,
                                                   "run_id": "owned", "service_incarnation": "service"})
                     if transport_change in {"release", "pause"}:
                         self.fresh["events"].append({"kind": "input_released" if transport_change == "release" else "pause",
@@ -12810,6 +12815,16 @@ def test_unknown_resume_result_keeps_authority_original_phase_and_error(monkeypa
             assert client.snapshot["evidence"]["active_acknowledged"] is True
             assert client.attaches == (1 if change == "held_wait" else len(resumes) - 1)
             assert len([v for v in records if v["event"] == "resume_result_unknown"]) == (0 if change == "held_wait" else len(resumes) - 1)
+        elif change == "reply_after_view_refusal":
+            assert not await guard.resume(expected_pause="input_expired", renewal_check=renewal)
+            resumes = [c for c in commands if c["op"] == "resume"]
+            assert len(resumes) == 3 and len({c["operation_id"] for c in resumes}) == 3
+            assert resumes[0]["connection_generation"] == resumes[1]["connection_generation"]
+            assert resumes[2]["connection_generation"] != resumes[1]["connection_generation"]
+            assert client.attaches == 1 and client.snapshot["evidence"]["active_acknowledged"] is True
+            refused, unknown = [v for v in records if v["event"] in {"resume_view_refused", "resume_result_unknown"}]
+            assert refused["operation_id"] == resumes[0]["operation_id"]
+            assert unknown["operation_id"] == resumes[1]["operation_id"]
         elif change.startswith("reply_"):
             with pytest.raises(TimeoutError) as caught:
                 await guard.resume(expected_pause="input_expired", renewal_check=renewal)
