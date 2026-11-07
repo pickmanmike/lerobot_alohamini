@@ -4209,6 +4209,86 @@ def ordinary_preactivation_cancel_fixture(tmp_path, monkeypatch, activation, rig
     return m, config, run, proof, state, manifest
 
 
+
+def ordinary_preactivation_camera_fixture(tmp_path, monkeypatch, activation):
+    m, config, run, proof, state, manifest = ordinary_preactivation_cancel_fixture(tmp_path, monkeypatch, activation)
+    camera_root = tmp_path / "camera-proof"
+    camera_root.mkdir()
+    _, camera_config, _, camera_proof, _ = late_camera_fixture(
+        camera_root, monkeypatch, backend_required_kill=True
+    )
+    config.update({key: camera_config[key] for key in (
+        "camera_binary", "camera_config", "camera_repository", "camera_state"
+    )})
+    for head, label in (("b" * 40, "original"), ("c" * 40, "current")):
+        manifest_raw = canonical(dict(manifest, version=2, executor_head=head))
+        digest = hashlib.sha256(manifest_raw).hexdigest()
+        path = tmp_path / "deployments" / digest[:16] / "manifest.json"
+        path.parent.mkdir()
+        path.write_bytes(manifest_raw)
+        if label == "original":
+            original_pins = str(path)
+            proof["original_motor_manifest_sha256"] = proof["source"]["original_manifest_sha256"] = digest
+            proof["source"]["original_executor_head"] = head
+        else:
+            config["source_pins"] = str(path)
+            proof["source"].update(manifest_sha256=digest, executor_head=head)
+    proof["source"].update(backend_contract=copy.deepcopy(config), motor_head=manifest["motor"]["head"])
+    run["backend_contract"] = dict(config, source_pins=original_pins)
+
+    camera = copy.deepcopy(camera_proof["camera_release"])
+    camera["session_id"] = run["run_id"]
+    run["physical_result"]["camera_release"] = proof["camera_release"] = camera
+    run["physical_result"]["readback"]["completed_at_monotonic_s"] = 98.2
+    camera_raw = canonical(camera)
+    camera_state = Path(config["camera_state"])
+    (camera_state / ("release-" + run["run_id"] + ".json")).write_bytes(camera_raw)
+    proof["camera_release_sha256"] = hashlib.sha256(camera_raw).hexdigest()
+    lease_raw = canonical(dict(session_id=run["run_id"], camera_pid=12344, started_at=97.,
+                               deadline=300., source_budget_seconds=203.))
+    (camera_state / ("lease-" + run["run_id"] + ".json")).write_bytes(lease_raw)
+    completion = proof["camera_completion"] = copy.deepcopy(camera_proof["camera_completion"])
+    completion.update(run_id=run["run_id"], host_incarnation=proof["host_incarnation"],
+                      original_camera_release_sha256=proof["camera_release_sha256"],
+                      original_camera_lease_sha256=hashlib.sha256(lease_raw).hexdigest())
+    return m, config, run, proof, state
+
+
+@pytest.mark.parametrize("fault", [None, "old-off", "fresh-lift", "camera-owner", "original-source", "declared-marker", "actual-marker"])
+def test_ordinary_preactivation_camera_completion_requires_both_qualifications(tmp_path, monkeypatch, activation, fault):
+    m, config, run, proof, state = ordinary_preactivation_camera_fixture(tmp_path, monkeypatch, activation)
+    if fault == "old-off":
+        run["physical_result"]["readback"]["readback"]["readbacks"][0]["value"] = 1
+    elif fault == "fresh-lift":
+        proof["readback"].pop("lift_stationary")
+    elif fault == "camera-owner":
+        proof["camera_completion"]["resources_after"]["backend_pid_absent"] = False
+    elif fault == "original-source":
+        path = Path(run["backend_contract"]["source_pins"])
+        manifest = json.loads(path.read_bytes())
+        manifest["motor"]["files"][0]["sha256"] = "c" * 64
+        path.write_bytes(canonical(manifest))
+    elif fault == "declared-marker":
+        proof["original_markers"]["cleanup-uncertain.json"] = {"sha256": "a" * 64}
+    elif fault == "actual-marker":
+        (state / "physical-in-progress.json").write_bytes(b"{}")
+    before = copy.deepcopy(run)
+    publish_late_camera(config, run, proof, state)
+    if fault:
+        with pytest.raises(ValueError):
+            m.load_qualified_proof(config, run)
+        assert not list(state.glob("reconciliation-ack-*.json"))
+    else:
+        actual, raw, inventory = m.load_qualified_proof(config, run)
+        operation = str(uuid.uuid4())
+        assert not m.acknowledged_receipt(actual, run, operation)
+        ack = m.archive_and_ack(config, actual, raw, inventory, operation)
+        assert m.acknowledged_receipt({**actual, "acknowledgment": {**ack, "consumed_operation_id": operation}}, run, operation)
+    assert run == before
+    assert run["physical_result"]["readback"]["readback"]["lift_readback"] == "unavailable-or-failed"
+    assert run["physical_result"]["camera_release"]["state"] == "release-incomplete"
+
+
 def test_ordinary_preactivation_cancel_actual_calibration_interruption_is_eligibility_only():
     from tools import am1_physical_reconciliation as m
     root = Path(__file__).resolve().parents[2]

@@ -963,8 +963,8 @@ def validate_ordinary_startup_stop_origin(run, receipt, *, motor_files):
     return True
 
 
-def validate_ordinary_preactivation_cancel_origin(run, receipt, *, motor_files):
-    """Admit only a source-bound preactivation cancellation, never an old lift proof.
+def _ordinary_preactivation_cancel_motor_origin(run, receipt):
+    """Check the original motor evidence without treating it as a fresh lift proof.
 
     In the protected host, skipped homing is forbidden and the lift operation is
     created before home or arm torque. With no cleanup errors, an unavailable
@@ -1029,11 +1029,6 @@ def validate_ordinary_preactivation_cancel_origin(run, receipt, *, motor_files):
             and {key: native["binding"][key] for key in ("profile", "right_elbow_p")}
                 == validate_ordinary_arm_profile(run.get("ordinary_arm_profile")),
             "same configured but never-active ordinary run policy required")
-    require(type(motor_files) is dict and len(motor_files) == 13
-            and all(type(path) is str and type(digest) is str and re.fullmatch("[0-9a-f]{64}", digest)
-                    for path, digest in motor_files.items())
-            and all(motor_files.get(path) == digest for path, digest in native["source_files_sha256"].items()),
-            "ordinary original five dependencies must match the full Motor manifest")
     started, completed, rows = rb.get("started_at_monotonic_s"), rb.get("completed_at_monotonic_s"), rb.get("readbacks")
     require(number(started) and number(completed) and 0 <= started <= completed
             and isinstance(rows, list) and len(rows) == 20
@@ -1041,7 +1036,21 @@ def validate_ordinary_preactivation_cancel_origin(run, receipt, *, motor_files):
             "original twenty distinct timed zero/off readbacks required")
     for row in rows:
         _timed_row(row, started, completed)
-    camera = lifecycle.get("camera_release") or {}
+    return native
+
+
+def validate_ordinary_preactivation_cancel_origin(run, receipt, *, motor_files, failed_camera_release=None):
+    """Qualify the original source and camera disposition before collecting fresh proof."""
+    native = _ordinary_preactivation_cancel_motor_origin(run, receipt)
+    require(type(motor_files) is dict and len(motor_files) == 13
+            and all(type(path) is str and type(digest) is str and re.fullmatch("[0-9a-f]{64}", digest)
+                    for path, digest in motor_files.items())
+            and all(motor_files.get(path) == digest for path, digest in native["source_files_sha256"].items()),
+            "ordinary original five dependencies must match the full Motor manifest")
+    if failed_camera_release is not None:
+        _validate_late_camera_release(run, failed_camera_release, allow_timeout=False)
+        return True
+    camera = run["physical_result"].get("camera_release") or {}
     require(camera.get("state") == "released" and camera.get("session_id") == run["run_id"]
             and camera.get("errors") == [] and not camera.get("runtime_failed")
             and all((camera.get("release_evidence") or {}).get(key) is True for key in
@@ -1271,10 +1280,11 @@ def validate_camera_completion(config, run, proof):
             "original_cleanup_sha256", "original_camera_release_sha256", "camera_config_sha256", "backend_pid",
             "original_camera_lease_sha256", "camera_pid", "started_at_monotonic_s", "completed_at_monotonic_s",
             "devices", "resources_before", "resources_after"}
+    origin = proof.get("original_cleanup_origin")
     require(isinstance(completion, dict) and set(completion) == keys
             and type(completion["version"]) is int and completion["version"] == 1
             and completion["kind"] == "am1-late-camera-release-completion"
-            and proof.get("original_cleanup_origin") in (None, PREIMPORT_STOP_ORIGIN),
+            and origin in (None, PREIMPORT_STOP_ORIGIN, ORDINARY_PREACTIVATION_CANCEL_ORIGIN),
             "closed generic camera completion required")
     for key in ("run_id", "host_incarnation", "boot_id", "original_terminal_run_sha256", "original_cleanup_sha256"):
         require(completion[key] == proof.get(key), "camera completion original binding changed")
@@ -1287,13 +1297,24 @@ def validate_camera_completion(config, run, proof):
     lifecycle = run.get("physical_result") or {}
     release = proof.get("camera_release") or {}
     released = release.get("released_at")
-    if proof.get("original_cleanup_origin") == PREIMPORT_STOP_ORIGIN:
+    if origin == PREIMPORT_STOP_ORIGIN:
         validate_preimport_camera_completion_origin(run, proof, release)
     else:
         receipt = lifecycle.get("readback")
-        validate_late_camera_completion_origin(run, receipt, release)
+        if origin == ORDINARY_PREACTIVATION_CANCEL_ORIGIN:
+            _ordinary_preactivation_cancel_motor_origin(run, receipt)
+            _validate_late_camera_release(run, release, allow_timeout=False)
+            source = proof["source"]
+            require(type(proof.get("original_motor_head")) is str
+                    and proof["original_motor_head"] == source.get("motor_head")
+                    and type(proof.get("original_motor_manifest_sha256")) is str
+                    and proof["original_motor_manifest_sha256"] == source.get("original_manifest_sha256"),
+                    "compound proof must bind the original ordinary Motor and manifest")
+        else:
+            validate_late_camera_completion_origin(run, receipt, release)
+        completed = receipt.get("completed_at_monotonic_s")
         require(receipt.get("first_cause") == proof.get("original_first_cause")
-                and number(released) and receipt["completed_at_monotonic_s"] <= released,
+                and number(released) and number(completed) and completed <= released,
                 "camera release must follow the unchanged original native cleanup")
     evidence = release.get("release_evidence") or {}
     require(lifecycle.get("backend_incarnation") == proof.get("host_incarnation")
