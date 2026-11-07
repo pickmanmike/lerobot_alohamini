@@ -3560,3 +3560,185 @@ def test_thermal_rejection_unknown_proof_shape_keeps_bounded_original_key_names(
     assert set(frozen["proof_fields"]) == set(proof)
     assert "unexpected_original_member" not in frozen["proof"]
     assert len(json.dumps(frozen, allow_nan=False).encode()) < 8192
+
+
+@pytest.mark.parametrize("right_p", [16, 32])
+def test_ordinary_profile_start_freezes_policy_without_experiment_or_advisory_view(tmp_path, monkeypatch, right_p):
+    from tools.am1_session_core import SessionAuthority
+    e, _ = admitted_executor()
+    a = SessionAuthority(tmp_path, clock=lambda: 10., executor=e)
+    monkeypatch.setattr(e, "begin", lambda recipe: True)
+    policy = {"profile": "ordinary-am1-arms-v1", "right_elbow_p": right_p}
+    expected = copy.deepcopy(policy)
+    try:
+        claim = a._handle({"op": "claim"}, "pc")
+        request = {"op": "start", "operation_id": str(uuid4()), "recipe": "physical-live-teleop",
+                   "controller_generation": claim["controller_generation"], "ordinary_arm_profile": policy}
+        result = a._handle(request, "pc")
+        assert result["accepted"], result
+        assert a.run["ordinary_arm_profile"] == e.ordinary_arm_profile == expected
+        assert a.snapshot()["run"]["ordinary_arm_profile"] == expected
+        assert a.run["bench_continuity"] is False and "control_intent" not in a.run
+        assert "selected_experiment" not in a.run and a.run["recovery_episodes"] == 0
+        policy["right_elbow_p"] = 32 if right_p == 16 else 16
+        assert a.run["ordinary_arm_profile"] == e.ordinary_arm_profile == expected
+        assert not a._handle(request, "pc")["accepted"], "same operation cannot change its ordinary settings policy"
+    finally:
+        a.run = None
+        a.close()
+
+
+@pytest.mark.parametrize("policy", [None, {}, {"profile": "ordinary-am1-arms-v1", "right_elbow_p": True},
+    {"profile": "ordinary-am1-arms-v1", "right_elbow_p": 24},
+    {"profile": "ordinary-am1-arms-v1", "right_elbow_p": 16, "left_elbow_p": 64},
+    {"profile": "foreign", "right_elbow_p": 16}])
+def test_ordinary_profile_start_refuses_invalid_policy_before_binding_or_native_begin(tmp_path, monkeypatch, policy):
+    from tools.am1_session_core import SessionAuthority
+    e, _ = admitted_executor()
+    a = SessionAuthority(tmp_path, clock=lambda: 10., executor=e)
+    began = []
+    monkeypatch.setattr(e, "begin", lambda recipe: began.append(recipe) or True)
+    try:
+        claim = a._handle({"op": "claim"}, "pc")
+        result = a._handle({"op": "start", "operation_id": str(uuid4()), "recipe": "physical-live-teleop",
+            "controller_generation": claim["controller_generation"], "ordinary_arm_profile": policy}, "pc")
+        assert result["accepted"] is False and a.run is None and began == []
+    finally:
+        a.run = None
+        a.close()
+
+
+def test_ordinary_profile_executor_selection_is_copied_and_cannot_change_while_owner_alive():
+    from types import SimpleNamespace
+    e = executor(ControlledHost())
+    policy = {"profile": "ordinary-am1-arms-v1", "right_elbow_p": 32}
+    e.set_ordinary_arm_profile(policy)
+    policy["right_elbow_p"] = 16
+    assert e.ordinary_arm_profile == {"profile": "ordinary-am1-arms-v1", "right_elbow_p": 32}
+    e.worker = SimpleNamespace(is_alive=lambda: True)
+    with pytest.raises(RuntimeError):
+        e.set_ordinary_arm_profile(None)
+    assert e.ordinary_arm_profile["right_elbow_p"] == 32
+    e.worker = None
+    e.set_ordinary_arm_profile(None)
+    assert e.ordinary_arm_profile is None
+
+
+def _ordinary_workspace_for_executor():
+    from examples.alohamini.am1_live_teleop import (
+        ORDINARY_AM1_ARMS_PROFILE, ORDINARY_AM1_ARM_CALIBRATION, ORDINARY_AM1_RAW_BOUNDS, normalized_raw,
+    )
+    value = {"version":1,"workspace_profile":ORDINARY_AM1_ARMS_PROFILE,
+             "calibration":{k:list(v) for k,v in ORDINARY_AM1_ARM_CALIBRATION.items()},
+             "raw_bounds":{k:list(v) for k,v in ORDINARY_AM1_RAW_BOUNDS.items()},
+             "bounds":{},"units":{},"reference":{}}
+    for key,(lower,upper) in ORDINARY_AM1_RAW_BOUNDS.items():
+        cal=ORDINARY_AM1_ARM_CALIBRATION[key[:-4]];gripper=key.endswith("gripper.pos")
+        value["bounds"][key]={"min":normalized_raw(lower,cal,gripper=gripper),
+            "max":normalized_raw(upper,cal,gripper=gripper),
+            "rate_per_s":20. if gripper else 4096/360*5*200/(cal[4]-cal[3])}
+        value["units"][key]="gripper_opening_percent" if gripper else "normalized_arm"
+        value["reference"][key]=normalized_raw((lower+upper)//2,cal,gripper=gripper)
+    return value
+
+
+def test_ordinary_profile_rejects_body_intent_and_foreign_workspace_without_consuming_fresh_input():
+    e,ids=admitted_executor()
+    e.set_ordinary_arm_profile({"profile":"ordinary-am1-arms-v1","right_elbow_p":16})
+    ordinary=_ordinary_workspace_for_executor()
+    e.sample["ack"]["live_input"]["workspace"]=ordinary
+    for key in ordinary["reference"]:e.sample["positions"][key]=ordinary["reference"][key]
+    bad_source=source()
+    assert not e.apply(ordinary["reference"],body={"x.vel":.1,"y.vel":0.,"theta.vel":0.,"lift_axis.vel":0},
+        source=bad_source,valid_until_monotonic_s=10.2,grant_id=bad_source["grant_id"],seq=1,**ids)
+    assert e._live_target is None and e._live_last_seq == -1
+    fresh=source(grant=str(uuid4()))
+    assert e.apply(ordinary["reference"],body={"x.vel":0.,"y.vel":0.,"theta.vel":0.,"lift_axis.vel":0},
+        source=fresh,valid_until_monotonic_s=10.2,grant_id=fresh["grant_id"],seq=1,**ids)
+    accepted=copy.deepcopy(e._live_target)
+    e.sample["ack"]["live_input"]["workspace"]=workspace()
+    foreign=source(seq=2,grant=str(uuid4()))
+    assert not e.apply(dict.fromkeys(KEYS,5.),body={"x.vel":0.,"y.vel":0.,"theta.vel":0.,"lift_axis.vel":0},
+        source=foreign,valid_until_monotonic_s=10.2,grant_id=foreign["grant_id"],seq=2,**ids)
+    assert e._live_target == accepted
+
+
+@pytest.mark.parametrize("bench", [False, True])
+def test_ordinary_startup_view_requirement_is_bound_before_worker(tmp_path, monkeypatch, bench, handoff=False):
+    from tools.am1_session_core import SessionAuthority
+    from tools.am1_local_observation import LocalObservationMailbox
+    e, _ = admitted_executor()
+    now=[10.]
+    e.clock=lambda:now[0]
+    e.observation = LocalObservationMailbox(e.observation.source,clock=e.clock,require_owned_session=True)
+    a = SessionAuthority(tmp_path, clock=e.clock, executor=e)
+    requirements=[]
+    def begin(recipe):
+        value=getattr(e,"_startup_view_requirement",None)
+        assert isinstance(value,dict), "normal ordinary Start must bind startup view before begin"
+        requirements.append(copy.deepcopy(value))
+        return True
+    monkeypatch.setattr(e,"begin",begin)
+    try:
+        claim=a._handle({"op":"claim"},"pc")
+        request={"op":"start","operation_id":str(uuid4()),"recipe":"physical-live-teleop",
+            "controller_generation":claim["controller_generation"],
+            "ordinary_arm_profile":{"profile":"ordinary-am1-arms-v1","right_elbow_p":16},
+            **({"bench_continuity":True} if bench else {})}
+        result=a._handle(request,"pc")
+        if bench:
+            assert result["accepted"] is False and not requirements
+            return  # Existing ordinary+advisory bench combination remains forbidden.
+        assert result["accepted"] and len(requirements)==1, (result,a.run.get("first_cause"))
+        requirement=requirements[0]
+        assert set(requirement)=={"run_id","operation_id","service_incarnation","host_incarnation",
+            "controller_generation","intent_revision","role","startup_deadline","controller_expires","required"}
+        assert requirement==dict(run_id=a.run["run_id"],operation_id=request["operation_id"],
+            service_incarnation=a.service_incarnation,host_incarnation=e.host_incarnation,
+            controller_generation=claim["controller_generation"],intent_revision=0,role="chest",
+            startup_deadline=a.run["startup_deadline"],controller_expires=a.controller["expires"],required=not bench)
+        assert a.run["native_live_at"] is None and a.run["deadline"] is None
+        if not bench:
+            request=e.observation.request
+            owner,capture,encode=str(uuid4()),str(uuid4()),str(uuid4())
+            e.observation.publish({**request,"owned_session":a.run["run_id"],"qualified":True,
+                "owner_generation":owner,"capture_generation":capture,"sequence":1,"arrived_at":10.,"decoded_at":10.,"frame_sha256":"f"*64})
+            progress=dict(op="view_progress",run_id=a.run["run_id"],role="chest",owner_generation=owner,
+                capture_generation=capture,encode_generation=encode,decoded_frames=1,media_time=.1,
+                source_sequence=1,source_fresh=True,received_at_monotonic_s=10.,request_received_at_monotonic_s=10.)
+            assert a.handle(progress,"gateway-view")["accepted"]
+            assert e.startup_view_ready() is True and e.sample is None and e._lifecycle["native_live_at"] is None
+            original=e._startup_view_progress["qualified_until"]
+            now[0]=10.4
+            if handoff:
+                original_handle=a._handle
+                def renewal_then_native_live(command,device):
+                    result=original_handle(command,device)
+                    if command["op"]=="claim":
+                        with e.mutex:
+                            e._lifecycle.update(phase="live",native_live_at=10.4,native_deadline_monotonic_s=310.4)
+                    return result
+                monkeypatch.setattr(a,"_handle",renewal_then_native_live)
+            assert a.handle({"op":"claim","controller_generation":a.controller["generation"]},"pc")["accepted"]
+            if handoff:
+                assert a.run["status"]=="starting" and a.run["native_live_at"] is None
+                assert e._lifecycle["phase"]=="live"
+                assert e._startup_view_progress["qualified_until"]==original
+                return  # Only normal subsequent Core lifecycle admission may promote NativeLive.
+            assert e._startup_view_requirement["controller_expires"]==a.controller["expires"]
+            assert e._startup_view_progress["qualified_until"]==original==10.5
+            assert e._lifecycle["startup_deadline"]==requirement["startup_deadline"]
+            paused=a._handle({"op":"pause","run_id":a.run["run_id"],"operation_id":str(uuid4())},"pc")
+            assert paused["accepted"] and a.run["status"]=="finishing"
+            assert a.run["requested_terminal"]=="stopped" and a.run["native_live_at"] is None
+            now[0]=10.45
+            assert a.handle(dict(progress,decoded_frames=2,media_time=.2,received_at_monotonic_s=10.45,
+                                 request_received_at_monotonic_s=10.45),"gateway-view")["accepted"]
+            with pytest.raises(RuntimeError,match="cancelled"):
+                e.startup_view_ready()
+    finally:
+        a.run=None;a.close()
+
+
+def test_startup_view_exact_live_handoff_after_core_tick_does_not_stop_or_admit(tmp_path,monkeypatch):
+    test_ordinary_startup_view_requirement_is_bound_before_worker(tmp_path,monkeypatch,False,handoff=True)

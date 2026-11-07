@@ -8,6 +8,482 @@ import pytest
 from tests.robots.test_am1_pre_activation import activation as activation
 
 
+def ordinary_configured_robot(activation, tmp_path, *, right_p=16, change=None):
+    from lerobot.motors import MotorCalibration, MotorNormMode
+    from lerobot.motors.feetech import FeetechMotorsBus
+
+    # Literal current mappings and legal stopped goals, independent of the profile builder.
+    rows = {
+        "left": [(1, 0, -1761, 731, 3438, 2677), (2, 0, 515, 848, 3223, 3222),
+                 (3, 0, 1845, 864, 3073, 1106), (4, 0, -1939, 1314, 3208, 2765),
+                 (5, 0, 879, 0, 4095, 2424), (6, 0, 933, 1886, 3401, 2902)],
+        "right": [(1, 0, -1719, 752, 3456, 2878), (2, 0, -1852, 1331, 3264, 3253),
+                  (3, 0, -658, 827, 3039, 1866), (4, 0, -1609, 1461, 3167, 3130),
+                  (5, 0, 1869, 0, 4095, 3143), (6, 0, -1811, 1657, 3191, 2995)],
+    }
+
+    def setup(robot):
+        robot._am1_protected_cleanup = True
+        robot._am1_ordinary_arm_profile_binding = dict(
+            robot._am1_teleop_binding, version=1, profile="ordinary-am1-arms-v1",
+            workload_segment="ordinary-arms", right_elbow_p=right_p,
+        )
+        robot._am1_ordinary_arm_profile_directory = str(tmp_path.resolve())
+        for side, values in rows.items():
+            bus = getattr(robot, side + "_bus")
+            for name, row in zip(getattr(robot, side + "_arm_motors"), values, strict=True):
+                bus.calibration[name] = MotorCalibration(*row[:5])
+                if name.endswith("gripper"):
+                    bus.motors[name].norm_mode = MotorNormMode.RANGE_0_100
+                for register, value in {
+                    "Min_Position_Limit": row[3], "Max_Position_Limit": row[4], "Homing_Offset": row[2],
+                    "Present_Position": row[5], "Goal_Position": row[5],
+                    "Present_Velocity": 0, "Moving": 0,
+                    "CW_Dead_Zone": 1, "CCW_Dead_Zone": 1, "Max_Torque_Limit": 1000, "Torque_Limit": 1000,
+                }.items():
+                    bus.registers[register, name] = value
+            elbow = "arm_" + side + "_elbow_flex"
+            for register, value in {"P_Coefficient": 16, "I_Coefficient": 0, "D_Coefficient": 32,
+                                    "Acceleration": 0, "Maximum_Acceleration": 254}.items():
+                bus.registers[register, elbow] = value
+            normalizer = FeetechMotorsBus("unused-ordinary-profile", bus.motors, bus.calibration)
+            bus.apply_drive_mode = normalizer.apply_drive_mode
+            bus.model_resolution_table = normalizer.model_resolution_table
+            bus._normalize, bus._unnormalize = normalizer._normalize, normalizer._unnormalize
+        if change is not None:
+            change(robot)
+
+    tmp_path.chmod(0o700)
+    return configured_robot(activation, before_configure=setup)
+
+
+@pytest.mark.parametrize("right_p", [16, 32])
+def test_ordinary_profile_configures_without_experiment_and_restores_originals(activation, tmp_path, right_p):
+    import json
+
+    robot = ordinary_configured_robot(activation, tmp_path, right_p=right_p)
+    left, right = "arm_left_elbow_flex", "arm_right_elbow_flex"
+    assert robot.left_bus.registers["P_Coefficient", left] == 32
+    assert robot.left_bus.registers["Acceleration", left] == 254
+    assert robot.right_bus.registers["P_Coefficient", right] == right_p
+    assert robot.right_bus.registers["Acceleration", right] == 0
+    assert robot.left_bus.registers["P_Coefficient", "arm_left_wrist_flex"] == 24
+    ordinary = robot._am1_ordinary_arm_profile
+    durable = json.loads(ordinary.snapshot_path.read_text())
+    assert durable["restore_required"] is True
+    assert durable["original_registers"]["right"]["CW_Dead_Zone"] == 1
+    assert durable["original_registers"]["right"]["CCW_Dead_Zone"] == 1
+    assert durable["original_registers"]["right"]["Max_Torque_Limit"] == 1000
+    ordinary.restore(robot)
+    assert robot.left_bus.registers["P_Coefficient", left] == 16
+    assert robot.left_bus.registers["Acceleration", left] == 0
+    assert robot.right_bus.registers["P_Coefficient", right] == 16
+    assert robot.right_bus.registers["Acceleration", right] == 0
+    assert ordinary.restore_required is False
+    assert json.loads(ordinary.snapshot_path.read_text())["restore_required"] is False
+    assert all(bus.registers["Torque_Enable", name] == 0
+               for bus, name in ((robot.left_bus, left), (robot.right_bus, right)))
+
+
+def test_ordinary_profile_activation_produces_common_motor_only_proof_and_fixed_region(activation, tmp_path, monkeypatch):
+    import copy
+
+    from lerobot.robots.alohamini.am1_elbow_integral import validate_ordinary_arm_profile_receipt
+    from lerobot.robots.alohamini.am1_live_teleop import workspace
+
+    robot = ordinary_configured_robot(activation, tmp_path, right_p=32)
+    robot.config.max_relative_target = 20.0
+    robot._joint_hold_goal, robot._gripper_hold_goal = {}, {}
+    monkeypatch.setattr("time.sleep", lambda seconds: setattr(activation.clock, "now", activation.clock.now + seconds))
+    robot.activate_motors(home_lift=False)
+    identity = {key: robot._am1_teleop_binding[key] for key in ("run_id", "host_incarnation")}
+    receipt = robot._am1_ordinary_arm_profile.active_receipt(robot)
+    assert validate_ordinary_arm_profile_receipt(receipt, **identity) == receipt
+    measured = {name + ".pos": value for bus, names in ((robot.left_bus, robot.left_arm_motors),
+                (robot.right_bus, robot.right_arm_motors)) for name, value in
+                robot._normalize_arm_feedback(bus, {name: bus.registers["Present_Position", name] for name in names}).items()}
+    first = workspace(robot, identity, measured)
+    assert first["workspace_profile"] == "ordinary-am1-arms-v1"
+    assert first["raw_bounds"]["arm_right_shoulder_pan.pos"] == [2876, 2995]
+    assert first["raw_bounds"]["arm_right_shoulder_lift.pos"] == [3136, 3255]
+    assert first["raw_bounds"]["arm_right_gripper.pos"] == [2118, 3005]
+    from examples.alohamini.am1_live_teleop import validate_target
+    closing = dict(first["reference"])
+    closing["arm_right_gripper.pos"] -= 20.
+    assert validate_target(closing, workspace=first) == closing
+    changed = dict(measured)
+    changed["arm_right_shoulder_pan.pos"] += .1
+    second = workspace(robot, identity, changed)
+    assert first["raw_bounds"] == second["raw_bounds"]
+    assert first["bounds"] == second["bounds"]
+    # Pure proof ignores unrelated runtime identity, but rejects altered motor evidence.
+    bad = copy.deepcopy(receipt)
+    bad["original_registers"]["right"]["CW_Dead_Zone"] = 7
+    with pytest.raises(ValueError):
+        validate_ordinary_arm_profile_receipt(bad, **identity)
+    robot._am1_ordinary_arm_profile.restore(robot)
+    validate_ordinary_arm_profile_receipt(robot._am1_ordinary_arm_profile.receipt, **identity, restored=True)
+
+
+@pytest.mark.parametrize("home", [False, True])
+def test_ordinary_start_acquires_saved_pose_without_relabeling_measured_reference(activation, tmp_path, monkeypatch, home):
+    import copy
+    from examples.alohamini.am1_live_teleop import validate_target
+    from examples.alohamini.am1_teleop_workload import VirtualIntentWorkload
+    from lerobot.robots.alohamini import alohamini_host as host
+    from tests.robots.test_am1_live_teleop_native import frame
+    from tests.robots.test_am1_live_phase_coordinator import ordinary_admission, ordinary_options
+    from tools import am1_leader_adapter as adapter, am1_live_phase_coordinator as coordinator
+
+    # Literal retained3e9 held pose, with its achieved elbow1150; not a requested reset.
+    measured_raw = dict(arm_left_shoulder_pan=2757, arm_left_shoulder_lift=3229,
+        arm_left_elbow_flex=1150, arm_left_wrist_flex=2760, arm_left_wrist_roll=2502, arm_left_gripper=2902,
+        arm_right_shoulder_pan=2879, arm_right_shoulder_lift=3253, arm_right_elbow_flex=1853,
+        arm_right_wrist_flex=3126, arm_right_wrist_roll=3141, arm_right_gripper=2982)
+    def change(robot):
+        for name, raw in measured_raw.items():
+            bus = robot.left_bus if name.startswith("arm_left") else robot.right_bus
+            bus.registers["Present_Position", name] = raw
+            bus.registers["Goal_Position", name] = 3223 if name == "arm_left_shoulder_lift" else raw
+    robot = ordinary_configured_robot(activation, tmp_path, change=change)
+    robot.config.max_relative_target = 3.
+    robot._joint_hold_goal, robot._gripper_hold_goal = {}, {}
+    monkeypatch.setattr("time.sleep", lambda seconds: setattr(activation.clock, "now", activation.clock.now + seconds))
+    robot.activate_motors(home_lift=home)
+    expected = dict(measured_raw, arm_left_shoulder_lift=3223, arm_left_wrist_flex=2762, arm_right_wrist_flex=3127)
+    for name, raw in expected.items():
+        bus = robot.left_bus if name.startswith("arm_left") else robot.right_bus
+        assert bus.registers["Goal_Position", name] == raw
+        assert bus.registers["Present_Position", name] == measured_raw[name]
+    proof = robot._am1_ordinary_arm_profile._snapshot["normal_activation"]["startup_acquisition"]
+    assert proof["measured_raw"] == measured_raw and proof["legal_goals_raw"] == expected
+    assert proof["displacement_bound_degrees"] == 1.
+    assert set(proof["goal_writes"]) == set(proof["goal_readbacks"]) == set(expected)
+    for name, raw in expected.items():
+        write, readback = proof["goal_writes"][name], proof["goal_readbacks"][name]
+        assert write["value"] == readback["raw"] == raw
+        assert write["started_at_monotonic_s"] <= write["completed_at_monotonic_s"] <= readback["read_started_at"] <= readback["read_completed_at"]
+    output = bytearray()
+    writer = host.AM1RoutineRecordWriter(write=lambda data: output.extend(data) or len(data))
+    assert writer.submit("[AM1 TELEOP REST] ", {"binding": robot._am1_teleop_binding,
+        "acquisitions": robot._am1_teleop_rest_evidence, "ordinary_startup_acquisition": proof})
+    writer.close()
+    import json
+    retained = json.loads(bytes(output).decode().split("] ", 1)[1])
+    assert retained["ordinary_startup_acquisition"] == proof and len(output) <= 32768
+    robot.get_observation = lambda: {name+".pos": value for bus, names in ((robot.left_bus, robot.left_arm_motors),
+        (robot.right_bus, robot.right_arm_motors)) for name, value in robot._normalize_arm_feedback(
+            bus, {name: bus.registers["Present_Position", name] for name in names}).items()}
+    robot.stop_motion = robot.hold_follower_arms = lambda: None
+    identity = {k:robot._am1_teleop_binding[k] for k in ("run_id", "host_incarnation")}
+    owner = {k:str(uuid4()) for k in ("service_incarnation", "controller_generation", "connection_generation")}
+    control = host.AM1LocalControl(**identity, live=True, live_recipe="physical-live-teleop", clock=lambda:activation.clock.now)
+    assert control.apply(robot, frame(identity, owner, 1))
+    held = control.live_snapshot(); workspace = held["workspace"]
+    assert workspace["reference"]["arm_left_shoulder_lift.pos"] == pytest.approx(100.50526315789475)
+    assert held["cursor"]["arm_left_shoulder_lift.pos"] == 100.
+    assert workspace["raw_bounds"]["arm_left_wrist_flex.pos"] == [2762, 2881]
+    assert workspace["raw_bounds"]["arm_right_wrist_flex.pos"] == [3127, 3167]
+    now = [10.]
+    source = VirtualIntentWorkload(workspace, command_reference=held["cursor"], clock=lambda:now[0])
+    assert not source.active and source.origin == held["cursor"] and source.measured_reference == held["reference"]
+    producer = adapter.FrameProducer(source, clock=lambda:now[0], source_id=source.intent_channel)
+    producer.workspace, producer.native_cursor = workspace, dict(held["cursor"])
+    def submit(seq, op, **extra):
+        source.submit(dict(seq=seq, op=op, intent_channel=source.intent_channel,
+            issued_at_perf_counter_s=now[0], expires_at_perf_counter_s=now[0]+10., **extra))
+        source.admit(now[0])
+    submit(1, "hold")
+    first = producer.capture({"grant_id":str(uuid4())})
+    assert first["target"] == held["cursor"] and producer.clutch.last_clamps == {}
+    ready, admitted = ordinary_admission(); current = admitted["snapshot"]["run"]["live_input"]
+    current.update(workspace=copy.deepcopy(workspace), reference=dict(held["reference"]),
+                   cursor=dict(held["cursor"]), accepted_target=dict(held["cursor"]))
+    admitted["snapshot"]["evidence"]["accepted_host_action"]["arm_feedback"]["positions"] = {
+        key:dict(raw=measured_raw[key[:-4]], normalized=value) for key,value in held["reference"].items()}
+    ready.update(command_reference=dict(held["cursor"]), bounds=copy.deepcopy(workspace["bounds"]), units=dict(workspace["units"]))
+    plan = coordinator.fresh_ordinary_targets(ready, admitted, ramp_seconds=3., gripper_direction="closing")
+    phase = coordinator.phases_for(plan, ordinary_options())[0]
+    assert plan["origin"] == held["cursor"] and workspace["reference"] == held["reference"]
+    submit(2, "move", transition_seconds=3., targets=phase["targets"])
+    for _ in range(46):  # Actual producer cadence advances the finite ramp; a timer jump is not progress.
+        now[0] += 1/15
+        source.advance(now[0])
+        moved = producer.capture({"grant_id":str(uuid4())})
+        source.accepted(moved["target"])
+    assert moved["target"] == phase["targets"] and validate_target(moved["target"], workspace=workspace)
+    assert producer.clutch.last_clamps == {}
+    if not home:  # The reused fake lift models startup, not subsequent live thermal history.
+        assert control.apply(robot, frame(identity, owner, 2))
+        paused = control.live_snapshot()
+        for key in ("workspace", "reference", "live_deadline_monotonic_s"):
+            assert paused[key] == held[key]
+    robot._am1_ordinary_arm_profile.restore(robot)
+
+
+@pytest.mark.parametrize("fault", ["degree", "relative", "left-elbow", "right-elbow", "stale", "off", "calibration", "stop", "thermal"])
+def test_ordinary_start_acquisition_preserves_finite_role_and_owner_refusals(activation, tmp_path, monkeypatch, fault):
+    from tests.robots.test_am1_pre_activation import energizing, goals
+    robot = ordinary_configured_robot(activation, tmp_path)
+    robot.config.max_relative_target = .01 if fault == "relative" else 3.
+    robot._joint_hold_goal, robot._gripper_hold_goal = {}, {}
+    robot.left_bus.registers["Present_Position", "arm_left_wrist_flex"] = 2760
+    if fault == "degree": robot.right_bus.registers["Present_Position", "arm_right_shoulder_pan"] = 3007
+    elif fault == "left-elbow": robot.left_bus.registers["Present_Position", "arm_left_elbow_flex"] = 1165
+    elif fault == "right-elbow": robot.right_bus.registers["Present_Position", "arm_right_elbow_flex"] = 1846
+    elif fault == "stale":
+        def delay(register, name):
+            if register == "Present_Position" and name == "arm_right_gripper" and any(row.get("phase") == "after_home" for row in robot._am1_activation_readbacks):
+                activation.clock.now += 1.1
+        robot.right_bus.on_read = delay
+    elif fault == "off": robot.right_bus.registers["Torque_Enable", "arm_right_wrist_flex"] = 1
+    elif fault == "calibration": robot.right_bus.calibration["arm_right_wrist_flex"].homing_offset += 1
+    elif fault == "stop": robot._am1_shutdown_in_progress = True
+    elif fault == "thermal": robot._am1_teleop_first_error = RuntimeError("original thermal qualification failure")
+    monkeypatch.setattr("time.sleep", lambda seconds: setattr(activation.clock, "now", activation.clock.now + seconds))
+    activation.events.clear()
+    with pytest.raises(RuntimeError, match="motor activation failed") as caught:
+        robot.activate_motors(home_lift=False)
+    assert not goals(activation.events) and not energizing(activation.events)
+    if fault in {"degree", "relative", "left-elbow", "right-elbow"}:
+        name = {"degree":"arm_right_shoulder_pan", "relative":"arm_left_wrist_flex",
+                "left-elbow":"arm_left_elbow_flex", "right-elbow":"arm_right_elbow_flex"}[fault]
+        assert name in str(caught.value.__cause__) and "measured=" in str(caught.value.__cause__)
+
+
+def test_ordinary_profile_partial_apply_restores_durable_originals(activation, tmp_path):
+    robot = activation.robot
+    original_write = robot.left_bus.write
+
+    def write(register, name, value, **kwargs):
+        if register == "Acceleration" and name == "arm_left_elbow_flex" and value == 254:
+            raise OSError("injected before acceleration write")
+        return original_write(register, name, value, **kwargs)
+
+    with pytest.raises(OSError, match="injected"):
+        ordinary_configured_robot(activation, tmp_path, change=lambda owner: setattr(owner.left_bus, "write", write))
+    assert robot.left_bus.registers["P_Coefficient", "arm_left_elbow_flex"] == 32
+    ordinary = robot._am1_ordinary_arm_profile
+    assert ordinary.restore_required is True
+    robot.left_bus.write = original_write
+    ordinary.restore(robot)
+    assert robot.left_bus.registers["P_Coefficient", "arm_left_elbow_flex"] == 16
+    assert robot.left_bus.registers["Acceleration", "arm_left_elbow_flex"] == 0
+    assert ordinary.evidence["first_failure"]["type"] == "OSError"
+    assert ordinary.restore_required is False
+
+
+def test_ordinary_profile_nested_ack_loss_keeps_original_write_failure(activation, tmp_path):
+    robot = activation.robot
+    write, read = robot.left_bus.write, robot.left_bus.read
+    failed = [False]
+    first = OSError("original injected write failure")
+    def changed_write(register, name, value, **kwargs):
+        if register == "P_Coefficient" and name == "arm_left_elbow_flex" and value == 32:
+            failed[0] = True
+            raise first
+        return write(register, name, value, **kwargs)
+    def changed_read(register, name, **kwargs):
+        if failed[0] and register == "P_Coefficient" and name == "arm_left_elbow_flex":
+            raise TimeoutError("injected acknowledgement read unavailable")
+        return read(register, name, **kwargs)
+    def change(owner):
+        owner.left_bus.write, owner.left_bus.read = changed_write, changed_read
+    with pytest.raises(OSError) as caught:
+        ordinary_configured_robot(activation, tmp_path, change=change)
+    assert caught.value is first
+    failed[0] = False
+    assert robot._safe_shutdown(close_buses=False) == []
+    assert robot._am1_ordinary_arm_profile.evidence["first_failure"]["type"] == "OSError"
+
+
+@pytest.mark.parametrize("fault", ["durable", "status", "authority"])
+def test_ordinary_profile_last_apply_boundary_refuses_before_gain_write(activation, tmp_path, monkeypatch, fault):
+    import copy
+
+    from lerobot.robots.alohamini.am1_elbow_integral import AM1OrdinaryArmProfile
+    original_apply = AM1OrdinaryArmProfile.apply
+    original_bytes = []
+
+    def apply(transaction, robot):
+        if fault == "durable":
+            original_bytes.append(transaction.snapshot_path.read_bytes())
+            transaction.snapshot_path.write_text("{}")
+        elif fault == "status":
+            robot.left_bus.registers["Status", "arm_left_elbow_flex"] = 1
+        else:
+            transaction.binding["right_elbow_p"] = 32
+            robot._am1_ordinary_arm_profile_binding["right_elbow_p"] = 32
+        return original_apply(transaction, robot)
+
+    monkeypatch.setattr(AM1OrdinaryArmProfile, "apply", apply)
+    with pytest.raises((ValueError, RuntimeError)):
+        ordinary_configured_robot(activation, tmp_path)
+    assert not [event for event in activation.events if event[0] == "write" and event[2] in {"P_Coefficient", "Acceleration"}]
+    ordinary = activation.robot._am1_ordinary_arm_profile
+    if original_bytes:
+        ordinary.snapshot_path.write_bytes(original_bytes[0])
+    activation.robot.left_bus.registers["Status", "arm_left_elbow_flex"] = 0
+    ordinary.binding = copy.deepcopy(ordinary.evidence["binding"])
+    activation.robot._am1_ordinary_arm_profile_binding = copy.deepcopy(ordinary.binding)
+    ordinary.restore(activation.robot)
+
+
+def test_ordinary_profile_captures_actual_dead_zones_without_historical_assumption(activation, tmp_path):
+    def change(robot):
+        robot.right_bus.registers["CW_Dead_Zone", "arm_right_elbow_flex"] = 2
+        robot.right_bus.registers["CCW_Dead_Zone", "arm_right_elbow_flex"] = 3
+        robot.right_bus.registers["Max_Torque_Limit", "arm_right_elbow_flex"] = 900
+        robot.right_bus.registers["Torque_Limit", "arm_right_elbow_flex"] = 900
+    robot = ordinary_configured_robot(activation, tmp_path, change=change)
+    rows = robot._am1_ordinary_arm_profile.receipt["original_registers"]["right"]
+    assert (rows["CW_Dead_Zone"], rows["CCW_Dead_Zone"], rows["Max_Torque_Limit"]) == (2, 3, 900)
+    robot._am1_ordinary_arm_profile.restore(robot)
+
+
+def test_ordinary_profile_shutdown_keeps_both_setting_obligations_locked_until_restore(activation, tmp_path):
+    from lerobot.robots.alohamini.am1_elbow_integral import validate_ordinary_arm_profile_receipt
+
+    robot = ordinary_configured_robot(activation, tmp_path, right_p=32)
+    activation.events.clear()
+    assert robot._safe_shutdown(close_buses=False) == []
+    for side in ("left", "right"):
+        elbow = "arm_" + side + "_elbow_flex"
+        events = [row for row in activation.events if row[0] == "write" and row[1] == side and row[3] == elbow]
+        first_unlock = next(i for i, row in enumerate(events) if row[2] == "Lock" and row[4] == 0)
+        restoration = next(i for i, row in enumerate(events) if row[2] == "P_Coefficient" and row[4] == 16)
+        assert restoration < first_unlock
+    identity = {key: robot._am1_teleop_binding[key] for key in ("run_id", "host_incarnation")}
+    validate_ordinary_arm_profile_receipt(robot._am1_shutdown_evidence["ordinary_arm_profile"], **identity, restored=True)
+
+
+def test_ordinary_profile_rejects_another_joint_beyond_start_acquisition_before_power(activation, tmp_path, monkeypatch):
+    from tests.robots.test_am1_pre_activation import energizing, goals
+
+    def change(robot):
+        robot.right_bus.registers["Present_Position", "arm_right_shoulder_pan"] = 3007
+    robot = ordinary_configured_robot(activation, tmp_path, change=change)
+    robot.config.max_relative_target = 20.
+    robot._joint_hold_goal, robot._gripper_hold_goal = {}, {}
+    monkeypatch.setattr("time.sleep", lambda seconds: setattr(activation.clock, "now", activation.clock.now + seconds))
+    activation.events.clear()
+    with pytest.raises(RuntimeError, match="motor activation failed"):
+        robot.activate_motors(home_lift=False)
+    assert not energizing(activation.events) and not goals(activation.events)
+
+
+@pytest.mark.parametrize("bad", [None, "body", "lift_height", "expired", "mapping", "profile"])
+def test_ordinary_profile_native_frames_share_twelve_target_path_and_zero_body_fences(activation, tmp_path, monkeypatch, bad):
+    import copy
+
+    from lerobot.robots.alohamini import alohamini_host as host
+    from lerobot.robots.alohamini.am1_live_teleop import before_write
+    from tests.robots.test_am1_live_teleop_native import frame, sample
+
+    robot = ordinary_configured_robot(activation, tmp_path)
+    robot.config.max_relative_target = 20.
+    robot._joint_hold_goal, robot._gripper_hold_goal = {}, {}
+    monkeypatch.setattr("time.sleep", lambda seconds: setattr(activation.clock, "now", activation.clock.now + seconds))
+    robot.activate_motors(home_lift=False)
+    identity = {key: robot._am1_teleop_binding[key] for key in ("run_id", "host_incarnation")}
+    owner = {key: str(uuid4()) for key in ("service_incarnation", "controller_generation", "connection_generation")}
+    control = host.AM1LocalControl(**identity, live=True, live_recipe="physical-live-teleop", clock=lambda: activation.clock.now)
+    robot.get_observation = lambda: {name + ".pos": value for bus, names in ((robot.left_bus, robot.left_arm_motors),
+        (robot.right_bus, robot.right_arm_motors)) for name, value in robot._normalize_arm_feedback(
+            bus, {name: bus.registers["Present_Position", name] for name in names}).items()}
+    actions = []
+    robot.stop_motion = lambda: None
+    robot.hold_follower_arms = lambda: None
+    def send(action):
+        before_write(control, robot)
+        actions.append(dict(action))
+        return dict(action)
+    robot.send_action = send
+    assert control.apply(robot, frame(identity, owner, 1))
+    original = copy.deepcopy(control.live_snapshot())
+    deadline = activation.clock.now + .25
+    target = sample(control, expiry=deadline)
+    if bad == "body":
+        target["body"]["x.vel"] = .1
+    elif bad == "lift_height":
+        target["body"]["lift_axis.height_mm"] = 10.
+    elif bad == "expired":
+        target["valid_until_monotonic_s"] = activation.clock.now - .01
+    elif bad == "mapping":
+        robot.right_bus.calibration["arm_right_wrist_roll"].homing_offset += 1
+    elif bad == "profile":
+        robot._am1_ordinary_arm_profile_binding["right_elbow_p"] = 32
+    activation.clock.now += .1
+    if bad in {"mapping", "profile"}:
+        with pytest.raises((RuntimeError, ValueError)):
+            control.apply(robot, frame(identity, owner, 2, mode="active", epoch=2, sample=target))
+    else:
+        assert control.apply(robot, frame(identity, owner, 2, mode="active", epoch=2, sample=target)) is (bad is None)
+    assert bool(actions) is (bad is None)
+    current = control.live_snapshot()
+    assert current["workspace"] == original["workspace"]
+    assert current["reference"] == original["reference"]
+    assert current["live_deadline_monotonic_s"] == original["live_deadline_monotonic_s"]
+    assert "ordinary_arm_profile" not in current
+    if bad is None:
+        assert set(original["workspace"]["bounds"]).issubset(actions[-1])
+        assert actions[-1]["arm_left_elbow_flex.pos"] < original["reference"]["arm_left_elbow_flex.pos"]
+        assert actions[-1]["arm_right_elbow_flex.pos"] < original["reference"]["arm_right_elbow_flex.pos"]
+        assert actions[-1]["arm_left_gripper.pos"] != original["reference"]["arm_left_gripper.pos"]
+    if bad in {"mapping", "profile"}:
+        assert robot._safe_shutdown(close_buses=False)
+        assert all(bus.registers["Torque_Enable", name] == 0 for bus, name in (
+            (robot.left_bus, "arm_left_elbow_flex"), (robot.right_bus, "arm_right_elbow_flex")))
+        assert robot._am1_ordinary_arm_profile.restore_required is True
+        # Restore only injected fixture metadata, then discharge the same retained obligation.
+        robot.right_bus.calibration["arm_right_wrist_roll"].homing_offset = 1869
+        robot._am1_ordinary_arm_profile_binding["right_elbow_p"] = 16
+        robot._am1_ordinary_arm_profile.restore(robot)
+
+
+@pytest.mark.parametrize("fault", ["i", "right_acceleration", "protection", "mapping", "binding", "legacy", "phase", "firmware", "gripper_units"])
+def test_ordinary_profile_refuses_changed_baseline_before_gain_writes(activation, tmp_path, fault):
+    def change(robot):
+        right = "arm_right_elbow_flex"
+        if fault == "i":
+            robot.right_bus.registers["I_Coefficient", right] = 1
+        elif fault == "right_acceleration":
+            robot.right_bus.registers["Acceleration", right] = 254
+        elif fault == "protection":
+            robot.right_bus.registers["Protection_Current", right] = 0
+        elif fault == "mapping":
+            robot.right_bus.calibration[right].homing_offset += 1
+        elif fault == "binding":
+            robot._am1_ordinary_arm_profile_binding["run_id"] = str(uuid4())
+        elif fault == "legacy":
+            robot._am1_left_response_p_binding = {"unexpected": True}
+        elif fault == "phase":
+            robot.right_bus.registers["Phase", right] = 0
+        elif fault == "firmware":
+            robot.right_bus.registers["Firmware_Minor_Version", right] = 9
+        elif fault == "gripper_units":
+            from lerobot.motors import MotorNormMode
+            robot.right_bus.motors["arm_right_gripper"].norm_mode = MotorNormMode.RANGE_M100_100
+    with pytest.raises((ValueError, RuntimeError)):
+        ordinary_configured_robot(activation, tmp_path, change=change)
+    assert not [event for event in activation.events if event[0] == "write" and event[2] in {"P_Coefficient", "Acceleration"}]
+
+
+def test_ordinary_profile_private_preparation_cannot_reset_original_thermal_clock(activation, tmp_path, monkeypatch):
+    from lerobot.robots.alohamini.am1_elbow_integral import AM1OrdinaryArmProfile
+    original_prepare = AM1OrdinaryArmProfile.prepare
+    def prepare(transaction, robot):
+        original_prepare(transaction, robot)
+        activation.clock.now += 1.125
+    monkeypatch.setattr(AM1OrdinaryArmProfile, "prepare", prepare)
+    with pytest.raises(RuntimeError, match="original follower baseline acquisition expired"):
+        ordinary_configured_robot(activation, tmp_path)
+    robot = activation.robot
+    assert not [event for event in activation.events if event[0] == "write" and event[2] in {"P_Coefficient", "Acceleration"}]
+    assert robot._safe_shutdown(close_buses=False) == []
+    assert robot._am1_ordinary_arm_profile.restore_required is False
+
+
 def configured_robot(activation, *, initial_temperature=28, before_configure=None):
     robot = activation.robot
     robot.config.no_follower = False
@@ -602,6 +1078,13 @@ def test_acquired_rest_native_workspace_and_hold_preserve_raw_reference_and_lega
         bus.registers["Present_Position", f"arm_{side}_elbow_flex"] = elbow
         bus.motors[f"arm_{side}_gripper"].norm_mode = MotorNormMode.RANGE_0_100
     robot.activate_motors()
+    # Use the real window API for this existing second-HOLD handoff; the shared
+    # pre-activation fixture's minimal lift stub covers only startup.
+    from lerobot.robots.alohamini.lift_operational import TemperatureWindow
+    lift_window = TemperatureWindow()
+    for offset in (-.4, -.3, -.2, -.1, 0.):
+        lift_window.update(28, activation.clock.now + offset)
+    robot._lift_operation.temperature = lift_window
     identity = {key: robot._am1_teleop_binding[key] for key in ("run_id", "host_incarnation")}
     owner = {
         key: str(uuid4()) for key in ("service_incarnation", "controller_generation", "connection_generation")
@@ -2322,3 +2805,40 @@ def test_normal_rest_goal0_keeps_actual_position_off_and_quiet_guards(activation
     assert not [row for row in activation.events if row[0]=="write" and row[2]=="Torque_Enable" and row[3].startswith("arm_") and row[4]==1]
     robot.left_bus.on_read=None
     robot._safe_shutdown(close_buses=True)
+
+
+@pytest.mark.parametrize("right_p", [16, 32])
+def test_ordinary_restored_proof_and_cleanup_reader_need_only_standard_library(activation, tmp_path, right_p):
+    import json
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    robot = ordinary_configured_robot(activation, tmp_path, right_p=right_p)
+    assert robot._safe_shutdown(close_buses=False) == []
+    readback = dict(robot._am1_shutdown_evidence)
+    # The fixture has no physical lift; its separately tested qualified result is
+    # supplied here to isolate the dependency boundary of the ordinary reader.
+    readback["lift_readback"] = "qualified"
+    identity = {key: robot._am1_teleop_binding[key] for key in ("run_id", "host_incarnation")}
+    payload = dict(version=1, **identity, cleanup="physical_readback_verified", uncertain=False,
+                   cleanup_errors=[], readback=readback)
+    path = tmp_path / "native-emitted-restored-cleanup.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    code = """
+import json, sys
+from examples.alohamini.am1_live_teleop import validate_ordinary_arm_profile_receipt
+from tools.am1_physical_executor import qualified_cleanup_receipt
+value = json.loads(open(sys.argv[1], encoding='utf-8').read())
+identity = {key: value[key] for key in ('run_id', 'host_incarnation')}
+proof = validate_ordinary_arm_profile_receipt(value['readback']['ordinary_arm_profile'], **identity, restored=True)
+policy = {key: proof['binding'][key] for key in ('profile', 'right_elbow_p')}
+assert 'ordinary_arm_profile_restore_required' not in value['readback']
+assert qualified_cleanup_receipt(value, identity['run_id'], identity['host_incarnation'], ordinary_arm_profile=policy)
+assert 'draccus' not in sys.modules and not any(key.startswith('lerobot') for key in sys.modules)
+"""
+    repo = Path(__file__).resolve().parents[2]
+    result = subprocess.run([sys.executable, "-S", "-c", code, str(path)], cwd=repo,
+                            env={**os.environ, "PYTHONPATH": str(repo)}, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr

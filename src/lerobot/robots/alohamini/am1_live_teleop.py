@@ -13,26 +13,7 @@ from contextlib import suppress
 from uuid import UUID
 
 RECIPE = "physical-live-teleop"
-STATIC = (
-    "ID",
-    "Model_Number",
-    "Firmware_Major_Version",
-    "Firmware_Minor_Version",
-    "Min_Position_Limit",
-    "Max_Position_Limit",
-    "Homing_Offset",
-    "Phase",
-    "P_Coefficient",
-    "I_Coefficient",
-    "D_Coefficient",
-    "Acceleration",
-    "Maximum_Acceleration",
-    "Protection_Current",
-    "Max_Temperature_Limit",
-    "Min_Voltage_Limit",
-    "Max_Voltage_Limit",
-    "Operating_Mode",
-)
+from examples.alohamini.am1_live_teleop import ORDINARY_ARM_STATIC as STATIC
 HEALTH = ("Status", "Present_Temperature", "Present_Voltage", "Torque_Enable", "Lock")
 LIVE_HEALTH = (*HEALTH, "Operating_Mode")
 
@@ -880,7 +861,7 @@ def prepare_settings(robot, *, defer_temperature_baseline=False):
         raise RuntimeError("AM1 teleop settings need the protected binding")
     if defer_temperature_baseline:
         if (sum(getattr(robot, "_am1_" + side + "_response_p_binding", None) is not None
-                for side in ("left", "right")) != 1
+                for side in ("left", "right")) + int(getattr(robot, "_am1_ordinary_arm_profile_binding", None) is not None) != 1
                 or getattr(robot, "_am1_teleop_temperatures", None)
                 or hasattr(robot, "_am1_teleop_initial_temperature_deadline")):
             raise RuntimeError("AM1 selected initial thermal acquisition cannot be reused or reset")
@@ -1010,6 +991,17 @@ def response_receipt(robot):
     return left_response_receipt(robot) or right_response_receipt(robot)
 
 
+def ordinary_arm_profile_receipt(robot):
+    transaction = getattr(robot, "_am1_ordinary_arm_profile", None)
+    binding = getattr(robot, "_am1_ordinary_arm_profile_binding", None)
+    if transaction is None and binding is None:
+        return None
+    from .am1_elbow_integral import AM1OrdinaryArmProfile
+    if type(transaction) is not AM1OrdinaryArmProfile:
+        raise RuntimeError("ordinary arm settings obligation is unavailable")
+    return transaction.active_receipt(robot)
+
+
 def _current_rest_shoulder_reference(robot, control, workspace, receipt, *, goals=None):
     """Freeze the original admitted literal Goal; later Pause/cursor values cannot renew it."""
     trial = getattr(robot, "_am1_left_response_p_trial", None)
@@ -1021,6 +1013,10 @@ def _current_rest_shoulder_reference(robot, control, workspace, receipt, *, goal
                and request.get("workspace_profile") == workspace.get("workspace_profile")
                == CURRENT_REST_WORKSPACE_PROFILES[receipt["workload_segment"]]
                and type(degrees) in (int, float) and degrees == 1)
+    ordinary = ordinary_arm_profile_receipt(robot)
+    if ordinary is not None:
+        trial = robot._am1_ordinary_arm_profile
+        enabled = workspace.get("workspace_profile") == trial.workspace_profile
     anchor = getattr(control, "_teleop_original_shoulder_goal", None)
     if not enabled and anchor is None:
         return None
@@ -1051,6 +1047,20 @@ def _current_rest_shoulder_reference(robot, control, workspace, receipt, *, goal
 
 
 def _left_response_target_valid(robot, control, sample):
+    ordinary = ordinary_arm_profile_receipt(robot)
+    if ordinary is not None:
+        from examples.alohamini.am1_live_teleop import ZERO_BODY, validate_target
+        if set(sample["body"]) != set(ZERO_BODY) or any(sample["body"][key] != 0 for key in ZERO_BODY):
+            return False
+        workspace = control._live_summary["workspace"]
+        if workspace.get("workspace_profile") != ordinary["binding"]["profile"]:
+            return False
+        _current_rest_shoulder_reference(robot, control, workspace, None)
+        try:
+            validate_target(sample["target"], workspace=workspace)
+        except (KeyError, TypeError, ValueError):
+            return False
+        return True
     receipt = response_receipt(robot)
     if receipt is None:
         if getattr(control, "_teleop_original_shoulder_goal", None) is not None:
@@ -1109,6 +1119,11 @@ def verify_settings(robot):
     records = read_groups(robot, (*STATIC, *HEALTH), active=True)
     expected = {side: {register: dict(robot._am1_teleop_settings[side]["registers"][register])
                        for register in STATIC} for side, _, _ in _groups(robot)}
+    ordinary = ordinary_arm_profile_receipt(robot)
+    if ordinary is not None:
+        for side in ("left", "right"):
+            for register in ("P_Coefficient", "Acceleration"):
+                expected[side][register]["arm_" + side + "_elbow_flex"] = ordinary["active_registers"][side][register]
     trial = response_receipt(robot)
     if trial is not None:
         side = "left" if trial["kind"] == "left-response-p" else "right"
@@ -1157,16 +1172,18 @@ def qualify_rest(robot, bus, name, calibration, *, phase, present_raw):
     binding = copy.deepcopy(robot._am1_teleop_binding)
     trial = robot._am1_current_rest_activation_trial()
     bound_degrees = 0.5 if trial is None else trial.normal_rest_startup_degrees(robot)
-    allowance_request = None if trial is None else {
+    ordinary = getattr(robot, "_am1_ordinary_arm_profile", None)
+    allowance_request = (dict(ordinary.binding) if trial is ordinary and ordinary is not None else None if trial is None else {
         "request_id": trial.binding["request"]["request_id"],
         "request_sha256": trial.binding["request_sha256"],
-    }
+    })
 
     def check_allowance():
         current = robot._am1_current_rest_activation_trial()
         if (current is not trial
                 or (0.5 if current is None else current.normal_rest_startup_degrees(robot)) != bound_degrees
-                or current is not None and {
+                or current is ordinary and ordinary is not None and dict(current.binding) != allowance_request
+                or current is not None and current is not ordinary and {
                     "request_id": current.binding["request"]["request_id"],
                     "request_sha256": current.binding["request_sha256"],
                 } != allowance_request):
@@ -1478,6 +1495,7 @@ def before_write(control, robot):
 def workspace(robot, identity, measured, *, goals=None):
     from examples.alohamini.am1_live_teleop import (
         CURRENT_REST_WORKSPACE_PROFILES, TELEOP_ARM_KEYS, normalized_raw, validate_workspace,
+        ORDINARY_AM1_ARM_CALIBRATION, ORDINARY_AM1_RAW_BOUNDS,
     )
 
     if not binding_valid(robot) or robot._am1_teleop_binding != {**identity, "recipe": RECIPE}:
@@ -1489,6 +1507,17 @@ def workspace(robot, identity, measured, *, goals=None):
     from examples.alohamini.am1_live_teleop import LEFT_ENTRY_ENDPOINT_RAW, LEFT_ENTRY_START_MIN_RAW, LEFT_ENTRY_START_MAX_RAW, LEFT_ENTRY_WORKSPACE_PROFILE
     profile = None
     gripper_interval = None
+    ordinary = ordinary_arm_profile_receipt(robot)
+    if ordinary is not None:
+        if receipt is not None:
+            raise RuntimeError("ordinary arm profile cannot share an experimental workspace")
+        profile = ordinary["binding"]["profile"]
+        result["workspace_profile"] = profile
+        acquisition = robot._am1_ordinary_arm_profile._snapshot.get("normal_activation", {}).get("startup_acquisition")
+        if not isinstance(acquisition, dict):
+            raise RuntimeError("ordinary arm original normal-start acquisition is unavailable")
+        result["startup_acquisition"] = {"version": 1, "displacement_bound_degrees": 1.,
+                                         "measured_reference": {}, "command_reference": {}}
     if receipt is not None:
         side = "left" if receipt["kind"] == "left-response-p" else "right"
         trial = getattr(robot, "_am1_" + side + "_response_p_trial")
@@ -1522,7 +1551,20 @@ def workspace(robot, identity, measured, *, goals=None):
             q0 = measured[key]
             if type(q0) not in (int, float) or not math.isfinite(q0):
                 raise RuntimeError("AM1 teleop actual resting pose is invalid")
-            if profile == LEFT_ENTRY_WORKSPACE_PROFILE:
+            if ordinary is not None:
+                if tuple(cal) != ORDINARY_AM1_ARM_CALIBRATION[name]:
+                    raise RuntimeError("ordinary arm calibrated region changed")
+                low, high = ORDINARY_AM1_RAW_BOUNDS[key]
+                cap = robot._am1_relative_target_cap(key)
+                if (type(cap) not in (int, float) or not math.isfinite(cap) or cap <= 0
+                    or abs(q0-normalized_raw(seed, cal, gripper=gripper)) > cap + 1e-9):
+                    raise RuntimeError("ordinary arm current measured/held Goal exceeds its relative cap: " + name)
+                if (not low <= seed <= high or acquisition["legal_goals_raw"].get(name) != seed
+                    or type(acquisition["measured_raw"].get(name)) is not int):
+                    raise RuntimeError("ordinary arm original legal startup Goal changed: " + name)
+                result["startup_acquisition"]["measured_reference"][key] = normalized_raw(acquisition["measured_raw"][name], cal, gripper=gripper)
+                result["startup_acquisition"]["command_reference"][key] = normalized_raw(seed, cal, gripper=gripper)
+            elif profile == LEFT_ENTRY_WORKSPACE_PROFILE:
                 if name == "arm_left_elbow_flex":
                     if not LEFT_ENTRY_START_MIN_RAW <= seed <= LEFT_ENTRY_START_MAX_RAW:
                         raise RuntimeError("AM1 entry requires its fresh stopped seed in1165..1268")

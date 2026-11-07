@@ -253,12 +253,13 @@ def test_strict_json_rejects_overflow_number():
         strict_json(b'{"value":1e999}')
 
 
-async def ws_attached(session, cluster):
+async def ws_attached(session, cluster, *, compress=0):
     result = (await post(session, cluster, "/api/attach", {}))[1]
     ws = await session.ws_connect(
         cluster.url.replace("https:", "wss:") + "/api/ws",
         ssl=session._test_tls,
         headers={"Origin": cluster.url},
+        compress=compress,
     )
     await ws.send_json({"ticket": result["ticket"]})
     current = await ws.receive_json(timeout=2)
@@ -862,7 +863,8 @@ def test_ticket_single_use_expiry_and_no_output_before_verification(cluster):
     asyncio.run(scenario())
 
 
-def test_wss_stop_has_reserved_admission_during_delayed_input_reply(cluster):
+@pytest.mark.parametrize("compress", [0, 15])
+def test_wss_stop_has_reserved_admission_during_delayed_input_reply(cluster, compress):
     # Sequential receive/dispatch places Stop behind a prior input's slow reply.
     async def scenario():
         a = await enrolled(cluster)
@@ -881,7 +883,7 @@ def test_wss_stop_has_reserved_admission_during_delayed_input_reply(cluster):
                     },
                 )
             )[1]
-            ws, state = await ws_attached(a, cluster)
+            ws, state = await ws_attached(a, cluster, compress=compress)
             connection = await ws_command(ws, {"op": "connect", "run_id": started["run_id"]})
             ids = {
                 "run_id": started["run_id"],
@@ -1137,7 +1139,17 @@ def test_private_state_refuses_nonempty_unrelated_directory(tmp_path):
     assert preserved.read_text() == "unrelated state"
 
 
-def test_wss_input_diagnostic_span_survives_real_ipc_and_tls(cluster, monkeypatch):
+@pytest.mark.parametrize("compress", [0, 15])
+def test_wss_input_diagnostic_span_survives_real_ipc_and_tls(cluster, monkeypatch, compress):
+    def required_marks(marks):
+        optional = {"core_checkpoint_started", "core_deferred_checkpoint_started"} & set(marks)
+        assert len(optional) <= 1
+        for key in optional:
+            before, after = (("core_locked", "core_tick_completed") if key == "core_checkpoint_started"
+                             else ("core_tick_completed", "core_returned"))
+            assert type(marks[key]) is float and marks[before] <= marks[key] <= marks[after]
+        return set(marks) - optional
+
     async def scenario():
         a = await enrolled(cluster)
         ws = None
@@ -1148,7 +1160,7 @@ def test_wss_input_diagnostic_span_survives_real_ipc_and_tls(cluster, monkeypatc
             run = (await post(a, cluster, "/api/start", {
                 "operation_id": oid(), "recipe": "fake-interactive",
                 "controller_generation": claim["controller_generation"]}))[1]
-            ws, state = await ws_attached(a, cluster)
+            ws, state = await ws_attached(a, cluster, compress=compress)
             connected = await ws_command(ws, {"op": "connect", "run_id": run["run_id"]})
             ids = {"run_id": run["run_id"], "service_incarnation": state["service_incarnation"],
                    "controller_generation": claim["controller_generation"],
@@ -1162,13 +1174,13 @@ def test_wss_input_diagnostic_span_survives_real_ipc_and_tls(cluster, monkeypatc
             grant_marks = ("gateway_received", "gateway_dispatch", "gateway_ipc_started", "core_entered",
                            "core_locked", "core_tick_completed", "core_returned", "gateway_ipc_completed",
                            "reply_ready", "reply_send_preparation_started")
-            assert set(grant["diagnostic_timing"]) == {"version", "clock", *grant_marks}
+            assert required_marks(grant["diagnostic_timing"]) == {"version", "clock", *grant_marks}
             assert [grant["diagnostic_timing"][key] for key in grant_marks] == sorted(
                 grant["diagnostic_timing"][key] for key in grant_marks)
             assert grant["expires"] - grant["issued"] == .25
             assert len(json.dumps(grant["diagnostic_timing"])) <= 512 and len(json.dumps(grant)) <= 1024
             assert refused_grant["effect_admitted"] is False
-            assert set(refused_grant["diagnostic_timing"]) == set(grant["diagnostic_timing"])
+            assert required_marks(refused_grant["diagnostic_timing"]) == required_marks(grant["diagnostic_timing"])
             foreign_grant = await ws_command(ws, {"op": "grant", **dict(ids, connection_generation=oid())})
             assert foreign_grant["accepted"] is False and foreign_grant["effect_admitted"] is False
             assert set(foreign_grant["diagnostic_timing"]) == {
@@ -1179,14 +1191,14 @@ def test_wss_input_diagnostic_span_survives_real_ipc_and_tls(cluster, monkeypatc
             span = result["diagnostic_timing"]
             ordered = ("gateway_received", "gateway_dispatch", "gateway_ipc_started", "core_entered",
                        "core_locked", "core_tick_completed", "core_returned", "gateway_ipc_completed")
-            assert set(span) == {"version", "clock", *ordered}
+            assert required_marks(span) == {"version", "clock", *ordered}
             assert span["version"] == 1 and span["clock"] == "pi-monotonic"
             assert all(type(span[key]) is float and span[key] >= 0 for key in ordered)
             assert [span[key] for key in ordered] == sorted(span[key] for key in ordered)
             assert len(json.dumps(span)) <= 512 and "target" not in span and "device" not in span
             stale = await ws_command(ws, {"op": "input", **ids, "grant_id": oid(), "seq": 2, "target": [.3]})
             assert not stale["accepted"] and stale["reason"] == "expired grant"
-            assert set(stale["diagnostic_timing"]) == set(span)
+            assert required_marks(stale["diagnostic_timing"]) == required_marks(span)
             assert len(json.dumps(result)) <= 1024
             # Exercise the actual PC result consumer with the real refused reply.
             from types import SimpleNamespace
@@ -1263,6 +1275,8 @@ def test_input_diagnostic_websocket_receive_precedes_auth_parse_and_rejects_clie
                 queued.append(value)
             async def close(self):
                 return None
+            def _trace_close(self, *args, **kwargs):
+                return None
         peer = Peer(None, "owner", "private-test-token")
         def resolve(token):
             resolved.append(clock[0])
@@ -1286,7 +1300,7 @@ def test_input_diagnostic_websocket_receive_precedes_auth_parse_and_rejects_clie
         async def current():
             return {}
         gateway.current = current
-        monkeypatch.setattr(service.web, "WebSocketResponse", lambda **kwargs: Socket())
+        monkeypatch.setattr(service, "ReportingWebSocketResponse", lambda **kwargs: Socket())
         monkeypatch.setattr(service, "Peer", lambda *args: peer)
         monkeypatch.setattr(service, "strict_json", parse)
         monkeypatch.setattr(service, "close_socket", close)
@@ -1608,7 +1622,7 @@ def test_peer_queue_intrinsically_oversized_initial_snapshot_rejects_and_closes(
             created.append(peer)
             return peer
         monkeypatch.setattr(service, "Peer", create_peer)
-        monkeypatch.setattr(service.web, "WebSocketResponse", lambda **_: ws)
+        monkeypatch.setattr(service, "ReportingWebSocketResponse", lambda **_: ws)
         class Request(dict):
             pass
         request = Request(token="private-test-token", device={"id": "owner"})
@@ -2008,7 +2022,7 @@ def test_bootstrap_grace_bounded_existing_journal_tags_never_change_close(monkey
             if logger_fails:raise RuntimeError("journal unavailable")
         gateway=service.Gateway.__new__(service.Gateway)
         gateway.pending_ws,gateway.peers=0,set()
-        monkeypatch.setattr(service.web,"WebSocketResponse",lambda **_:ws)
+        monkeypatch.setattr(service,"ReportingWebSocketResponse",lambda **_:ws)
         class Request(dict):pass
         request=Request();request.app=SimpleNamespace(logger=SimpleNamespace(warning=warning))
         request.transport=SimpleNamespace(set_write_buffer_limits=lambda **_:None,
@@ -2143,7 +2157,7 @@ def test_wss_close_trace_receive_end_correlates_only_initial_public_revision(mon
             ws.release.set()
             sockets.append(ws)
             gateway.tickets = {service.digest(sentinel): ("PRIVATE-DEVICE", time.monotonic()+10)}
-            monkeypatch.setattr(service.web, "WebSocketResponse", lambda **_: ws)
+            monkeypatch.setattr(service, "ReportingWebSocketResponse", lambda **_: ws)
             class Request(dict):
                 pass
             request = Request(token=sentinel, device={"id": "PRIVATE-DEVICE"})
@@ -2193,4 +2207,185 @@ def test_wss_close_trace_existing_close_abort_keeps_sender_first_cause():
             assert all(len(row) <= 512 and "PRIVATE" not in row for row in calls)
         finally:
             await peer.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("compress", [0, 9, 15])
+def test_wss_deflate_negotiates_stateless_contexts_and_preserves_ack(cluster, compress):
+    async def scenario():
+        session = await enrolled(cluster)
+        ws = None
+        try:
+            attached = (await post(session, cluster, "/api/attach", {}))[1]
+            ws = await session.ws_connect(
+                cluster.url.replace("https:", "wss:") + "/api/ws",
+                ssl=session._test_tls, headers={"Origin": cluster.url}, compress=compress,
+                max_msg_size=65536,
+            )
+            extension = ws._response.headers.get("Sec-WebSocket-Extensions", "")
+            if compress:
+                assert ws.compress == 15, "offered standard compression was not negotiated"
+                if compress < 15:
+                    assert "server_max_window_bits=" + str(compress) in extension
+                assert "server_no_context_takeover" in extension
+                assert "client_no_context_takeover" in extension
+                assert ws.client_notakeover and ws._writer.notakeover
+            else:
+                assert not ws.compress and not extension
+            await ws.send_json({"ticket": attached["ticket"]})
+            initial = await ws.receive_json(timeout=2)
+            assert initial["kind"] == "snapshot" and initial["snapshot"] == attached["snapshot"]
+            # Negotiation cannot stand in for the original public-snapshot ACK.
+            refused = await ws_command(ws, {"op": "claim"})
+            assert refused["accepted"] is False and refused["effect_admitted"] is False
+            await ws.send_json({"ack": initial["revision"]})
+            claimed = await ws_command(ws, {"op": "claim"})
+            assert claimed["accepted"] is True
+            async with asyncio.timeout(2):
+                while True:
+                    repeated = await ws.receive_json()
+                    if repeated.get("kind") == "snapshot":
+                        assert repeated["snapshot"]["controller"]["device_id"] == session._test_device
+                        break
+        finally:
+            if ws is not None:
+                await ws.close()
+            await session.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("nonreading", [False, True])
+def test_wss_deflate_full_status_is_exact_with_existing_writer_bound(cluster, tmp_path, monkeypatch, nonreading):
+    from types import SimpleNamespace
+
+    from aiohttp import web
+
+    from tools.am1_session_ipc import encode
+    from tools.am1_session_service import Gateway
+
+    async def scenario():
+        # Only this gateway owns the fake owner's reporting/auth boundary.
+        # A second publisher with a different auth store would correctly revoke it.
+        cluster.stop("gateway")
+        gateway = Gateway(cluster.owner_dir, tmp_path / "deflate-status-auth")
+        expected = await gateway.current()
+        expected["bounded_status_fixture"] = ""
+        envelope = {"kind": "snapshot", "snapshot": expected}
+        # Retain the complete decoded message at the observed idle-envelope size.
+        # Deterministic higher-entropy text still exercises a bounded status,
+        # while a paused compressed reader must eventually reach real pressure.
+        import random
+        import string
+
+        expected["bounded_status_fixture"] = "".join(random.Random(0).choices(
+            string.ascii_letters + string.digits, k=39037 - len(encode(envelope))))
+        assert len(encode(envelope)) == 39037
+
+        async def current():
+            return expected
+
+        monkeypatch.setattr(gateway, "current", current)
+        runner = web.AppRunner(gateway.app)
+        server_tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_tls.load_cert_chain(cluster.cert, cluster.key)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0, ssl_context=server_tls)
+        await site.start()
+        gateway.origin = "https://127.0.0.1:" + str(site._server.sockets[0].getsockname()[1])
+        local = SimpleNamespace(url=gateway.origin, cert=cluster.cert, pair=gateway.auth.pair)
+        session = await enrolled(local)
+        ws = None
+        try:
+            ws, initial = await ws_attached(session, local, compress=15)
+            assert ws.compress == 15 and initial == expected
+            assert len(gateway.peers) == 1
+            peer = next(iter(gateway.peers))
+            assert peer.ws._writer._limit == 4096 and peer.ws._writer.notakeover
+            wire_messages = []
+            write_frame = peer.ws._writer._write_websocket_frame
+
+            def observed_frame(payload, opcode, rsv):
+                if opcode == WSMsgType.TEXT:
+                    wire_messages.append((payload, rsv))
+                return write_frame(payload, opcode, rsv)
+
+            monkeypatch.setattr(peer.ws._writer, "_write_websocket_frame", observed_frame)
+            for _ in range(3):
+                value = await ws.receive_json(timeout=2)
+                assert value["kind"] == "snapshot" and value["snapshot"] == expected
+            result = await ws_command(ws, {"op": "claim"})
+            assert result["accepted"] is True
+            assert peer.bytes + peer.inflight <= 65536
+            if nonreading:
+                started = (await post(session, local, "/api/start", {
+                    "operation_id": oid(), "recipe": "fake-finite",
+                    "controller_generation": result["controller_generation"],
+                }))[1]
+                assert started["accepted"], started
+                before = (await gateway.ipc.request({"op": "snapshot"}, "gateway-view"))["snapshot"]
+                transport = ws._response.connection.transport
+                transport.pause_reading()
+                raw_transport = transport._ssl_protocol._transport
+                raw_transport.pause_reading()
+                async with asyncio.timeout(4):
+                    while not peer.closed:
+                        assert peer.bytes + peer.inflight <= 65536
+                        await asyncio.sleep(.01)
+                cause = peer.close_diagnostic
+                assert cause["origin"] == "sender" and cause["reason"] == "send_timeout"
+                assert .5 <= cause["send_elapsed_s"] < .8
+                async with asyncio.timeout(1.3):
+                    while not peer.ws._writer.transport.is_closing():
+                        await asyncio.sleep(.01)
+                current = (await gateway.ipc.request({"op": "snapshot"}, "gateway-view"))["snapshot"]
+                assert current["run"]["progress_s"] > before["run"]["progress_s"] + .4
+                began = time.monotonic()
+                stopped = (await post(session, local, "/api/stop", {
+                    "run_id": started["run_id"], "operation_id": oid(),
+                }))[1]
+                assert stopped["accepted"] and time.monotonic() - began < .5
+                transport.resume_reading()
+                raw_transport.resume_reading()
+            # Decode each captured library-produced frame with a fresh context.
+            # Later messages must never require an earlier frame's dictionary.
+            import zlib
+
+            assert len(wire_messages) >= 3
+            for wire, rsv in wire_messages:
+                assert rsv == 0x40
+                decoder = zlib.decompressobj(wbits=-15)
+                restored = json.loads(decoder.decompress(wire + b"\x00\x00\xff\xff"))
+                if restored.get("kind") == "snapshot":
+                    assert restored["snapshot"] == expected and len(wire) < len(encode(restored))
+        finally:
+            if ws is not None:
+                await ws.close()
+            await session.close()
+            await runner.cleanup()
+    asyncio.run(scenario())
+
+
+def test_wss_deflate_limits_decoded_control_before_dispatch(cluster):
+    from tools.am1_session_ipc import CONTROL_LIMIT
+
+    async def scenario():
+        session = await enrolled(cluster)
+        ws = None
+        try:
+            ws, before = await ws_attached(session, cluster, compress=15)
+            assert ws.compress == 15
+            await ws.send_json({"id": "oversized", "command": {"op": "claim", "padding": "x" * CONTROL_LIMIT}})
+            async with asyncio.timeout(2):
+                while True:
+                    message = await ws.receive()
+                    if message.type != WSMsgType.TEXT:
+                        assert message.type in (WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR)
+                        break
+                    assert json.loads(message.data).get("id") != "oversized"
+            assert before["controller"] is None
+            assert (await snapshot(session, cluster))["controller"] is None
+        finally:
+            if ws is not None:
+                await ws.close()
+            await session.close()
     asyncio.run(scenario())

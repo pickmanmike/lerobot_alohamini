@@ -231,6 +231,243 @@ def test_virtual_intent_reader_stamps_friendly_input_and_keeps_only_latest_comma
     reader.close()
 
 
+def test_ordinary_control_reader_keeps_pause_barrier_ahead_of_later_movement():
+    m, now = adapter(), [10.]
+    reader = m.VirtualIntentReader("interactive", clock=lambda: now[0], allow_controls=True)
+    reader.receive_line("move 1 4 right_elbow_flex=1\n")
+    reader.receive_line("pause 4\n")
+    reader.receive_line("move 1 4 right_elbow_flex=2\n")
+    assert reader.take()["op"] == "pause"
+    assert reader.control_generation == reader.taken_control_generation == 1
+    floor = reader.discard_motion()
+    assert floor == 3 and reader.take() is None
+    now[0] = 10.1
+    reader.receive_line("resume 4\n")
+    old_resume = reader.take()
+    generation = reader.taken_control_generation
+    reader.receive_line("pause 4\n")
+    assert old_resume["op"] == "resume" and generation < reader.control_generation
+    assert reader.take()["op"] == "pause"
+
+
+def test_ordinary_control_reader_finish_and_bounded_queue_cannot_be_overwritten():
+    m = adapter()
+    reader = m.VirtualIntentReader("interactive", clock=lambda: 10., allow_controls=True)
+    reader.receive_line("pause 4\n")
+    reader.receive_line("finish\n")
+    reader.receive_line("move 1 4 right_elbow_flex=2\n")
+    assert reader.finished
+    assert [reader.take()["op"], reader.take()["op"]] == ["pause", "finish"]
+    assert reader.take() is None
+    another = m.VirtualIntentReader("interactive", clock=lambda: 10., allow_controls=True)
+    for _ in range(8):
+        another.receive_line("pause 4\n")
+    with pytest.raises(ValueError, match="bounded"):
+        another.receive_line("resume 4\n")
+    assert [another.take()["op"] for _ in range(8)] == ["pause"] * 8
+
+
+def test_ordinary_control_expired_finish_requires_a_new_acquisition_after_rejection():
+    m, now = adapter(), [10.]
+    reader = m.VirtualIntentReader("interactive", clock=lambda: now[0], allow_controls=True)
+    reader.receive_line("finish")
+    old = reader.take()
+    now[0] = 12.
+    reader.receive_line("move 1 2 right_elbow_flex=2")
+    assert reader.take() is None  # Pending Finish cannot be silently countermanded.
+    reader.discard_rejected_finish(old["seq"])
+    reader.receive_line("finish")
+    fresh = reader.take()
+    assert fresh["op"] == "finish" and fresh["seq"] > old["seq"]
+    assert fresh["issued_at_perf_counter_s"] == 12. and fresh["expires_at_perf_counter_s"] == 13.
+
+
+@pytest.mark.parametrize("op", ["move", "resume", "pause", "finish"])
+def test_ordinary_control_receive_parse_race_enforces_acquisition_epoch_and_preserves_barriers(op):
+    import threading
+
+    m = adapter()
+    acquired, release = threading.Event(), threading.Event()
+    main = threading.get_ident()
+    def clock():
+        if threading.get_ident() != main:
+            acquired.set()
+            assert release.wait(2.)
+            return 10.
+        return 12.
+    reader = m.VirtualIntentReader("interactive", clock=clock, allow_controls=True)
+    line = "move 1 10 right_elbow_flex=2" if op == "move" else "finish" if op == "finish" else op+" 10"
+    worker = threading.Thread(target=reader.receive_line, args=(line,))
+    worker.start()
+    try:
+        assert acquired.wait(2.)
+        reader.discard_motion()  # Actual accepted Resume/HOLD acquisition boundary.
+    finally:
+        release.set(); worker.join(2.)
+    assert not worker.is_alive()
+    result = reader.take()
+    assert (result is None) is (op in {"move", "resume"})
+    if result is not None: assert result["op"] == op
+
+
+@pytest.mark.parametrize("op", ["move", "hold", "return", "resume", "pause", "finish"])
+def test_ordinary_control_jsonl_old_issued_time_cannot_become_fresh_after_resume_receipt(op):
+    import json
+
+    m = adapter()
+    reader = m.VirtualIntentReader("jsonl", clock=lambda: 12., allow_controls=True)
+    reader.discard_motion()
+    value = dict(seq=1, op=op, intent_channel=reader.intent_channel,
+                 issued_at_perf_counter_s=10., expires_at_perf_counter_s=20.)
+    if op in {"move", "return"}: value["transition_seconds"] = 1.
+    if op == "move": value["targets"] = {"arm_right_elbow_flex.pos": 2.}
+    reader.receive_line(json.dumps(value))
+    result = reader.take()
+    assert (result is None) is (op not in {"pause", "finish"})
+    if result is not None: assert result == value
+
+
+@pytest.mark.parametrize("changed", ["extra", "channel", "lifetime", "boolean_seq"])
+def test_ordinary_control_jsonl_uses_closed_original_acquisition_envelope(changed):
+    import json
+
+    m = adapter()
+    reader = m.VirtualIntentReader("jsonl", clock=lambda: 10., allow_controls=True)
+    value = dict(seq=1, op="pause", intent_channel=reader.intent_channel,
+                 issued_at_perf_counter_s=10., expires_at_perf_counter_s=14.)
+    if changed == "extra": value["targets"] = {}
+    elif changed == "channel": value["intent_channel"] = str(uuid4())
+    elif changed == "lifetime": value["expires_at_perf_counter_s"] = float("inf")
+    else: value["seq"] = True
+    with pytest.raises(ValueError):
+        reader.receive_line(json.dumps(value))
+    assert reader.take() is None
+
+
+def ordinary_paused_control_client():
+    import copy
+    import types
+    m = adapter()
+    client, _ = held_command119_client()
+    state = client.snapshot
+    client.fixture_state = state
+    state["run"].update(recovery_episodes=0, bench_continuity=False, operation_id=str(uuid4()))
+    state["events"][-1].update(kind="pause", at=100.2)
+    state["evidence"]["measured_body"] = dict(m.ZERO_BODY)
+    client.connection, client.sequence, client.transport_error = str(uuid4()), 0, None
+    client.ws, client.reader = None, None
+    commands = []
+    def identities():
+        return dict(run_id=state["run"]["run_id"], service_incarnation=state["service_incarnation"],
+                    host_incarnation=state["run"]["backend_incarnation"], controller_generation=client.generation,
+                    connection_generation=client.connection, intent_revision=state["run"]["intent_revision"])
+    def change(kind=None, active=False):
+        run, evidence, live = state["run"], state["evidence"], state["run"]["live_input"]
+        run["remaining_s"] -= .001
+        run["intent_revision"] += 1
+        run["status"] = "running" if active else "paused"
+        if kind:
+            state["events"].append(dict(kind=kind, at=run["deadline"]-run["remaining_s"],
+                run_id=run["run_id"], service_incarnation=state["service_incarnation"]))
+        revision = run["intent_revision"]
+        live["cursor_intent_revision"] = evidence["acknowledged_intent_revision"] = revision
+        evidence["active_acknowledged"] = active
+        evidence["hold_acknowledged"] = not active
+        evidence["accepted_host_action"].update(intent_revision=revision, state="active" if active else "paused",
+            acquired_at_monotonic_s=run["deadline"]-run["remaining_s"], epoch=revision+1)
+    async def get(path): return {"snapshot": copy.deepcopy(state)}
+    async def post(path, body):
+        commands.append(dict(op=path, **body))
+        assert path == "pause"
+        change("pause")
+        return dict(accepted=True, status="paused", uncertain=False, effect_admitted=False)
+    async def command(value, **kwargs):
+        commands.append(dict(value))
+        if value["op"] == "connect":
+            client.connection = str(uuid4()); change()
+            return dict(connection_generation=client.connection, snapshot=state)
+        if value["op"] == "release_input":
+            return dict(accepted=True, status="released", effect_admitted=False)
+        assert value["op"] == "resume"
+        change("resumed", active=True)
+        return dict(accepted=True, status="running", effect_admitted=True)
+    async def wait(predicate, seconds):
+        assert predicate(), "fixture provides current real-method qualification proof"
+    client.identities, client.get, client.post, client.command, client.wait = identities, get, post, command, wait
+    client.resume = types.MethodType(m.SessionClient.resume, client)
+    return client, commands, change
+
+
+def test_explicit_pause_reuses_current_hold_then_generic_fresh_resume_without_input():
+    import asyncio
+    m = adapter()
+    client, commands, _ = ordinary_paused_control_client()
+    guard = m.SameRunRecovery(client, lambda value: None)
+    original = guard.original.copy()
+    async def check():
+        proof = await guard.finish_owned(bench=False, wall_deadline=m.time.monotonic()+2,
+            renewal_check=lambda: None, deliberate=True, observed_pause=client.snapshot["events"][-1])
+        assert proof["native_held_qualified"] and proof["pause_operation_id"] is None
+        await guard.resume_paused(proof, wall_deadline=m.time.monotonic()+2, renewal_check=lambda: None,
+                                  control_check=lambda: None)
+    asyncio.run(check())
+    assert [value["op"] for value in commands] == ["connect", "release_input", "resume"]
+    assert client.snapshot["run"]["status"] == "running" and guard.original == original
+
+
+def test_deliberate_pause_unknown_receipt_replays_only_same_operation_and_keeps_hold():
+    import asyncio
+    m = adapter()
+    client, commands, _ = ordinary_paused_control_client()
+    guard = m.SameRunRecovery(client, lambda value: None)
+    post, bodies, accepted = client.post, [], []
+    async def lost(path, body):
+        bodies.append(dict(body))
+        if not accepted:
+            accepted.append(await post(path, body))
+            from tools.am1_session_service import unknown_outcome
+            raise m.HTTPOutcomeError(503, unknown_outcome())
+        assert body == bodies[0]
+        return accepted[0]
+    client.post = lost
+    async def check():
+        result = await guard.finish_owned(bench=False, deliberate=True,
+            wall_deadline=m.time.monotonic()+2, renewal_check=lambda: None)
+        assert result["pause_operation_id"] == bodies[0]["operation_id"]
+        assert result["native_held_qualified"] is True
+    asyncio.run(check())
+    assert len(bodies) == 2 and bodies[0] == bodies[1]
+    assert [value["op"] for value in commands] == ["pause"]
+
+
+@pytest.mark.parametrize("fault", ["new_pause", "stop", "reboot", "takeover", "local_barrier"])
+def test_explicit_resume_keeps_newer_pause_stop_and_authority_changes(fault):
+    import asyncio
+    m = adapter()
+    client, commands, change = ordinary_paused_control_client()
+    guard = m.SameRunRecovery(client, lambda value: None)
+    async def check():
+        proof = await guard.finish_owned(bench=False, wall_deadline=m.time.monotonic()+2,
+            renewal_check=lambda: None, deliberate=True, observed_pause=client.snapshot["events"][-1])
+        if fault == "new_pause": change("pause")
+        elif fault == "stop": client.fixture_state["run"]["status"] = "stopped"
+        elif fault == "reboot": client.fixture_state["service_incarnation"] = str(uuid4())
+        elif fault == "takeover": client.fixture_state["controller"]["controller_generation"] = str(uuid4())
+        def control():
+            if fault == "local_barrier": raise RuntimeError("newer local Pause")
+        with pytest.raises(RuntimeError):
+            await guard.resume_paused(proof, wall_deadline=m.time.monotonic()+2,
+                                      renewal_check=lambda: None, control_check=control)
+    asyncio.run(check())
+    assert not commands
+
+
+@pytest.mark.parametrize("ending", ["control_cycle", "control_finish", "control_expired_resume", "control_new_pause", "control_lost_resume", "control_finish_race"])
+def test_ordinary_runner_explicit_pause_requires_new_resume_and_movement(tmp_path, monkeypatch, ending):
+    test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
+        tmp_path, monkeypatch, "normal_program_finish_ordinary_arms_intents_" + ending)
+
+
 @pytest.mark.parametrize("line", ["move 1 2 body.x=1\n", "move nan 2 left_gripper=4\n",
                                  "hold inf\n", "{" * 4097], ids=["body", "nan", "infinite", "oversized"])
 def test_virtual_intent_reader_rejects_invalid_or_oversized_input_without_fresh_sample(line):
@@ -1632,6 +1869,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
     cycle_run = failure in {"normal_program_finish_left_reach_cycles", "normal_program_finish_left_reach_closing_cycles"}
     ordinary_arms = isinstance(failure, str) and failure.startswith("normal_program_finish_ordinary_arms")
     changing_intents = ordinary_arms and "_intents" in failure
+    control_case = changing_intents and failure.endswith(("control_cycle", "control_finish", "control_expired_resume", "control_new_pause", "control_lost_resume", "control_finish_race"))
     entry_case = changing_intents and "_intents_entry" in failure
     finish_recovery = changing_intents and failure.endswith("expired_finish_recovery")
     pending_recovery_finish, recovery_reader = [], []
@@ -2107,7 +2345,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                             host_incarnation="host", intent_revision=self.snapshot["run"]["intent_revision"])
             return {"run_id": self.snapshot["run"]["run_id"] if foreign_boundary else owned_id}
 
-        async def resume(self, *, check=None, refusal_record=None):
+        async def resume(self, *, check=None, refusal_record=None, qualification_ceiling=None):
             assert self.snapshot["run"]["run_id"] == owned_id
             if failure in {"bench_renewal_during_resume", "bench_renewal_attach_ceiling"} and self.resumes == 0:
                 self.resumes += 1
@@ -2157,6 +2395,13 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 ]
                 self.connection = str(uuid4())
                 self.sequence = 0
+                if control_case:
+                    self.snapshot["events"] = [{"kind": "resumed", "at": 2., "run_id": owned_id, "service_incarnation": "service"}]
+                    self.snapshot["evidence"]["active_acknowledged"] = True
+                    if failure.endswith("control_lost_resume") and self.resumes == 2:
+                        raise TimeoutError("original explicit Resume outcome lost after admission")
+                    if failure.endswith("control_finish_race") and self.resumes == 2:
+                        recovery_reader[-1].finished = True
 
         async def command(self, payload, *, check=None):
             if check is not None:
@@ -2609,15 +2854,51 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                         self.delivered = set()
                         self.waits = 0
                         self.intent_channel = options["intent_channel"]
-                        if finish_recovery:
+                        if control_case:
+                            self.control_generation = self.taken_control_generation = self.sequence = self.revision = 0
+                            self.discards = 0
+                        if finish_recovery or control_case:
                             recovery_reader.append(self)
                     def start(self):
                         assert not instances, "stdin acquisition must begin before ownership/cold startup"
                     def close(self):
                         pass
+                    def discard_motion(self):
+                        self.discards += 1
+                        self.revision += 1
+                        return self.sequence
                     def take(self):
                         session = instances[0]
                         count = len(session.inputs)
+                        if control_case:
+                            if not self.delivered: name, op = "first", "move"
+                            elif count >= 3 and "pause" not in self.delivered: name, op = "pause", "pause"
+                            elif self.discards and "resume" not in self.delivered:
+                                name, op = "resume", "finish" if failure.endswith("control_finish") else "resume"
+                            elif failure.endswith("control_new_pause") and "resume" in self.delivered and "second_pause" not in self.delivered:
+                                name, op = "second_pause", "pause"
+                            elif failure.endswith(("control_expired_resume", "control_lost_resume", "control_new_pause", "control_finish_race")) and "resume" in self.delivered:
+                                if "finish" in self.delivered: return None
+                                name, op = "finish", "finish"
+                            elif session.resumes >= 2 and "new_move" not in self.delivered: name, op = "new_move", "move"
+                            elif count >= 6 and "finish" not in self.delivered: name, op = "finish", "finish"
+                            else: return None
+                            self.delivered.add(name)
+                            self.sequence += 1
+                            self.revision += 1
+                            self.taken_revision = self.revision
+                            if op == "pause": self.control_generation += 1
+                            self.taken_control_generation = self.control_generation
+                            command = dict(seq=self.sequence, op=op, intent_channel=self.intent_channel,
+                                issued_at_perf_counter_s=source_clock[0], expires_at_perf_counter_s=source_clock[0]+5.)
+                            if op == "move":
+                                command.update(transition_seconds=.2,
+                                    targets={"arm_left_gripper.pos" if name == "first" else "arm_right_gripper.pos": 4. if name == "first" else 6.})
+                            if name == "resume" and failure.endswith("control_new_pause"):
+                                self.control_generation += 1  # A newer acquired Pause fences this older Resume.
+                            if name == "resume" and failure.endswith("control_expired_resume"):
+                                source_clock[0] += 6.
+                            return command
                         if entry_case:
                             if failure.endswith("wall_cap"):
                                 pc_clock[0] += 20.
@@ -2790,7 +3071,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 assert session.starts == 1 and session.resumes == 0 and not session.inputs
                 assert session.stops == [owned_id]
                 return
-            if changing_intents and failure.endswith("pause"):
+            if changing_intents and failure.endswith("pause") and not control_case:
                 with pytest.raises(RuntimeError, match="held|superseded|pause"):
                     asyncio.run(asyncio.wait_for(m.run(args), 10))
                 session = instances[0]
@@ -2807,6 +3088,21 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
             session = instances[0]
             records = [json.loads(line) for line in (tmp_path / "evidence/frames.jsonl").read_text().splitlines()]
             start = next(row for row in records if row["event"] == "start_requested")
+            if control_case:
+                frames = [row for row in records if row["event"] == "leader_frame"]
+                assert summary["finish_qualified"] and summary["native_held_qualified"]
+                assert summary["original_native_deadline"] == 301.
+                cycle = failure.endswith("control_cycle")
+                assert len(frames) == (6 if cycle else 3)
+                assert session.resumes == (2 if cycle or failure.endswith(("control_lost_resume", "control_finish_race")) else 1)
+                assert len(session.pauses) == (3 if failure.endswith(("control_lost_resume", "control_new_pause", "control_finish_race")) else 2)
+                assert session.stops == [owned_id]
+                assert [row["event"] for row in records if row["event"] in {"virtual_control_paused", "virtual_control_resumed"}] == (
+                    ["virtual_control_paused", "virtual_control_resumed"] if cycle else
+                    ["virtual_control_paused"] * (2 if failure.endswith(("control_lost_resume", "control_new_pause", "control_finish_race")) else 1))
+                assert all(row["virtual_intent"]["seq"] in {1, 4} for row in frames)
+                assert all(row["frame"]["body"] == m.ZERO_BODY for row in frames)
+                return
             if entry_case:
                 frames = [row for row in records if row["event"] == "leader_frame"]
                 assert summary["finish_qualified"] and summary["native_held_qualified"]
@@ -3968,7 +4264,7 @@ def test_original_recovery_ceiling_includes_authenticated_read_time_without_rean
 
 
 @pytest.mark.parametrize("cause", ["grant_native_renewal_before", "grant_native_renewal_pause", "grant_native_renewal_stop", "grant_native_renewal_takeover", "grant_native_renewal_deadline", "grant_native_renewal_descriptor", "initial_view_refusal", "initial_view_refusal_pause", "initial_connect_loss_pre", "initial_connect_loss_post", "initial_connect_loss_late", "initial_connect_loss_late_pause", "initial_connect_loss_contract", "initial_connect_loss_qualified_pause", "initial_connect_loss_bound_pause", "feedback", "view", "server_connection_replaced", "connect_loss_pre", "connect_loss_post", "connect_attach_loss_pre", "connect_attach_loss_post", "release_loss_pre", "release_loss_post", "release_connection_loss", "resume_view_pause", "resume_view_twice", "resume_view_refusal", "resume_view_refused_twice", "resume_pong_pause", "resume_reporting_pause", "resume_reporting_renewal", "grant_loss_pre", "grant_loss_post", "grant_connection_loss", "grant_unknown_receipt", "ordinary_input_unknown_pre", "ordinary_input_unknown_post", "ordinary_input_unknown_transport", "grant_view_reconnect", "grant_view_switch", "connect_view_reconnect", "release_view_reconnect", "qualification_episode_pending", "qualification_episode_cleared", "qualification_same_episode", "resume_result_loss_pre", "resume_result_loss_post", "resume_result_loss_native", "resume_result_loss_pending", "held_qualification_loss", "resume_alignment_refusal", "resume_alignment_refused_twice", "runner_initial_cursor_pending", "resume_reply_timeout_pre", "resume_reply_timeout_post", "resume_reply_timeout_alignment", "resume_reply_timeout_alignment_persistent", "acquisition_input_pause", "receipt_ack_starvation", "ack_never_returns", "ack_close_cancel", "transport_blackout_hb1", "transport_blackout_hb2", "transport_blackout_long", "initial_ack_timely", "initial_ack_missing", "connect_receipt_fast", "connect_receipt_delayed", "connect_receipt_missing", "connect_receipt_late", "connect_receipt_caller_ceiling", "connect_receipt_input", "connect_receipt_grant", "renew_receipt_cost", "renew_receipt_cost_expired", "bench_reacquire", "bench_reacquire_receipt_lost", "bench_reacquire_receipt_cancelled", "bench_input_receipt_unknown_native", "bench_input_receipt_unknown_pause", "grant_close_timeout", "grant_close_timeout_pause", "grant_close_timeout_takeover", "grant_close_timeout_cancel", "resume_send_pre", "resume_send_post", "resume_send_transport", "resume_send_pause", "resume_send_takeover", "resume_send_stop", "resume_send_cancel", "resume_send_budget", "resume_send_reboot", "bench_finish_hold", "bench_finish_no_ack", "bench_finish_stale_revision", "bench_finish_body_nonzero", "bench_finish_fault", "bench_finish_external_pause", "bench_finish_stop", "bench_finish_takeover", "bench_finish_reboot", "bench_finish_cancel", "bench_finish_pause_unknown", "bench_finish_budget", "bench_finish_native_ceiling", "bench_finish_strict", "normal_finish_hold", "normal_finish_budget_post_create", "normal_finish_budget_get_create", "normal_finish_unknown_budget_create", "normal_finish_unknown_pre", "normal_finish_unknown_post", "normal_finish_unknown_twice", "normal_finish_unknown_wrong_status", "normal_finish_unknown_wrong_shape", "normal_finish_unknown_wrong_type", "normal_finish_unknown_refused", "normal_finish_unknown_new_pause", "normal_finish_unknown_new_stop", "normal_finish_unknown_new_owner", "normal_finish_unknown_new_service", "normal_finish_unknown_cancel", "normal_finish_unknown_view_lost", "normal_finish_unknown_ceiling", "normal_finish_no_ack", "normal_finish_stale_revision", "normal_finish_body_nonzero", "normal_finish_fault", "normal_finish_external_pause", "normal_finish_stop", "normal_finish_takeover", "normal_finish_reboot", "normal_finish_cancel", "normal_finish_pause_unknown", "normal_finish_budget", "normal_finish_native_ceiling", "normal_finish_view_before", "normal_finish_view_after", "ordinary_lease_dispatch_stall", "ordinary_lease_expired", "ordinary_start_late_first_renewal", "peer_start_normal", "peer_start_bench", "peer_bench_unqualified_view", "peer_bench_local_loss", "peer_normal_unqualified_view", "held_command120_view_later", "held_command120_view_never", "held_command120_local_loss", "view_refusal122_input_before", "view_refusal122_input_after", "view_refusal122_grant_before", "view_refusal122_grant_after", "view_refusal122_never", "view_refusal122_pause", "view_refusal122_stop", "view_refusal122_takeover", "view_refusal122_grant_connect_preflight_before", "view_refusal122_grant_connect_preflight_pending", "view_refusal122_grant_connect_preflight_queue", "view_refusal122_grant_connect_preflight_sent", "view_refusal122_grant_connect_preflight_pause", "view_refusal122_grant_connect_preflight_stop", "view_refusal122_grant_connect_preflight_takeover", "view_refusal122_grant_connect_preflight_reboot", "view_refusal122_grant_connect_preflight_lease", "view_refusal122_grant_connect_preflight_deadline", "view_refusal122_grant_connect_preflight_cancel", "view_refusal130_grant_input_race_before", "view_refusal130_grant_input_race_never", "view_refusal130_grant_input_race_pause", "view_refusal130_grant_input_race_stop", "view_refusal130_grant_input_race_takeover", "view_refusal130_grant_input_race_revision", "view_refusal130_grant_input_race_history", "view_refusal130_grant_input_race_time", "renewal_unknown133_grant_before", "renewal_unknown133_grant_pause", "renewal_unknown133_grant_takeover", "renewal_unknown133_grant_unchanged", "renewal_unknown133_grant_receipt_unknown", "renewal_unknown133_grant_second_read", "renewal_unknown133_grant_stream_before"])
-def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause, initial_unknown=False, initial_ack_attach=False):
+def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(tmp_path, monkeypatch, cause, initial_unknown=False, initial_ack_attach=False, zero_input_retry=None, ordinary_profile=False, ordinary_control=False, inactive_recovery=None, renewal_profile_p=None, reporting_payload=None):
     import asyncio
     import copy
     import json
@@ -3987,6 +4283,14 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
     a.run.update(backend_incarnation=e.host_incarnation, recovery_episodes=0, status="paused")
     a._teleop_view = {"run_id": e.run_id, "qualified_until": 10.5, "role": "chest"}
     healthy, epoch, commands = [True], [0], []
+    renewal_workspace = None
+    if renewal_profile_p is not None:
+        from tests.robots.test_am1_live_phase_coordinator import ordinary_admission
+        renewal_workspace = copy.deepcopy(ordinary_admission()[1]["snapshot"]["run"]["live_input"]["workspace"])
+        a.run.update(ordinary_arm_profile={"profile": m.ORDINARY_AM1_ARMS_PROFILE,
+                                          "right_elbow_p": renewal_profile_p},
+                     bench_continuity=False, accepted_at=8., startup_deadline=188.)
+        e.sample["ack"]["live_input"]["workspace"] = copy.deepcopy(renewal_workspace)
     initial_connect = cause.startswith("initial_connect_loss_")
     initial_view = cause.startswith("initial_view_refusal")
     initial_phase = initial_connect or initial_view or initial_unknown
@@ -4066,6 +4370,14 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 value["pose_aligned"] = False
             if cause == "held_command120_local_loss":
                 value["required_observation"] = False
+        if renewal_workspace is not None:
+            live.update(workspace=copy.deepcopy(renewal_workspace),
+                        reference=copy.deepcopy(renewal_workspace["reference"]),
+                        cursor=copy.deepcopy(renewal_workspace["reference"]),
+                        accepted_target=copy.deepcopy(renewal_workspace["reference"]), body=dict(m.ZERO_BODY))
+            value.update(source="protected-physical-provider",
+                         measured_positions=copy.deepcopy(renewal_workspace["reference"]))
+            value["accepted_host_action"]["accepted_action"] = {"mode": "raw_goal_hold", "body_velocity": 0.}
         if not cursor_ready[0]:
             for key in ("cursor", "cursor_intent_revision", "cursor_feedback_sequence"):
                 live.pop(key, None)
@@ -4129,6 +4441,28 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
         owner.authority = a
         owner.stopping.set()  # Test explicitly advances the real Core, without any device worker.
         gateway = Gateway(owner.directory, tmp_path / "auth")
+        if cause.startswith("upgrade_attach_post_"):
+            from contextvars import ContextVar
+            in_attach = ContextVar("reporting_attach_fixture", default=False)
+            original_current, attach_snapshot_failures = gateway.current, []
+            @web.middleware
+            async def attach_scope(request, handler):
+                token = in_attach.set(request.path == "/api/attach")
+                try:
+                    return await handler(request)
+                finally:
+                    in_attach.reset(token)
+            gateway.app.middlewares.append(attach_scope)
+            async def current_with_first_attach_loss():
+                if in_attach.get() and not attach_snapshot_failures:
+                    attach_snapshot_failures.append(tuple(gateway.tickets))
+                    assert len(gateway.tickets) == 1  # The real route has already created its first ephemeral ticket.
+                    if cause.endswith("stop"):
+                        assert a.handle(dict(op="stop", run_id=a.run["run_id"], operation_id=str(uuid4())),
+                                        enrolled["device_id"])["accepted"]
+                    raise TimeoutError("first attach snapshot owner result unavailable")
+                return await original_current()
+            gateway.current = current_with_first_attach_loss
         enrolled = gateway.auth.enroll(gateway.auth.pair(control=True))
         a.controller["device_id"] = a.connection["device_id"] = enrolled["device_id"]
         if initial_phase:
@@ -4175,6 +4509,691 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     }
                 )
             )
+            if cause == "startup_required_view":
+                from tools.am1_local_observation import LocalObservationMailbox
+                client=m.SessionClient(gateway.origin,cert,storage)
+                a.run.update(status="starting",native_live_at=None,deadline=None,accepted_at=10.,startup_deadline=190.,
+                    ordinary_arm_profile={"profile":"ordinary-am1-arms-v1","right_elbow_p":16})
+                e._lifecycle.update(phase="startup",native_live_at=None,startup_deadline=190.)
+                e.ordinary_arm_profile=copy.deepcopy(a.run["ordinary_arm_profile"])
+                e.observation=LocalObservationMailbox(e.observation.source,clock=a.clock,require_owned_session=True)
+                e.observation.begin(e.run_id,300.)
+                binding=dict(run_id=e.run_id,operation_id=a.run["operation_id"],service_incarnation=a.service_incarnation,
+                    host_incarnation=e.host_incarnation,controller_generation=a.controller["generation"],intent_revision=0,
+                    role="chest",startup_deadline=190.,controller_expires=a.controller["expires"],required=True)
+                a._startup_view_binding=copy.deepcopy(binding)
+                e.configure_startup_view(binding)
+                normal_evidence=e.evidence
+                def startup_evidence():
+                    value=normal_evidence();value["lifecycle"]=copy.deepcopy(e._lifecycle);return value
+                e.evidence=startup_evidence
+                request=e.observation.request
+                view_owner,capture,encode=str(uuid4()),str(uuid4()),str(uuid4())
+                e.observation.publish({**request,"owned_session":e.run_id,"qualified":True,"owner_generation":view_owner,
+                    "capture_generation":capture,"sequence":1,"arrived_at":10.,"decoded_at":10.,"frame_sha256":"f"*64})
+                assert e.startup_view_ready() is False
+                await client.attach()
+                assert client.snapshot["run"]["status"]=="starting" and client.snapshot["run"]["native_live_at"] is None
+                progress=dict(op="view_progress",run_id=e.run_id,role="chest",owner_generation=view_owner,capture_generation=capture,
+                    encode_generation=encode,decoded_frames=1,media_time=.1,source_sequence=1,source_fresh=True,
+                    received_at_monotonic_s=10.,request_received_at_monotonic_s=10.)
+                response=await gateway.ipc.request(progress,"gateway-view")
+                assert response["accepted"], response
+                assert e.startup_view_ready() is True and e.worker is None
+                await client.post("pause",{"run_id":e.run_id,"operation_id":str(uuid4())})
+                current=(await client.get("state"))["snapshot"]
+                assert current["run"]["status"]=="finishing" and current["run"]["native_live_at"] is None
+                assert (await gateway.ipc.request(dict(progress,decoded_frames=2,media_time=.2),"gateway-view"))["accepted"]
+                with pytest.raises(RuntimeError,match="cancelled"):
+                    e.startup_view_ready()
+                assert not any(op in {"grant","input","resume","start"} for op,_ in commands)
+                return
+            if cause.startswith("next_grant_"):
+                mode = cause.removeprefix("next_grant_")
+                client = m.SessionClient(gateway.origin, cert, storage)
+                await client.attach()
+                client.generation, client.connection = ids["controller_generation"], ids["connection_generation"]
+                connected = await client.command(dict(op="connect", **client.identities()))
+                client.connection = connected["connection_generation"]
+                client.snapshot = (await client.get("state"))["snapshot"]
+                await client.command(dict(op="release_input", **client.identities()))
+                client.snapshot = (await client.get("state"))["snapshot"]
+                await client.command(dict(op="resume", **client.identities(),
+                    expected_intent_revision=client.snapshot["run"]["intent_revision"], operation_id=str(uuid4())))
+                now = [10.]
+                a.clock = e.clock = lambda: now[0]
+                a.controller["expires"] = 30.
+                a._teleop_view["qualified_until"] = 30.
+                client.snapshot = (await client.get("state"))["snapshot"]
+                class Input:
+                    kind = "virtual-leaders"
+                    def get_action(self):
+                        return {key.removeprefix("arm_"): 1. for key in KEYS}
+                producer = m.FrameProducer(Input())
+                producer.workspace = workspace()
+                producer.native_cursor = dict(workspace()["reference"])
+                original_call, wire, applied = gateway.call, [], []
+                one_way = .075 if mode == "piggyback150" else .05
+                async def next_grant_delay(command, device):
+                    if command.get("op") not in {"grant", "input"}:
+                        return await original_call(command, device)
+                    wire.append(copy.deepcopy(command))
+                    await asyncio.sleep(one_way);now[0] += one_way
+                    result = await original_call(command, device)
+                    if command["op"] == "grant" and mode == "serial100":
+                        result.pop("next_grant_supported", None)  # Exact old-server capability absence.
+                    if command["op"] == "input" and result.get("accepted") is True:
+                        applied.append(copy.deepcopy(e._live_target))
+                        if mode == "lost":
+                            raise TimeoutError("lost original Input receipt")
+                    await asyncio.sleep(one_way);now[0] += one_way
+                    a.tick()
+                    return result
+                gateway.call = next_grant_delay
+                if mode == "lost":
+                    with pytest.raises(m.CommandRefusedError):
+                        await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="fixed", progress_s=0.)
+                    assert len(applied) == 1 and producer.sequence == 1 and client._next_grant is None
+                    assert [x["op"] for x in wire] == ["grant", "input"]
+                    return
+                first = await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="fixed", progress_s=0.)
+                assert len(applied) == 1 and applied[0]["valid_until_monotonic_s"] == first[0]["expires"]
+                if mode == "serial100":
+                    assert "request_next_grant" not in next(x for x in wire if x["op"] == "input")
+                    try:
+                        assert await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="fixed", progress_s=.1) is None
+                    except m.CommandRefusedError:
+                        pass
+                    assert len(applied) == 1 and a.run["status"] == "paused"
+                elif mode == "piggyback100":
+                    assert first[2].get("next_grant") is not None
+                    assert client._next_grant is not None, {"binding":client._next_grant_binding(), "identity":client.identities(), "result":first[2], "timing":client.last_command_timing}
+                    for progress in (.1, .2):
+                        current = await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="fixed", progress_s=progress)
+                        assert current is not None, {"wire":wire,"status":a.run["status"],"events":a.events,"records":records[-3:]}
+                        assert current[0]["grant_id"] == wire[-1]["grant_id"]
+                    assert len(applied) == 3 and [x["op"] for x in wire] == ["grant", "input", "input", "input"]
+                    assert all(x["request_next_grant"] is True for x in wire if x["op"] == "input")
+                    assert all(x["source"]["grant_received_at_monotonic_s"] <= x["source"]["acquired_at_monotonic_s"] for x in wire if x["op"] == "input")
+                    assert a.run["status"] == "running" and a.run["deadline"] == 309.
+                elif mode == "piggyback150":
+                    assert first[2].get("next_grant") is not None
+                    original_expiry = applied[0]["valid_until_monotonic_s"]
+                    try:
+                        assert await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="fixed", progress_s=.1) is None
+                    except m.CommandRefusedError:
+                        pass
+                    assert len(applied) == 1 and now[0] >= original_expiry and a.run["status"] == "paused"
+                    assert any(x["kind"] == "input_expired" for x in a.events)
+                elif mode == "stop":
+                    await client.post("stop", {"run_id":e.run_id,"operation_id":str(uuid4())})
+                    client.snapshot = (await client.get("state"))["snapshot"]
+                    with pytest.raises(m.CommandRefusedError):
+                        await m.send_leader_sample(client, producer, m.ZERO_BODY, record, phase="fixed", progress_s=.1)
+                    assert len(applied) == 1 and len([op for op, _ in commands if op == "resume"]) == 1
+                return
+            if cause.startswith("upgrade_attach_"):
+                mode = cause.removeprefix("upgrade_attach_")
+                expected_reporting_snapshot = None
+                if mode == "compression":
+                    if reporting_payload is not None:
+                        async def retained_current():
+                            return copy.deepcopy(reporting_payload)
+                        gateway.current = retained_current
+                    expected_reporting_snapshot = await gateway.current()
+                client = m.SessionClient(gateway.origin, cert, storage)
+                client.record = record
+                real_upgrade, real_post = client.http.ws_connect, client.post
+                upgrades, tickets = [], []
+                first = TimeoutError("first reporting HTTP upgrade timeout")
+                original_deadline = a.run["deadline"]
+                async def ticket(path, body):
+                    result = await real_post(path, body)
+                    if path == "attach": tickets.append(result["ticket"])
+                    return result
+                async def upgrade(*args, **kwargs):
+                    upgrades.append(True)
+                    assert client.ws is None
+                    if mode == "refusal":
+                        return await real_upgrade(*args, **dict(kwargs, headers={"Origin": "https://foreign.invalid"}))
+                    if mode.startswith("post_") or mode == "compression":
+                        return await real_upgrade(*args, **kwargs)
+                    if len(upgrades) == 1:
+                        if mode == "stop":
+                            a.handle(dict(op="stop", run_id=a.run["run_id"], operation_id=str(uuid4())), enrolled["device_id"])
+                        raise first
+                    return await real_upgrade(*args, **kwargs)
+                client.post, client.http.ws_connect = ticket, upgrade
+                if mode == "refusal":
+                    from aiohttp import WSServerHandshakeError
+                    with pytest.raises(WSServerHandshakeError):
+                        await client.attach()
+                    assert len(upgrades) == len(tickets) == 1 and client.ws is None
+                else:
+                    await client.attach()
+                    if mode == "compression":
+                        assert len(upgrades) == len(tickets) == 1
+                        assert client.ws.compress == 15
+                        extensions = client.ws._response.headers["Sec-WebSocket-Extensions"]
+                        assert "server_no_context_takeover" in extensions and "client_no_context_takeover" in extensions
+                        assert client.ws._writer.notakeover is True
+                        assert client.snapshot == expected_reporting_snapshot
+                        assert json.dumps(client.snapshot, sort_keys=True) == json.dumps(expected_reporting_snapshot, sort_keys=True)
+                    elif mode.startswith("post_"):
+                        assert len(upgrades) == len(tickets) == len(attach_snapshot_failures) == 1
+                        assert len(gateway.tickets) == 1  # Only the undelivered first ticket remains, bounded by its5s expiry.
+                        assert tuple(gateway.tickets) == attach_snapshot_failures[0]
+                    else:
+                        assert len(upgrades) == len(tickets) == 2 and tickets[0] != tickets[1]
+                    if mode != "compression":
+                        assert client.snapshot["run"]["status"] == ("finishing" if mode in {"stop", "post_stop"} else "paused")
+                    if mode in {"stop", "post_stop"}: assert client.snapshot["run"]["requested_terminal"] == "stopped"
+                    assert client.generation is client.connection is None and client.sequence == 0
+                    assert len(gateway.peers) == 1
+                assert a.run["deadline"] == original_deadline
+                assert not any(op in {"claim", "start", "connect", "release_input", "resume", "grant", "input"} for op, _ in commands)
+                assert all(ticket not in json.dumps(records) for ticket in tickets)
+                return
+            if zero_input_retry is not None:
+                # Real run()/Start/Stop, Core, Owner IPC and TLS/WSS. Only the
+                # device preparation/native receipts below are fake; no device worker starts.
+                from types import SimpleNamespace
+                from examples.alohamini.am1_live_teleop import normalized_raw
+
+                phase, pi_now, readers, clients = [0], [10.], [], []
+                current_observation, inactive_tasks, recovery_observed, control_requests = [True], [], [], []
+                inactive_barrier = asyncio.Event()
+                inactive_waiting = asyncio.Event()
+                normal_waiting_renewal = asyncio.Event()
+                lose_waiting_renewal, fresh_waiting_move = [False], [False]
+                inactive_guards, early_order = [], []
+                started, stops, inputs, preparations = [], [], [], []
+                renewal_failure = TimeoutError("original pre-admission renewal timeout")
+                renewal_failed = asyncio.Event()
+                initial_resume_renewal = zero_input_retry in {"initial-resume-renewal", "initial-resume-stale-renewal"}
+                stale_renewal = zero_input_retry == "initial-resume-stale-renewal"
+                pause_observed, renewal_in_flight = asyncio.Event(), asyncio.Event()
+                lose_initial_renewal = False
+                initial_resumes, lost_renewals, initial_timing = [], [], []
+                base = held_command119_workspace()
+                base["workspace_profile"] = m.ORDINARY_ARMS_PROFILE
+                policy = None
+                if ordinary_profile:
+                    from tests.robots.test_am1_live_phase_coordinator import ordinary_admission
+                    base = copy.deepcopy(ordinary_admission()[1]["snapshot"]["run"]["live_input"]["workspace"])
+                    policy = {"profile": m.ORDINARY_AM1_ARMS_PROFILE, "right_elbow_p": 16}
+                native = [copy.deepcopy(base)]
+                e.desired = "hold"
+                a.run = a.controller = a.connection = None
+                a.clock = e.clock = lambda: pi_now[0]
+                if initial_resume_renewal:
+                    from tools.am1_local_observation import LocalObservationMailbox
+                    e.observation = LocalObservationMailbox(dict(e.observation.source, role="chest", device="/dev/am_camera_chest"),
+                                                            clock=a.clock, require_owned_session=True)
+
+                native_ack_state = [None]
+                def native_evidence():
+                    value = copy.deepcopy(recovery_state()["evidence"])
+                    revision = a.run["intent_revision"] if a.run else 0
+                    active = e.desired == "active"
+                    marker = (e.run_id, revision, active)
+                    if marker != native_ack_state[0]:
+                        epoch[0] += 1
+                        native_ack_state[0] = marker
+                    cursor = {**native[0]["reference"], "arm_left_shoulder_lift.pos": 100.}
+                    target = e._live_target
+                    live = dict(state="active" if active else "held", workspace=copy.deepcopy(native[0]),
+                        reference=copy.deepcopy(native[0]["reference"]), cursor=cursor,
+                        accepted_target=dict(target["target"] if target else cursor), body=dict(m.ZERO_BODY),
+                        cursor_intent_revision=revision, cursor_feedback_sequence=1,
+                        live_admitted_at_monotonic_s=e._lifecycle.get("native_live_at", pi_now[0]),
+                        live_deadline_monotonic_s=e._lifecycle.get("native_deadline_monotonic_s", pi_now[0]+300),
+                        last_input_seq=target["seq"] if target else -1)
+                    if target:
+                        live.update(source=copy.deepcopy(target["source"]), body=copy.deepcopy(target["body"]))
+                    value.update(source="protected-physical-provider", live_input=live,
+                        lifecycle=copy.deepcopy(e._lifecycle), feedback=True, required_observation=current_observation[0],
+                        pose_aligned=True, native_ack=True, hold_acknowledged=not active,
+                        active_acknowledged=active, acknowledged_intent_revision=revision,
+                        measured_positions=copy.deepcopy(native[0]["reference"]),
+                        accepted_host_action=dict(run_id=e.run_id, host_incarnation=e.host_incarnation,
+                            intent_revision=revision, state="active" if active else "paused", epoch=epoch[0],
+                            acquired_at_monotonic_s=pi_now[0],
+                            accepted_action={"mode": "raw_goal_hold", "body_velocity": 0.}))
+                    e.sample = dict(at=pi_now[0], sequence=1, positions=value["measured_positions"],
+                        ack=dict(run_id=e.run_id, host_incarnation=e.host_incarnation, intent_revision=revision,
+                                 state="active" if active else "paused", epoch=epoch[0], live_input=live))
+                    return value
+
+                def begin_without_devices(recipe):
+                    if initial_resume_renewal:
+                        owner, capture, encode = (str(uuid4()) for _ in range(3))
+                        e.observation.publish(dict(e.observation.request, owned_session=e.run_id, qualified=True,
+                            owner_generation=owner, capture_generation=capture, sequence=1, arrived_at=pi_now[0],
+                            decoded_at=pi_now[0], frame_sha256="f" * 64))
+                        a._teleop_view = dict(run_id=e.run_id, role="chest", owner_generation=owner,
+                            capture_generation=capture, encode_generation=encode, decoded_frames=1, media_time=.1,
+                            source_sequence=1, source_fresh=True, received_at_monotonic_s=pi_now[0],
+                            request_received_at_monotonic_s=pi_now[0], qualified_until=pi_now[0] + .5)
+                        assert e.publish_startup_view(a._startup_view_binding, a._teleop_view) and e.startup_view_ready()
+                    e._lifecycle.update(phase="startup" if phase[0] == 0 and zero_input_retry != "view" else "live", native_live_at=pi_now[0],
+                        native_deadline_monotonic_s=pi_now[0]+300, backend_incarnation=e.host_incarnation)
+                    return True
+
+                def finish_without_devices(status):
+                    uncertain = zero_input_retry == "uncertain" and phase[0] == 0
+                    e.desired = "hold"
+                    e._lifecycle.update(phase="terminal", terminal_status=status,
+                        cleanup="physical_cleanup_unknown" if uncertain else "physical_readback_verified",
+                        uncertain=uncertain)
+                    return copy.deepcopy(e._lifecycle)
+
+                e.evidence, e.begin, e.finish = native_evidence, begin_without_devices, finish_without_devices
+                native_dispatches, native_dispatch_revisions = [0], set()
+                def dispatch_then_ack(recipe):
+                    e.desired = "active"
+                    native_dispatches[0] += 1
+                    if inactive_recovery is not None:
+                        revision = a.run["intent_revision"]
+                        first = revision not in native_dispatch_revisions
+                        native_dispatch_revisions.add(revision)
+                        return not first  # Every Resume receives a later real Core resuming→running event.
+                    return native_dispatches[0] > 1
+                e.dispatch = dispatch_then_ack
+                actual_handle = a.handle
+                def retry_handle(command, device):
+                    # The original fixture's paused-only Connect assertion is for
+                    # recovery, while this branch starts from genuine Core idle.
+                    if phase[0] == 1:
+                        control_requests.append(copy.deepcopy(command))
+                    result = real_handle(command, device)
+                    if command["op"] == "start" and result.get("accepted") is True:
+                        started.append(copy.deepcopy(a.run))
+                    elif command["op"] == "stop":
+                        stops.append(copy.deepcopy(command))
+                    elif command["op"] == "input" and result.get("accepted") is True:
+                        inputs.append(copy.deepcopy(command))
+                    return result
+                a.handle = retry_handle
+                actual_reader = m.VirtualIntentReader
+                if inactive_recovery is not None:
+                    actual_recovery = m.SameRunRecovery
+                    class ObservedRecovery(actual_recovery):
+                        def __init__(self, *args, **kwargs):
+                            super().__init__(*args, **kwargs)
+                            inactive_guards.append(self)
+                        def observe_inactive(self, state, *, inactive):
+                            result = super().observe_inactive(state, inactive=inactive)
+                            if inactive and self._inactive_anchor is not None and self._inactive_episode is None:
+                                inactive_waiting.set()
+                            return result
+                    monkeypatch.setattr(m, "SameRunRecovery", ObservedRecovery)
+                class Reader(actual_reader):
+                    def start(self):
+                        readers.append(self)
+                        if phase[0] == 0:
+                            # An acquired but now expired first-attempt intention
+                            # must never turn into the explicit retry's sample.
+                            self.receive_line("hold 0.001")
+                    def discard_motion(self, **kwargs):
+                        floor = super().discard_motion(**kwargs)
+                        if (inactive_recovery is not None and phase[0] == 1 and a.run
+                            and a.run["status"] == "paused" and a.run["recovery_episodes"] == 1
+                            and clients[-1].snapshot["run"]["status"] == "paused"):
+                            inactive_barrier.set()
+                        if ordinary_control and phase[0] == 1 and not kwargs.get("pause"):
+                            if a.run["status"] == "paused" and not getattr(self, "resume_issued", False):
+                                self.resume_issued = True
+                                asyncio.get_running_loop().call_soon(self.receive_line, "resume 5")
+                            elif a.run["status"] == "running" and not getattr(self, "new_move_issued", False):
+                                self.new_move_issued = True
+                                target = native[0]["reference"]["arm_left_elbow_flex.pos"]+.1
+                                asyncio.get_running_loop().call_soon(self.receive_line, f"move 0.1 2 left_elbow_flex={target}")
+                        return floor
+
+                actual_session = m.SessionClient
+                class RunnerSession(actual_session):
+                    def __init__(self, *args):
+                        super().__init__(*args)
+                        clients.append(self)
+                        self.fresh_intent = False
+                        self.lost = False
+                    async def post(self, path, body):
+                        nonlocal lose_initial_renewal
+                        if (phase[0] == 0 and zero_input_retry != "view" and path == "claim"
+                            and "controller_generation" in body and started):
+                            renewal_failed.set()
+                            raise renewal_failure
+                        if (initial_resume_renewal and path == "claim" and "controller_generation" in body
+                            and not lost_renewals and normal_waiting_renewal.is_set()):
+                            lose_initial_renewal = (self.connection is not None
+                                and self.snapshot["run"]["intent_revision"] == 1) if stale_renewal else pause_observed.is_set()
+                        try:
+                            result = await super().post(path, body)
+                        except m.HTTPOutcomeError as error:
+                            if initial_resume_renewal and lose_initial_renewal:
+                                assert m._owner_unknown_http(error)
+                                renewal_failed.set()
+                            raise
+                        finally:
+                            if path == "claim":
+                                lose_initial_renewal = False
+                        if (phase[0] == 1 and path == "claim" and "controller_generation" in body
+                            and m._normal_renewal_receipt(result, self.generation)):
+                            normal_waiting_renewal.set()  # Real accepted receipt, before any later reply loss.
+                        if phase[0] == 1 and lose_waiting_renewal[0] and path == "claim" and "controller_generation" in body:
+                            from tools.am1_session_service import unknown_outcome
+                            lose_waiting_renewal[0] = False
+                            if inactive_recovery == "renewal_early":
+                                # This dispatch completes before the run loop can observe the new episode.
+                                guard = inactive_guards[-1]
+                                assert guard._inactive_anchor is not None and guard._inactive_episode is None
+                                early_order.append(dict(event="renewal_accepted_before_hold", anchor=True,
+                                    observed_episode=False, state=self.snapshot["run"]["status"], core_state=a.run["status"]))
+                                current_observation[0] = False
+                                pi_now[0] += .125
+                                a.tick()
+                                assert a.run["status"] == "recovering"
+                                early_order.append(dict(event="core_hold_before_reply_loss", anchor=True,
+                                    observed_episode=guard._inactive_episode is not None, core_state=a.run["status"]))
+                                recovery_observed.append(copy.deepcopy(a.run["recovery"]))
+                                async def requalify():
+                                    await asyncio.sleep(.1)
+                                    if a.run["status"] == "recovering":
+                                        current_observation[0] = True
+                                        pi_now[0] += .125
+                                        a.tick()
+                                inactive_tasks.append(asyncio.create_task(requalify()))
+                            raise m.HTTPOutcomeError(503, unknown_outcome())  # Actual renewal accepted, its reply is lost.
+                        return result
+                    async def get(self, path):
+                        if (phase[0] == 1 and inactive_recovery == "expired" and fresh_waiting_move[0]
+                            and path == "state" and not getattr(self, "intent_read_delayed", False)):
+                            self.intent_read_delayed = True
+                            await asyncio.sleep(.3)  # Expire the actual acquired intent during authenticated qualification.
+                        return await super().get(path)
+                    async def wait(self, predicate, timeout):
+                        if phase[0] == 0 and zero_input_retry != "view" and started and not self.lost:
+                            self.lost = True
+                            # Native has reached Live, but that admission has not
+                            # been observed by this PC's WSS reader.
+                            assert (self.snapshot.get("run") or {}).get("native_live_at") is None
+                            e._lifecycle["phase"] = "live"
+                            a.tick()
+                            assert a.run["native_live_at"] == pi_now[0]
+                            for peer in list(gateway.peers):
+                                await peer.ws.close(code=1006)
+                            await asyncio.wait_for(renewal_failed.wait(), 1.)
+                            await asyncio.sleep(0)
+                        if initial_resume_renewal and timeout == 5 and len(initial_resumes) == 1:
+                            await super().wait(lambda: self.snapshot["run"]["status"] == "paused", timeout)
+                            assert m._live(self.snapshot)["last_input_seq"] == -1 and not inputs
+                            pause_observed.set()
+                            await asyncio.wait_for(renewal_failed.wait(), 2.)
+                        result = await super().wait(predicate, timeout)
+                        if phase[0] == 1 and (self.snapshot["run"] or {}).get("status") == "running" and not self.fresh_intent:
+                            if initial_resume_renewal:
+                                assert len(initial_resumes) == 2 and not inputs
+                            self.fresh_intent = True
+                            joint_key = "arm_left_elbow_flex.pos"
+                            target = native[0]["reference"][joint_key]+.05
+                            if inactive_recovery is None:
+                                readers[-1].receive_line(f"move 0.1 2 {joint_key}={target}")
+                            else:
+                                async def held_before_fresh_intent():
+                                    await asyncio.wait_for(inactive_waiting.wait(), 1.)
+                                    original = copy.deepcopy(a.run)
+                                    assert not inputs and len([x for x in control_requests if x["op"] == "resume"]) == 1
+                                    if inactive_recovery == "renewal_early":
+                                        await asyncio.wait_for(normal_waiting_renewal.wait(), args.duration_seconds)
+                                        assert m._normal_renewal_receipt(getattr(self, "_renewal_ack", None), self.generation)
+                                        lose_waiting_renewal[0] = True
+                                        return
+                                    current_observation[0] = False
+                                    pi_now[0] += .125
+                                    a.tick()
+                                    assert a.run["status"] == "recovering"
+                                    episode = copy.deepcopy(a.run["recovery"])
+                                    if inactive_recovery == "buffered":
+                                        readers[-1].receive_line(f"move 0.1 2 {joint_key}={target}")
+                                    await asyncio.sleep(.08)
+                                    current_observation[0] = True
+                                    pi_now[0] += .125
+                                    a.tick()
+                                    assert a.run["status"] == "paused"
+                                    await asyncio.wait_for(inactive_barrier.wait(), 1.)
+                                    await asyncio.sleep(.06)
+                                    assert a.run["status"] == "paused", "no-intent recovery must remain held rather than abort"
+                                    assert not inputs and len([x for x in control_requests if x["op"] == "resume"]) == 1
+                                    assert a.run["deadline"] == original["deadline"]
+                                    assert a.run["live_input"]["reference"] == original["live_input"]["reference"]
+                                    recovery_observed.append(episode)
+                                    if inactive_recovery == "renewal":
+                                        await asyncio.wait_for(normal_waiting_renewal.wait(), args.duration_seconds)
+                                        assert m._normal_renewal_receipt(getattr(self, "_renewal_ack", None), self.generation)
+                                        lose_waiting_renewal[0] = True
+                                        return  # Still no movement intention; presence must not imply Resume.
+                                    if inactive_recovery in {"pause", "stop"}:
+                                        await self.post(inactive_recovery, {"run_id": a.run["run_id"], "operation_id": str(uuid4())})
+                                    elif inactive_recovery == "takeover": a.controller["generation"] = str(uuid4())
+                                    elif inactive_recovery == "reboot": a.service_incarnation = str(uuid4())
+                                    elif inactive_recovery == "deadline": a.run["deadline"] += 1
+                                    elif inactive_recovery == "descriptor":
+                                        next(x for x in a.events if x["kind"] == "required_hold")["recovery"]["ceiling"] += .1
+                                    fresh_waiting_move[0] = True
+                                    ttl = .2 if inactive_recovery == "expired" else 2
+                                    readers[-1].receive_line(f"move 0.1 {ttl} {joint_key}={target}")
+                                inactive_tasks.append(asyncio.create_task(held_before_fresh_intent()))
+                        return result
+                    async def command(self, command, **kwargs):
+                        result = await super().command(command, **kwargs)
+                        if phase[0] == 1 and command["op"] == "input" and result.get("accepted") is True:
+                            if ordinary_control and len(inputs) == 1:
+                                await self.post("pause", {"run_id": a.run["run_id"], "operation_id": str(uuid4())})
+                            else:
+                                readers[-1].receive_line("finish")
+                        return result
+
+                def prepare(args, output):
+                    preparations.append(str(output))
+                    return {"fixture": "local-only prepared native receipts"}
+                monkeypatch.setattr(m, "VirtualIntentReader", Reader)
+                monkeypatch.setattr(m, "SessionClient", RunnerSession)
+                monkeypatch.setattr(m, "prepare_current_rest_invocation", prepare)
+                ticking = True
+                async def native_receipts():
+                    while ticking:
+                        if (inactive_recovery is not None and phase[0] == 1 and a.run and a.run.get("native_live_at") is not None
+                            and a.run["status"] not in {"stopped", "completed", "faulted", "interrupted"}):
+                            # Exact binary clock steps avoid inventing future ACKs through
+                            # decimal deadline-minus-remaining cancellation in this fake clock.
+                            pi_now[0] += .015625
+                        if phase[0] == 1 and a.run:
+                            a._teleop_view = dict(run_id=e.run_id, role="chest", qualified_until=pi_now[0]+.5)
+                        a.tick()
+                        await asyncio.sleep(.01)
+                ticker = asyncio.create_task(native_receipts())
+                args = SimpleNamespace(source="virtual-leaders", workload_segment="ordinary-arms",
+                    virtual_input="interactive", prepare_current_rest=True, bindings="fixture-current-binding",
+                    output_root=str(tmp_path), output=str(tmp_path/"failed"), url=gateway.origin,
+                    ca=cert, storage_state=storage, next_start_seconds=None, duration_seconds=2.,
+                    interrupt_at_seconds=None, interrupt_controller=False)
+                if policy is not None:
+                    args.ordinary_arm_profile = policy
+                    args.prepare_current_rest = False
+                try:
+                    if initial_resume_renewal:
+                        phase[0], pi_now[0] = 1, 20.
+                        original_call = gateway.call
+                        async def first_resume_view_pause(command, device):
+                            op = command.get("op")
+                            first_resume = op == "resume" and not initial_resumes
+                            if first_resume:
+                                await asyncio.wait_for(normal_waiting_renewal.wait(), 2.)
+                                if stale_renewal:
+                                    await asyncio.wait_for(renewal_in_flight.wait(), 2.)
+                            if op == "claim" and "controller_generation" in command:
+                                pi_now[0] += .125
+                            result = await original_call(command, device)
+                            if op == "claim" and lose_initial_renewal:
+                                assert result["accepted"] is True
+                                lost_renewals.append(result)
+                                renewal_in_flight.set()
+                                if stale_renewal:
+                                    await asyncio.wait_for(pause_observed.wait(), 2.)
+                                raise TimeoutError("injected lost receipt after accepted renewal")
+                            if op == "resume":
+                                initial_resumes.append(command)
+                            if first_resume:
+                                assert result == {"accepted": True, "status": "resuming", "effect_admitted": False}
+                                assert not inputs and m._live(a.snapshot())["last_input_seq"] == -1
+                                initial_timing.extend(a.run[key] for key in ("native_live_at", "deadline"))
+                                pi_now[0] += .125
+                                a._teleop_view["qualified_until"] = pi_now[0] - .001
+                                a.tick()
+                                assert a.run["status"] == "paused" and a.events[-1]["kind"] == "required_view_expired"
+                            return result
+                        gateway.call = first_resume_view_pause
+                        if stale_renewal:
+                            with pytest.raises(m.HTTPOutcomeError) as refused:
+                                await m.run(args)
+                            assert m._owner_unknown_renewal(refused.value)
+                            assert refused.value.renewal_context["identity"]["intent_revision"] == initial_resumes[0]["intent_revision"]
+                            assert len(initial_resumes) == 1 and not inputs
+                        else:
+                            summary = await m.run(args)
+                            assert summary["finish_qualified"] and summary["original_native_deadline"] == initial_timing[1]
+                            assert len(initial_resumes) == 2 and len(inputs) == 1
+                            assert initial_resumes[1]["operation_id"] != initial_resumes[0]["operation_id"]
+                        rows = [json.loads(line) for line in (tmp_path / "failed/frames.jsonl").read_text().splitlines()]
+                        recovered = [row for row in rows if row["event"] == "controller_renewal_requalified"]
+                        assert len(recovered) == int(not stale_renewal)
+                        assert len(started) == len(stops) == len(lost_renewals) == 1
+                        assert a.run["status"] == "stopped"
+                        assert [a.run[key] for key in ("native_live_at", "deadline")] == initial_timing
+                        return
+                    with pytest.raises((TimeoutError, ConnectionError)) as caught:
+                        await m.run(args)
+                    failed_path = tmp_path/"failed"/"summary.json"
+                    failed_bytes = failed_path.read_bytes()
+                    failed = json.loads(failed_bytes)
+                    assert len(started) == 1 and not inputs
+                    if policy is not None:
+                        assert started[0]["ordinary_arm_profile"] == policy
+                        assert failed["ordinary_arm_profile"] == policy
+                    assert failed["frame_count"] == 0 and failed["owned_run_id"] == started[0]["run_id"]
+                    assert failed["failure_type"] == "TimeoutError"
+                    assert len({row["operation_id"] for row in stops}) == 1
+                    assert all(row["run_id"] == started[0]["run_id"] for row in stops)
+                    assert failed["stop_operation_id"] == stops[0]["operation_id"]
+                    assert a.run["status"] == "stopped"
+                    first_terminal = copy.deepcopy(a.run)
+                    assert first_terminal["deadline"] == 310.
+                    if zero_input_retry != "view":
+                        assert caught.value is renewal_failure
+                        assert failed.get("run_id") is None
+                        assert failed.get("workspace") is None and failed.get("original_native_deadline") is None
+                        assert failed["controller_renewal"]["failed"] == 1
+                    else:
+                        assert str(caught.value) == "qualified current native state did not arrive"
+                        assert failed["run_id"] == started[0]["run_id"]
+                    if zero_input_retry == "uncertain":
+                        assert failed["native_cleanup_uncertain"] is True
+                        assert e._lifecycle["uncertain"] is True
+                        phase[0] = 1
+                        args.output = str(tmp_path/"blocked")
+                        with pytest.raises(m.HTTPOutcomeError) as refused:
+                            await m.run(args)
+                        assert refused.value.response["accepted"] is False
+                        assert len(started) == 1 and not inputs
+                        assert a.run["run_id"] == started[0]["run_id"] and a.run["uncertain"] is True
+                        assert failed_path.read_bytes() == failed_bytes
+                        return
+                    assert failed["native_cleanup_uncertain"] is False
+                    assert a.run["cleanup"] == "physical_readback_verified" and a.run["uncertain"] is False
+                    # Explicit caller decision AFTER stopped/certain qualification.
+                    # This is a second normal run(), never an internal Start retry.
+                    phase[0], pi_now[0] = 1, 20.
+                    native[0] = copy.deepcopy(base)
+                    joint_key = "arm_left_elbow_flex.pos"
+                    native[0]["reference"][joint_key] = normalized_raw(1110, native[0]["calibration"][joint_key[:-4]])
+                    args.output = str(tmp_path/"fresh")
+                    if inactive_recovery in {"renewal", "renewal_early"}:
+                        # This fresh fixture operation needs two actual renewal
+                        # receipts, not a race against an assumed first-receipt delay.
+                        args.duration_seconds = 4.
+                    if inactive_recovery not in (None, "held", "buffered"):
+                        failure = None
+                        try:
+                            await m.run(args)
+                        except (RuntimeError, TimeoutError) as error:
+                            failure = error
+                        await asyncio.gather(*inactive_tasks)
+                        assert failure is not None, "invalid waiting recovery must refuse before Resume"
+                        assert recovery_observed and not inputs
+                        assert len([x for x in control_requests if x["op"] == "resume"]) == 1
+                        if inactive_recovery in {"renewal", "renewal_early"}:
+                            assert not lose_waiting_renewal[0] and m._owner_unknown_renewal(failure)
+                            if inactive_recovery == "renewal_early":
+                                guard = inactive_guards[-1]
+                                assert guard.episodes == 0 and guard.cause is None
+                                assert early_order == [
+                                    dict(event="renewal_accepted_before_hold", anchor=True, observed_episode=False,
+                                         state="running", core_state="running"),
+                                    dict(event="core_hold_before_reply_loss", anchor=True, observed_episode=False,
+                                         core_state="recovering")]
+                                early_order.append(dict(event="original_renewal_error_retained", resume_requests=1,
+                                    input_frames=0, adopted_episodes=guard.episodes, adopted_cause=guard.cause))
+                                (tmp_path/"early-renewal-order.json").write_text(json.dumps(early_order))
+                        elif inactive_recovery == "expired":
+                            assert clients[-1].intent_read_delayed, "expiry must occur inside the authenticated qualification read"
+                        return
+                    fresh = await m.run(args)
+                    if inactive_recovery is not None:
+                        await asyncio.gather(*inactive_tasks)
+                        assert len(recovery_observed) == 1
+                        assert fresh["qualified_native_recovery_episodes"] == 1
+                        assert len([x for x in control_requests if x["op"] == "resume"]) == 2
+                    assert fresh["finish_qualified"] is True and fresh["frame_count"] >= 1
+                    assert fresh["native_cleanup_uncertain"] is False and fresh["cleanup_errors"] == []
+                    assert len(started) == 2 and len(clients) == len(readers) == len(preparations) == 2
+                    assert started[0]["operation_id"] != started[1]["operation_id"]
+                    assert started[0]["run_id"] != started[1]["run_id"]
+                    expected_deadline = (fresh["native_terminal"]["run"]["native_live_at"]+300.
+                                         if inactive_recovery is not None else 320.)
+                    assert fresh["original_native_deadline"] == expected_deadline != first_terminal["deadline"]
+                    assert fresh["workspace"]["reference"] == native[0]["reference"] != base["reference"]
+                    assert inputs and all(row["run_id"] == started[1]["run_id"] for row in inputs)
+                    if inactive_recovery is not None:
+                        first_source = inputs[0]["source"]
+                        assert first_source["sample_seq"] == 1
+                        assert first_source["kind"] == "virtual-leaders"
+                        rows = [json.loads(line) for line in (tmp_path/"fresh/frames.jsonl").read_text().splitlines()]
+                        first_frame = next(row for row in rows if row["event"] == "leader_frame")
+                        assert first_frame["virtual_intent"]["seq"] == (2 if inactive_recovery == "buffered" else 1)
+                    if ordinary_control:
+                        records = [json.loads(line) for line in (tmp_path/"fresh/frames.jsonl").read_text().splitlines()]
+                        controls = [row for row in records if row["event"] in {"virtual_control_paused", "virtual_control_resumed"}]
+                        assert [row["event"] for row in controls] == ["virtual_control_paused", "virtual_control_resumed"]
+                        assert controls[0]["seq"] is None and controls[1]["seq"] == 2
+                        frames = [row for row in records if row["event"] == "leader_frame"]
+                        assert [row["virtual_intent"]["seq"] for row in frames] == [1, 3]
+                        assert len(inputs) == 2 and all(row["body"] == m.ZERO_BODY for row in inputs)
+                        assert inputs[0]["grant_id"] != inputs[1]["grant_id"]
+                        assert inputs[0]["source"]["sample_seq"] < inputs[1]["source"]["sample_seq"]
+                        assert started[1]["ordinary_arm_profile"] == policy == fresh["ordinary_arm_profile"]
+                    assert all(row["source"]["source_id"] == readers[1].intent_channel for row in inputs)
+                    assert readers[0].intent_channel != readers[1].intent_channel
+                    assert failed_path.read_bytes() == failed_bytes
+                finally:
+                    ticking = False
+                    await ticker
+                    for task in inactive_tasks:
+                        if not task.done(): task.cancel()
+                    if inactive_tasks:
+                        await asyncio.gather(*inactive_tasks, return_exceptions=True)
+                    a.handle = actual_handle
+                return
             client = m.SessionClient(gateway.origin, cert, storage)
             initial_revision_allowed = [cause not in {"initial_ack_timely", "initial_ack_missing"}]
             if not initial_revision_allowed[0]:
@@ -6294,7 +7313,15 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                             error = (await asyncio.gather(renewal, return_exceptions=True))[0]
                             assert m._owner_unknown_renewal(error)
                             renewal_errors.append(error)
-                            if mode == "pause":
+                            if renewal_profile_p is not None:
+                                assert error.renewal_context["run"] == guard.original["run"]
+                                assert guard.original["run"]["ordinary_arm_profile"] == {
+                                    "profile": m.ORDINARY_AM1_ARMS_PROFILE, "right_elbow_p": renewal_profile_p}
+                            if mode == "policy":
+                                a.run["ordinary_arm_profile"]["right_elbow_p"] = 32 if renewal_profile_p == 16 else 16
+                            elif mode == "missing_policy":
+                                a.run.pop("ordinary_arm_profile")
+                            elif mode == "pause":
                                 assert a.handle({"op": "pause", "run_id": e.run_id,
                                                  "operation_id": str(uuid4())}, enrolled["device_id"])["accepted"]
                             elif mode == "stop":
@@ -7960,7 +8987,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
             a.run = None
             await owner.close()
 
-    asyncio.run(asyncio.wait_for(scenario(), 8 if cause == "transport_blackout_long" or normal_raw_close else 5))
+    asyncio.run(asyncio.wait_for(scenario(), 18 if zero_input_retry else 8 if cause == "transport_blackout_long" or normal_raw_close else 5))
 
 
 @pytest.mark.parametrize("count", [3, 4])
@@ -8063,6 +9090,7 @@ def test_fourth_ordinary_pause_still_requires_qualified_held_ack_before_resume()
         "later_terminal",
         "later_uncertain",
         "later_native_fault",
+        "core_terminal", "core_finishing", "core_foreign_operation", "core_changed_startup_clock",
     ],
 )
 def test_runner_starting_transport_reattaches_once_to_exact_owned_admission(tmp_path, monkeypatch, change):
@@ -8080,14 +9108,39 @@ def test_runner_starting_transport_reattaches_once_to_exact_owned_admission(tmp_
         m, "time", SimpleNamespace(monotonic=lambda: clock[0], perf_counter=time.perf_counter)
     )
     owned = str(uuid4())
+    core_projection = change in {"core_terminal", "core_finishing", "core_foreign_operation", "core_changed_startup_clock"}
+    native_cause = "ComparisonRefusal: live: grouped feedback failed: [TxRxResult] There is no status packet!"
+    if core_projection:
+        from urllib.parse import parse_qsl, urlsplit
+        from tests.robots.test_am1_live_teleop_executor import authority_lane
+        from tools.am1_session_service import Gateway
+
+        authority, executor, _ = authority_lane(tmp_path / "core")
+        authority.run = None
+        begins = []
+        monkeypatch.setattr(executor, "begin", lambda recipe: begins.append(recipe.name) or True)
+        gateway = object.__new__(Gateway)
+        async def core_call(command, _device):
+            return authority.snapshot_detail(command) if "reference" in command else {"snapshot": authority.snapshot()}
+        gateway.call = core_call
 
     class Session:
-        wait = actual_wait
+        async def wait(self, predicate, timeout):
+            if core_projection:
+                self.waits += 1
+                if self.waits == 2:
+                    self.pending.append(asyncio.create_task(self.publish_live()))
+            return await actual_wait(self, predicate, timeout)
 
         def __init__(self, *args):
             self.device, self.generation, self.connection = "device", "control", None
             self.snapshot = recovery_state()
             self.snapshot["run"] = None
+            if core_projection:
+                self.device = "pc"
+                self.generation = authority.controller["generation"]
+                self.snapshot = authority.snapshot()
+            self.waits = 0
             self.transport_close = self.transport_error = self.reader = None
             self.ws = SimpleNamespace(closed=False)
             self.changed = asyncio.Event()
@@ -8095,6 +9148,19 @@ def test_runner_starting_transport_reattaches_once_to_exact_owned_admission(tmp_
             self.renewing, self.closed = False, False
             self.pending = []
             instances.append(self)
+
+        async def core_state(self):
+            response = await Gateway.state(gateway, SimpleNamespace(query={}))
+            state = json.loads(response.body)["snapshot"]
+            assert state["status_projection"] == {"kind": "am1-essential-status", "version": 1}
+            assert "accepted_at" not in state["run"]
+            return state
+
+        def complete_core_fault(self):
+            executor._lifecycle.update(phase="terminal", run_id=owned, backend_incarnation=executor.host_incarnation,
+                native_live_at=None, cleanup="physical_readback_verified", uncertain=False,
+                terminal_status="faulted", first_cause=native_cause, cleanup_errors=[])
+            authority.tick()
 
         def starting(self):
             state = recovery_state()
@@ -8146,8 +9212,10 @@ def test_runner_starting_transport_reattaches_once_to_exact_owned_admission(tmp_
                 clock[0] += 180.0
             if change == "stale_attach":
                 return
-            self.snapshot = self.starting()
-            if change is None or change.startswith("later_"):
+            self.snapshot = await self.core_state() if core_projection else self.starting()
+            if core_projection:
+                pass  # Publish only once the next wait begins, after qualified reattachment.
+            elif change is None or change.startswith("later_"):
                 self.pending.append(asyncio.create_task(self.publish_live()))
             else:
                 self.mutate(change)
@@ -8173,6 +9241,19 @@ def test_runner_starting_transport_reattaches_once_to_exact_owned_admission(tmp_
 
         async def publish_live(self):
             await asyncio.sleep(0)
+            if core_projection:
+                assert self.attaches == 2 and self.renewing
+                if change == "core_foreign_operation":
+                    authority.run["operation_id"] = str(uuid4())
+                elif change == "core_changed_startup_clock":
+                    authority.run["startup_deadline"] += .01
+                else:
+                    authority._finish("faulted", "protected host exited during startup")
+                    if change == "core_terminal":
+                        self.complete_core_fault()
+                self.snapshot = await self.core_state()
+                self.changed.set()
+                return
             self.snapshot["run"].update(
                 native_live_at=1009.0,
                 deadline=1309.0,
@@ -8198,18 +9279,33 @@ def test_runner_starting_transport_reattaches_once_to_exact_owned_admission(tmp_
                 self.renewing = False
 
         async def post(self, path, body):
+            nonlocal owned
             if path == "start":
                 self.starts.append(copy.deepcopy(body))
-                self.snapshot = self.starting()
+                if core_projection:
+                    receipt = authority.handle(dict(body, op="start"), self.device)
+                    assert receipt["accepted"] and receipt["effect_admitted"] is False
+                    owned = receipt["run_id"]
+                    self.snapshot = await self.core_state()
+                else:
+                    self.snapshot = self.starting()
                 if change == "missing_anchor":
                     del self.snapshot["run"]["accepted_at"]
                 self.pending.append(asyncio.create_task(self.lose()))
-                return {"accepted": True, "run_id": owned, "operation_id": body["operation_id"]}
+                return receipt if core_projection else {"accepted": True, "run_id": owned, "operation_id": body["operation_id"]}
             assert path == "stop"
             self.stops.append(copy.deepcopy(body))
+            if core_projection:
+                receipt = authority.handle(dict(body, op="stop"), self.device)
+                assert receipt["accepted"]
+                self.complete_core_fault()
+                return receipt
             return {"accepted": True, "status": "finishing"}
 
         async def get(self, path):
+            if core_projection:
+                response = await Gateway.state(gateway, SimpleNamespace(query=dict(parse_qsl(urlsplit(path).query))))
+                return json.loads(response.body)
             assert path == "state"
             state = self.starting()
             if self.stops:
@@ -8220,6 +9316,10 @@ def test_runner_starting_transport_reattaches_once_to_exact_owned_admission(tmp_
             for task in self.pending:
                 await task
             self.closed = True
+            if core_projection:
+                self.final_core_run = copy.deepcopy(authority.run)
+                authority.run = None
+                authority.close()
 
     def live_boundary(value):
         live_entries.append(copy.deepcopy(instances[0].snapshot))
@@ -8241,7 +9341,8 @@ def test_runner_starting_transport_reattaches_once_to_exact_owned_admission(tmp_
     summary = json.loads((tmp_path / "run" / "summary.json").read_text())
     rows = [json.loads(row) for row in (tmp_path / "run" / "frames.jsonl").read_text().splitlines()]
     assert len(session.starts) == 1 and session.claims == 1
-    assert [row["run_id"] for row in session.stops] == [owned]
+    # Existing cleanup skips a redundant Stop when the actual native terminal is already clean.
+    assert [row["run_id"] for row in session.stops] == ([] if change == "core_terminal" else [owned])
     assert session.closed and not session.renewing
     assert summary["frame_count"] == 0 and summary["cleanup_errors"] == []
     refused_without_attach = change in {
@@ -8256,7 +9357,24 @@ def test_runner_starting_transport_reattaches_once_to_exact_owned_admission(tmp_
     assert session.attaches == (1 if refused_without_attach else 2)
     assert len(live_entries) == (1 if change is None else 0)
     assert not any(row["event"] == "native_admitted" for row in rows)
-    if change is None:
+    if core_projection:
+        assert begins == ["physical-live-teleop"] and not live_entries
+        assert len([row for row in rows if row["event"] == "native_admission_reattached"]) == 1
+        assert summary["failure_type"] == "RuntimeError"
+        assert executor._live_target is None and session.final_core_run["native_live_at"] is None
+        assert session.final_core_run["deadline"] is None
+        if change in {"core_terminal", "core_finishing"}:
+            assert session.final_core_run["accepted_at"] == 10. and session.final_core_run["startup_deadline"] == 190.
+        if change == "core_terminal":
+            assert summary["native_admission_terminal"]["run"]["native_first_cause"] == native_cause
+            assert native_cause in summary["failure"]
+        elif change == "core_finishing":
+            assert summary["failure"] == "native admission reattachment unsafe: protected host exited during startup"
+        else:
+            assert summary["failure"] == "original native admission ownership/startup timestamps changed or unavailable"
+            assert "native_admission_terminal" not in summary
+        assert summary["native_terminal"]["run"]["native_first_cause"] == native_cause
+    elif change is None:
         assert summary["failure"] == "synthetic reached existing Live entrypoint"
         assert live_entries[0]["run"]["operation_id"] == session.starts[0]["operation_id"]
         assert live_entries[0]["run"]["recovery_episodes"] == 0
@@ -14266,3 +15384,371 @@ def test_old_reader_cannot_publish_after_joining_its_ack_worker_on_a_new_stream(
         assert client.pending == {"new": pending} and not pending.done()
         pending.cancel()
     asyncio.run(asyncio.wait_for(scenario(), 1))
+
+
+@pytest.mark.parametrize("failure", ["view", "pre-admission", "uncertain"])
+def test_normal_entrypoint_zero_input_failure_reconciles_before_explicit_fresh_retry(tmp_path, monkeypatch, failure):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
+        tmp_path, monkeypatch, "zero_input_fresh_retry", zero_input_retry=failure)
+
+
+@pytest.mark.parametrize("failure", ["view", "renewal", "uncertain"])
+def test_new_ordinary_policy_zero_input_prefix_uses_real_core_and_explicit_fresh_retry(tmp_path, monkeypatch, failure):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
+        tmp_path, monkeypatch, "zero_input_fresh_retry", zero_input_retry=failure, ordinary_profile=True)
+
+
+@pytest.mark.parametrize("case", ["initial-resume-renewal", "initial-resume-stale-renewal"])
+def test_initial_ordinary_resume_qualifies_only_current_unknown_renewal(tmp_path, monkeypatch, case):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
+        tmp_path, monkeypatch, "zero_input_fresh_retry", zero_input_retry=case, ordinary_profile=True)
+
+
+def test_new_ordinary_policy_external_pause_keeps_real_owner_until_fresh_resume_and_new_input(tmp_path, monkeypatch):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
+        tmp_path, monkeypatch, "zero_input_fresh_retry", zero_input_retry="view", ordinary_profile=True, ordinary_control=True)
+
+
+@pytest.mark.parametrize("mode", ["held", "buffered"])
+def test_inactive_runner_retains_native_episode_until_new_movement_intent(tmp_path, monkeypatch, mode):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
+        tmp_path, monkeypatch, "zero_input_fresh_retry", zero_input_retry="view", ordinary_profile=True, inactive_recovery=mode)
+
+
+@pytest.mark.parametrize("mode", ["pause", "stop", "takeover", "reboot", "deadline", "descriptor", "renewal", "renewal_early", "expired"])
+def test_inactive_native_episode_cannot_countermand_newer_authority_or_source(tmp_path, monkeypatch, mode):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
+        tmp_path, monkeypatch, "zero_input_fresh_retry", zero_input_retry="view", ordinary_profile=True, inactive_recovery=mode)
+
+
+@pytest.mark.parametrize("mode", ["success", "twice", "ticket", "refusal", "tls", "subclass", "cancel", "cancel_second",
+                                  "outer", "session", "post", "snapshot", "auth", "logger"])
+def test_attach_retries_only_one_unassigned_bare_upgrade_timeout(monkeypatch, mode):
+    import asyncio
+    import json
+    import ssl
+    from types import SimpleNamespace
+    from aiohttp import WSServerHandshakeError
+
+    m = adapter()
+    first, second = TimeoutError("first private upgrade detail"), TimeoutError("second upgrade timeout")
+    refusal = WSServerHandshakeError(None, (), status=403, message="private refusal")
+    tls = ssl.SSLError("private TLS failure")
+    class ConnectorTimeout(TimeoutError): pass
+    specific = ConnectorTimeout("connection-specific timeout")
+    requests, upgrades, sent, records = [], [], [], []
+    async def scenario():
+        async def get(path):
+            requests.append(("get", path))
+            if mode == "session": raise first
+            return dict(control=True, csrf="private-csrf", device_id="existing-device")
+        async def post(path, body):
+            requests.append(("post", path))
+            if mode == "post" or mode == "ticket" and len(upgrades) == 1:
+                raise second
+            return dict(ticket="private-ticket-" + str(len(requests)))
+        class Socket:
+            async def send_json(self, value):
+                sent.append(value)
+                if mode == "auth": raise second
+        async def upgrade(*args, **kwargs):
+            upgrades.append(kwargs)
+            assert client.ws is None
+            assert kwargs == dict(ssl=client.tls, heartbeat=6, max_msg_size=65536, compress=15)
+            if mode == "refusal": raise refusal
+            if mode == "tls": raise tls
+            if mode == "subclass": raise specific
+            if mode == "cancel" or mode == "cancel_second" and len(upgrades) == 2:
+                raise asyncio.CancelledError()
+            if mode not in {"snapshot", "auth"} and len(upgrades) == 1:
+                raise first
+            if mode == "twice": raise second
+            if mode == "outer": await asyncio.Event().wait()
+            return Socket()
+        async def read():
+            await asyncio.Event().wait()
+        async def wait(predicate, timeout):
+            assert timeout == 3
+            if mode == "snapshot": raise second
+            client.snapshot = {"reporting": "fresh"}
+        def record(value):
+            records.append(value)
+            if mode == "logger": raise OSError("private record unavailable")
+        client = SimpleNamespace(get=get, post=post, origin="https://example.invalid", tls=object(), ws=None,
+            reader=None, snapshot=None, _read=read, wait=wait, record=record,
+            generation="original-owner", connection="original-connection", sequence=17)
+        client.http = SimpleNamespace(ws_connect=upgrade)
+        try:
+            if mode in {"success", "logger"}:
+                await m.SessionClient.attach(client)
+                assert len(upgrades) == 2 and client.snapshot == {"reporting": "fresh"}
+                assert sent == [{"ticket": "private-ticket-3"}]
+            elif mode in {"cancel", "cancel_second"}:
+                with pytest.raises(asyncio.CancelledError): await m.SessionClient.attach(client)
+                assert len(upgrades) == (1 if mode == "cancel" else 2)
+            elif mode == "outer":
+                with pytest.raises(TimeoutError) as caught:
+                    async with asyncio.timeout(.04): await m.SessionClient.attach(client)
+                assert caught.value is not first and len(upgrades) == 2 and client.ws is None
+            else:
+                expected = {"twice": first, "ticket": first, "refusal": refusal, "tls": tls, "subclass": specific,
+                            "session": first, "post": second, "snapshot": second, "auth": second}[mode]
+                with pytest.raises(type(expected)) as caught: await m.SessionClient.attach(client)
+                assert caught.value is expected
+                assert len(upgrades) == (2 if mode == "twice" else 0 if mode in {"session", "post"} else 1)
+                if mode in {"twice", "ticket"}: assert caught.value.__cause__ is second
+            assert client.generation == "original-owner" and client.connection == "original-connection" and client.sequence == 17
+            assert not any(path not in {"session", "attach"} for _, path in requests)
+            assert len(upgrades) <= 2
+            assert len(json.dumps(records).encode()) <= 2048
+            assert not any(secret in json.dumps(records) for secret in ("private-ticket", "private-csrf", "private upgrade detail"))
+        finally:
+            if client.reader is not None:
+                client.reader.cancel()
+                await asyncio.gather(client.reader, return_exceptions=True)
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("mode", ["success", "stop", "refusal"])
+def test_reporting_upgrade_retry_uses_fresh_real_tls_gateway_ticket_without_control(tmp_path, monkeypatch, mode):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
+        tmp_path, monkeypatch, "upgrade_attach_" + mode)
+
+
+@pytest.mark.parametrize("streams", ["text", "bytes", "missing"])
+def test_run_keeps_bounded_called_process_error_streams_privately_before_api(tmp_path, monkeypatch, streams):
+    import asyncio
+    import json
+    import subprocess
+    from types import SimpleNamespace
+
+    m = adapter()
+    output = "stdout-private-" + "é" * 6000
+    stderr = "actual remote refusal\n" + "界" * 6000
+    if streams == "bytes": output, stderr = output.encode(), stderr.encode()
+    if streams == "missing": output = stderr = None
+    original = subprocess.CalledProcessError(1, ["ssh", "fixture-preparer"], output=output, stderr=stderr)
+    def prepare(*args): raise original
+    def forbidden(*args): raise AssertionError("failed preparation must not create an API client")
+    monkeypatch.setattr(m, "prepare_current_rest_invocation", prepare)
+    monkeypatch.setattr(m, "SessionClient", forbidden)
+    args = SimpleNamespace(source="virtual-leaders", workload_segment="full", duration_seconds=1.,
+        output=str(tmp_path/"private-run"), bindings="fixture", url="unused", ca="unused", storage_state="unused",
+        next_start_seconds=None, interrupt_at_seconds=None, interrupt_controller=False)
+    with pytest.raises(subprocess.CalledProcessError) as caught: asyncio.run(m.run(args))
+    assert caught.value is original
+    summary = json.loads((tmp_path/"private-run/summary.json").read_bytes())
+    detail = summary["subprocess_failure"]
+    assert detail["returncode"] == 1 and summary["failure_type"] == "CalledProcessError"
+    assert summary["failure"] == str(original) and summary["frame_count"] == 0
+    assert "owned_run_id" not in summary and "start_operation_id" not in summary
+    for name, value in (("stdout", output), ("stderr", stderr)):
+        retained = detail[name]
+        if value is None:
+            assert retained is None
+        else:
+            raw = value if isinstance(value, bytes) else value.encode()
+            assert retained == dict(text=raw[:4096].decode("utf-8", errors="replace"),
+                captured_bytes=len(raw), retained_bytes=4096, truncated=True)
+    assert len(json.dumps(detail).encode()) < 32768
+
+
+@pytest.mark.parametrize("right_elbow_p", [16, 32])
+@pytest.mark.parametrize("mode", ["hold", "unknown", "pause", "stop", "takeover", "reboot", "policy", "missing_policy"])
+def test_ordinary_profile_unknown_renewal_retains_exact_policy_after_owned_pause(
+    tmp_path, monkeypatch, right_elbow_p, mode
+):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
+        tmp_path, monkeypatch, "normal_finish_renewal_" + mode, renewal_profile_p=right_elbow_p)
+
+
+@pytest.mark.parametrize("mode", ["success", "twice", "unknown_then_upgrade_timeout", "upgrade_timeout_then_unknown",
+    "post_timeout", "malformed", "noncanonical", "wrong_status", "auth", "cancel", "cancel_second", "outer", "late", "snapshot", "logger", "subclass"])
+def test_attach_replaces_only_exact_unknown_ticket_with_shared_attempt_budget(monkeypatch, mode):
+    import asyncio
+    import json
+    from types import SimpleNamespace
+
+    m = adapter()
+    canonical = {"accepted": None, "status": "unknown", "uncertain": True,
+        "reason": "owner outcome unknown; inspect state or lookup the same operation", "effect_admitted": None}
+    first = m.HTTPOutcomeError(503, dict(canonical))
+    second = TimeoutError("replacement reporting request failed")
+    upgrade_first = TimeoutError("first reporting upgrade failed")
+    other = m.HTTPOutcomeError(503, dict(canonical, extra=True))
+    if mode in {"twice", "upgrade_timeout_then_unknown"}: other = m.HTTPOutcomeError(503, dict(canonical))
+    elif mode == "noncanonical": other = m.HTTPOutcomeError(503, dict(canonical, reason="different owner result"))
+    elif mode == "wrong_status": other = m.HTTPOutcomeError(502, dict(canonical))
+    elif mode == "auth": other = m.HTTPOutcomeError(403, {"accepted": False, "status": "refused", "effect_admitted": False})
+    if mode == "subclass":
+        class DerivedOutcome(m.HTTPOutcomeError): pass
+        other = DerivedOutcome(503, dict(canonical))
+    requests, upgrades, sent, records = [], [], [], []
+
+    async def scenario():
+        async def get(path):
+            requests.append(("get", path))
+            return dict(control=True, csrf="private-csrf", device_id="existing-device")
+        async def post(path, body):
+            requests.append(("post", path))
+            count = sum(op == "post" for op, _ in requests)
+            assert path == "attach" and body == {} and client.ws is None
+            if mode == "cancel" or mode == "cancel_second" and count == 2: raise asyncio.CancelledError()
+            if mode == "late": await asyncio.Event().wait()
+            if mode == "outer" and count == 2: await asyncio.Event().wait()
+            if mode == "post_timeout": raise second
+            if mode in {"malformed", "noncanonical", "wrong_status", "auth", "subclass"}: raise other
+            if mode == "snapshot" or mode == "upgrade_timeout_then_unknown" and count == 1:
+                return dict(ticket="private-ticket-" + str(count))
+            if count == 1: raise first
+            if mode in {"twice", "upgrade_timeout_then_unknown"}: raise other
+            return dict(ticket="private-ticket-" + str(count))
+        class Socket:
+            async def send_json(self, value): sent.append(value)
+        async def upgrade(*args, **kwargs):
+            upgrades.append(kwargs)
+            assert client.ws is None
+            if mode == "unknown_then_upgrade_timeout": raise second
+            if mode == "upgrade_timeout_then_unknown": raise upgrade_first
+            return Socket()
+        async def read(): await asyncio.Event().wait()
+        async def wait(predicate, timeout):
+            if mode == "snapshot": raise second
+            client.snapshot = {"reporting": "fresh"}
+        def record(value):
+            records.append(value)
+            if mode == "logger": raise OSError("private reporting record unavailable")
+        client = SimpleNamespace(get=get, post=post, origin="https://example.invalid", tls=object(), ws=None,
+            reader=None, snapshot=None, _read=read, wait=wait, record=record,
+            generation="original-owner", connection="original-connection", sequence=17)
+        client.http = SimpleNamespace(ws_connect=upgrade)
+        try:
+            if mode in {"success", "logger"}:
+                await m.SessionClient.attach(client)
+                assert sent == [{"ticket": "private-ticket-2"}] and len(upgrades) == 1
+                assert len(records) == 1 and records[0]["phase"] == "ticket_request"
+                assert records[0]["control_request"] is False and records[0]["new_motor_authority"] is False
+            elif mode in {"cancel", "cancel_second"}:
+                with pytest.raises(asyncio.CancelledError): await m.SessionClient.attach(client)
+            elif mode in {"outer", "late"}:
+                with pytest.raises(TimeoutError) as caught:
+                    async with asyncio.timeout(.03): await m.SessionClient.attach(client)
+                assert caught.value not in (first, second, upgrade_first)
+            else:
+                expected = (first if mode in {"twice", "unknown_then_upgrade_timeout"} else
+                            upgrade_first if mode == "upgrade_timeout_then_unknown" else
+                            other if mode in {"malformed", "noncanonical", "wrong_status", "auth", "subclass"} else second)
+                with pytest.raises(type(expected)) as caught: await m.SessionClient.attach(client)
+                assert caught.value is expected
+                if mode in {"twice", "upgrade_timeout_then_unknown"}: assert caught.value.__cause__ is other
+                elif mode == "unknown_then_upgrade_timeout": assert caught.value.__cause__ is second
+            post_count = sum(op == "post" for op, _ in requests)
+            assert post_count == (2 if mode in {"success", "logger", "twice", "unknown_then_upgrade_timeout",
+                "upgrade_timeout_then_unknown", "cancel_second", "outer"} else 1)
+            assert post_count <= 2 and len(upgrades) <= 1
+            assert client.generation == "original-owner" and client.connection == "original-connection" and client.sequence == 17
+            assert not any(path not in {"session", "attach"} for _, path in requests)
+            assert len(json.dumps(records).encode()) <= 2048
+            assert not any(secret in json.dumps(records) for secret in ("private-ticket", "private-csrf", str(first)))
+        finally:
+            if client.reader is not None:
+                client.reader.cancel()
+                await asyncio.gather(client.reader, return_exceptions=True)
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("mode", ["success", "stop"])
+def test_reporting_attach_unknown_replacement_uses_fresh_real_tls_ticket_without_control(tmp_path, monkeypatch, mode):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
+        tmp_path, monkeypatch, "upgrade_attach_post_" + mode)
+
+
+def test_session_client_negotiates_deflate_without_changing_snapshot_or_control(tmp_path, monkeypatch):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
+        tmp_path, monkeypatch, "upgrade_attach_compression")
+
+
+@pytest.mark.parametrize("mode", ["serial100", "piggyback100", "piggyback150", "stop", "lost"])
+def test_optional_next_grant_uses_real_core_ipc_tls_and_original_input_deadline(tmp_path, monkeypatch, mode):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
+        tmp_path, monkeypatch, "next_grant_" + mode)
+
+
+@pytest.mark.parametrize("change", [None,"service","run","host","controller","connection","revision","deadline",
+    "operation","pause","stop","feedback","view","transport","late","newer_control","malformed",
+    "missing_operation","missing_live","missing_deadline","invalid_operation","boolean_live","infinite_deadline","boolean_revision","null_host","opaque_host"])
+def test_optional_next_grant_cache_is_one_use_original_age_and_full_identity(monkeypatch, change):
+    from types import SimpleNamespace
+    m = adapter()
+    client = object.__new__(m.SessionClient)
+    client.ws, client.reader = SimpleNamespace(closed=False), None
+    client.device, client.generation, client.connection = "device", str(uuid4()), str(uuid4())
+    client.transport_error = None
+    client._next_grant, client._next_grant_epoch = None, 0
+    client.snapshot = {"service_incarnation":str(uuid4()),
+        "controller":{"device_id":client.device,"controller_generation":client.generation},
+        "run":{"run_id":str(uuid4()),"backend_incarnation":str(uuid4()),"intent_revision":3,"operation_id":str(uuid4()),
+               "status":"running","uncertain":False,"recovery":None,"native_live_at":9.,"deadline":309.},
+        "evidence":{"feedback":True,"required_observation":True}}
+    now = [100.1]
+    monkeypatch.setattr(m.time, "perf_counter", lambda:now[0])
+    unqualified = change in {"missing_operation","missing_live","missing_deadline","invalid_operation",
+                            "boolean_live","infinite_deadline","boolean_revision","null_host"}
+    if change in {"missing_operation","missing_live","missing_deadline"}:
+        client.snapshot["run"].pop({"missing_operation":"operation_id","missing_live":"native_live_at","missing_deadline":"deadline"}[change])
+    elif change == "invalid_operation":client.snapshot["run"]["operation_id"] = "not-an-operation-uuid"
+    elif change == "boolean_live":client.snapshot["run"]["native_live_at"] = True
+    elif change == "infinite_deadline":client.snapshot["run"]["deadline"] = float("inf")
+    elif change == "boolean_revision":client.snapshot["run"]["intent_revision"] = True
+    elif change == "null_host":client.snapshot["run"]["backend_incarnation"] = None
+    elif change == "opaque_host":client.snapshot["run"]["backend_incarnation"] = "opaque-host-identity"
+    identity = client.identities()
+    command = {"op":"input",**identity,"request_next_grant":True}
+    grant = {"accepted":True,"status":"granted","grant_id":str(uuid4()),"issued":10.,"expires":10.25,"next_grant_supported":True}
+    result = {"accepted":True,"status":"input","effect_admitted":True,"next_grant":grant}
+    timing = {"request_started_at_monotonic_s":100.,"response_observed_at_monotonic_s":100.1}
+    if change == "newer_control":
+        client._discard_next_grant()
+    if change == "malformed":
+        grant["expires"] = 11.
+    client._remember_next_grant(command,result,timing,0)
+    if unqualified or change in {"newer_control","malformed"}:
+        assert client._next_grant is None
+        return
+    assert client._next_grant is not None
+    if change in {"run","host","revision","deadline","operation"}:
+        field={"run":"run_id","host":"backend_incarnation","revision":"intent_revision","deadline":"deadline","operation":"operation_id"}[change]
+        client.snapshot["run"][field] = 4 if change=="revision" else 310. if change=="deadline" else str(uuid4())
+    elif change == "service":client.snapshot["service_incarnation"] = str(uuid4())
+    elif change == "controller":client.snapshot["controller"]["controller_generation"] = str(uuid4())
+    elif change == "connection":client.connection = str(uuid4())
+    elif change in {"pause","stop"}:client.snapshot["run"]["status"] = "paused" if change=="pause" else "stopped"
+    elif change in {"feedback","view"}:client.snapshot["evidence"]["feedback" if change=="feedback" else "required_observation"] = False
+    elif change == "transport":client.transport_error = "lost reporting"
+    elif change == "late":now[0] = 100.25
+    retained = client._take_next_grant(identity)
+    if change in {None,"opaque_host"}:
+        assert retained["grant"] == grant and retained["received"] == 100.1 and retained["ceiling"] == 100.25
+    else:assert retained is None
+    assert client._take_next_grant(identity) is None
+
+
+@pytest.mark.parametrize("operation", ["state", "renewal"])
+def test_optional_next_grant_reporting_error_discards_cache(monkeypatch, operation):
+    import asyncio
+    m = adapter()
+    client = object.__new__(m.SessionClient)
+    client._next_grant, client._next_grant_epoch = {"previous":"permission"}, 0
+    client.origin, client.csrf = "https://127.0.0.1:8443", "fixture"
+    class HTTP:
+        def get(self,*args,**kwargs):raise TimeoutError("original reporting timeout")
+        def post(self,*args,**kwargs):raise TimeoutError("original reporting timeout")
+    client.http = HTTP()
+    with pytest.raises(TimeoutError, match="original reporting timeout"):
+        asyncio.run(client.get("state") if operation == "state" else client.post("claim", {"controller_generation":"same"}))
+    assert client._next_grant is None
+
+
+def test_startup_required_view_core_ipc_tls_has_no_native_live_cycle_and_pause_wins(tmp_path,monkeypatch):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
+        tmp_path,monkeypatch,"startup_required_view")

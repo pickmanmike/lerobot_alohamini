@@ -7,7 +7,9 @@ limitation documented here remain unchanged.
 
 <a id="current-ordinary-viewing-path"></a>
 
-## Current ordinary route — Stage88, 2026-10-28
+## Ordinary viewing route
+
+The [canonical current-state record](current-state.md#current-operation-and-installation) owns actual installed identities, accepted viewing scope and next action. The Stage88 details below are retained historical evidence; they are not a competing current deployment table.
 
 Stage88 changes only the runtime viewer diagnostics (WebRTC JSa97118fe).
 The maintained camera bytes, enrolled software-decoder profile, source mapping

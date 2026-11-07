@@ -501,6 +501,7 @@ class PhysicalExecutor:
         self._completion_returns = []
         self.positive_prerequisite = None
         self.selected_experiment = None
+        self.ordinary_arm_profile = None
         self._lifecycle = {
             "run_id": None,
             "phase": "idle",
@@ -518,6 +519,10 @@ class PhysicalExecutor:
         self._live_admission_requested = False
         self._live_expired = None
         self._teleop_source = None
+        self._startup_view_requirement = self._startup_view_progress = None
+        self._startup_view_armed = False
+        self._startup_view_invalid = None
+        self._startup_observation_generation = None
         self._reset_input_transport_trace()
 
     def _reset_input_transport_trace(self):
@@ -660,6 +665,14 @@ class PhysicalExecutor:
             if self.worker and self.worker.is_alive():
                 raise RuntimeError("Positive prerequisite cannot change during an active owner")
             self.positive_prerequisite = copy.deepcopy(proof)
+
+    def set_ordinary_arm_profile(self, policy):
+        """Freeze a closed ordinary operating policy before fresh native ownership."""
+        from examples.alohamini.am1_live_teleop import validate_ordinary_arm_profile
+        with self.mutex:
+            if self.worker and self.worker.is_alive():
+                raise RuntimeError("Ordinary settings cannot change during an active owner")
+            self.ordinary_arm_profile = validate_ordinary_arm_profile(policy) if policy is not None else None
 
     def set_selected_experiment(self, definition):
         """Freeze only an authority-validated descriptor before native admission."""
@@ -804,6 +817,8 @@ class PhysicalExecutor:
 
     def bind_run(self, run_id, recipe):
         with self.mutex:
+            if self.ordinary_arm_profile is not None and recipe.name != TELEOP_RECIPE:
+                raise ValueError("Ordinary arms policy requires the whole-frame teleop recipe")
             if recipe.name == SelectedElbowExperiment.recipe_name and self.selected_experiment is None:
                 raise RuntimeError("Selected experiment definition required before binding")
             if (
@@ -849,11 +864,159 @@ class PhysicalExecutor:
                 "uncertain": False,
                 "terminal_status": None,
             }
+            self._startup_view_requirement = self._startup_view_progress = None
+            self._startup_view_armed, self._startup_view_invalid = False, None
+            self._startup_observation_generation = None
             self.observation.begin(run_id, self._live_ceiling())
+
+    def configure_startup_view(self, binding, *, advisory_bench=False):
+        """Trusted Core policy, fixed to this Start before any host can launch."""
+        keys = {"run_id", "operation_id", "service_incarnation", "host_incarnation", "controller_generation",
+                "intent_revision", "role", "startup_deadline", "controller_expires", "required"}
+        with self.mutex:
+            if (self.ordinary_arm_profile is None or self.recipe.name != TELEOP_RECIPE
+                    or self._startup_view_requirement is not None or self.worker and self.worker.is_alive()
+                    or type(binding) is not dict or set(binding) != keys or type(advisory_bench) is not bool
+                    or type(binding["required"]) is not bool or binding["required"] == advisory_bench
+                    or binding["run_id"] != self.run_id or binding["host_incarnation"] != self.host_incarnation
+                    or type(binding["intent_revision"]) is not int or binding["intent_revision"] != self.revision
+                    or binding["role"] != "chest"
+                    or any(type(binding[k]) is not str or not binding[k] for k in
+                           ("run_id", "operation_id", "service_incarnation", "host_incarnation", "controller_generation"))
+                    or any(type(binding[k]) not in (int, float) or not math.isfinite(binding[k])
+                           or self.clock() >= binding[k] for k in ("startup_deadline", "controller_expires"))):
+                raise ValueError("exact current ordinary startup view policy required")
+            request = self.observation.request
+            if (not request or request["run_id"] != self.run_id or not request["active"]
+                    or binding["required"] and self.observation.source["role"] != binding["role"]):
+                raise ValueError("ordinary startup view requires its own Chest observation request")
+            self._startup_view_requirement = copy.deepcopy(binding)
+            self._startup_observation_generation = request["generation"]
+            self._lifecycle["startup_deadline"] = min(self._lifecycle["startup_deadline"], binding["startup_deadline"])
+
+    def invalidate_startup_view(self, reason):
+        with self.mutex:
+            required = self._startup_view_requirement
+            if required and required["required"] and self._lifecycle["phase"] == "startup":
+                self._startup_view_invalid = self._startup_view_invalid or str(reason)
+                self._wake.set()
+
+    def publish_startup_view(self, binding, view):
+        """Copy actual authority expiry and original browser clocks; never renew on read."""
+        with self.mutex:
+            required = self._startup_view_requirement
+            if required is None or not required["required"] or self._lifecycle["phase"] not in {"startup", "live"}:
+                return False
+            immutable = set(required) - {"controller_expires"}
+            if (self._startup_view_invalid or self.finish_status or type(binding) is not dict
+                    or set(binding) != set(required) or any(binding[k] != required[k] for k in immutable)
+                    or type(binding["controller_expires"]) not in (int, float)
+                    or not math.isfinite(binding["controller_expires"])
+                    or self.clock() >= required["controller_expires"]
+                    or binding["controller_expires"] < required["controller_expires"]):
+                self._startup_view_invalid = self._startup_view_invalid or "startup authority changed or expired"
+                return False
+            required["controller_expires"] = binding["controller_expires"]
+            self._startup_view_progress = copy.deepcopy(view) if isinstance(view, dict) else None
+            self._wake.set()
+            if self._lifecycle["phase"] == "live":
+                # Exact worker handoff may precede Core's next lifecycle tick.
+                # Acknowledging the mailbox never promotes Core NativeLive.
+                live = self._lifecycle.get("native_live_at")
+                request = self.observation.request or {}
+                owner = self._live_binding or {}
+                return bool(self._startup_view_armed and self.run_id == required["run_id"]
+                    and self.host_incarnation == required["host_incarnation"] and self.revision == required["intent_revision"]
+                    and all(owner.get(k) == required[k] for k in ("service_incarnation", "controller_generation"))
+                    and self._lifecycle.get("run_id") == self.run_id
+                    and type(live) in (int, float) and math.isfinite(live)
+                    and request.get("started_at", float("inf")) <= live < required["startup_deadline"]
+                    and self._startup_view_matches())
+            return True  # Delivery accepted; qualification is checked against current local evidence below.
+
+    def _startup_view_matches(self, *, failure_context=None):
+        required, view = self._startup_view_requirement, self._startup_view_progress
+        local, browser_checked_at, reason = None, None, None
+
+        def checked(name, value):
+            nonlocal reason
+            if not value:
+                reason = name
+            return value
+
+        if not required or not view:
+            matched, reason = False, "browser_descriptor_absent" if required else "startup_requirement_absent"
+        else:
+            local = self.observation.evidence()
+            floor, expiry = view.get("received_at_monotonic_s"), view.get("qualified_until")
+            matched = bool(checked("local_qualified", local["qualified"])
+                and checked("owned_session", local.get("owned_session") == self.run_id)
+                and checked("request_generation", local.get("generation") == self._startup_observation_generation)
+                and checked("role", local.get("role") == required["role"] == view.get("role"))
+                and checked("owner_generation", local.get("owner_generation") == view.get("owner_generation"))
+                and checked("capture_generation", local.get("capture_generation") == view.get("capture_generation"))
+                and checked("browser_run", view.get("run_id") == self.run_id)
+                and checked("browser_source_qualified", view.get("source_fresh") is True)
+                and checked("browser_decoded_frames", type(view.get("decoded_frames")) is int and view["decoded_frames"] > 0)
+                and checked("browser_encode_generation", type(view.get("encode_generation")) is str and bool(view["encode_generation"]))
+                and checked("browser_clock_types", all(type(x) in (int, float) and math.isfinite(x) for x in (floor, expiry)))
+                and checked("browser_receipt_range", floor <= (browser_checked_at := self.clock()) < expiry)
+                and checked("browser_original_interval", abs(expiry - floor - .5) < 1e-9))
+        if not matched and failure_context is not None and "startup_view_failure" not in self._lifecycle:
+            # One fixed, original proof snapshot; later finishing reads cannot replace it.
+            self._lifecycle["startup_view_failure"] = dict(
+                version=1, kind="am1-startup-required-view-failure", reason=reason,
+                run_id=self.run_id, host_incarnation=self.host_incarnation,
+                binding=copy.deepcopy(required), current_authority=copy.deepcopy(failure_context["current_authority"]),
+                startup_deadline=failure_context["startup_deadline"],
+                checked_at=dict(startup=failure_context["startup"], authority=failure_context["authority"], browser=browser_checked_at),
+                local=copy.deepcopy(local), browser=copy.deepcopy(view))
+        return matched
+
+    def _check_startup_view(self):
+        with self.mutex:
+            required = self._startup_view_requirement
+            if not required or not required["required"]:
+                return
+            if self.finish_status:
+                raise StartupCancelledError("physical startup cancelled by Stop")
+            if self._lifecycle["phase"] != "startup":
+                return
+            if (startup_checked_at := self.clock()) >= (startup_deadline := self._lifecycle["startup_deadline"]):
+                raise RuntimeError("physical startup deadline expired")
+            owner = self._live_binding or {}
+            if (self._startup_view_invalid or self.revision != required["intent_revision"]
+                    or self.run_id != required["run_id"] or self.host_incarnation != required["host_incarnation"]
+                    or any(owner.get(k) != required[k] for k in ("service_incarnation", "controller_generation"))
+                    or (authority_checked_at := self.clock()) >= required["controller_expires"]):
+                self._startup_view_invalid = self._startup_view_invalid or "startup authority changed or expired"
+                self.finish_status = self.finish_status or "stopped"
+                raise StartupCancelledError("physical startup cancelled: " + self._startup_view_invalid)
+            if self._startup_view_armed and not self._startup_view_matches(failure_context=dict(
+                    startup=startup_checked_at, authority=authority_checked_at, startup_deadline=startup_deadline,
+                    current_authority=dict(run_id=self.run_id,host_incarnation=self.host_incarnation,
+                                           intent_revision=self.revision,**owner))):
+                raise RuntimeError("required owned local/browser view expired during physical startup")
+
+    def startup_view_ready(self):
+        with self.mutex:
+            self._check_startup_view()
+            required = self._startup_view_requirement
+            if required is None:
+                return self.ordinary_arm_profile is None
+            if not required["required"]:
+                return True
+            if self._lifecycle["phase"] != "startup":
+                return False
+            if not self._startup_view_matches():
+                return False
+            self._startup_view_armed = True
+            return True
 
     def begin(self, recipe):
         with self.mutex:
-            if self.recipe != recipe or self.worker and self.worker.is_alive():
+            if (self.recipe != recipe or self.worker and self.worker.is_alive()
+                    or self.ordinary_arm_profile is not None and self._startup_view_requirement is None):
                 return False
             self.worker = threading.Thread(target=self._run, name="am1-protected-native", daemon=False)
             self.worker.start()
@@ -962,6 +1125,9 @@ class PhysicalExecutor:
             workspace = validate_workspace((self.sample or {}).get("ack", {}).get("live_input", {}).get("workspace"))
             target = validate_target(target, workspace=workspace)
             body = validate_body(body)
+            if self.ordinary_arm_profile is not None and (
+                    workspace.get("workspace_profile") != self.ordinary_arm_profile["profile"] or body != ZERO_BODY):
+                return False
             source = validate_source(source, grant_id=grant_id, previous=self._teleop_source)
         except (KeyError, TypeError, ValueError):
             return False
@@ -1369,12 +1535,17 @@ class PhysicalExecutor:
                     raise StartupCancelledError("physical startup cancelled by Stop")
                 if self.clock() >= self._lifecycle["startup_deadline"]:
                     raise RuntimeError("physical startup deadline expired")
+                self._check_startup_view()
 
             io.observation = self.observation
+            if self._startup_view_requirement and self._startup_view_requirement["required"]:
+                io.startup_view = self.startup_view_ready
             io.start(
                 self.run_id, self.host_incarnation, self.recipe, cancel,
                 **({"selected_experiment": self.selected_experiment.payload}
                    if self.recipe.name == SelectedElbowExperiment.recipe_name else {}),
+                **({"ordinary_arm_profile": copy.deepcopy(self.ordinary_arm_profile)}
+                   if self.ordinary_arm_profile is not None else {}),
             )
             while True:
                 with self.mutex:
@@ -1510,6 +1681,7 @@ class PhysicalExecutor:
                             self._live_admission_requested = True
                             admitted = ack.get("live_input", {})
                             if self._lifecycle["phase"] == "startup" and admitted.get("live_admitted_at_monotonic_s") is not None:
+                                self._check_startup_view()
                                 self._lifecycle.update(phase="live", native_live_at=admitted["live_admitted_at_monotonic_s"],
                                     native_deadline_monotonic_s=admitted["live_deadline_monotonic_s"],
                                     backend_incarnation=self.host_incarnation)
@@ -1735,7 +1907,7 @@ class PhysicalExecutor:
 BODY_MOTORS = ("base_left_wheel", "base_back_wheel", "base_right_wheel", "lift_axis")
 
 
-def qualified_cleanup_receipt(receipt, run_id, incarnation):
+def qualified_cleanup_receipt(receipt, run_id, incarnation, *, ordinary_arm_profile=None):
     if (
         not isinstance(receipt, dict)
         or receipt.get("version") != 1
@@ -1757,6 +1929,24 @@ def qualified_cleanup_receipt(receipt, run_id, incarnation):
         or readback.get("selected_gain_restore_required")
     ):
         return False
+    ordinary = readback.get("ordinary_arm_profile")
+    if ordinary_arm_profile is not None or ordinary is not None or "ordinary_arm_profile_restore_required" in readback:
+        try:
+            from examples.alohamini.am1_live_teleop import validate_ordinary_arm_profile
+            from examples.alohamini.am1_live_teleop import validate_ordinary_arm_profile_receipt
+            if readback.get("selected_gain_restore_required") is not False or (
+                "ordinary_arm_profile_restore_required" in readback
+                and readback["ordinary_arm_profile_restore_required"] is not False
+            ):
+                return False
+            proof = validate_ordinary_arm_profile_receipt(ordinary, run_id=run_id,
+                                                        host_incarnation=incarnation, restored=True)
+            if ordinary_arm_profile is not None and {
+                    key: proof["binding"][key] for key in ("profile", "right_elbow_p")
+            } != validate_ordinary_arm_profile(ordinary_arm_profile):
+                return False
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return False
     expected = {
         ("left" if "_left_" in k else "right", k.removesuffix(".pos"), "Torque_Enable") for k in JOINT_KEYS
     }
@@ -1781,6 +1971,7 @@ class ProtectedHostRun:
         self.config = config
         self.host = self.camera = self.client = None
         self.observation = None
+        self.startup_view = None
         self.host_log = self.camera_log = None
         self.run_id = self.incarnation = None
         self.recipe = None
@@ -1854,7 +2045,11 @@ class ProtectedHostRun:
             if hashlib.sha256(Path(path).read_bytes()).hexdigest() != digest:
                 raise RuntimeError("preserved calibration content changed")
 
-    def start(self, run_id, incarnation, recipe, cancel, *, selected_experiment=None):
+    def start(self, run_id, incarnation, recipe, cancel, *, selected_experiment=None, ordinary_arm_profile=None):
+        from examples.alohamini.am1_live_teleop import validate_ordinary_arm_profile
+        ordinary = validate_ordinary_arm_profile(ordinary_arm_profile) if ordinary_arm_profile is not None else None
+        if ordinary is not None and (recipe.name != TELEOP_RECIPE or selected_experiment is not None):
+            raise ValueError("Ordinary arms require the existing whole-frame recipe without an experiment")
         definition = None
         if recipe.name == SelectedElbowExperiment.recipe_name:
             if selected_experiment is None:
@@ -1874,12 +2069,15 @@ class ProtectedHostRun:
 
         self.run_id, self.incarnation = run_id, incarnation
         self.recipe = recipe
+        self.ordinary_arm_profile = copy.deepcopy(ordinary)
         self._validate_source()
         cancel()
         state = Path(self.config["physical_state_directory"])
         if (state / "cleanup-uncertain.json").exists() or (state / "physical-in-progress.json").exists():
             raise RuntimeError("previous physical cleanup requires actual stopped reconciliation")
         pending_response = [state / (side + "-response-p-request.json") for side in ("left", "right")]
+        if ordinary is not None and any(path.exists() or path.is_symlink() for path in pending_response):
+            raise ValueError("Ordinary arms cannot consume a pending legacy response experiment")
         if all(path.exists() or path.is_symlink() for path in pending_response):
             raise ValueError("response P admission requires one selected elbow request")
         # The isolated hardware host unit acquires canonical + serial admission before robot construction.
@@ -1895,18 +2093,19 @@ class ProtectedHostRun:
             consume_right_p20_request,
             consume_right_response_p_request,
         )
-        left_response_p_file = consume_left_response_p_request(
-            state, self.run_directory, recipe.name, run_id, incarnation, self.config["host_head"]
-        )
-        right_response_p_file = None
-        if left_response_p_file is None:
-            right_response_p_file = consume_right_response_p_request(
+        left_response_p_file = right_response_p_file = None
+        if ordinary is None:
+            left_response_p_file = consume_left_response_p_request(
                 state, self.run_directory, recipe.name, run_id, incarnation, self.config["host_head"]
             )
+            if left_response_p_file is None:
+                right_response_p_file = consume_right_response_p_request(
+                    state, self.run_directory, recipe.name, run_id, incarnation, self.config["host_head"]
+                )
         # Named baseline presets derive fixed native settings from the authenticated
         # recipe and this fresh run identity; experimental nonces are unrelated.
         right_p20_file = None
-        if recipe.name not in PRACTICAL_ELBOW_PRESETS:
+        if ordinary is None and recipe.name not in PRACTICAL_ELBOW_PRESETS:
             right_p20_file = consume_right_p20_request(state, self.run_directory, recipe.name,
                                                      run_id, incarnation, self.config["host_head"])
         experiment_file = None
@@ -1952,7 +2151,8 @@ class ProtectedHostRun:
             log=self.camera_log,
             camera_route_discovery=True,
         )
-        wait_required_camera(self.camera, self.observation, cancel)
+        wait_required_camera(self.camera, self.observation, cancel,
+                             **({"required_view": self.startup_view} if self.startup_view is not None else {}))
         cancel()
         env["AM1_MOTOR_PYTHON"] = self.config["host_python"]
         env["AM1_LOG_DIRECTORY"] = str(self.run_directory)
@@ -2012,6 +2212,9 @@ class ProtectedHostRun:
             "--am1-physical-state-directory",
             str(state),
         ]
+        if ordinary is not None:
+            host_command.extend(["--am1-ordinary-arm-profile", ordinary["profile"],
+                                 "--am1-ordinary-right-elbow-p", str(ordinary["right_elbow_p"])])
         if experiment_file is not None:
             host_command.extend(["--am1-selected-experiment-file", str(experiment_file)])
         if right_p20_file is not None:
@@ -2040,6 +2243,7 @@ class ProtectedHostRun:
             PYTHONDONTWRITEBYTECODE="1",
             PYTHONUNBUFFERED="1",
         )
+        cancel()  # Recheck the original required-view/authority proof at the host-launch boundary.
         self.host = OwnedUnit(
             "am1-pa01-host-" + run_id,
             self.config["host_repository"],
@@ -2143,7 +2347,8 @@ class ProtectedHostRun:
                 self.client.disconnect()
             except Exception as exc:
                 errors.append("local client close: " + str(exc))
-        motors = qualified_cleanup_receipt(receipt, self.run_id, self.incarnation)
+        motors = qualified_cleanup_receipt(receipt, self.run_id, self.incarnation,
+                                            ordinary_arm_profile=getattr(self, "ordinary_arm_profile", None))
         no_device_effects = self.host is None
         # Required camera remains through host finishing. Release main process once; it cleans its child.
         camera_receipt = None
@@ -2374,14 +2579,14 @@ class OwnedUnit:
             raise RuntimeError("owned unit cooperative stop refused")
 
 
-def wait_required_camera(camera, observation, cancel, *, sleep=time.sleep):
+def wait_required_camera(camera, observation, cancel, *, sleep=time.sleep, required_view=None):
     if observation is None:
         raise ValueError("actual required local-camera mailbox unavailable")
     while True:
         cancel()
         if camera.poll() is not None:
             raise RuntimeError("required owned camera exited before physical host launch")
-        if observation.evidence()["qualified"]:
+        if observation.evidence()["qualified"] and (required_view is None or required_view()):
             return
         sleep(0.05)
 
@@ -2648,6 +2853,8 @@ def main(argv=None):
                         help="Explicit temporary 1-degree inward LEFT shoulder startup allowance for current-rest only")
     args = parser.parse_args(argv)
     profile = CURRENT_REST_WORKSPACE_PROFILES[args.left_response_workload] if args.left_response_workspace is not None else None
+    if args.left_shoulder_startup_degrees is not None and profile is None:
+        parser.error("Left shoulder startup allowance requires the explicit current-rest workspace")
     receipt = prepare_left_response_p_remote(args.config, ssh=args.ssh, ttl_seconds=args.ttl_seconds,
         workspace_profile=profile, left_shoulder_startup_degrees=args.left_shoulder_startup_degrees,
         workload_segment=args.left_response_workload)

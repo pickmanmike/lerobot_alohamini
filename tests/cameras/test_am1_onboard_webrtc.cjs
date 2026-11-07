@@ -162,6 +162,10 @@ test("loaded camera page selects WebRTC and switches roles without any control r
   assert.ok(liveDiagnostic.records.some(row=>row.phase==="offer"&&row.http_status===201&&row.headers_valid===true));
   assert.ok(liveDiagnostic.records.length<=8);
   sourceFresh=false;
+  await page.waitForFunction(()=>AM1CameraHealth().video?.source_fresh===false);
+  assert.equal((await readDiagnostic()).state,"current","same-generation source staleness must preserve the presenting attachment");
+  assert.equal((await readDiagnostic()).attempt,liveDiagnostic.attempt);
+  captures[selected]=randomUUID(); // A genuine source identity change still invalidates the peer.
   await page.waitForFunction(()=>document.querySelector("#diagnostics").textContent.includes('"state":"stopped"'));
   const stoppedDiagnostic=await readDiagnostic();assert.equal(stoppedDiagnostic.attempt,liveDiagnostic.attempt);
   assert.equal(stoppedDiagnostic.state,"stopped");assert.deepEqual(stoppedDiagnostic.records.slice(0,liveDiagnostic.records.length),liveDiagnostic.records);
@@ -327,9 +331,9 @@ test("actual video separates delayed source publication from explicit stale reof
  const {chromium}=require("playwright"),directory=path.resolve(__dirname,"../../tools/am1_camera");
  const browser=await chromium.launch({headless:true,channel:process.env.AM1_TEST_BROWSER_CHANNEL||"msedge"});
  t.after(()=>browser.close());const results=[];
- for(const policy of ["existing-stale-reoffer","retain-peer-test-only"]){
+ for(const policy of ["existing-stale-reoffer","retain-peer-test-only","retain-peer-status-loss","retain-peer-source-stale"])await t.test(policy,async()=>{
   const page=await browser.newPage({viewport:{width:1400,height:1000}}),errors=[],offers=[],status=[];
-  page.on("pageerror",error=>errors.push(error.message));let delayNextStatus=false,delayed=false;
+  page.on("pageerror",error=>errors.push(error.message));let delayNextStatus=false,delayed=false,statusUnavailable=false,sourceStale=false;
   await page.addInitScript(()=>{
    globalThis.am1Remote={csrf:"offline"};globalThis.probePeers=[];globalThis.probeSenders=[];
    globalThis.probeFrames=[];globalThis.probeTicks=[];globalThis.probeSamples=[];
@@ -360,11 +364,12 @@ test("actual video separates delayed source publication from explicit stale reof
    const request=route.request(),url=new URL(request.url());
    const reply=(code,mime,body,headers={})=>route.fulfill({status:code,contentType:mime,body,headers});
    if(url.pathname==="/api/onboard/status"){
+    if(statusUnavailable)return reply(503,"text/plain","synthetic status receipt loss");
     const sampled=await page.evaluate(()=>({at:performance.now(),tick:probeTicks.at(-1)??performance.now(),sequence:Math.max(1,probeTicks.length)}));
     const slow=delayNextStatus&&!delayed;if(slow){delayed=true;await new Promise(resolve=>setTimeout(resolve,650));}
     const delivered=await page.evaluate(()=>performance.now());status.push({sampled_at:sampled.at,delivered_at:delivered,synthetic_delayed:slow});
     return reply(200,"application/json",JSON.stringify({owner_generation:"offline-owner",
-     cameras:Object.fromEntries(roles.map(role=>[role,{configured:role==="chest",state:role==="chest"?"fresh":"unavailable",
+     cameras:Object.fromEntries(roles.map(role=>[role,{configured:role==="chest",state:role==="chest"?(sourceStale?"stale":"fresh"):"unavailable",
       age_ms:Math.max(0,sampled.at-sampled.tick),sequence:sampled.sequence,capture_generation:"offline-capture",rotation_degrees:0}])),
      video:{enabled:true,transport:"webrtc",role:"chest",encode_generation:"offline-encode",capture_generation:"offline-capture",state:"running"}}));
    }
@@ -402,22 +407,34 @@ test("actual video separates delayed source publication from explicit stale reof
   await page.goto("https://am1-publication.invalid");await page.addStyleTag({path:path.resolve(__dirname,"../../tools/am1_console_ui/style.css")});
   await page.waitForFunction(()=>typeof AM1CameraHealth==="function");await page.evaluate(()=>AM1CameraSelect("chest"));
   await page.waitForFunction(()=>AM1CameraHealth().video?.fresh&&AM1CameraHealth().video.decoded_frames>=5,null,{timeout:7000});
-  const before=await page.evaluate(()=>probeSnapshot()),offersBefore=offers.length;delayNextStatus=true;
-  await page.waitForFunction(()=>{const v=AM1CameraHealth().video;return v?.source_fresh===false&&v.decoded_frames>0&&v.decoded_age_ms<500;},null,{timeout:4000,polling:25});
+  const before=await page.evaluate(()=>probeSnapshot()),offersBefore=offers.length;
+  if(policy==="retain-peer-status-loss")statusUnavailable=true;
+  else if(policy==="retain-peer-source-stale")sourceStale=true;
+  else delayNextStatus=true;
+  if(statusUnavailable)await page.waitForFunction(()=>AM1CameraHealth().status_available===false,null,{timeout:4000,polling:25});
+  else if(sourceStale)await page.waitForFunction(()=>AM1CameraHealth().roles.find(row=>row.role==="chest").source_state==="stale",null,{timeout:4000,polling:25});
+  else await page.waitForFunction(()=>{const v=AM1CameraHealth().video;return v?.source_fresh===false&&v.decoded_frames>0&&v.decoded_age_ms<500;},null,{timeout:4000,polling:25});
   const stale=await page.evaluate(()=>probeSnapshot());assert.equal(stale.health.fresh,false);assert.equal(stale.health.source_fresh,false);
-  assert.ok(stale.last_rvfc.at>before.last_rvfc.at,"the synthetic status delay must coexist with genuine new presentation");
+  assert.ok(stale.last_rvfc.at>before.last_rvfc.at,"the synthetic status loss must coexist with genuine new presentation");
+  if(statusUnavailable||sourceStale){
+   assert.equal(stale.peer_id,before.peer_id);assert.equal(stale.peer_state,"connected","status/source uncertainty must not close the same presenting peer");
+   assert.ok(stale.health.decoded_frames>before.health.decoded_frames);assert.ok(stale.health.decoded_age_ms<500);
+   assert.equal(offers.length,offersBefore);assert.equal(await page.locator("#primary").evaluate(node=>node.classList.contains("fresh")),false);
+  }
+  statusUnavailable=false;sourceStale=false;
   const action=policy==="existing-stale-reoffer"?await page.evaluate(()=>AM1CameraReconnect("chest")):{accepted:false,reason:"test-only retain connected advancing peer"};
   const decisionAt=await page.evaluate(()=>performance.now());
   await page.waitForFunction(()=>AM1CameraHealth().video?.fresh===true,null,{timeout:7000,polling:25});
   const after=await page.evaluate(()=>probeSnapshot());
   const snapshots=await page.evaluate(()=>({frames:probeFrames,ticks:probeTicks}));
-  results.push({policy,synthetic_status_delay_ms:650,before,stale,decision_at:decisionAt,action,after,
+  results.push({policy,synthetic_status_delay_ms:delayNextStatus?650:null,status_receipt_loss:policy==="retain-peer-status-loss",source_report_stale:policy==="retain-peer-source-stale",before,stale,decision_at:decisionAt,action,after,
    first_observed_local_fresh_after_stale_ms:after.at-stale.at,peer_retained:after.peer_id===before.peer_id,
    offers_before:offersBefore,offers_total:offers.length,offers,status,frames_during_interval:snapshots.frames.filter(x=>x.at>=before.at&&x.at<=after.at),
    source_ticks_during_interval:snapshots.ticks.filter(x=>x>=before.at&&x<=after.at),native_qualification:"not present; local health only"});
   if(policy==="existing-stale-reoffer"){assert.equal(action.accepted,true);assert.ok(offers.length>offersBefore);}
+  else{assert.equal(after.peer_id,before.peer_id);assert.equal(offers.length,offersBefore);}
   assert.deepEqual(errors,[]);await page.evaluate(()=>{clearInterval(probeMedia.timer);probeMedia.stream.getTracks().forEach(track=>track.stop());probePeers.forEach(peer=>peer.close());});await page.close();
- }
+ });
  t.diagnostic(JSON.stringify({actual_video:true,comparison:results,production_assets_unchanged:true,physical_workload_credit:false}));
  const retained=results.find(row=>row.policy==="retain-peer-test-only");
  assert.equal(retained.peer_retained,true,"the production default player must retain a connected presenting peer through status-only staleness");
@@ -425,33 +442,41 @@ test("actual video separates delayed source publication from explicit stale reof
 });
 
 
-for(const mode of ["source-only","presentation-stale","failed","disconnected","closed","no-frame-startup","invalid-age","source-unavailable"])
+for(const mode of ["source-only","presentation-stale","failed","disconnected","closed","no-frame-startup","invalid-age",
+ "source-unavailable","status-unavailable","status-and-decoder-stale","owner-changed","capture-changed","encode-changed","role-changed"])
  test("default player preserves qualification and bounded transport failure: "+mode,()=>{
  const code=fs.readFileSync(path.resolve(__dirname,"../../tools/am1_camera/app.js"),"utf8");
- const start=code.indexOf("function render() {"),end=code.indexOf("async function statusLoop()",start);
+ const start=code.indexOf("function samePrimarySource("),end=code.indexOf("async function statusLoop()",start);
  assert.ok(start>=0&&end>start);const stops=[];let starts=0;
- const health={fresh:false,source_fresh:mode!=="source-only",decoded_frames:10,decoded_age_ms:30};
- if(mode==="presentation-stale")health.decoded_age_ms=501;
+ const health={fresh:false,source_fresh:!["source-only","source-unavailable","status-unavailable","status-and-decoder-stale"].includes(mode),decoded_frames:10,decoded_age_ms:30};
+ if(["presentation-stale","status-and-decoder-stale"].includes(mode))health.decoded_age_ms=501;
  if(mode==="invalid-age")health.decoded_age_ms=NaN;
  if(mode==="no-frame-startup"){health.decoded_frames=0;health.decoded_age_ms=null;}
- const context=vm.createContext({primary:{dataset:{}},selected:"chest",usable:()=>mode!=="source-unavailable",statusAvailable:()=>true,
-  stream:{kind:"webrtc",progressed:0,decoded:mode!=="no-frame-startup",deadline:6000},
-  webView:{health:()=>health,pc:{connectionState:["failed","disconnected","closed"].includes(mode)?mode:"connected"}},
+ const binding={role:"chest",owner_generation:"owner",capture_generation:"capture",encode_generation:"encode"};
+ const report={owner_generation:"owner",cameras:{chest:{capture_generation:"capture"}},video:{role:"chest",capture_generation:"capture",encode_generation:"encode"}};
+ if(mode==="owner-changed")report.owner_generation="new-owner";
+ if(mode==="capture-changed")report.cameras.chest.capture_generation="new-capture";
+ if(mode==="encode-changed")report.video.encode_generation="new-encode";
+ if(mode==="role-changed")report.video.role="forward";
+ const unavailable=["source-unavailable","status-unavailable","status-and-decoder-stale"].includes(mode);
+ const context=vm.createContext({primary:{dataset:{}},selected:"chest",latest:report,latestStatusBinding:binding,usable:()=>!unavailable,statusAvailable:()=>!mode.startsWith("status-"),
+  stream:{role:"chest",kind:"webrtc",progressed:0,decoded:mode!=="no-frame-startup",deadline:6000},
+  webView:{binding,health:()=>health,pc:{connectionState:["failed","disconnected","closed"].includes(mode)?mode:"connected"}},
   performance:{now:()=>mode==="no-frame-startup"?7000:1000},paint(){},tiles:new Map(),slots:new Map(),roles:[],
   connection:{},diagnostics:{},statusUncertain:false,sourceFor:()=>({state:"fresh"}),webPrimary:()=>true,
   document:{body:{dataset:{}}},timing:{},progress:new Map(),labels:{}});
  context.stopPrimary=reason=>{stops.push(reason);context.stream=null;};context.startPrimary=()=>{starts++;context.stream={kind:"webrtc"};};
  vm.runInContext(code.slice(start,end)+";render();",context);
  assert.equal(health.fresh,false,"transport liveness must never grant local source/view qualification");
- if(mode==="source-only"){
+ if(["source-only","source-unavailable","status-unavailable"].includes(mode)){
   assert.deepEqual(stops,[]);assert.equal(starts,0);assert.equal(context.stream.progressed,1000);
   assert.equal(health.source_fresh,false);assert.equal(health.decoded_age_ms,30);
  }else{
-  assert.equal(stops.length,1);assert.equal(stops[0],mode==="source-unavailable"?"source-unavailable":"decoded-video-stall");
-  assert.equal(starts,mode==="source-unavailable"?0:1);
+  assert.equal(stops.length,1);
+  assert.equal(stops[0],mode.endsWith("-changed")?"source-generation-changed":mode==="status-and-decoder-stale"?"status-unavailable":"decoded-video-stall");
+  assert.equal(starts,unavailable?0:1);
  }
 });
-
 
 test("latest-only progress publishes new decoded data before an older receipt body finishes",async()=>{
  const p=fixture(),bodies=[];await p.view.start("chest");p.source();
@@ -471,21 +496,44 @@ test("latest-only progress publishes new decoded data before an older receipt bo
  }finally{bodies.forEach(v=>v.finish());await p.view.stop();}
 });
 
-test("latest-only progress bounds two requests and aborts older delivery without queuing frames",async()=>{
- const p=fixture(),pending=[],sent=[];let active=0,maximum=0;await p.view.start("chest");p.source();
- p.setProgressResponse(options=>{const frame=JSON.parse(options.body).decoded_frames;sent.push(frame);active++;maximum=Math.max(maximum,active);
-  const body=JSON.stringify({accepted:true,view_delivery:{frame}});
-  return {ok:true,headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":String(body.length)},
-   text:()=>new Promise((resolve,reject)=>{let done=false;const finish=error=>{if(done)return;done=true;active--;error?reject(error):resolve(body);};
-    options.signal.addEventListener("abort",()=>finish(new Error("aborted")),{once:true});pending.push(()=>finish());})};});
- try{
-  for(const [at,frame]of [[0,1],[150,2],[300,3]]){p.advance(at);p.source();p.callbacks.shift()(at,{presentedFrames:frame,mediaTime:frame/10});void p.view.report();await new Promise(setImmediate);}
-  assert.equal(p.requests.filter(r=>r.url.endsWith("/progress")).length,2);
-  assert.equal(p.requests.find(r=>r.url.endsWith("/progress")).signal.aborted,true);
-  p.advance(450);p.source();p.callbacks.shift()(450,{presentedFrames:5,mediaTime:.5});void p.view.report();await new Promise(setImmediate);
-  assert.deepEqual(sent,[1,2,5],"the latest current capture replaces skipped frames; no FIFO replay");assert.equal(maximum,2);
- }finally{pending.forEach(finish=>finish());await p.view.stop();}
-});
+for(const mode of ["current","expired","capture-changed","stopped"])test("superseded report settlement: "+mode,async()=>{
+  const p=fixture({manualTimers:true}),pending=[],sent=[];
+  let active=0,maximum=0,settleAborted;
+  await p.view.start("chest");p.source();
+  p.setProgressResponse(options=>{const frame=JSON.parse(options.body).decoded_frames;sent.push(frame);active++;maximum=Math.max(maximum,active);
+   const body=JSON.stringify({accepted:true,view_delivery:{frame}});
+   return {ok:true,headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":String(body.length)},
+    text:()=>new Promise((resolve,reject)=>{let done=false;const finish=error=>{if(done)return;done=true;active--;error?reject(error):resolve(body);};
+     options.signal.addEventListener("abort",()=>{
+      const settle=()=>finish(new Error("aborted"));
+      if(frame===1&&mode!=="current")settleAborted=settle;else settle();
+     },{once:true});pending.push(()=>finish());})};});
+  try{
+   for(const [at,frame]of [[0,1],[150,2]]){p.advance(at);p.callbacks.shift()(at,{presentedFrames:frame,mediaTime:frame/10});await new Promise(setImmediate);}
+   p.advance(300);p.callbacks.shift()(300,{presentedFrames:3,mediaTime:.3});
+   assert.deepEqual(sent,[1,2],"two raw requests remain the cap until actual settlement");
+   assert.equal(p.requests.find(r=>r.url.endsWith("/progress")).signal.aborted,true);
+   if(mode!=="current"){
+    assert.equal(typeof settleAborted,"function");
+    await new Promise(setImmediate);
+    assert.deepEqual(sent,[1,2],"abort without settlement does not free a slot");
+    if(mode==="expired")p.advance(800);
+    else if(mode==="capture-changed"){p.ids.capture_generation="capture-b";p.source();}
+    else await p.view.stop();
+    settleAborted();
+   }
+   await new Promise(setImmediate);
+   if(mode==="current"){
+    assert.deepEqual(sent,[1,2,3],"a superseded raw settlement dispatches the latest fresh frame without another callback or timer");
+    p.advance(450);void p.view.report();
+    assert.deepEqual(sent,[1,2,3],"the frame cannot be dispatched twice");
+    p.callbacks.shift()(450,{presentedFrames:5,mediaTime:.5});
+    await new Promise(setImmediate);
+    assert.deepEqual(sent,[1,2,3,5],"the latest current presentation is used with no FIFO replay");
+   }else assert.deepEqual(sent,[1,2],"expired, replaced or stopped evidence cannot dispatch on settlement");
+   assert.equal(maximum,2);
+  }finally{await p.view.stop();pending.forEach(finish=>finish());await new Promise(setImmediate);}
+ });
 
 test("ignored transport abort settles callers while quarantining no more than two raw requests",async()=>{
  const p=fixture(),finish=[];await p.view.start("chest");p.source();

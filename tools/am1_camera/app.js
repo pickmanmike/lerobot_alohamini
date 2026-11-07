@@ -28,7 +28,7 @@ if (onboard) {
 }
 const diagnostics = document.querySelector("#diagnostics");
 let selected = roles[0], latest = null, reportAt = 0, statusReceivedAt = 0, stream = null;
-let statusRequest = 0, acceptedStatusRequest = 0, statusUncertain = false;
+let statusRequest = 0, acceptedStatusRequest = 0, statusUncertain = false, latestStatusBinding = null;
 const tiles = new Map(), slots = new Map(), details = new Map(), busy = new Set(), decodingRoles = new Map();
 const snapshotRequests = new Map(), reconnects = new Map(), minimumSequences = new Map();
 const retained = new AM1RetainedFrames();
@@ -247,21 +247,32 @@ function startPrimary() {
     finally { if (stream === current) stopPrimary("stream-ended-or-failed"); }
   })();
 }
+function samePrimarySource(role, report = latest) {
+  const binding=webView?.binding, source=report?.cameras?.[role], video=report?.video;
+  return stream?.kind==="webrtc" && stream.role===role && binding?.role===role &&
+    binding.owner_generation===report?.owner_generation && binding.capture_generation===source?.capture_generation &&
+    binding.encode_generation===video?.encode_generation && video?.role===role &&
+    video.capture_generation===binding.capture_generation;
+}
 function render() {
   primary.dataset.role = selected;
   const allowed = usable(selected);
-  if (!allowed) stopPrimary(statusAvailable() ? "source-unavailable" : "status-unavailable");
-  else if (stream?.kind === "webrtc") {
+  if (stream?.kind === "webrtc") {
     const health=webView?.health();
     // Source qualification can expire while the same peer is still presenting.
     // Preserve that transport; health().fresh remains false until source proof returns.
     const presenting=Number.isSafeInteger(health?.decoded_frames)&&health.decoded_frames>0&&
       Number.isFinite(health.decoded_age_ms)&&health.decoded_age_ms>=0&&health.decoded_age_ms<500&&
       !["failed","disconnected","closed"].includes(webView?.pc?.connectionState);
-    if(presenting){stream.progressed=performance.now();stream.decoded=true;}
+    // A status request begun for an older attachment cannot invalidate its replacement.
+    const same=latestStatusBinding!==webView?.binding || samePrimarySource(selected);
+    if(webView?.binding && !same) stopPrimary("source-generation-changed");
+    else if(!allowed && !(same && presenting)) stopPrimary(statusAvailable() ? "source-unavailable" : "status-unavailable");
+    else if(presenting){stream.progressed=performance.now();stream.decoded=true;}
     else if(stream.decoded && performance.now()-stream.progressed>500 || performance.now()>stream.deadline && !stream.decoded)
       stopPrimary("decoded-video-stall");
-  } else if (stream && performance.now() - stream.progressed > 500) stopPrimary("display-stall");
+  } else if (!allowed) stopPrimary(statusAvailable() ? "source-unavailable" : "status-unavailable");
+  else if (stream && performance.now() - stream.progressed > 500) stopPrimary("display-stall");
   if (allowed && !stream) startPrimary();
   paint(primary, selected);
   for (const [role, tile] of tiles) {
@@ -301,7 +312,7 @@ async function statusLoop() {
         if ([0, 90, 180, 270].includes(source?.rotation_degrees)) roleRotations.set(role, source.rotation_degrees);
         const state = source?.state === "fresh" && source.configured !== false ? "fresh" : "not-fresh";
         if (state === "fresh" && ((Number.isSafeInteger(previous) && source.sequence < previous) ||
-            sourceStates.get(role) === "not-fresh")) bumpGeneration(role);
+            sourceStates.get(role) === "not-fresh" && !samePrimarySource(role,next))) bumpGeneration(role);
         if (Number.isSafeInteger(source?.sequence)) sourceSequences.set(role, source.sequence);
         sourceStates.set(role, state);
       }
@@ -310,7 +321,8 @@ async function statusLoop() {
         stopPrimary("shared-primary-generation-changed");
         if(roles.includes(next.video.role))selected=next.video.role;
       }
-      latest = next; reportAt = start; statusReceivedAt = performance.now(); statusUncertain = false;
+      latest = next; latestStatusBinding = requestedBinding;
+      reportAt = start; statusReceivedAt = performance.now(); statusUncertain = false;
       webView?.updateSource(next,start);
     }
   } catch {

@@ -14,6 +14,14 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+from examples.alohamini.am1_live_teleop import (
+    _ORDINARY_EXTRA,
+    _ORDINARY_SOURCE_PATHS,
+    _ORDINARY_STATE,
+    validate_ordinary_arm_profile_binding,
+    validate_ordinary_arm_profile_receipt,
+)
+
 from lerobot.motors import MotorNormMode
 
 ELBOW = "arm_left_elbow_flex"
@@ -1734,6 +1742,330 @@ class AM1RightResponseProportionalTrial(AM1LeftResponseProportionalTrial):
     side, kind, motor = "right", RIGHT_RESPONSE_P_KIND, "arm_right_elbow_flex"
     calibration = (3, 0, -658, 827, 3039)
     raw_bounds = (1847, 1960)
+
+
+class AM1OrdinaryArmProfile(AM1ElbowIntegralTrial):
+    """One ordinary two-elbow settings obligation on the existing sole bus owner."""
+
+    motor, raw_bounds = ELBOW, (1051, 1164)
+
+    def __init__(self, binding, directory):
+        self.binding = validate_ordinary_arm_profile_binding(binding)
+        self.workspace_profile = self.binding["profile"]
+        self.directory = Path(directory)
+        super().__init__(integral=0, snapshot_path=self.directory / "ordinary-arm-profile-original.json")
+        self._snapshot = {"schema_version": 1, "kind": "ordinary-arm-profile", "binding": dict(self.binding), "events": []}
+        self._robot = None
+
+    def _same_owner(self, robot):
+        from examples.alohamini.am1_live_teleop import ORDINARY_AM1_ARM_CALIBRATION
+
+        from .am1_live_teleop import binding_valid
+
+        if (not binding_valid(robot) or not getattr(robot, "_am1_protected_cleanup", False)
+                or getattr(robot, "_am1_ordinary_arm_profile", None) is not self
+                or self.binding != self._snapshot["binding"] or self.workspace_profile != self.binding["profile"]
+                or validate_ordinary_arm_profile_binding(getattr(robot, "_am1_ordinary_arm_profile_binding", None)) != self.binding
+                or robot._am1_teleop_binding != {key: self.binding[key] for key in ("run_id", "host_incarnation", "recipe")}
+                or any(getattr(robot, "_am1_" + side + "_response_p_" + field, None) is not None
+                       for side in ("left", "right") for field in ("binding", "trial"))):
+            raise RuntimeError("ordinary arm same owner/profile/run binding changed")
+        if (AM1ElbowIntegralTrial.requested_integral() is not None
+                or getattr(robot, "_am1_selected_joint_evidence_enabled", False)
+                or any(getattr(robot, key, None) is not None for key in (
+                    "_am1_elbow_integral_trial", "_am1_right_elbow_p_trial", "_am1_elbow_recovery_binding",
+                    "_am1_right_p20_trial_binding", "_am1_visible_control_binding", "_am1_practical_config"))):
+            raise RuntimeError("ordinary arm profile cannot inherit an experimental owner")
+        for side in ("left", "right"):
+            bus = getattr(robot, side + "_bus")
+            if self._robot is not None and bus is not self._buses[side]:
+                raise RuntimeError("ordinary arm bus owner changed")
+            if set(getattr(robot, side + "_arm_motors")) != {
+                    name for name in ORDINARY_AM1_ARM_CALIBRATION if name.startswith("arm_" + side + "_")}:
+                raise RuntimeError("ordinary arm complete calibrated role mapping changed")
+            for name in getattr(robot, side + "_arm_motors"):
+                if (not bus.is_connected or type(bus.motors[name].id) is not int or bus.motors[name].model != "sts3215"
+                        or not bus.apply_drive_mode
+                        or bus.motors[name].norm_mode is not (
+                            MotorNormMode.RANGE_0_100 if name.endswith("gripper") else MotorNormMode.RANGE_M100_100)
+                        or robot._am1_activation_calibration(bus, name) != ORDINARY_AM1_ARM_CALIBRATION[name]):
+                    raise RuntimeError("ordinary arm actual calibration/mapping changed")
+        return robot.left_bus
+
+    _retained_owner = _same_owner
+
+    def _off_owner(self, side):
+        """Lost session metadata cannot prevent OFF on the retained exact device."""
+        bus = self._buses[side]
+        motor = bus.motors.get("arm_" + side + "_elbow_flex")
+        if (getattr(self._robot, side + "_bus") is not bus or not bus.is_connected
+                or motor is None or type(motor.id) is not int or motor.id != 3 or motor.model != "sts3215"):
+            raise RuntimeError("ordinary arm OFF requires the retained physical bus/ID3 owner")
+
+    def _service_boundary(self):
+        self._same_owner(self._robot)
+        if not getattr(self._robot, "_am1_shutdown_in_progress", False):
+            from .am1_live_teleop import check_initial_temperature_budget, refresh_startup_temperatures
+            if getattr(self._robot, "_am1_teleop_initial_temperature_pending", False):
+                check_initial_temperature_budget(self._robot)
+            refresh_startup_temperatures(self._robot)
+            if getattr(self._robot, "_lift_operation", None) is not None:
+                self._robot._refresh_am1_startup_lift_feedback()
+
+    def _read_side(self, side, register, *, phase):
+        if getattr(self._robot, "_am1_shutdown_in_progress", False) and register in ("Torque_Enable", "Lock"):
+            self._off_owner(side)
+        else:
+            self._service_boundary()
+        row = {"operation": "read", "side": side, "register": register, "phase": phase,
+               "started_at_monotonic_s": time.monotonic()}
+        self._snapshot["events"].append(row)
+        try:
+            raw = self._buses[side].read(register, "arm_" + side + "_elbow_flex", normalize=False, num_retry=0)
+            if type(raw) is not int:
+                raise RuntimeError("ordinary arm settings readback must be an integer")
+            row["value"] = raw
+            return raw
+        finally:
+            row["completed_at_monotonic_s"] = time.monotonic()
+
+    def _rows(self, *, phase):
+        from .am1_live_teleop import STATIC
+        return {side: {register: self._read_side(side, register, phase=phase)
+                       for register in (*STATIC, *_ORDINARY_EXTRA, *_ORDINARY_STATE)} for side in ("left", "right")}
+
+    def prepare(self, robot):
+        from examples.alohamini.am1_live_teleop import ORDINARY_AM1_ARM_CALIBRATION
+        if self._robot is not None or self._created or getattr(robot, "_am1_shutdown_in_progress", False):
+            raise RuntimeError("ordinary arm settings obligation cannot be reused")
+        self._same_owner(robot)
+        self._buses = {side: getattr(robot, side + "_bus") for side in ("left", "right")}
+        self._robot, self._bus = robot, robot.left_bus
+        self._prepare_path()
+        original = self._rows(phase="baseline")
+        from .am1_live_teleop import STATIC
+        if any(original[side][register] != robot._am1_teleop_settings[side]["registers"][register]["arm_" + side + "_elbow_flex"]
+               for side in ("left", "right") for register in STATIC):
+            raise RuntimeError("ordinary arm captured baseline changed during preparation")
+        root = Path(__file__).resolve().parents[4]
+        hashes = {}
+        for path in _ORDINARY_SOURCE_PATHS:
+            self._service_boundary()
+            hashes[path] = hashlib.sha256((root / path).read_bytes()).hexdigest()
+        self._snapshot.update(calibration={key: list(cal) for key, cal in ORDINARY_AM1_ARM_CALIBRATION.items()},
+            source_files_sha256=hashes, original_registers=original, active_registers=None, restored_registers=None,
+            original_settings_sha256=hashlib.sha256(_right_p20_json(original)).hexdigest(),
+            prepared_at_monotonic_s=time.monotonic(), configured_at_monotonic_s=None, restored_at_monotonic_s=None)
+        # Validate captured originals through the common pure proof before any write.
+        candidate = self.receipt
+        candidate.update(state="restored", restore_required=False, restored_registers=copy.deepcopy(original),
+                         restored_at_monotonic_s=self._snapshot["prepared_at_monotonic_s"])
+        validate_ordinary_arm_profile_receipt(candidate, run_id=self.binding["run_id"],
+                                            host_incarnation=self.binding["host_incarnation"], restored=True)
+        self.restore_required = True
+        self._persist_snapshot("prepared")
+
+    def _write_side(self, side, register, value, *, phase):
+        original = self._snapshot["original_registers"][side]
+        allowed = {"Torque_Enable": (0,), "Lock": (0, 1),
+                   "P_Coefficient": (original["P_Coefficient"], 32 if side == "left" else self.binding["right_elbow_p"])}
+        if side == "left":
+            allowed["Acceleration"] = (original["Acceleration"], 254)
+        if register not in allowed or type(value) is not int or value not in allowed[register]:
+            raise ValueError("ordinary arm settings cannot write that role/register/value")
+        if getattr(self._robot, "_am1_shutdown_in_progress", False) and (
+                register == "Torque_Enable" and value == 0 or register == "Lock" and value == 1):
+            self._off_owner(side)
+        else:
+            self._service_boundary()
+        if register not in ("Torque_Enable", "Lock") and (
+                self._read_side(side, "Torque_Enable", phase=phase) != 0
+                or self._read_side(side, "Lock", phase=phase) != 1):
+            raise RuntimeError("ordinary arm settings write needs actual OFF/Lock1")
+        if register not in ("Torque_Enable", "Lock") and not getattr(self._robot, "_am1_shutdown_in_progress", False):
+            voltage = self._read_side(side, "Present_Voltage", phase=phase)
+            if (self._read_side(side, "Status", phase=phase) != 0
+                    or abs(self._read_side(side, "Present_Current", phase=phase)) >= original["Protection_Current"]
+                    or not original["Min_Voltage_Limit"] <= voltage <= original["Max_Voltage_Limit"]
+                    or self._read_side(side, "Maximum_Acceleration", phase=phase) != original["Maximum_Acceleration"]):
+                raise RuntimeError("ordinary arm actual settings/protection health changed")
+        row = {"operation": "write", "side": side, "register": register, "value": value, "phase": phase,
+               "started_at_monotonic_s": time.monotonic()}
+        self._snapshot["events"].append(row)
+        try:
+            try:
+                self._buses[side].write(register, "arm_" + side + "_elbow_flex", value, normalize=False, num_retry=0)
+            except Exception as error:
+                row["error_type"] = type(error).__name__
+                try:
+                    actual = self._read_side(side, register, phase=phase + "_ack_reconciliation")
+                except BaseException as read_error:
+                    error.add_note("ordinary arm acknowledgement readback failed: " + type(read_error).__name__)
+                    raise error from read_error
+                if actual != value:
+                    raise
+                row["reconciled"] = True
+        finally:
+            row["completed_at_monotonic_s"] = time.monotonic()
+        if self._read_side(side, register, phase=phase + "_verify") != value:
+            raise RuntimeError("ordinary arm settings write readback differs")
+
+    def disable_torque(self, robot, *, side=None):
+        if robot is not self._robot:
+            raise RuntimeError("ordinary arm OFF owner changed")
+        if not getattr(robot, "_am1_shutdown_in_progress", False):
+            self._same_owner(robot)
+        if side not in (None, "left", "right"):
+            raise ValueError("ordinary arm OFF requires an exact side")
+        for selected in (("left", "right") if side is None else (side,)):
+            self._write_side(selected, "Torque_Enable", 0, phase="torque_off")
+            self._write_side(selected, "Lock", 1, phase="volatile_lock")
+
+    def apply(self, robot):
+        try:
+            if not self._created or not self.restore_required or self._apply_attempted:
+                raise RuntimeError("ordinary arm settings need one durable apply opportunity")
+            self._apply_attempted = True
+            self._same_owner(robot)
+            info = self.snapshot_path.lstat()
+            if (self._snapshot.get("state") != "prepared" or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or os.name != "nt" and (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600)
+                    or hashlib.sha256(self.snapshot_path.read_bytes()).hexdigest() != self._state_hash
+                    or getattr(robot, "_am1_shutdown_in_progress", False)):
+                raise RuntimeError("ordinary arm original durable obligation changed or Stop prevailed")
+            self._write_side("left", "P_Coefficient", 32, phase="configure_proportional")
+            self._write_side("left", "Acceleration", 254, phase="configure_acceleration")
+            if self.binding["right_elbow_p"] != 16:
+                self._write_side("right", "P_Coefficient", self.binding["right_elbow_p"], phase="configure_proportional")
+            self._snapshot["configured_at_monotonic_s"] = time.monotonic()
+            self._persist_snapshot("configured")
+        except BaseException as error:
+            self._failure("configure_failed", error)
+            raise
+
+    def require_normal_activation_owner(self, robot):
+        self._same_owner(robot)
+        if (not self.restore_required or self._snapshot.get("state") != "configured"
+                or getattr(robot, "_am1_shutdown_in_progress", False)):
+            raise RuntimeError("ordinary arm activation owner/phase changed or Stop prevailed")
+
+    def normal_rest_startup_degrees(self, robot):
+        self.require_normal_activation_owner(robot)
+        return 1.0
+
+    def qualify_normal_activation(self, robot, all_goals):
+        from examples.alohamini.am1_live_teleop import ORDINARY_AM1_RAW_BOUNDS
+        self.require_normal_activation_owner(robot)
+        robot._require_am1_activation_fresh("after_home")
+        if len(all_goals) != 2:
+            raise RuntimeError("ordinary arm startup needs both complete qualified owners")
+        rows = robot._am1_activation_readbacks
+        measured, legal, caps, vectors = {}, {}, {}, {}
+        now = time.monotonic()
+        for side in ("left", "right"):
+            matching = [values for bus, values in all_goals if bus is self._buses[side]]
+            if len(matching) != 1 or set(matching[0]) != set(getattr(robot, side + "_arm_motors")):
+                raise RuntimeError("ordinary arm startup needs the complete fresh measured vector")
+            vectors[side] = matching[0]
+            for name, seed in matching[0].items():
+                self.require_normal_activation_owner(robot)
+                positions = [row for row in rows if row.get("phase") == "after_home"
+                             and row.get("motor") == name and row.get("register") == "Present_Position"]
+                torque = [row for row in rows if row.get("phase") == "after_home"
+                          and row.get("motor") == name and row.get("register") == "Torque_Enable"]
+                low, high = ORDINARY_AM1_RAW_BOUNDS[name + ".pos"]
+                if len(positions) != 1 or len(torque) != 1:
+                    raise RuntimeError("ordinary startup original raw/OFF acquisition missing: " + name)
+                position, off = positions[0], torque[0]
+                raw = position.get("raw")
+                if (type(seed) is not int or type(raw) is not int or off.get("raw") != 0
+                    or any("unavailable" in row or any(type(row.get(k)) not in (int, float) or not math.isfinite(row[k])
+                           for k in ("read_started_at", "read_completed_at")) for row in (position, off))
+                    or not 0 <= off["read_started_at"] <= off["read_completed_at"] <= position["read_started_at"] <= position["read_completed_at"] <= now
+                    or now-position["read_started_at"] >= robot.AM1_ACTIVATION_MAX_RAW_AGE_S):
+                    raise RuntimeError("ordinary startup original raw/OFF acquisition stale or invalid: " + name)
+                cal = robot._am1_activation_calibration(self._buses[side], name)
+                if seed != raw:
+                    rest = [row for row in robot._am1_teleop_rest_evidence if row.get("phase") == "after_home"
+                            and row.get("qualified") is True and row.get("seed_raw") == seed and row.get("measured_raw") == raw]
+                    if name != "arm_left_shoulder_lift" or not rest:
+                        raise RuntimeError("ordinary startup legal calibration seed differs from original measurement: " + name)
+                goal = low if seed < low else high if seed > high else seed
+                cap = robot._am1_relative_target_cap(name + ".pos")
+                cap_raw = math.floor(cap * (cal[4]-cal[3]) / (100 if name.endswith("gripper") else 200)) if type(cap) in (int, float) and math.isfinite(cap) and cap > 0 else -1
+                if (name.endswith("elbow_flex") and not low <= raw == goal <= high
+                    or abs(raw-goal) > min(math.floor(self.normal_rest_startup_degrees(robot)*4096/360), cap_raw)):
+                    raise RuntimeError(f"ordinary startup acquisition refused: {name} measured={raw} legalGoal={goal} fixed={low}..{high} displacement exceeds1degree/relative cap or elbow corridor")
+                measured[name], legal[name], caps[name] = raw, goal, cap
+        evidence = AM1LeftResponseProportionalTrial.qualify_normal_activation(self, robot, all_goals)
+        robot._require_am1_activation_fresh("after_home")
+        evidence["startup_acquisition"] = {"version": 1, "displacement_bound_degrees": 1.,
+            "measured_raw": measured, "legal_goals_raw": legal, "relative_target_caps": caps,
+            "goal_writes": {}, "goal_readbacks": {},
+            "original_readbacks": copy.deepcopy([row for row in rows if row.get("phase") == "after_home"])}
+        # Only after the entire original vector qualifies, the ordinary owner
+        # seeds these explicit legal Goals. Original measured readbacks stay intact.
+        for side in ("left", "right"):
+            vectors[side].update({name: legal[name] for name in vectors[side]})
+        return evidence
+
+    def verify_active(self, robot):
+        self.require_normal_activation_owner(robot)
+        activation = self._snapshot.get("normal_activation") or {}
+        position, write, readback = (activation.get(key) or {} for key in ("position", "goal_write", "goal_readback"))
+        expected = position.get("raw")
+        if (type(expected) is not int or not self.raw_bounds[0] <= expected <= self.raw_bounds[1]
+                or write.get("value") != expected or readback.get("raw") != expected
+                or readback.get("phase") != "seed_readback" or readback.get("register") != "Goal_Position"
+                or readback.get("motor") != self.motor or "unavailable" in readback
+                or any(key in write for key in ("error", "error_type"))
+                or not position["read_completed_at"] <= write.get("started_at_monotonic_s", -1)
+                <= write.get("completed_at_monotonic_s", -1) <= readback.get("read_started_at", -1)
+                <= readback.get("read_completed_at", -1) <= time.monotonic()):
+            raise RuntimeError("ordinary arm fresh measured Goal acknowledgement unavailable")
+        self._snapshot["active_registers"] = self._rows(phase="active")
+        self._snapshot["state"] = "active"
+        validate_ordinary_arm_profile_receipt(self.receipt, run_id=self.binding["run_id"], host_incarnation=self.binding["host_incarnation"])
+
+    @property
+    def receipt(self):
+        keys = ("binding", "calibration", "source_files_sha256", "original_registers", "active_registers", "restored_registers",
+                "original_settings_sha256", "prepared_at_monotonic_s", "configured_at_monotonic_s", "restored_at_monotonic_s", "state")
+        return {"version": 1, "kind": "ordinary-arm-profile", "restore_required": self.restore_required,
+                **{key: copy.deepcopy(self._snapshot.get(key)) for key in keys}}
+
+    def active_receipt(self, robot):
+        self._same_owner(robot)
+        if getattr(robot, "_am1_shutdown_in_progress", False):
+            raise RuntimeError("ordinary arm active authority ended")
+        return validate_ordinary_arm_profile_receipt(self.receipt, run_id=self.binding["run_id"], host_incarnation=self.binding["host_incarnation"])
+
+    def restore(self, robot):
+        if not self.restore_required:
+            return
+        try:
+            self.disable_torque(robot)
+            for side in ("left", "right"):
+                original = self._snapshot["original_registers"][side]
+                self._write_side(side, "P_Coefficient", original["P_Coefficient"], phase="restore_proportional")
+                if side == "left":
+                    self._write_side(side, "Acceleration", original["Acceleration"], phase="restore_acceleration")
+                self._write_side(side, "Lock", original["Lock"], phase="restore_original_lock")
+            self._snapshot["restored_registers"] = self._rows(phase="restored")
+            self._snapshot["restored_at_monotonic_s"] = time.monotonic()
+            candidate = self.receipt
+            candidate.update(state="restored", restore_required=False)
+            validate_ordinary_arm_profile_receipt(candidate, run_id=self.binding["run_id"],
+                                                host_incarnation=self.binding["host_incarnation"], restored=True)
+            self._persist_snapshot("restored", required=False)
+            self.restore_required = False
+        except BaseException as error:
+            try:
+                self.disable_torque(robot)
+            except BaseException as off_error:
+                error.add_note("ordinary arm failed-restore OFF/Lock1: " + type(off_error).__name__)
+            self._failure("restore_failed", error)
+            raise
 
 
 def complete_stopped_left_response_p_original(

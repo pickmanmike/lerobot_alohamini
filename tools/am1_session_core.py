@@ -646,6 +646,8 @@ class SessionAuthority:
         self.released = False
         self._live_rearm = None  # Volatile; restart/reconnect never restores gesture authority.
         self._teleop_view = None
+        self._startup_view_binding = None
+        self._startup_view_cancelled = None
         self._teleop_view_request = None  # Same-run ordering; never renews source freshness.
         self.events = deque(maxlen=64)
         self.last_tick = clock()
@@ -1117,6 +1119,9 @@ class SessionAuthority:
         return 1.5
 
     def _invalidate_control_intent(self, reason):
+        if self._required_startup_view():
+            self._startup_view_cancelled = reason
+            self.executor.invalidate_startup_view(reason)
         intent = self.run.get("control_intent") if self.run else None
         if isinstance(intent, dict) and intent.get("eligible") is True:
             intent.update(eligible=False, invalidated_by=reason)
@@ -1182,6 +1187,7 @@ class SessionAuthority:
             self._clear_input()
             self._event(reason)
             self._save()
+            self._sync_startup_view()
 
     def _live_write_history(self, value, *, retained=False):
         """Bounded native history only; never a current acknowledgement or permission."""
@@ -1347,6 +1353,26 @@ class SessionAuthority:
             return old is None or old == workspace
         except (TypeError, ValueError, KeyError):
             return False
+
+    def _required_startup_view(self):
+        return bool(self.run and self._startup_view_binding and self._startup_view_binding["required"]
+                    and self.run["run_id"] == self._startup_view_binding["run_id"]
+                    and self.run.get("native_live_at") is None)
+
+    def _sync_startup_view(self):
+        if not self._required_startup_view() or self.run["status"] in TERMINAL | {"finishing"}:
+            return
+        binding = self._startup_view_binding
+        if (self._startup_view_cancelled or self.run["status"] != "starting" or not self.controller
+                or self.controller["generation"] != binding["controller_generation"]
+                or self.service_incarnation != binding["service_incarnation"]
+                or self.run["intent_revision"] != binding["intent_revision"]
+                or self.clock() >= self.controller["expires"]):
+            self._finish("stopped")
+            return
+        current = dict(binding, controller_expires=self.controller["expires"])
+        if self.executor.publish_startup_view(current, self._teleop_view) is not True:
+            self._finish("stopped")
 
     def _teleop_view_qualified(self):
         v = self._teleop_view
@@ -2252,6 +2278,7 @@ class SessionAuthority:
                 if marks is not None:
                     marks["core_tick_completed"] = _input_diagnostic_monotonic()
                 result = self._handle(command, device_id)
+                self._sync_startup_view()
                 if protective:
                     self.tick()
                 if oid:
@@ -2269,6 +2296,26 @@ class SessionAuthority:
                     marks["core_deferred_checkpoint_started"] = _input_diagnostic_monotonic()
                 self._save()
                 self.last_checkpoint = deferred_checkpoint
+            if (command.get("op") == "input" and command.get("request_next_grant") is True
+                    and result.get("accepted") is True and result.get("effect_admitted") is True):
+                # The admitted sample keeps its ORIGINAL expiry. A checkpoint
+                # or native handoff may have consumed its remaining lifetime.
+                admitted = dict(self.applied_input or {})
+                self.tick()
+                if (self._physical_interactive() and self.run["recipe"] == TELEOP_RECIPE
+                        and self.run["run_id"] == command.get("run_id")
+                        and self._connection_valid(command, device_id)
+                        and self.run["intent_revision"] == command.get("intent_revision")
+                        and self.executor.host_incarnation == command.get("host_incarnation")
+                        and self.applied_input == admitted and admitted.get("seq") == command.get("seq")
+                        and self.clock() < admitted.get("expires", 0)):
+                    permission = self._handle({**command, "op": "grant"}, device_id)
+                    if (permission.get("accepted") is True and self.clock() < admitted["expires"]
+                            and self._connection_valid(command, device_id)
+                            and self.run["intent_revision"] == command["intent_revision"]):
+                        result = dict(result, next_grant=permission)
+                    elif self.grant and self.grant["id"] == permission.get("grant_id"):
+                        self.grant = None
             if marks is not None:
                 marks["core_returned"] = _input_diagnostic_monotonic()
                 result = _input_diagnostic_result(result, marks)
@@ -2390,8 +2437,17 @@ class SessionAuthority:
             if not recipe or not self.executor.supports(recipe):
                 return self._refuse("unknown fake recipe")
             allowed = {"op", "operation_id", "recipe", "controller_generation"}
+            ordinary_profile = None
             if recipe.name == TELEOP_RECIPE:
-                allowed.add("bench_continuity")
+                allowed.update(("bench_continuity", "ordinary_arm_profile"))
+                if "ordinary_arm_profile" in c:
+                    from examples.alohamini.am1_live_teleop import validate_ordinary_arm_profile
+                    if self.executor.source != "protected-physical-provider" or c.get("bench_continuity") is True:
+                        return self._refuse("ordinary arms require protected normal required-view operation")
+                    try:
+                        ordinary_profile = validate_ordinary_arm_profile(c["ordinary_arm_profile"])
+                    except (TypeError, ValueError) as error:
+                        return self._refuse(str(error))
                 if ("bench_continuity" in c and type(c["bench_continuity"]) is not bool
                         or c.get("bench_continuity") is True and self.executor.source != "protected-physical-provider"):
                     return self._refuse("explicit protected virtual bench policy required")
@@ -2418,6 +2474,7 @@ class SessionAuthority:
             canonical = json.dumps(
                 {"recipe": recipe.name, "device_id": d, **({"confirmation_of":confirmation_of} if confirmation_of else {}),
                  **({"selected_experiment":selected_definition.payload} if selected_definition else {}),
+                 **({"ordinary_arm_profile":ordinary_profile} if ordinary_profile is not None else {}),
                  **({"bench_continuity": c["bench_continuity"]} if "bench_continuity" in c else {})},
                 sort_keys=True, separators=(",", ":")
             )
@@ -2470,6 +2527,14 @@ class SessionAuthority:
                     return self._refuse("idle checkpoint busy or incomplete")
                 if not self._owned(c, d):
                     return self._refuse("current controller lease required")
+            ordinary_setter = getattr(self.executor, "set_ordinary_arm_profile", None)
+            if callable(ordinary_setter):
+                try:
+                    ordinary_setter(ordinary_profile)
+                except (RuntimeError, ValueError) as error:
+                    return self._refuse(str(error))
+            elif ordinary_profile is not None:
+                return self._refuse("ordinary arms require the protected executor")
             positive_prerequisite = None
             selected_setter = getattr(self.executor, "set_selected_experiment", None)
             if callable(selected_setter):
@@ -2547,6 +2612,8 @@ class SessionAuthority:
             }
             if recipe.name == TELEOP_RECIPE:
                 self.run["bench_continuity"] = c.get("bench_continuity", False)
+                if ordinary_profile is not None:
+                    self.run["ordinary_arm_profile"] = copy.deepcopy(ordinary_profile)
                 if self.run["bench_continuity"]:
                     self.run["control_intent"] = {
                         "eligible": True, "device_id": d,
@@ -2592,6 +2659,16 @@ class SessionAuthority:
                         intent_revision=self.run["intent_revision"],
                     ):
                         raise RuntimeError("physical live admission binding refused")
+                    self._startup_view_binding = None
+                    self._startup_view_cancelled = None
+                    if ordinary_profile is not None:
+                        self._startup_view_binding = dict(run_id=self.run["run_id"], operation_id=oid,
+                            service_incarnation=self.service_incarnation, host_incarnation=self.executor.host_incarnation,
+                            controller_generation=self.controller["generation"], intent_revision=self.run["intent_revision"],
+                            role="chest", startup_deadline=self.run["startup_deadline"],
+                            controller_expires=self.controller["expires"], required=not self._bench_continuity())
+                        self.executor.configure_startup_view(self._startup_view_binding,
+                                                             advisory_bench=self._bench_continuity())
                     if not self.executor.begin(recipe):
                         self._finish("faulted", "physical_startup_unaccepted")
                     else:
@@ -2690,6 +2767,7 @@ class SessionAuthority:
                 self._hold()
                 self._event("pause")
                 self._save()
+                self._sync_startup_view()
             return {"accepted": True, "status": self.run["status"], "effect_admitted": not self.asynchronous}
         if self.run["status"] in TERMINAL:
             return self._refuse("terminal")
@@ -2873,8 +2951,12 @@ class SessionAuthority:
                 "grant_id": self.grant["id"],
                 "issued": now,
                 "expires": now + 0.25,
+                **({"next_grant_supported": True} if self._physical_interactive() and self.run["recipe"] == TELEOP_RECIPE else {}),
             }
         if op == "input":
+            if "request_next_grant" in c and (not self._physical_interactive()
+                    or self.run["recipe"] != TELEOP_RECIPE or c["request_next_grant"] is not True):
+                return self._refuse("unsupported next grant request")
             seq = c.get("seq")
             target = c.get("target")
             if not self.grant or c.get("grant_id") != self.grant["id"] or now >= self.grant["expires"]:
@@ -2890,7 +2972,7 @@ class SessionAuthority:
                     "host_incarnation", "intent_revision", "grant_id", "seq", "target",
                 }
                 if teleop:
-                    allowed |= {"body", "source"}
+                    allowed |= {"body", "source", "request_next_grant"}
                 if (set(c) - allowed or type(c.get("intent_revision")) is not int
                         or c["intent_revision"] != self.run["intent_revision"]
                         or c.get("host_incarnation") != self.executor.host_incarnation):
@@ -3443,6 +3525,7 @@ class SessionAuthority:
                 "mode",
                 "live_input",
                 "bench_continuity",
+                "ordinary_arm_profile",
                 "control_intent",
             }
             public = _status_small(run, keys)
