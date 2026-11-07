@@ -4281,10 +4281,11 @@ def test_ordinary_preactivation_cancel_ack_rechecks_originals(tmp_path, monkeypa
 
 
 
-def preimport_view_cancel_fixture(tmp_path, monkeypatch, right_p=16):
+def preimport_view_cancel_fixture(tmp_path, monkeypatch, right_p=16, *, retained_run=None):
     m, config, run, proof, state, directory = processor_preimport_fixture(tmp_path, monkeypatch)
     root = Path(__file__).resolve().parents[2]
-    retained = root / ".cache/am1-teleop-consolidation-16/physical-runs/am1-virtual-e2ec87c8-f7a6-4b55-9dd7-62dad8b6d24c"
+    retained = (root / ".cache/am1-teleop-consolidation-16/physical-runs/am1-virtual-e2ec87c8-f7a6-4b55-9dd7-62dad8b6d24c"
+                if retained_run is None else retained_run)
     original = json.loads((retained / "native-run.private.json").read_bytes())
     run.update(status="faulted", requested_terminal="faulted", first_cause=ORDINARY_STARTUP_VIEW_CAUSE,
                mode="interactive", intent=None, deadline=None,
@@ -4369,4 +4370,57 @@ def test_preimport_view_cancel_refuses_other_faults_imports_and_unqualified_proo
     publish_preimport_fixture(run, proof, state)
     with pytest.raises((ValueError, RuntimeError, OSError, TypeError)):
         m.load_qualified_proof(config, run)
+    assert not list(state.glob("reconciliation-ack-*"))
+
+
+
+def base_module_preimport_fixture(tmp_path, monkeypatch):
+    root=Path(__file__).resolve().parents[2]
+    retained=root/".cache/am1-teleop-consolidation-16/physical-runs/am1-virtual-389688ba-4e5b-4abd-b4ef-03e24c9f3b44"
+    return preimport_view_cancel_fixture(tmp_path,monkeypatch,retained_run=retained)
+
+
+def test_preimport_base_module_discovery_requires_actual_source_fresh_proof_and_ack(tmp_path,monkeypatch):
+    m,config,run,proof,state,directory=base_module_preimport_fixture(tmp_path,monkeypatch)
+    before=copy.deepcopy(run);logs={p.name:p.read_bytes() for p in directory.glob("host-*.log")}
+    actual,raw,inventory=m.load_qualified_proof(config,run)
+    operation=str(uuid.uuid4())
+    assert not m.acknowledged_receipt(actual,run,operation)
+    ack=m.archive_and_ack(config,actual,raw,inventory,operation)
+    assert m.acknowledged_receipt({**actual,"acknowledgment":{**ack,"consumed_operation_id":operation}},run,operation)
+    assert run==before and run["physical_result"]["readback"] is None and not (directory/"cleanup.json").exists()
+    assert {p.name:p.read_bytes() for p in directory.glob("host-*.log")}==logs
+
+
+@pytest.mark.parametrize("broken",[
+    "constructor","host-module","device-module","foreign","source","frozen-name","frozen-body","frozen-origin",
+    "frozen-entry","extra-operational","fresh-off","fresh-lift",
+])
+def test_preimport_base_module_discovery_refuses_execution_foreign_and_unqualified(tmp_path,monkeypatch,broken):
+    m,config,run,proof,state,directory=base_module_preimport_fixture(tmp_path,monkeypatch)
+    path=directory/"host-runtime.log";data=path.read_bytes()
+    repository=Path(config["host_repository"])/"src/lerobot"
+    if broken=="constructor":data=data.replace(b"in <module>",b"in __init__",1)
+    elif broken in ("host-module","device-module"):
+        source=repository/("robots/alohamini/alohamini_host.py" if broken=="host-module" else "motors/feetech/feetech.py")
+        body=source.read_text(encoding="utf-8").splitlines()[0].strip()
+        extra=f'  File "{source.as_posix()}", line 1, in <module>\n    {body}\n'.encode()
+        data=data.replace(b'  File "<frozen importlib._bootstrap>", line 1357',extra+b'  File "<frozen importlib._bootstrap>", line 1357',1)
+    elif broken=="foreign":
+        data=data.replace((repository/"robots/robot.py").as_posix().encode(),(tmp_path/"foreign.py").as_posix().encode())
+    elif broken=="source":
+        source=Path(config["host_python"]).parent.parent/"lib/python3.12/site-packages/torch/__init__.py"
+        source.write_bytes(b"# foreign changed source\n")
+    elif broken=="frozen-name":data=data.replace(b"in acquire",b"in execute_control")
+    elif broken=="frozen-body":data=data.replace(b"in acquire\n",b"in acquire\n    enable_motor()\n")
+    elif broken=="frozen-origin":data=data.replace(b"<frozen importlib._bootstrap>",b"<frozen motor.driver>")
+    elif broken=="frozen-entry":data=data.replace(b"in _find_and_load",b"in __enter__",1)
+    elif broken=="extra-operational":
+        data=data.replace(b"KeyboardInterrupt",b'  File "/foreign/device.py", line 1, in activate\n    enable()\nKeyboardInterrupt')
+    elif broken=="fresh-off":proof["readback"]["readbacks"][0]["value"]=1
+    else:proof["readback"].pop("lift_stationary")
+    path.write_bytes(data);proof["original_host_logs"][path.name]=hashlib.sha256(data).hexdigest()
+    publish_preimport_fixture(run,proof,state)
+    with pytest.raises((ValueError,RuntimeError,OSError,TypeError)):
+        m.load_qualified_proof(config,run)
     assert not list(state.glob("reconciliation-ack-*"))

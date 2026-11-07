@@ -1711,10 +1711,15 @@ def _validate_processor_import_frames(config, frames, *, enum_source=None):
     )
     repository = Path(config["host_repository"]) / "src/lerobot"
     package = repository / "robots/alohamini"
-    anchors = (
-        (package / "__init__.py", "from .alohamini import AlohaMini"),
-        (package / "alohamini.py", "from lerobot.processor import RobotAction, RobotObservation"),
+    entries = (
+        ((package / "__init__.py", "from .alohamini import AlohaMini"),
+         (package / "alohamini.py", "from lerobot.processor import RobotAction, RobotObservation")),
+        ((repository / "robots/__init__.py", "from .robot import Robot"),
+         (repository / "robots/robot.py", "from lerobot.motors import MotorCalibration")),
     )
+    anchors = next((entry for entry in entries if all(frame[0] == path.as_posix()
+        and frame[3] and frame[3][0] == "    " + source for frame, (path, source) in zip(frames[2:4], entry, strict=True))), None)
+    require(anchors is not None, "source-checked pre-main package discovery anchors required")
     for frame, (path, source) in zip(frames[2:4], anchors, strict=True):
         require(
             frame[0] == path.as_posix() and frame[2] == "<module>" and frame[3]
@@ -1733,7 +1738,8 @@ def _validate_processor_import_frames(config, frames, *, enum_source=None):
             permitted = path == anchors[index - 2][0]
         elif local:
             relative = path.relative_to(repository)
-            permitted = bool(relative.parts) and relative.parts[0] in {"processor", "configs", "transforms"}
+            permitted = ((bool(relative.parts) and relative.parts[0] in {"processor", "configs", "transforms", "utils"})
+                         or relative.as_posix() in {"robots/__init__.py", "robots/robot.py", "motors/__init__.py", "motors/motors_bus.py"})
         else:
             relative = path.relative_to(site) if path.is_relative_to(site) else None
             permitted = (relative is not None and len(relative.parts) >= 2 and relative.parts[0] in {
@@ -1851,29 +1857,33 @@ def _load_preimport_stop_originals(config, proof):
         else:
             require(bool(frames), "unexpected original traceback prefix")
             frames[-1][3].append(line)
-    if len(frames) > 3 and frames[3][3] and frames[3][3][0] == (
-        "    from lerobot.processor import RobotAction, RobotObservation"
-    ):
-        if cache_directory is not None:
-            # Frozen interpreter discovery frames have no source bodies, like
-            # runpy above. Bind the complete tail to the last source-checked
-            # dependency directory; no host/constructor frame is admitted.
-            tail = [
-                ("<frozen importlib._bootstrap>", "_find_and_load"),
-                ("<frozen importlib._bootstrap>", "_find_and_load_unlocked"),
-                ("<frozen importlib._bootstrap>", "_find_spec"),
-                ("<frozen importlib._bootstrap_external>", "find_spec"),
-                ("<frozen importlib._bootstrap_external>", "_get_spec"),
-                ("<frozen importlib._bootstrap_external>", "_path_importer_cache"),
-                ("<frozen importlib._bootstrap_external>", "_path_hooks"),
-                ("<frozen importlib._bootstrap_external>", "path_hook_for_FileFinder"),
-            ]
-            require(enum_source is None and len(frames) > len(tail)
-                    and [(name, context) for name, _, context, _ in frames[-len(tail):]] == tail
-                    and all(number > 0 and body == [] for _, number, _, body in frames[-len(tail):])
-                    and Path(frames[-len(tail)-1][0]).parent.as_posix() == cache_directory,
-                    "exact handled import-cache discovery tail/directory required")
-            frames = frames[:-len(tail)]
+    require(5 <= len(frames) + len(handled_frames) + (cache_directory is not None) <= 64,
+            "bounded complete pre-main import chain required")
+    if len(frames) > 3 and frames[3][3] and frames[3][3][0] in {
+        "    from lerobot.processor import RobotAction, RobotObservation",
+        "    from lerobot.motors import MotorCalibration",
+    }:
+        # Only a contiguous suffix of interpreter import discovery/lock frames
+        # is permitted. The source-backed prefix remains module imports only.
+        frozen = {
+            "<frozen importlib._bootstrap>": {"_find_and_load", "_find_and_load_unlocked", "_find_spec", "__enter__", "acquire", "__init__"},
+            "<frozen importlib._bootstrap_external>": {"find_spec", "_get_spec", "_path_importer_cache", "_path_hooks", "path_hook_for_FileFinder"},
+        }
+        cut = len(frames)
+        while cut and frames[cut-1][0] in frozen:
+            cut -= 1
+        tail = frames[cut:]
+        if tail:
+            require(enum_source is None and 1 <= len(tail) <= 16 and cut >= 4
+                    and tail[0][0:3:2] == ("<frozen importlib._bootstrap>", "_find_and_load")
+                    and all(number > 0 and body == [] and context in frozen[name] for name, number, context, body in tail),
+                    "bounded interpreter import discovery/lock suffix required")
+            if cache_directory is not None:
+                require(Path(frames[cut-1][0]).parent.as_posix() == cache_directory,
+                        "handled import-cache directory must match source-checked dependency")
+            frames = frames[:cut]
+        else:
+            require(cache_directory is None, "handled import-cache miss requires its complete discovery suffix")
         if enum_source is not None:
             site = Path(config["host_python"]).parent.parent / "lib/python3.12/site-packages"
             require(
