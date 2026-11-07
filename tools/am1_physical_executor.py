@@ -934,22 +934,44 @@ class PhysicalExecutor:
                     and self._startup_view_matches())
             return True  # Delivery accepted; qualification is checked against current local evidence below.
 
-    def _startup_view_matches(self):
+    def _startup_view_matches(self, *, failure_context=None):
         required, view = self._startup_view_requirement, self._startup_view_progress
+        local, browser_checked_at, reason = None, None, None
+
+        def checked(name, value):
+            nonlocal reason
+            if not value:
+                reason = name
+            return value
+
         if not required or not view:
-            return False
-        local = self.observation.evidence()
-        floor, expiry = view.get("received_at_monotonic_s"), view.get("qualified_until")
-        return bool(local["qualified"] and local.get("owned_session") == self.run_id
-            and local.get("generation") == self._startup_observation_generation
-            and local.get("role") == required["role"] == view.get("role")
-            and local.get("owner_generation") == view.get("owner_generation")
-            and local.get("capture_generation") == view.get("capture_generation")
-            and view.get("run_id") == self.run_id and view.get("source_fresh") is True
-            and type(view.get("decoded_frames")) is int and view["decoded_frames"] > 0
-            and type(view.get("encode_generation")) is str and bool(view["encode_generation"])
-            and all(type(x) in (int, float) and math.isfinite(x) for x in (floor, expiry))
-            and floor <= self.clock() < expiry and abs(expiry - floor - .5) < 1e-9)
+            matched, reason = False, "browser_descriptor_absent" if required else "startup_requirement_absent"
+        else:
+            local = self.observation.evidence()
+            floor, expiry = view.get("received_at_monotonic_s"), view.get("qualified_until")
+            matched = bool(checked("local_qualified", local["qualified"])
+                and checked("owned_session", local.get("owned_session") == self.run_id)
+                and checked("request_generation", local.get("generation") == self._startup_observation_generation)
+                and checked("role", local.get("role") == required["role"] == view.get("role"))
+                and checked("owner_generation", local.get("owner_generation") == view.get("owner_generation"))
+                and checked("capture_generation", local.get("capture_generation") == view.get("capture_generation"))
+                and checked("browser_run", view.get("run_id") == self.run_id)
+                and checked("browser_source_qualified", view.get("source_fresh") is True)
+                and checked("browser_decoded_frames", type(view.get("decoded_frames")) is int and view["decoded_frames"] > 0)
+                and checked("browser_encode_generation", type(view.get("encode_generation")) is str and bool(view["encode_generation"]))
+                and checked("browser_clock_types", all(type(x) in (int, float) and math.isfinite(x) for x in (floor, expiry)))
+                and checked("browser_receipt_range", floor <= (browser_checked_at := self.clock()) < expiry)
+                and checked("browser_original_interval", abs(expiry - floor - .5) < 1e-9))
+        if not matched and failure_context is not None and "startup_view_failure" not in self._lifecycle:
+            # One fixed, original proof snapshot; later finishing reads cannot replace it.
+            self._lifecycle["startup_view_failure"] = dict(
+                version=1, kind="am1-startup-required-view-failure", reason=reason,
+                run_id=self.run_id, host_incarnation=self.host_incarnation,
+                binding=copy.deepcopy(required), current_authority=copy.deepcopy(failure_context["current_authority"]),
+                startup_deadline=failure_context["startup_deadline"],
+                checked_at=dict(startup=failure_context["startup"], authority=failure_context["authority"], browser=browser_checked_at),
+                local=copy.deepcopy(local), browser=copy.deepcopy(view))
+        return matched
 
     def _check_startup_view(self):
         with self.mutex:
@@ -960,17 +982,20 @@ class PhysicalExecutor:
                 raise StartupCancelledError("physical startup cancelled by Stop")
             if self._lifecycle["phase"] != "startup":
                 return
-            if self.clock() >= self._lifecycle["startup_deadline"]:
+            if (startup_checked_at := self.clock()) >= (startup_deadline := self._lifecycle["startup_deadline"]):
                 raise RuntimeError("physical startup deadline expired")
             owner = self._live_binding or {}
             if (self._startup_view_invalid or self.revision != required["intent_revision"]
                     or self.run_id != required["run_id"] or self.host_incarnation != required["host_incarnation"]
                     or any(owner.get(k) != required[k] for k in ("service_incarnation", "controller_generation"))
-                    or self.clock() >= required["controller_expires"]):
+                    or (authority_checked_at := self.clock()) >= required["controller_expires"]):
                 self._startup_view_invalid = self._startup_view_invalid or "startup authority changed or expired"
                 self.finish_status = self.finish_status or "stopped"
                 raise StartupCancelledError("physical startup cancelled: " + self._startup_view_invalid)
-            if self._startup_view_armed and not self._startup_view_matches():
+            if self._startup_view_armed and not self._startup_view_matches(failure_context=dict(
+                    startup=startup_checked_at, authority=authority_checked_at, startup_deadline=startup_deadline,
+                    current_authority=dict(run_id=self.run_id,host_incarnation=self.host_incarnation,
+                                           intent_revision=self.revision,**owner))):
                 raise RuntimeError("required owned local/browser view expired during physical startup")
 
     def startup_view_ready(self):

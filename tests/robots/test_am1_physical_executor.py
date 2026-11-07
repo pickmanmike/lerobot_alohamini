@@ -4307,3 +4307,75 @@ def test_startup_required_view_renewals_never_extend_original_startup_deadline(s
     with pytest.raises(RuntimeError):
         case.e.startup_view_ready()
     assert case.binding["startup_deadline"]==10. and case.host is None and not case.clients
+
+
+@pytest.mark.parametrize("fault,reason",[("browser-expired","browser_receipt_range"),("local-unqualified","local_qualified"),("capture-mismatch","capture_generation")])
+def test_startup_view_failure_retains_exact_first_predicate_and_consumed_proofs(startup_required_view_case,monkeypatch,fault,reason):
+    import copy,json
+    case=startup_required_view_case
+    case.local();original=case.view();assert case.e.publish_startup_view(case.binding,original)
+    assert case.e.startup_view_ready()
+    case.now=.501 if fault=="browser-expired" else .1
+    case.local(2)
+    if fault=="local-unqualified":
+        case.box.publish(dict(case.box.request,owned_session=case.e.run_id,qualified=False,reason="fixture local receipt unavailable"))
+    elif fault=="capture-mismatch":
+        original=dict(original,capture_generation="77777777-7777-4777-8777-777777777777")
+        assert case.e.publish_startup_view(case.binding,original)
+    consumed=case.box.evidence();reads=[];read=case.box.evidence
+    def once():
+        reads.append(True);value=read();case.box.stop();return value
+    monkeypatch.setattr(case.box,"evidence",once)
+    with pytest.raises(RuntimeError,match="required owned local/browser view expired during physical startup"):
+        case.e._check_startup_view()
+    record=case.e._lifecycle.get("startup_view_failure")
+    assert isinstance(record,dict),"first failed startup view predicate and original proof clocks must survive cleanup"
+    assert len(reads)==1 and record["reason"]==reason
+    assert record["run_id"]==case.e.run_id and record["host_incarnation"]==case.e.host_incarnation
+    assert record["binding"]==case.e._startup_view_requirement and record["startup_deadline"]==case.e._lifecycle["startup_deadline"]
+    assert record["local"]==consumed and record["browser"]==original
+    assert record["checked_at"]["startup"]==record["checked_at"]["authority"]==case.now
+    assert record["checked_at"]["browser"]==(case.now if fault=="browser-expired" else None)
+    assert record["current_authority"]==dict(case.identity)
+    assert len(json.dumps(record,allow_nan=False).encode())<=4096
+    frozen=copy.deepcopy(record);case.now=.7
+    with pytest.raises(RuntimeError):case.e._check_startup_view()
+    assert case.e._lifecycle["startup_view_failure"]==frozen
+    case.e._lifecycle.update(phase="terminal",backend_incarnation=case.e.host_incarnation,cleanup="physical_cleanup_unknown",uncertain=True,terminal_status="faulted")
+    assert case.e.evidence()["lifecycle"]["startup_view_failure"]==frozen
+
+
+def test_startup_view_failure_is_absent_before_armed_and_newer_stop_wins(startup_required_view_case):
+    case=startup_required_view_case
+    case.local();assert case.e.startup_view_ready() is False
+    assert "startup_view_failure" not in case.e._lifecycle
+    assert case.e.publish_startup_view(case.binding,case.view());assert case.e.startup_view_ready()
+    case.e.finish("stopped")
+    with pytest.raises(RuntimeError,match="cancelled by Stop"):case.e._check_startup_view()
+    assert "startup_view_failure" not in case.e._lifecycle
+
+
+def test_startup_view_failure_existing_core_terminal_copy_persists_diagnostic(startup_required_view_case,tmp_path):
+    import copy,json
+    from tools.am1_session_core import SessionAuthority
+    case=startup_required_view_case
+    case.local();assert case.e.publish_startup_view(case.binding,case.view());assert case.e.startup_view_ready()
+    case.now=.501;case.local(2)
+    with pytest.raises(RuntimeError):case.e._check_startup_view()
+    diagnostic=copy.deepcopy(case.e._lifecycle.get("startup_view_failure"))
+    assert isinstance(diagnostic,dict),"actual guard result must be retained before lifecycle cleanup"
+    case.e._lifecycle.update(phase="terminal",backend_incarnation=case.e.host_incarnation,cleanup="physical_cleanup_unknown",uncertain=True,terminal_status="faulted",first_cause=None)
+    authority=SessionAuthority(tmp_path/"authority",executor=case.e,clock=lambda:case.now)
+    try:
+        cause="RuntimeError: required owned local/browser view expired during physical startup"
+        authority.run=dict(run_id=case.e.run_id,operation_id=case.binding["operation_id"],dispatch="acknowledged",source="protected-physical-provider",status="finishing",requested_terminal="faulted",uncertain=True,first_cause=cause,finish_ceiling=10.)
+        assert authority._physical_lifecycle(case.e.evidence(),case.now)
+        assert authority.run["physical_result"]["startup_view_failure"]==diagnostic
+        saved=json.loads(authority.db.execute("SELECT data FROM state WHERE id=1").fetchone()[0])
+        assert saved["physical_result"]["startup_view_failure"]==diagnostic
+        assert saved["first_cause"]==cause and saved["status"]=="faulted" and saved["uncertain"] is True
+        archives=list((authority.directory/"run-results"/case.e.run_id).glob("*.json"))
+        assert len(archives)==1
+        assert json.loads(archives[0].read_text(encoding="utf-8"))["physical_result"]["startup_view_failure"]==diagnostic
+    finally:
+        authority.close()

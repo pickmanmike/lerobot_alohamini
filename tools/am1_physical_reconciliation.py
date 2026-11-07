@@ -23,6 +23,7 @@ PRECONFIGURE_COOL_STALE_ORIGIN = "preconfigure-cool-thermal-stale-lift-unqualifi
 FOLLOWER_BASELINE_EXPIRED_ORIGIN = "preconfigure-follower-baseline-expired-lift-unqualified"
 PREIMPORT_STOP_ORIGIN = "preimport-stop-missing-host-receipt"
 ORDINARY_STARTUP_STOP_ORIGIN = "preactivation-ordinary-restored-expected-stop"
+ORDINARY_PREACTIVATION_CANCEL_ORIGIN = "ordinary-preactivation-cancelled-lift-unqualified"
 RESPONSE_BASELINE_REFUSED_ORIGIN = "preconfigure-left-response-baseline-refused-lift-unqualified"
 RESPONSE_GOAL_RESTORE_ORIGIN = "preconfigure-left-response-goal-restore-incomplete-lift-unqualified"
 RESPONSE_GOAL_RUN = "72de22d9-ee93-4f76-809a-f10bd88e512a"
@@ -962,6 +963,93 @@ def validate_ordinary_startup_stop_origin(run, receipt, *, motor_files):
     return True
 
 
+def validate_ordinary_preactivation_cancel_origin(run, receipt, *, motor_files):
+    """Admit only a source-bound preactivation cancellation, never an old lift proof.
+
+    In the protected host, skipped homing is forbidden and the lift operation is
+    created before home or arm torque. With no cleanup errors, an unavailable
+    lift readback therefore means that operation was never constructed. The
+    configured/restored ordinary receipt independently excludes active settings.
+    A fresh full stopped/lift proof and durable ACK are still mandatory.
+    """
+    from examples.alohamini.am1_live_teleop import validate_ordinary_arm_profile, validate_ordinary_arm_profile_receipt
+
+    require(isinstance(run, dict) and isinstance(receipt, dict), "original ordinary Stop objects required")
+    lifecycle, execution = run.get("physical_result"), run.get("execution")
+    require(isinstance(lifecycle, dict) and isinstance(execution, dict), "original ordinary lifecycle required")
+    require(
+        run.get("source") == "protected-physical-provider" and run.get("recipe") == "physical-live-teleop"
+        and run.get("mode") == "interactive" and run.get("status") == run.get("requested_terminal") == "faulted"
+        and run.get("uncertain") is True and run.get("cleanup") == "physical_cleanup_unknown"
+        and "native_live_at" in run and run["native_live_at"] is None
+        and "deadline" in run and run["deadline"] is None
+        and number(run.get("progress_s")) and run["progress_s"] == 0
+        and run.get("intent") is None and run.get("recovery_episodes") == 0
+        and run.get("first_cause") == "RuntimeError: required owned local/browser view expired during physical startup"
+        and "native_first_cause" in run and run["native_first_cause"] is None
+        and execution.get("complete") is False and execution.get("fault") == run["first_cause"]
+        and number(execution.get("progress_s")) and execution["progress_s"] == 0
+        and lifecycle.get("phase") == "terminal" and lifecycle.get("terminal_status") == "faulted"
+        and lifecycle.get("run_id") == run.get("run_id") and lifecycle.get("uncertain") is True
+        and lifecycle.get("cleanup") == "physical_cleanup_unknown" and lifecycle.get("cleanup_errors") == []
+        and "native_live_at" in lifecycle and lifecycle["native_live_at"] is None
+        and lifecycle.get("first_cause") is None and lifecycle.get("readback") == receipt,
+        "exact uncertain ordinary preactivation view cancellation required",
+    )
+    trace = execution.get("input_transport_trace")
+    if trace is not None:
+        require(isinstance(trace, dict) and trace.get("recent") == []
+                and trace.get("invalid_rows") == trace.get("dropped_rows") == 0
+                and trace.get("first_native_expiry") is None, "ordinary startup must retain no accepted input")
+    for value in (run, execution):
+        for key in ("accepted_input_count", "input_count", "frame_count"):
+            if key in value:
+                require(type(value[key]) is int and value[key] == 0, "ordinary startup input count must remain zero")
+    require(
+        type(receipt.get("version")) is int and receipt["version"] == 1
+        and receipt.get("run_id") == run.get("run_id")
+        and receipt.get("host_incarnation") == lifecycle.get("backend_incarnation")
+        and receipt.get("cleanup") == "physical_readback_verified" and receipt.get("uncertain") is False
+        and receipt.get("provenance") == "protected-host/actual-motor-readback"
+        and receipt.get("cleanup_errors") == [] and receipt.get("first_cause") is None
+        and receipt.get("first_error_chain") == []
+        and receipt.get("expected_stop") == {"signal": "SIGINT", "interruption": [{"cause": "KeyboardInterrupt: ", "notes": []}]},
+        "literal verified ordinary expected-SIGINT cleanup required",
+    )
+    rb = receipt.get("readback")
+    require(isinstance(rb, dict) and rb.get("verified") is True and rb.get("buses_closed") is True
+            and rb.get("lift_readback") == "unavailable-or-failed" and rb.get("cleanup_errors") == []
+            and rb.get("selected_gain_restore_required") is False
+            and ("ordinary_arm_profile_restore_required" not in rb or rb["ordinary_arm_profile_restore_required"] is False)
+            and not {"left_response_p_trial", "right_response_p_trial", "right_p20_trial", "elbow_integral"}.intersection(rb),
+            "restored inactive ordinary settings and original all-off cleanup required; lift remains unqualified")
+    native = validate_ordinary_arm_profile_receipt(rb.get("ordinary_arm_profile"), run_id=run["run_id"],
+        host_incarnation=receipt["host_incarnation"], restored=True)
+    require(native["active_registers"] is None and native["configured_at_monotonic_s"] is not None
+            and {key: native["binding"][key] for key in ("profile", "right_elbow_p")}
+                == validate_ordinary_arm_profile(run.get("ordinary_arm_profile")),
+            "same configured but never-active ordinary run policy required")
+    require(type(motor_files) is dict and len(motor_files) == 13
+            and all(type(path) is str and type(digest) is str and re.fullmatch("[0-9a-f]{64}", digest)
+                    for path, digest in motor_files.items())
+            and all(motor_files.get(path) == digest for path, digest in native["source_files_sha256"].items()),
+            "ordinary original five dependencies must match the full Motor manifest")
+    started, completed, rows = rb.get("started_at_monotonic_s"), rb.get("completed_at_monotonic_s"), rb.get("readbacks")
+    require(number(started) and number(completed) and 0 <= started <= completed
+            and isinstance(rows, list) and len(rows) == 20
+            and {(row.get("bus"), row.get("motor"), row.get("register")) for row in rows} == expected_readbacks(),
+            "original twenty distinct timed zero/off readbacks required")
+    for row in rows:
+        _timed_row(row, started, completed)
+    camera = lifecycle.get("camera_release") or {}
+    require(camera.get("state") == "released" and camera.get("session_id") == run["run_id"]
+            and camera.get("errors") == [] and not camera.get("runtime_failed")
+            and all((camera.get("release_evidence") or {}).get(key) is True for key in
+                    ("backend_exited", "readers_joined", "viewer_socket_closed", "runtime_config_removed")),
+            "same-run genuine camera release required")
+    return True
+
+
 def validate_camera_completion_resources(resources, devices):
     """Qualify the original canonical owner; protected unrelated FDs are not globally certified free."""
     keys = {"backend_pid_absent", "camera_pid_absent", "camera_unit_main_pid", "camera_unit_control_pid", "camera_unit_job",
@@ -1423,7 +1511,7 @@ def validate_cleanup_origin(run, proof, receipt):
     if "camera_completion" in proof:
         validate_camera_completion((proof.get("source") or {}).get("backend_contract"), run, proof)
         return True  # Native motors were verified; the separate camera proof never rewrites their history.
-    if origin == ORDINARY_STARTUP_STOP_ORIGIN:
+    if origin in (ORDINARY_STARTUP_STOP_ORIGIN, ORDINARY_PREACTIVATION_CANCEL_ORIGIN):
         original = run.get("backend_contract") or {}
         head, digest = proof.get("original_motor_head"), proof.get("original_motor_manifest_sha256")
         path = original.get("source_pins")
@@ -1441,7 +1529,9 @@ def validate_cleanup_origin(run, proof, receipt):
                 "same original Motor manifest binding required")
         files = {row.get("path"): row.get("sha256") for row in rows}
         require(len(files) == len(rows), "distinct Motor manifest files required")
-        validate_ordinary_startup_stop_origin(run, receipt, motor_files=files)
+        validator = (validate_ordinary_startup_stop_origin if origin == ORDINARY_STARTUP_STOP_ORIGIN
+                     else validate_ordinary_preactivation_cancel_origin)
+        validator(run, receipt, motor_files=files)
         require(proof.get("original_markers") == dict.fromkeys(MARKERS),
                 "restored ordinary expected Stop requires both original markers absent")
         return True
@@ -2489,7 +2579,7 @@ def archive_and_ack(config, proof, raw, originals, operation_id):
         _load_preimport_stop_originals(config, proof)
     if proof.get("original_cleanup_origin") == RESPONSE_GOAL_RESTORE_ORIGIN:
         _load_selected_restoration(config, proof)
-    if proof.get("original_cleanup_origin") == ORDINARY_STARTUP_STOP_ORIGIN:
+    if proof.get("original_cleanup_origin") in (ORDINARY_STARTUP_STOP_ORIGIN, ORDINARY_PREACTIVATION_CANCEL_ORIGIN):
         require(sha(_private_bytes(Path(config["run_root"]) / proof["run_id"][:8] / "cleanup.json"))
                 == proof["original_cleanup_sha256"], "original ordinary restored cleanup changed before ACK")
     acknowledgment_path = _ack_path(state, proof["run_id"])
@@ -2573,6 +2663,7 @@ def archive_and_ack(config, proof, raw, originals, operation_id):
         PREIMPORT_STOP_ORIGIN,
         RESPONSE_BASELINE_REFUSED_ORIGIN,
         ORDINARY_STARTUP_STOP_ORIGIN,
+        ORDINARY_PREACTIVATION_CANCEL_ORIGIN,
     ):
         require(
             originals == dict.fromkeys(MARKERS)
@@ -2581,7 +2672,7 @@ def archive_and_ack(config, proof, raw, originals, operation_id):
         )
     if proof.get("original_cleanup_origin") == PREIMPORT_STOP_ORIGIN:
         _load_preimport_stop_originals(config, proof)
-    if proof.get("original_cleanup_origin") == ORDINARY_STARTUP_STOP_ORIGIN:
+    if proof.get("original_cleanup_origin") in (ORDINARY_STARTUP_STOP_ORIGIN, ORDINARY_PREACTIVATION_CANCEL_ORIGIN):
         require(sha(_private_bytes(Path(config["run_root"]) / proof["run_id"][:8] / "cleanup.json"))
                 == proof["original_cleanup_sha256"], "original ordinary restored cleanup changed during ACK")
     if "camera_completion" in proof:

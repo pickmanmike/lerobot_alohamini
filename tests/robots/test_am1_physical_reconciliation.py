@@ -4178,3 +4178,103 @@ def test_late_camera_completed_kill_origin_refuses_ambiguous_original_release(tm
     with pytest.raises(ValueError):
         m.validate_late_camera_completion_origin(run, run["physical_result"]["readback"], release)
     assert run == before
+
+
+# A required-view cancellation interrupted calibration before the native lift owner existed.
+ORDINARY_PREACTIVATION_CANCEL = "ordinary-preactivation-cancelled-lift-unqualified"
+ORDINARY_STARTUP_VIEW_CAUSE = "RuntimeError: required owned local/browser view expired during physical startup"
+
+
+def ordinary_preactivation_cancel_fixture(tmp_path, monkeypatch, activation, right_p=16):
+    m, config, run, proof, state, manifest = ordinary_startup_stop_fixture(tmp_path, monkeypatch, activation, right_p)
+    run.update(status="faulted", requested_terminal="faulted", first_cause=ORDINARY_STARTUP_VIEW_CAUSE)
+    run["execution"]["fault"] = ORDINARY_STARTUP_VIEW_CAUSE
+    run["physical_result"].update(terminal_status="faulted")
+    run["physical_result"]["readback"]["readback"]["lift_readback"] = "unavailable-or-failed"
+    proof["original_cleanup_origin"] = ORDINARY_PREACTIVATION_CANCEL
+    return m, config, run, proof, state, manifest
+
+
+def test_ordinary_preactivation_cancel_actual_calibration_interruption_is_eligibility_only():
+    from tools import am1_physical_reconciliation as m
+    root = Path(__file__).resolve().parents[2]
+    actual = root / ".cache/am1-teleop-consolidation-16/physical-runs/am1-virtual-eaf96b8b-f62c-473c-8a60-9a9dc449e889"
+    raw = (actual / "native-run.private.json").read_bytes()
+    run = json.loads(raw)
+    audit = json.loads((actual / "native-terminal-idle-collected.private.json").read_bytes())
+    receipt = json.loads((actual / "cleanup.json").read_bytes())
+    motor = {row["path"]: row["sha256"] for row in audit["facts"]["manifest"]["value"]["motor"]["files"]}
+    before = copy.deepcopy((run, receipt, motor))
+    assert m.validate_ordinary_preactivation_cancel_origin(run, receipt, motor_files=motor) is True
+    assert (run, receipt, motor) == before
+    assert run["uncertain"] is True and receipt["readback"]["lift_readback"] == "unavailable-or-failed"
+    assert (actual / "native-run.private.json").read_bytes() == raw
+
+
+@pytest.mark.parametrize("right_p", [16, 32])
+def test_ordinary_preactivation_cancel_requires_fresh_lift_proof_and_durable_ack(tmp_path, monkeypatch, activation, right_p):
+    m, config, run, proof, state, manifest = ordinary_preactivation_cancel_fixture(tmp_path, monkeypatch, activation, right_p)
+    raw = publish_incomplete_fixture(config, run, proof, state)
+    before = copy.deepcopy(run)
+    old_path = Path(config["run_root"]) / run["run_id"][:8] / "cleanup.json"
+    old_raw = old_path.read_bytes()
+    actual, received, inventory = m.load_qualified_proof(config, run)
+    assert actual == proof and received == raw and inventory == dict.fromkeys(m.MARKERS)
+    operation = str(uuid.uuid4())
+    assert not m.acknowledged_receipt(actual, run, operation)
+    ack = m.archive_and_ack(config, actual, received, inventory, operation)
+    assert m.acknowledged_receipt({**actual, "acknowledgment": {**ack, "consumed_operation_id": operation}}, run, operation)
+    assert run == before and old_path.read_bytes() == old_raw
+    assert run["first_cause"] == ORDINARY_STARTUP_VIEW_CAUSE and run["native_first_cause"] is None
+
+
+@pytest.mark.parametrize("broken", [
+    "status", "cause", "native-cause", "execution-cause", "live", "progress", "input", "trace", "signal",
+    "active", "configuration", "restore", "aggregate", "lift-owner", "original-off", "original-time",
+    "policy", "source", "camera", "fresh-lift", "fresh-off", "fresh-thermal", "fresh-age", "locks",
+])
+def test_ordinary_preactivation_cancel_refuses_powered_ambiguous_or_unqualified_proof(tmp_path, monkeypatch, activation, broken):
+    m, config, run, proof, state, manifest = ordinary_preactivation_cancel_fixture(tmp_path, monkeypatch, activation)
+    old = run["physical_result"]["readback"]
+    rb = old["readback"]
+    native = rb["ordinary_arm_profile"]
+    if broken == "status": run["status"] = "starting"
+    elif broken == "cause": run["first_cause"] = "RuntimeError: different fault"
+    elif broken == "native-cause": run["native_first_cause"] = old["first_cause"] = "real native fault"
+    elif broken == "execution-cause": run["execution"]["fault"] = None
+    elif broken == "live": run["native_live_at"] = 97.
+    elif broken == "progress": run["progress_s"] = .01
+    elif broken == "input": run["accepted_input_count"] = 1
+    elif broken == "trace": run["execution"]["input_transport_trace"]["recent"] = [{"accepted": True}]
+    elif broken == "signal": old["expected_stop"]["signal"] = "SIGTERM"
+    elif broken == "active": native["active_registers"] = copy.deepcopy(native["restored_registers"])
+    elif broken == "configuration": native["configured_at_monotonic_s"] = None
+    elif broken == "restore": native["restore_required"] = True
+    elif broken == "aggregate": rb["selected_gain_restore_required"] = True
+    elif broken == "lift-owner": rb["lift_readback"] = "qualified"
+    elif broken == "original-off": rb["readbacks"][0]["value"] = 1
+    elif broken == "original-time": rb["readbacks"][0]["read_completed_at_monotonic_s"] = 200.
+    elif broken == "policy": run["ordinary_arm_profile"]["right_elbow_p"] = 32
+    elif broken == "source": native["source_files_sha256"][next(iter(native["source_files_sha256"]))] = "f" * 64
+    elif broken == "camera": run["physical_result"]["camera_release"]["state"] = "release-incomplete"
+    elif broken == "fresh-lift": proof["readback"]["lift_readback"] = "unavailable-or-failed"
+    elif broken == "fresh-off": proof["readback"]["readbacks"][0]["value"] = 1
+    elif broken == "fresh-thermal": proof["readback"]["lift_stationary"]["samples"][0]["temperature_c"] = 99
+    elif broken == "fresh-age": monkeypatch.setattr(m.time, "monotonic", lambda: 500.)
+    elif broken == "locks": proof["admission"]["both_locks_held"] = False
+    publish_incomplete_fixture(config, run, proof, state)
+    with pytest.raises((ValueError, KeyError, TypeError)):
+        m.load_qualified_proof(config, run)
+    assert not m._ack_path(state, run["run_id"]).exists()
+
+
+@pytest.mark.parametrize("changed", ["marker", "original"])
+def test_ordinary_preactivation_cancel_ack_rechecks_originals(tmp_path, monkeypatch, activation, changed):
+    m, config, run, proof, state, _ = ordinary_preactivation_cancel_fixture(tmp_path, monkeypatch, activation)
+    publish_incomplete_fixture(config, run, proof, state)
+    actual, raw, inventory = m.load_qualified_proof(config, run)
+    target = state / m.MARKERS[0] if changed == "marker" else Path(config["run_root"]) / run["run_id"][:8] / "cleanup.json"
+    target.write_bytes(b"changed")
+    with pytest.raises(ValueError):
+        m.archive_and_ack(config, actual, raw, inventory, str(uuid.uuid4()))
+    assert target.read_bytes() == b"changed"
