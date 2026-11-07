@@ -5405,6 +5405,7 @@ async def run(args):
 
         if not bench:
             await recovery.resume(renewal_check=renewal_healthy,
+                                  renewal_reconcile=restart_qualified_renewal if ordinary_input_rearm else None,
                                   **({"wall_deadline": entry_wall_deadline} if left_entry else {}))
             producer.native_cursor = _live(client.snapshot)["cursor"]
             if left_entry:

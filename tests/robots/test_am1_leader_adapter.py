@@ -4710,6 +4710,11 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 started, stops, inputs, preparations = [], [], [], []
                 renewal_failure = TimeoutError("original pre-admission renewal timeout")
                 renewal_failed = asyncio.Event()
+                initial_resume_renewal = zero_input_retry in {"initial-resume-renewal", "initial-resume-stale-renewal"}
+                stale_renewal = zero_input_retry == "initial-resume-stale-renewal"
+                pause_observed, renewal_in_flight = asyncio.Event(), asyncio.Event()
+                lose_initial_renewal = False
+                initial_resumes, lost_renewals, initial_timing = [], [], []
                 base = held_command119_workspace()
                 base["workspace_profile"] = m.ORDINARY_ARMS_PROFILE
                 policy = None
@@ -4721,6 +4726,10 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 e.desired = "hold"
                 a.run = a.controller = a.connection = None
                 a.clock = e.clock = lambda: pi_now[0]
+                if initial_resume_renewal:
+                    from tools.am1_local_observation import LocalObservationMailbox
+                    e.observation = LocalObservationMailbox(dict(e.observation.source, role="chest", device="/dev/am_camera_chest"),
+                                                            clock=a.clock, require_owned_session=True)
 
                 native_ack_state = [None]
                 def native_evidence():
@@ -4757,6 +4766,16 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     return value
 
                 def begin_without_devices(recipe):
+                    if initial_resume_renewal:
+                        owner, capture, encode = (str(uuid4()) for _ in range(3))
+                        e.observation.publish(dict(e.observation.request, owned_session=e.run_id, qualified=True,
+                            owner_generation=owner, capture_generation=capture, sequence=1, arrived_at=pi_now[0],
+                            decoded_at=pi_now[0], frame_sha256="f" * 64))
+                        a._teleop_view = dict(run_id=e.run_id, role="chest", owner_generation=owner,
+                            capture_generation=capture, encode_generation=encode, decoded_frames=1, media_time=.1,
+                            source_sequence=1, source_fresh=True, received_at_monotonic_s=pi_now[0],
+                            request_received_at_monotonic_s=pi_now[0], qualified_until=pi_now[0] + .5)
+                        assert e.publish_startup_view(a._startup_view_binding, a._teleop_view) and e.startup_view_ready()
                     e._lifecycle.update(phase="startup" if phase[0] == 0 and zero_input_retry != "view" else "live", native_live_at=pi_now[0],
                         native_deadline_monotonic_s=pi_now[0]+300, backend_incarnation=e.host_incarnation)
                     return True
@@ -4840,11 +4859,25 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         self.fresh_intent = False
                         self.lost = False
                     async def post(self, path, body):
+                        nonlocal lose_initial_renewal
                         if (phase[0] == 0 and zero_input_retry != "view" and path == "claim"
                             and "controller_generation" in body and started):
                             renewal_failed.set()
                             raise renewal_failure
-                        result = await super().post(path, body)
+                        if (initial_resume_renewal and path == "claim" and "controller_generation" in body
+                            and not lost_renewals and normal_waiting_renewal.is_set()):
+                            lose_initial_renewal = (self.connection is not None
+                                and self.snapshot["run"]["intent_revision"] == 1) if stale_renewal else pause_observed.is_set()
+                        try:
+                            result = await super().post(path, body)
+                        except m.HTTPOutcomeError as error:
+                            if initial_resume_renewal and lose_initial_renewal:
+                                assert m._owner_unknown_http(error)
+                                renewal_failed.set()
+                            raise
+                        finally:
+                            if path == "claim":
+                                lose_initial_renewal = False
                         if (phase[0] == 1 and path == "claim" and "controller_generation" in body
                             and m._normal_renewal_receipt(result, self.generation)):
                             normal_waiting_renewal.set()  # Real accepted receipt, before any later reply loss.
@@ -4892,8 +4925,15 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                                 await peer.ws.close(code=1006)
                             await asyncio.wait_for(renewal_failed.wait(), 1.)
                             await asyncio.sleep(0)
+                        if initial_resume_renewal and timeout == 5 and len(initial_resumes) == 1:
+                            await super().wait(lambda: self.snapshot["run"]["status"] == "paused", timeout)
+                            assert m._live(self.snapshot)["last_input_seq"] == -1 and not inputs
+                            pause_observed.set()
+                            await asyncio.wait_for(renewal_failed.wait(), 2.)
                         result = await super().wait(predicate, timeout)
-                        if phase[0] == 1 and self.snapshot["run"]["status"] == "running" and not self.fresh_intent:
+                        if phase[0] == 1 and (self.snapshot["run"] or {}).get("status") == "running" and not self.fresh_intent:
+                            if initial_resume_renewal:
+                                assert len(initial_resumes) == 2 and not inputs
                             self.fresh_intent = True
                             joint_key = "arm_left_elbow_flex.pos"
                             target = native[0]["reference"][joint_key]+.05
@@ -4982,6 +5022,56 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     args.ordinary_arm_profile = policy
                     args.prepare_current_rest = False
                 try:
+                    if initial_resume_renewal:
+                        phase[0], pi_now[0] = 1, 20.
+                        original_call = gateway.call
+                        async def first_resume_view_pause(command, device):
+                            op = command.get("op")
+                            first_resume = op == "resume" and not initial_resumes
+                            if first_resume:
+                                await asyncio.wait_for(normal_waiting_renewal.wait(), 2.)
+                                if stale_renewal:
+                                    await asyncio.wait_for(renewal_in_flight.wait(), 2.)
+                            if op == "claim" and "controller_generation" in command:
+                                pi_now[0] += .125
+                            result = await original_call(command, device)
+                            if op == "claim" and lose_initial_renewal:
+                                assert result["accepted"] is True
+                                lost_renewals.append(result)
+                                renewal_in_flight.set()
+                                if stale_renewal:
+                                    await asyncio.wait_for(pause_observed.wait(), 2.)
+                                raise TimeoutError("injected lost receipt after accepted renewal")
+                            if op == "resume":
+                                initial_resumes.append(command)
+                            if first_resume:
+                                assert result == {"accepted": True, "status": "resuming", "effect_admitted": False}
+                                assert not inputs and m._live(a.snapshot())["last_input_seq"] == -1
+                                initial_timing.extend(a.run[key] for key in ("native_live_at", "deadline"))
+                                pi_now[0] += .125
+                                a._teleop_view["qualified_until"] = pi_now[0] - .001
+                                a.tick()
+                                assert a.run["status"] == "paused" and a.events[-1]["kind"] == "required_view_expired"
+                            return result
+                        gateway.call = first_resume_view_pause
+                        if stale_renewal:
+                            with pytest.raises(m.HTTPOutcomeError) as refused:
+                                await m.run(args)
+                            assert m._owner_unknown_renewal(refused.value)
+                            assert refused.value.renewal_context["identity"]["intent_revision"] == initial_resumes[0]["intent_revision"]
+                            assert len(initial_resumes) == 1 and not inputs
+                        else:
+                            summary = await m.run(args)
+                            assert summary["finish_qualified"] and summary["original_native_deadline"] == initial_timing[1]
+                            assert len(initial_resumes) == 2 and len(inputs) == 1
+                            assert initial_resumes[1]["operation_id"] != initial_resumes[0]["operation_id"]
+                        rows = [json.loads(line) for line in (tmp_path / "failed/frames.jsonl").read_text().splitlines()]
+                        recovered = [row for row in rows if row["event"] == "controller_renewal_requalified"]
+                        assert len(recovered) == int(not stale_renewal)
+                        assert len(started) == len(stops) == len(lost_renewals) == 1
+                        assert a.run["status"] == "stopped"
+                        assert [a.run[key] for key in ("native_live_at", "deadline")] == initial_timing
+                        return
                     with pytest.raises((TimeoutError, ConnectionError)) as caught:
                         await m.run(args)
                     failed_path = tmp_path/"failed"/"summary.json"
@@ -15306,6 +15396,12 @@ def test_normal_entrypoint_zero_input_failure_reconciles_before_explicit_fresh_r
 def test_new_ordinary_policy_zero_input_prefix_uses_real_core_and_explicit_fresh_retry(tmp_path, monkeypatch, failure):
     test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
         tmp_path, monkeypatch, "zero_input_fresh_retry", zero_input_retry=failure, ordinary_profile=True)
+
+
+@pytest.mark.parametrize("case", ["initial-resume-renewal", "initial-resume-stale-renewal"])
+def test_initial_ordinary_resume_qualifies_only_current_unknown_renewal(tmp_path, monkeypatch, case):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
+        tmp_path, monkeypatch, "zero_input_fresh_retry", zero_input_retry=case, ordinary_profile=True)
 
 
 def test_new_ordinary_policy_external_pause_keeps_real_owner_until_fresh_resume_and_new_input(tmp_path, monkeypatch):
