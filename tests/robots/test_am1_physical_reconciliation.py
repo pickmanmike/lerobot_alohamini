@@ -2345,7 +2345,16 @@ def processor_preimport_fixture(tmp_path, monkeypatch):
     return m, config, run, proof, state, directory
 
 
-def test_preimport_processor_discovery_accepts_retained_trace_only_with_fresh_proof(tmp_path, monkeypatch):
+@pytest.mark.parametrize("blank_terminal_indicator", [False, True])
+def test_preimport_processor_discovery_accepts_retained_trace_only_with_fresh_proof(
+    tmp_path, monkeypatch, blank_terminal_indicator
+):
+    if blank_terminal_indicator:
+        # The interrupted dependency emitted an empty terminal indicator line.
+        name, number, context, body = PROCESSOR_PREIMPORT_TRACE[-1]
+        monkeypatch.setitem(globals(), "PROCESSOR_PREIMPORT_TRACE", (
+            *PROCESSOR_PREIMPORT_TRACE[:-1], (name, number, context, (body[0], ""))
+        ))
     m, config, run, proof, state, directory = processor_preimport_fixture(tmp_path, monkeypatch)
     original = copy.deepcopy(run)
     logs = {name: (directory / name).read_bytes() for name in proof["original_host_logs"]}
@@ -2366,7 +2375,7 @@ def test_preimport_processor_discovery_accepts_retained_trace_only_with_fresh_pr
     "broken",
     [
         "discovery", "package_source", "local_function", "host_main", "physical_module",
-        "foreign_dependency", "dependency_source", "caret", "trace_bound", "frame_bound",
+        "foreign_dependency", "dependency_source", "caret", "blank_before_discovery_tail", "trace_bound", "frame_bound",
         "source_bound", "source_escape", "fresh_torque", "fresh_lift", "fresh_thermal",
     ],
 )
@@ -2396,6 +2405,11 @@ def test_preimport_processor_discovery_refuses_execution_and_unqualified_proof(t
         dependency.write_text("# source changed\n", encoding="utf-8")
     elif broken == "caret":
         data = data.replace(b'        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^', b'    unexpected execution text')
+    elif broken == "blank_before_discovery_tail":
+        data = data.replace(
+            b"        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nKeyboardInterrupt",
+            b'\n  File "<frozen importlib._bootstrap>", line 1176, in _find_and_load\nKeyboardInterrupt',
+        )
     elif broken == "trace_bound":
         data = data.replace(b"KeyboardInterrupt", b" " * 65536 + b"KeyboardInterrupt")
     elif broken == "frame_bound":

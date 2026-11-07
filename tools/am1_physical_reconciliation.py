@@ -1754,7 +1754,7 @@ def _stdlib_import_frame_source(config, name, *, native_lock):
     return None
 
 
-def _validate_processor_import_frames(config, frames, *, enum_source=None):
+def _validate_processor_import_frames(config, frames, *, enum_source=None, complete_tail=True):
     """Bounded pre-main package discovery; never evidence of stopped hardware."""
     require(
         5 <= len(frames) <= 64
@@ -1787,6 +1787,7 @@ def _validate_processor_import_frames(config, frames, *, enum_source=None):
     for index, (name, number, context, body) in enumerate(frames[2:], 2):
         path = Path(name)
         local = path.is_relative_to(repository)
+        dependency = False
         if index < 4:
             permitted = path == anchors[index - 2][0]
         elif local:
@@ -1795,9 +1796,12 @@ def _validate_processor_import_frames(config, frames, *, enum_source=None):
                          or relative.as_posix() in {"robots/__init__.py", "robots/robot.py", "motors/__init__.py", "motors/motors_bus.py"})
         else:
             relative = path.relative_to(site) if path.is_relative_to(site) else None
-            permitted = (relative is not None and len(relative.parts) >= 2 and relative.parts[0] in {
+            dependency = relative is not None and len(relative.parts) >= 2 and relative.parts[0] in {
                 "torch", "torchvision", "sympy"
-            }) or (enum_source is not None and path == enum_source and context in {"__new__", "__set_name__"})
+            }
+            permitted = dependency or (enum_source is not None and path == enum_source and context in {
+                "__new__", "__set_name__"
+            })
         native_lock = index == len(frames) - 1 and (name, context) == _NATIVE_IMPORT_LOCK_FRAME
         stdlib_source = _stdlib_import_frame_source(config, name, native_lock=native_lock) if not permitted and not local else None
         frozen_stdlib = stdlib_source is not None and name.startswith("<frozen ")
@@ -1823,7 +1827,10 @@ def _validate_processor_import_frames(config, frames, *, enum_source=None):
         if frozen_stdlib:
             require(body == [], "frozen stdlib trace frames cannot carry a source body")
         else:
-            terminal_formatting = stdlib_source is not None and index == len(frames) - 1 and body[1:] == ["    "]
+            terminal_formatting = index == len(frames) - 1 and (
+                (stdlib_source is not None and body[1:] == ["    "])
+                or (complete_tail and dependency and body[1:] == [""])
+            )
             require(
                 1 <= len(body) <= 2 and body[0] == "    " + source[number - 1].strip()
                 and (terminal_formatting or all(len(line) <= 1024 and re.fullmatch(r" +[~^]+", line) for line in body[1:])),
@@ -1977,7 +1984,9 @@ def _load_preimport_stop_originals(config, proof):
                 ],
                 "exact original Swin weights construction in stdlib enum import required",
             )
-        _validate_processor_import_frames(config, frames + handled_frames, enum_source=enum_source)
+        _validate_processor_import_frames(
+            config, frames + handled_frames, enum_source=enum_source, complete_tail=not tail
+        )
         return logs
     require(enum_source is None and cache_directory is None, "handled cancellation requires the retained processor discovery chain")
     require(
