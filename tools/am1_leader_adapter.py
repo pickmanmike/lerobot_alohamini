@@ -6173,9 +6173,15 @@ async def run(args):
                     if terminal["run"].get("status") in {"stopped", "faulted", "interrupted"}:
                         summary["native_terminal"] = terminal
                         terminal_run = terminal["run"]
+                        cleanup = terminal_run.get("cleanup")
+                        preactivation_exit = (
+                            cleanup == "no_physical_device_effects"
+                            and "native_live_at" in terminal_run
+                            and terminal_run["native_live_at"] is None
+                        )
                         summary["native_cleanup_uncertain"] = (
                             terminal_run.get("uncertain") is not False
-                            or terminal_run.get("cleanup") != "physical_readback_verified"
+                            or (cleanup != "physical_readback_verified" and not preactivation_exit)
                         )
                         if terminal_run["status"] in {"faulted", "interrupted"}:
                             summary["terminal_failure"] = {

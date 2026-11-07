@@ -1770,6 +1770,7 @@ def test_real_wss_clean_close_ends_qualified_wait_before_timeout(tmp_path):
         "start_unknown",
         "terminal_fault",
         "admission_fault",
+        "admission_no_device_effects",
         "admission_terminal",
         "terminal_stop_race",
         "foreign_terminal",
@@ -1886,6 +1887,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
     http_start = failure is not None and failure.startswith("http_start_")
     prelive = {
         "admission_fault",
+        "admission_no_device_effects",
         "admission_terminal",
         "terminal_stop_race",
         "foreign_terminal",
@@ -2291,6 +2293,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                         native_first_cause="injected original pre-Live native fault",
                         cleanup="unknown"
                         if failure in {"admission_fault", "http_start_terminal_uncertain"}
+                        else "no_physical_device_effects" if failure == "admission_no_device_effects"
                         else "physical_readback_verified",
                         uncertain=failure in {"admission_fault", "http_start_terminal_uncertain"},
                     )
@@ -3634,6 +3637,9 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                     summary["native_terminal"]["run"]["native_first_cause"]
                     == "injected original pre-Live native fault"
                 )
+            if failure == "admission_no_device_effects":
+                assert summary["physical_register_off_readback_verified"] is False
+                assert summary["frame_count"] == 0
             assert "run_id" not in summary and "final_native_ack" not in summary
     else:
         summary = asyncio.run(m.run(args))
@@ -3643,7 +3649,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
         and session.stops
         == (
             []
-            if failure in {"start_unknown", "admission_fault", "admission_terminal", "foreign_terminal"}
+            if failure in {"start_unknown", "admission_fault", "admission_no_device_effects", "admission_terminal", "foreign_terminal"}
             or foreign_boundary
             else [owned_id] * (3 if failure == "stop" else 1)
         )
