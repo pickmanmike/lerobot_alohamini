@@ -1628,10 +1628,39 @@ def validate_preimport_stop_origin(run, proof):
     """Eligibility only: a missing original receipt never proves a stopped motor."""
     lifecycle = run.get("physical_result") or {}
     execution = run.get("execution") or {}
+    view_cause = "RuntimeError: required owned local/browser view expired during physical startup"
+    view_cancel = (run.get("status") == run.get("requested_terminal") == "faulted"
+                   and run.get("first_cause") == execution.get("fault") == view_cause)
+    if view_cancel:
+        from examples.alohamini.am1_live_teleop import validate_ordinary_arm_profile
+
+        validate_ordinary_arm_profile(run.get("ordinary_arm_profile"))
+        diagnostic = lifecycle.get("startup_view_failure") or {}
+        binding = diagnostic.get("binding") or {}
+        require(run.get("mode") == "interactive" and run.get("intent") is None
+                and "deadline" in run and run["deadline"] is None
+                and type(diagnostic.get("version")) is int and diagnostic["version"] == 1
+                and diagnostic.get("kind") == "am1-startup-required-view-failure"
+                and diagnostic.get("run_id") == binding.get("run_id") == run.get("run_id")
+                and diagnostic.get("host_incarnation") == binding.get("host_incarnation") == lifecycle.get("backend_incarnation")
+                and binding.get("operation_id") == run.get("operation_id")
+                and binding.get("service_incarnation") == run.get("service_incarnation")
+                and binding.get("required") is True and binding.get("role") == "chest"
+                and diagnostic.get("startup_deadline") == binding.get("startup_deadline") == run.get("startup_deadline"),
+                "same-run ordinary required-view cancellation diagnostic required")
+        trace = execution.get("input_transport_trace")
+        require(isinstance(trace, dict) and trace.get("recent") == []
+                and trace.get("invalid_rows") == trace.get("dropped_rows") == 0
+                and trace.get("first_native_expiry") is None,
+                "preimport view cancellation must retain no accepted input")
+        for value in (run, execution):
+            for key in ("accepted_input_count", "input_count", "frame_count"):
+                if key in value:
+                    require(type(value[key]) is int and value[key] == 0, "preimport input count must remain zero")
     require(
         run.get("source") == "protected-physical-provider"
         and run.get("recipe") == "physical-live-teleop"
-        and run.get("status") == run.get("requested_terminal") == "stopped"
+        and (view_cancel or run.get("status") == run.get("requested_terminal") == "stopped")
         and run.get("uncertain") is True
         and run.get("cleanup") == "physical_cleanup_unknown"
         and "native_live_at" in run
@@ -1642,12 +1671,13 @@ def validate_preimport_stop_origin(run, proof):
         and run["recovery_episodes"] == 0
         and execution.get("complete") is False
         and "fault" in execution
-        and execution["fault"] is None
+        and (view_cancel or execution["fault"] is None)
         and number(execution.get("progress_s"))
         and execution["progress_s"] == 0
-        and all(key in run and run[key] is None for key in ("first_cause", "native_first_cause"))
+        and "first_cause" in run and (view_cancel or run["first_cause"] is None)
+        and "native_first_cause" in run and run["native_first_cause"] is None
         and lifecycle.get("phase") == "terminal"
-        and lifecycle.get("terminal_status") == "stopped"
+        and lifecycle.get("terminal_status") == ("faulted" if view_cancel else "stopped")
         and lifecycle.get("run_id") == run.get("run_id")
         and lifecycle.get("backend_incarnation") == proof.get("host_incarnation")
         and lifecycle.get("cleanup") == "physical_cleanup_unknown"
@@ -1773,7 +1803,15 @@ def _load_preimport_stop_originals(config, proof):
         "one original same-run SIGINT host launch required",
     )
     lines = logs["host-runtime.log"].splitlines()
-    enum_source, handled_frames = None, []
+    enum_source, handled_frames, cache_directory = None, [], None
+    if len(lines) >= 7 and re.fullmatch(
+            r'  File "<frozen importlib\._bootstrap_external>", line [1-9][0-9]*, in _path_importer_cache', lines[1]):
+        missing = re.fullmatch(r"KeyError: '([^'\n]+)'", lines[2])
+        require(lines[0] == "Traceback (most recent call last):" and missing is not None
+                and lines[3:6] == ["", "During handling of the above exception, another exception occurred:", ""],
+                "one complete handled import-cache miss required")
+        cache_directory = missing.group(1)
+        lines = lines[6:]
     if lines and lines[-1] == (
         "Error calling __set_name__ on '_proto_member' instance 'IMAGENET1K_V1' in 'Swin_V2_S_Weights'"
     ):
@@ -1816,6 +1854,26 @@ def _load_preimport_stop_originals(config, proof):
     if len(frames) > 3 and frames[3][3] and frames[3][3][0] == (
         "    from lerobot.processor import RobotAction, RobotObservation"
     ):
+        if cache_directory is not None:
+            # Frozen interpreter discovery frames have no source bodies, like
+            # runpy above. Bind the complete tail to the last source-checked
+            # dependency directory; no host/constructor frame is admitted.
+            tail = [
+                ("<frozen importlib._bootstrap>", "_find_and_load"),
+                ("<frozen importlib._bootstrap>", "_find_and_load_unlocked"),
+                ("<frozen importlib._bootstrap>", "_find_spec"),
+                ("<frozen importlib._bootstrap_external>", "find_spec"),
+                ("<frozen importlib._bootstrap_external>", "_get_spec"),
+                ("<frozen importlib._bootstrap_external>", "_path_importer_cache"),
+                ("<frozen importlib._bootstrap_external>", "_path_hooks"),
+                ("<frozen importlib._bootstrap_external>", "path_hook_for_FileFinder"),
+            ]
+            require(enum_source is None and len(frames) > len(tail)
+                    and [(name, context) for name, _, context, _ in frames[-len(tail):]] == tail
+                    and all(number > 0 and body == [] for _, number, _, body in frames[-len(tail):])
+                    and Path(frames[-len(tail)-1][0]).parent.as_posix() == cache_directory,
+                    "exact handled import-cache discovery tail/directory required")
+            frames = frames[:-len(tail)]
         if enum_source is not None:
             site = Path(config["host_python"]).parent.parent / "lib/python3.12/site-packages"
             require(
@@ -1830,7 +1888,7 @@ def _load_preimport_stop_originals(config, proof):
             )
         _validate_processor_import_frames(config, frames + handled_frames, enum_source=enum_source)
         return logs
-    require(enum_source is None, "enum cancellation requires the retained processor discovery chain")
+    require(enum_source is None and cache_directory is None, "handled cancellation requires the retained processor discovery chain")
     require(
         len(frames) == 11
         and [f[2] for f in frames]

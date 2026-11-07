@@ -4278,3 +4278,95 @@ def test_ordinary_preactivation_cancel_ack_rechecks_originals(tmp_path, monkeypa
     with pytest.raises(ValueError):
         m.archive_and_ack(config, actual, raw, inventory, str(uuid.uuid4()))
     assert target.read_bytes() == b"changed"
+
+
+
+def preimport_view_cancel_fixture(tmp_path, monkeypatch, right_p=16):
+    m, config, run, proof, state, directory = processor_preimport_fixture(tmp_path, monkeypatch)
+    root = Path(__file__).resolve().parents[2]
+    retained = root / ".cache/am1-teleop-consolidation-16/physical-runs/am1-virtual-e2ec87c8-f7a6-4b55-9dd7-62dad8b6d24c"
+    original = json.loads((retained / "native-run.private.json").read_bytes())
+    run.update(status="faulted", requested_terminal="faulted", first_cause=ORDINARY_STARTUP_VIEW_CAUSE,
+               mode="interactive", intent=None, deadline=None,
+               ordinary_arm_profile={"profile": "ordinary-am1-arms-v1", "right_elbow_p": right_p})
+    run["execution"]["fault"] = ORDINARY_STARTUP_VIEW_CAUSE
+    run["execution"]["input_transport_trace"] = copy.deepcopy(original["execution"]["input_transport_trace"])
+    run["physical_result"]["terminal_status"] = "faulted"
+    diagnostic = copy.deepcopy(original["physical_result"]["startup_view_failure"])
+    host = run["physical_result"]["backend_incarnation"]
+    run.update(operation_id=original["operation_id"], service_incarnation=original["service_incarnation"],
+               startup_deadline=original["startup_deadline"])
+    for part in (diagnostic, diagnostic["binding"], diagnostic["current_authority"]):
+        part["run_id"] = run["run_id"]
+        part["host_incarnation"] = host
+    run["physical_result"]["startup_view_failure"] = diagnostic
+    trace = (retained / "host-runtime.log").read_text(encoding="utf-8")
+    trace = trace.replace("/home/pickmanmike/lerobot_alohamini/src/", (root / "src").as_posix() + "/")
+    trace = trace.replace("/home/pickmanmike/lerobot_alohamini/.venv/", str(Path(config["host_python"]).parent.parent).replace("\\", "/") + "/")
+    # Retain the actual trace; source fixtures replace only its private deployment paths.
+    import re
+    for match in re.finditer(r'  File "([^"]+)", line ([0-9]+), in [^\n]+\n((?:    [^\n]*\n)+)', trace):
+        name, number, body = match.groups()
+        if "/site-packages/" not in name:
+            continue
+        path = Path(name); path.parent.mkdir(parents=True, exist_ok=True)
+        lines = ["# retained import source"] * int(number)
+        lines[int(number) - 1] = body.splitlines()[0].strip()
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    data = trace.encode()
+    (directory / "host-runtime.log").write_bytes(data)
+    proof["original_host_logs"]["host-runtime.log"] = hashlib.sha256(data).hexdigest()
+    publish_preimport_fixture(run, proof, state)
+    return m, config, run, proof, state, directory
+
+
+@pytest.mark.parametrize("right_p", [16, 32])
+def test_preimport_view_cancel_requires_fresh_stopped_proof_and_durable_ack(tmp_path, monkeypatch, right_p):
+    m, config, run, proof, state, directory = preimport_view_cancel_fixture(tmp_path, monkeypatch, right_p)
+    before = copy.deepcopy(run)
+    originals = {p.name: p.read_bytes() for p in directory.glob("host-*.log")}
+    actual, raw, inventory = m.load_qualified_proof(config, run)
+    operation = str(uuid.uuid4())
+    assert not m.acknowledged_receipt(actual, run, operation)
+    ack = m.archive_and_ack(config, actual, raw, inventory, operation)
+    assert m.acknowledged_receipt({**actual, "acknowledgment": {**ack, "consumed_operation_id": operation}}, run, operation)
+    assert m.load_qualified_proof(config, run)[0] == proof
+    assert run == before and run["first_cause"] == ORDINARY_STARTUP_VIEW_CAUSE
+    assert run["physical_result"]["readback"] is None and not (directory / "cleanup.json").exists()
+    assert {p.name: p.read_bytes() for p in directory.glob("host-*.log")} == originals
+
+
+@pytest.mark.parametrize("broken", [
+    "cause", "native-cause", "execution-cause", "diagnostic", "profile", "live", "input", "readback",
+    "handled-path", "handled-prefix", "import-tail", "extra-operational", "fresh-off", "fresh-lift", "fresh-thermal",
+    "fresh-age", "source", "markers",
+])
+def test_preimport_view_cancel_refuses_other_faults_imports_and_unqualified_proof(tmp_path, monkeypatch, broken):
+    m, config, run, proof, state, directory = preimport_view_cancel_fixture(tmp_path, monkeypatch)
+    path = directory / "host-runtime.log"
+    data = path.read_bytes()
+    if broken == "cause": run["first_cause"] = "RuntimeError: unrelated"
+    elif broken == "native-cause": run["native_first_cause"] = "native failure"
+    elif broken == "execution-cause": run["execution"]["fault"] = None
+    elif broken == "diagnostic": run["physical_result"]["startup_view_failure"]["run_id"] = str(uuid.uuid4())
+    elif broken == "profile": run["ordinary_arm_profile"]["right_elbow_p"] = True
+    elif broken == "live": run["native_live_at"] = 1.
+    elif broken == "input": run["execution"]["input_transport_trace"]["recent"] = [{"accepted_at": 1.}]
+    elif broken == "readback": run["physical_result"]["readback"] = {"cleanup": "unknown"}
+    elif broken == "handled-path": data = data.replace(b"/torch/distributed/_shard'", b"/foreign/private'")
+    elif broken == "handled-prefix": data = data.replace(b"KeyError:", b"RuntimeError:", 1)
+    elif broken == "import-tail": data = data.replace(b"in _path_hooks", b"in execute")
+    elif broken == "extra-operational":
+        data = data.replace(b"KeyboardInterrupt", b'  File "/foreign/motor.py", line 1, in activate\n    enable()\nKeyboardInterrupt')
+    elif broken == "fresh-off": proof["readback"]["readbacks"][0]["value"] = 1
+    elif broken == "fresh-lift": proof["readback"].pop("lift_stationary")
+    elif broken == "fresh-thermal": proof["readback"]["lift_stationary"]["temperature_slots"][0][0] = 99.
+    elif broken == "fresh-age": monkeypatch.setattr(m.time, "monotonic", lambda: 281.)
+    elif broken == "source": proof["source"]["backend_contract"]["host_head"] = "f" * 40
+    else: (state / "physical-in-progress.json").write_bytes(b"unknown")
+    path.write_bytes(data)
+    proof["original_host_logs"][path.name] = hashlib.sha256(data).hexdigest()
+    publish_preimport_fixture(run, proof, state)
+    with pytest.raises((ValueError, RuntimeError, OSError, TypeError)):
+        m.load_qualified_proof(config, run)
+    assert not list(state.glob("reconciliation-ack-*"))
