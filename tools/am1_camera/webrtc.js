@@ -367,18 +367,20 @@ globalThis.AM1OnboardView=class {
     const epoch=this.epoch,id=++this.reportSerial,controller=new AbortController();
     const body={...this.binding,decoded_frames:this.frames,media_time:this.mediaTime};
     const slot={id,epoch,cancelled:false,done:false,controller};
-    const current=()=>{
+    const sameAttachment=()=>{
       const source=this.source?.cameras?.[body.role],video=this.source?.video;
-      return !slot.cancelled&&epoch===this.epoch&&id===this.latestReport&&
+      return epoch===this.epoch&&
         ["role","owner_generation","capture_generation","encode_generation","view_generation"].every(key=>body[key]===this.binding?.[key])&&
         body.owner_generation===this.source?.owner_generation&&body.capture_generation===source?.capture_generation&&
         body.capture_generation===video?.capture_generation&&body.encode_generation===video?.encode_generation&&body.role===video?.role;
     };
+    const current=()=>!slot.cancelled&&id===this.latestReport&&sameAttachment();
     let release;
     const cancelled=new Promise(resolve=>{release=resolve;});
     slot.cancel=reason=>{
       if(slot.cancelled||slot.done)return;
-      const active=current();slot.cancelled=true;controller.abort();release();this.updateReporting();
+      const active=current();slot.cancelled=true;slot.superseded=reason==="superseded";
+      controller.abort();release();this.updateReporting();
       this.progressDiagnostic("cancel",slot,reason);
       if(active&&reason==="timeout")this.error="View progress delivery unavailable";
     };
@@ -407,7 +409,11 @@ globalThis.AM1OnboardView=class {
         const active=current();if(active)this.progressReceipt=receipt;
         this.progressDiagnostic("receipt",slot,{receipt,current:active});
       } catch {if(current())this.error="View progress delivery unavailable";this.progressDiagnostic("error",slot);}
-      finally {slot.done=true;clearTimeout(slot.timer);this.reports.delete(id);this.updateReporting();this.progressDiagnostic("settled",slot);}
+      finally {
+        slot.done=true;clearTimeout(slot.timer);this.reports.delete(id);this.updateReporting();this.progressDiagnostic("settled",slot);
+        // A superseded raw slot can now sample current presentation through the normal gates.
+        if(slot.superseded&&sameAttachment())void this.report();
+      }
     })();
     slot.promise=Promise.race([work,cancelled]);
     return slot.promise;

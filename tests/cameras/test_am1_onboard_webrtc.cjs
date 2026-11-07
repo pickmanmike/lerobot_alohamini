@@ -496,21 +496,44 @@ test("latest-only progress publishes new decoded data before an older receipt bo
  }finally{bodies.forEach(v=>v.finish());await p.view.stop();}
 });
 
-test("latest-only progress bounds two requests and aborts older delivery without queuing frames",async()=>{
- const p=fixture(),pending=[],sent=[];let active=0,maximum=0;await p.view.start("chest");p.source();
- p.setProgressResponse(options=>{const frame=JSON.parse(options.body).decoded_frames;sent.push(frame);active++;maximum=Math.max(maximum,active);
-  const body=JSON.stringify({accepted:true,view_delivery:{frame}});
-  return {ok:true,headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":String(body.length)},
-   text:()=>new Promise((resolve,reject)=>{let done=false;const finish=error=>{if(done)return;done=true;active--;error?reject(error):resolve(body);};
-    options.signal.addEventListener("abort",()=>finish(new Error("aborted")),{once:true});pending.push(()=>finish());})};});
- try{
-  for(const [at,frame]of [[0,1],[150,2],[300,3]]){p.advance(at);p.source();p.callbacks.shift()(at,{presentedFrames:frame,mediaTime:frame/10});void p.view.report();await new Promise(setImmediate);}
-  assert.equal(p.requests.filter(r=>r.url.endsWith("/progress")).length,2);
-  assert.equal(p.requests.find(r=>r.url.endsWith("/progress")).signal.aborted,true);
-  p.advance(450);p.source();p.callbacks.shift()(450,{presentedFrames:5,mediaTime:.5});void p.view.report();await new Promise(setImmediate);
-  assert.deepEqual(sent,[1,2,5],"the latest current capture replaces skipped frames; no FIFO replay");assert.equal(maximum,2);
- }finally{pending.forEach(finish=>finish());await p.view.stop();}
-});
+for(const mode of ["current","expired","capture-changed","stopped"])test("superseded report settlement: "+mode,async()=>{
+  const p=fixture({manualTimers:true}),pending=[],sent=[];
+  let active=0,maximum=0,settleAborted;
+  await p.view.start("chest");p.source();
+  p.setProgressResponse(options=>{const frame=JSON.parse(options.body).decoded_frames;sent.push(frame);active++;maximum=Math.max(maximum,active);
+   const body=JSON.stringify({accepted:true,view_delivery:{frame}});
+   return {ok:true,headers:{get:name=>name.toLowerCase()==="content-type"?"application/json":String(body.length)},
+    text:()=>new Promise((resolve,reject)=>{let done=false;const finish=error=>{if(done)return;done=true;active--;error?reject(error):resolve(body);};
+     options.signal.addEventListener("abort",()=>{
+      const settle=()=>finish(new Error("aborted"));
+      if(frame===1&&mode!=="current")settleAborted=settle;else settle();
+     },{once:true});pending.push(()=>finish());})};});
+  try{
+   for(const [at,frame]of [[0,1],[150,2]]){p.advance(at);p.callbacks.shift()(at,{presentedFrames:frame,mediaTime:frame/10});await new Promise(setImmediate);}
+   p.advance(300);p.callbacks.shift()(300,{presentedFrames:3,mediaTime:.3});
+   assert.deepEqual(sent,[1,2],"two raw requests remain the cap until actual settlement");
+   assert.equal(p.requests.find(r=>r.url.endsWith("/progress")).signal.aborted,true);
+   if(mode!=="current"){
+    assert.equal(typeof settleAborted,"function");
+    await new Promise(setImmediate);
+    assert.deepEqual(sent,[1,2],"abort without settlement does not free a slot");
+    if(mode==="expired")p.advance(800);
+    else if(mode==="capture-changed"){p.ids.capture_generation="capture-b";p.source();}
+    else await p.view.stop();
+    settleAborted();
+   }
+   await new Promise(setImmediate);
+   if(mode==="current"){
+    assert.deepEqual(sent,[1,2,3],"a superseded raw settlement dispatches the latest fresh frame without another callback or timer");
+    p.advance(450);void p.view.report();
+    assert.deepEqual(sent,[1,2,3],"the frame cannot be dispatched twice");
+    p.callbacks.shift()(450,{presentedFrames:5,mediaTime:.5});
+    await new Promise(setImmediate);
+    assert.deepEqual(sent,[1,2,3,5],"the latest current presentation is used with no FIFO replay");
+   }else assert.deepEqual(sent,[1,2],"expired, replaced or stopped evidence cannot dispatch on settlement");
+   assert.equal(maximum,2);
+  }finally{await p.view.stop();pending.forEach(finish=>finish());await new Promise(setImmediate);}
+ });
 
 test("ignored transport abort settles callers while quarantining no more than two raw requests",async()=>{
  const p=fixture(),finish=[];await p.view.start("chest");p.source();
