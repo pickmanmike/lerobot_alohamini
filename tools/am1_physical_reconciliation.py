@@ -1230,19 +1230,34 @@ def validate_late_camera_completion_origin(run, receipt, camera_release):
                         and ((trial.get("binding") or {}).get("request") or {}).get("source_head")
                             == (run.get("backend_contract") or {}).get("host_head"),
                         "original selected P/acceleration restoration binding required")
+    _validate_late_camera_release(run, camera_release)
+    return True
+
+
+def _validate_late_camera_release(run, camera_release, *, allow_timeout=True):
+    lifecycle = run.get("physical_result") or {}
     evidence = (camera_release or {}).get("release_evidence") or {}
-    require(camera_release == lifecycle.get("camera_release")
+    require(isinstance(camera_release, dict) and camera_release == lifecycle.get("camera_release")
             and type(camera_release.get("version")) is int and camera_release["version"] == 1
             and camera_release.get("session_id") == run["run_id"] and camera_release.get("state") == "release-incomplete"
             and camera_release.get("runtime_failed") is False
-            and ((camera_release.get("errors") == ["backend-stop:TimeoutExpired", "backend-not-exited"]
+            and ((allow_timeout and camera_release.get("errors") == ["backend-stop:TimeoutExpired", "backend-not-exited"]
                   and evidence.get("backend_exited") is False and evidence.get("backend_returncode") is None)
                  or (camera_release.get("errors") == ["backend-required-kill"]
                      and evidence.get("backend_exited") is True
                      and type(evidence.get("backend_returncode")) is int and evidence["backend_returncode"] == 0))
             and type(evidence.get("backend_pid")) is int and evidence["backend_pid"] > 0
             and all(evidence.get(key) is True for key in ("readers_joined", "viewer_socket_closed", "runtime_config_removed")),
-            "only original timeout or completed backend-kill camera release may complete separately")
+            "only an eligible original failed camera release may complete separately")
+
+
+def validate_preimport_camera_completion_origin(run, proof, camera_release):
+    """Qualify the two original obligations; fresh stopped and camera proofs are separate."""
+    validate_preimport_stop_origin(run, proof)
+    require(run.get("status") == "faulted"
+            and proof.get("original_terminal_run_sha256") == terminal_run_hash(run),
+            "exact original preimport required-view fault required for camera completion")
+    _validate_late_camera_release(run, camera_release, allow_timeout=False)
     return True
 
 
@@ -1259,7 +1274,7 @@ def validate_camera_completion(config, run, proof):
     require(isinstance(completion, dict) and set(completion) == keys
             and type(completion["version"]) is int and completion["version"] == 1
             and completion["kind"] == "am1-late-camera-release-completion"
-            and proof.get("original_cleanup_origin") is None,
+            and proof.get("original_cleanup_origin") in (None, PREIMPORT_STOP_ORIGIN),
             "closed generic camera completion required")
     for key in ("run_id", "host_incarnation", "boot_id", "original_terminal_run_sha256", "original_cleanup_sha256"):
         require(completion[key] == proof.get(key), "camera completion original binding changed")
@@ -1270,12 +1285,18 @@ def validate_camera_completion(config, run, proof):
             and re.fullmatch("[0-9a-f]{64}", completion["camera_config_sha256"]) is not None,
             "camera completion original run/release/config binding required")
     lifecycle = run.get("physical_result") or {}
-    receipt = lifecycle.get("readback")
     release = proof.get("camera_release") or {}
-    validate_late_camera_completion_origin(run, receipt, release)
+    released = release.get("released_at")
+    if proof.get("original_cleanup_origin") == PREIMPORT_STOP_ORIGIN:
+        validate_preimport_camera_completion_origin(run, proof, release)
+    else:
+        receipt = lifecycle.get("readback")
+        validate_late_camera_completion_origin(run, receipt, release)
+        require(receipt.get("first_cause") == proof.get("original_first_cause")
+                and number(released) and receipt["completed_at_monotonic_s"] <= released,
+                "camera release must follow the unchanged original native cleanup")
     evidence = release.get("release_evidence") or {}
     require(lifecycle.get("backend_incarnation") == proof.get("host_incarnation")
-            and receipt.get("first_cause") == proof.get("original_first_cause")
             and type(completion["backend_pid"]) is int and completion["backend_pid"] == evidence["backend_pid"]
             and type(completion["camera_pid"]) is int and completion["camera_pid"] > 0
             and completion["camera_pid"] != completion["backend_pid"]
@@ -1283,8 +1304,8 @@ def validate_camera_completion(config, run, proof):
             and re.fullmatch("[0-9a-f]{64}", completion["original_camera_lease_sha256"]) is not None,
             "same original native fault/backend and separate camera lease PID required")
     start, end = completion["started_at_monotonic_s"], completion["completed_at_monotonic_s"]
-    require(all(number(value) for value in (start, end, release.get("released_at"), receipt.get("completed_at_monotonic_s")))
-            and receipt["completed_at_monotonic_s"] <= release["released_at"] <= start <= end
+    require(all(number(value) for value in (start, end, released))
+            and released <= start <= end
             and proof["started_at_monotonic_s"] <= start <= end <= proof["completed_at_monotonic_s"],
             "late camera evidence must use original clocks inside the fresh stopped proof")
     devices = completion["devices"]
@@ -1438,8 +1459,13 @@ def _recheck_camera_completion(config, proof):
     source = proof["source"]
     current_manifest = Path(config["source_pins"])
     original_manifest = current_manifest.parent.parent / source["original_manifest_sha256"][:16] / "manifest.json"
-    for key, path, digest in (("native", Path(config["run_root"]) / run_id[:8] / "cleanup.json", completion["original_cleanup_sha256"]),
-                             ("camera", Path(config["camera_state"]) / ("release-" + run_id + ".json"), completion["original_camera_release_sha256"]),
+    if proof.get("original_cleanup_origin") == PREIMPORT_STOP_ORIGIN:
+        _load_preimport_stop_originals(config, proof)
+    else:
+        native = _private_bytes(Path(config["run_root"]) / run_id[:8] / "cleanup.json")
+        require(sha(native) == completion["original_cleanup_sha256"],
+                "original motor receipt changed before camera completion ACK")
+    for key, path, digest in (("camera", Path(config["camera_state"]) / ("release-" + run_id + ".json"), completion["original_camera_release_sha256"]),
                              ("lease", Path(config["camera_state"]) / ("lease-" + run_id + ".json"), completion["original_camera_lease_sha256"]),
                              ("original_manifest", original_manifest, source["original_manifest_sha256"]),
                              ("current_manifest", current_manifest, source["manifest_sha256"])):
@@ -1510,7 +1536,7 @@ def validate_cleanup_origin(run, proof, receipt):
     origin = proof.get("original_cleanup_origin")
     if "camera_completion" in proof:
         validate_camera_completion((proof.get("source") or {}).get("backend_contract"), run, proof)
-        return True  # Native motors were verified; the separate camera proof never rewrites their history.
+        return True  # The separate camera proof never rewrites the original motor history.
     if origin in (ORDINARY_STARTUP_STOP_ORIGIN, ORDINARY_PREACTIVATION_CANCEL_ORIGIN):
         original = run.get("backend_contract") or {}
         head, digest = proof.get("original_motor_head"), proof.get("original_motor_manifest_sha256")
@@ -1701,6 +1727,28 @@ def validate_preimport_stop_origin(run, proof):
     )
 
 
+def _stdlib_type_frame_source(config, name):
+    """Resolve only the interpreter's type and collection support sources."""
+    supported = {"typing.py", "abc.py", "_collections_abc.py", "collections/__init__.py", "collections/abc.py"}
+    frozen = re.fullmatch(r"<frozen ([a-z_][a-z0-9_]*)>", name)
+    path = Path(name)
+    if frozen:
+        relative = frozen.group(1) + ".py"
+        if relative not in supported:
+            return None
+    elif path.name not in {Path(member).name for member in supported}:
+        return None
+
+    interpreter = Path(config["host_python"]).resolve(strict=True)
+    require(interpreter.is_file(), "configured real interpreter required for stdlib type support")
+    stdlib = interpreter.parent.parent / "lib/python3.12"
+    if frozen:
+        return stdlib / relative
+    if path.is_relative_to(stdlib) and path.relative_to(stdlib).as_posix() in supported:
+        return path
+    return None
+
+
 def _validate_processor_import_frames(config, frames, *, enum_source=None):
     """Bounded pre-main package discovery; never evidence of stopped hardware."""
     require(
@@ -1745,8 +1793,12 @@ def _validate_processor_import_frames(config, frames, *, enum_source=None):
             permitted = (relative is not None and len(relative.parts) >= 2 and relative.parts[0] in {
                 "torch", "torchvision", "sympy"
             }) or (enum_source is not None and path == enum_source and context in {"__new__", "__set_name__"})
+        stdlib_source = _stdlib_type_frame_source(config, name) if not permitted and not local else None
+        frozen_stdlib = stdlib_source is not None and name.startswith("<frozen ")
+        if stdlib_source is not None:
+            permitted, path = True, stdlib_source
         require(
-            permitted and path.is_absolute() and path.as_posix() == name and ".." not in path.parts
+            permitted and path.is_absolute() and (frozen_stdlib or path.as_posix() == name) and ".." not in path.parts
             and path.suffix == ".py" and all(not p.is_symlink() for p in (path, *path.parents))
             and path.is_file() and path.stat().st_size <= 2 * 1024 * 1024,
             "literal bounded package-import source required; device/foreign source refused",
@@ -1759,11 +1811,25 @@ def _validate_processor_import_frames(config, frames, *, enum_source=None):
         source = sources[name]
         require(
             0 < number <= len(source) and len(source[number - 1]) <= 1024
-            and 1 <= len(body) <= 2 and body[0] == "    " + source[number - 1].strip()
-            and all(len(line) <= 1024 and re.fullmatch(r" +[~^]+", line) for line in body[1:])
             and re.fullmatch(r"<module>|[A-Za-z_][A-Za-z_0-9.]*", context),
-            "trace must match actual bounded import source/carets",
+            "actual bounded import source line and context required",
         )
+        if frozen_stdlib:
+            require(body == [], "frozen stdlib trace frames cannot carry a source body")
+        else:
+            terminal_formatting = stdlib_source is not None and index == len(frames) - 1 and body[1:] == ["    "]
+            require(
+                1 <= len(body) <= 2 and body[0] == "    " + source[number - 1].strip()
+                and (terminal_formatting or all(len(line) <= 1024 and re.fullmatch(r" +[~^]+", line) for line in body[1:])),
+                "trace must match actual bounded import source/carets",
+            )
+        if stdlib_source is not None:
+            tree = ast.parse("\n".join(source))
+            scopes = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                      and node.lineno <= number <= node.end_lineno]
+            scope = max(scopes, key=lambda node: (node.lineno, -node.end_lineno), default=None)
+            require(context == (scope.name if scope is not None else "<module>"),
+                    "stdlib type support trace must match its actual source scope")
         if local:
             tree = ast.parse("\n".join(source))
             require(
@@ -1796,16 +1862,19 @@ def _load_preimport_stop_originals(config, proof):
         require(sha(data) == digest, "original host log changed")
         require(len(data) <= 65536, "bounded original import-cancel logs required")
         logs[name] = data.decode("utf-8")
+    duration = r"([0-9]{1,9}(?:\.[0-9]{1,9})?)(ms|s)"
     launch = re.fullmatch(
         r"Running as unit: am1-pa01-host-"
         + re.escape(proof["run_id"])
         + r"\.service; invocation ID: [0-9a-f]{32}\nFinished with result: success\n"
         r"Main processes terminated with: code=killed, status=2/INT\n"
-        r"Service runtime: ([0-9]+(?:\.[0-9]+)?)s\nCPU time consumed: ([0-9]+(?:\.[0-9]+)?)s\n",
+        rf"Service runtime: {duration}\nCPU time consumed: {duration}\n",
         logs["host-launch.log"],
     )
+    elapsed = () if launch is None else tuple(float(value) / (1000 if unit == "ms" else 1)
+        for value, unit in zip(launch.groups()[::2], launch.groups()[1::2], strict=True))
     require(
-        launch is not None and all(math.isfinite(float(v)) and float(v) > 0 for v in launch.groups()),
+        len(elapsed) == 2 and all(math.isfinite(value) and value > 0 for value in elapsed),
         "one original same-run SIGINT host launch required",
     )
     lines = logs["host-runtime.log"].splitlines()
