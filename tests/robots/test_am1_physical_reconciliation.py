@@ -4647,3 +4647,59 @@ def test_preimport_camera_completion_rejects_mixed_origin_or_foreign_proof(tmp_p
     with pytest.raises(ValueError):
         m.load_qualified_proof(config, run)
     assert not list(state.glob("reconciliation-ack-*.json"))
+
+
+def preimport_native_lock_fixture(tmp_path, monkeypatch):
+    m, config, run, proof, state, directory, _ = preimport_camera_completion_fixture(tmp_path, monkeypatch)
+    stdlib = Path(config["host_python"]).resolve().parent.parent / "lib/python3.12"
+    bootstrap = stdlib / "importlib/_bootstrap.py"
+    bootstrap.parent.mkdir()
+    bootstrap.write_bytes(b"\n" * 459 + b"def unrelated():\n    return None\n\n"
+                          b"def _lock_unlock_module(name):\n    lock = _get_module_lock(name)\n"
+                          b"    lock.acquire()\n    lock.release()\n")
+    path = directory / "host-runtime.log"
+    trace = path.read_bytes().split(b'  File "<frozen _collections_abc>"')[0]
+    trace += b'  File "<frozen importlib._bootstrap>", line 463, in _lock_unlock_module\nKeyboardInterrupt\n'
+    path.write_bytes(trace)
+    proof["original_host_logs"][path.name] = hashlib.sha256(trace).hexdigest()
+    publish_preimport_fixture(run, proof, state)
+    return m, config, run, proof, state, path, bootstrap
+
+
+def test_preimport_native_lock_requires_pinned_source_fresh_proof_and_ack(tmp_path, monkeypatch):
+    m, config, run, proof, state, path, _ = preimport_native_lock_fixture(tmp_path, monkeypatch)
+    original, trace = copy.deepcopy(run), path.read_bytes()
+    actual, raw, inventory = m.load_qualified_proof(config, run)
+    operation = str(uuid.uuid4())
+    assert not m.acknowledged_receipt(actual, run, operation)
+    ack = m.archive_and_ack(config, actual, raw, inventory, operation)
+    assert m.acknowledged_receipt({**actual, "acknowledgment": {**ack, "consumed_operation_id": operation}}, run, operation)
+    assert run == original and path.read_bytes() == trace and not (path.parent / "cleanup.json").exists()
+    assert (state / ("reconciliation-ack-" + run["run_id"] + ".json")).is_file()
+
+
+@pytest.mark.parametrize("fault", ["missing-source", "wrong-scope", "wrong-line", "foreign-module",
+                                  "fabricated-body", "nonterminal", "fresh-off"])
+def test_preimport_native_lock_refuses_unbound_frames_and_unqualified_readback(tmp_path, monkeypatch, fault):
+    m, config, run, proof, state, path, bootstrap = preimport_native_lock_fixture(tmp_path, monkeypatch)
+    trace = path.read_bytes()
+    if fault == "missing-source":
+        bootstrap.unlink()
+    elif fault == "wrong-scope":
+        bootstrap.write_bytes(bootstrap.read_bytes().replace(b"def _lock_unlock_module", b"def _foreign_scope"))
+    elif fault == "wrong-line":
+        trace = trace.replace(b"line 463, in _lock_unlock_module", b"line 460, in _lock_unlock_module")
+    elif fault == "foreign-module":
+        trace = trace.replace(b"<frozen importlib._bootstrap>", b"<frozen importlib._bootstrap_external>")
+    elif fault == "fabricated-body":
+        trace = trace.replace(b"KeyboardInterrupt", b"    enable()\nKeyboardInterrupt")
+    elif fault == "nonterminal":
+        trace = trace.replace(b"KeyboardInterrupt", b'  File "/foreign/device.py", line 1, in activate\n    enable()\nKeyboardInterrupt')
+    else:
+        proof["readback"]["readbacks"][0]["value"] = 1
+    path.write_bytes(trace)
+    proof["original_host_logs"][path.name] = hashlib.sha256(trace).hexdigest()
+    publish_preimport_fixture(run, proof, state)
+    with pytest.raises(ValueError):
+        m.load_qualified_proof(config, run)
+    assert not list(state.glob("reconciliation-ack-*"))

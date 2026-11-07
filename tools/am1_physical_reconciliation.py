@@ -1727,12 +1727,17 @@ def validate_preimport_stop_origin(run, proof):
     )
 
 
-def _stdlib_type_frame_source(config, name):
-    """Resolve only the interpreter's type and collection support sources."""
+_NATIVE_IMPORT_LOCK_FRAME = ("<frozen importlib._bootstrap>", "_lock_unlock_module")
+
+
+def _stdlib_import_frame_source(config, name, *, native_lock):
+    """Resolve the interpreter's source for the narrowly supported stdlib frames."""
     supported = {"typing.py", "abc.py", "_collections_abc.py", "collections/__init__.py", "collections/abc.py"}
     frozen = re.fullmatch(r"<frozen ([a-z_][a-z0-9_]*)>", name)
     path = Path(name)
-    if frozen:
+    if native_lock:
+        relative = "importlib/_bootstrap.py"
+    elif frozen:
         relative = frozen.group(1) + ".py"
         if relative not in supported:
             return None
@@ -1740,9 +1745,9 @@ def _stdlib_type_frame_source(config, name):
         return None
 
     interpreter = Path(config["host_python"]).resolve(strict=True)
-    require(interpreter.is_file(), "configured real interpreter required for stdlib type support")
+    require(interpreter.is_file(), "configured real interpreter required for stdlib import support")
     stdlib = interpreter.parent.parent / "lib/python3.12"
-    if frozen:
+    if native_lock or frozen:
         return stdlib / relative
     if path.is_relative_to(stdlib) and path.relative_to(stdlib).as_posix() in supported:
         return path
@@ -1793,7 +1798,8 @@ def _validate_processor_import_frames(config, frames, *, enum_source=None):
             permitted = (relative is not None and len(relative.parts) >= 2 and relative.parts[0] in {
                 "torch", "torchvision", "sympy"
             }) or (enum_source is not None and path == enum_source and context in {"__new__", "__set_name__"})
-        stdlib_source = _stdlib_type_frame_source(config, name) if not permitted and not local else None
+        native_lock = index == len(frames) - 1 and (name, context) == _NATIVE_IMPORT_LOCK_FRAME
+        stdlib_source = _stdlib_import_frame_source(config, name, native_lock=native_lock) if not permitted and not local else None
         frozen_stdlib = stdlib_source is not None and name.startswith("<frozen ")
         if stdlib_source is not None:
             permitted, path = True, stdlib_source
@@ -1828,8 +1834,9 @@ def _validate_processor_import_frames(config, frames, *, enum_source=None):
             scopes = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
                       and node.lineno <= number <= node.end_lineno]
             scope = max(scopes, key=lambda node: (node.lineno, -node.end_lineno), default=None)
-            require(context == (scope.name if scope is not None else "<module>"),
-                    "stdlib type support trace must match its actual source scope")
+            require(context == (scope.name if scope is not None else "<module>")
+                    and (not native_lock or isinstance(scope, ast.FunctionDef) and scope in tree.body),
+                    "stdlib import support trace must match its actual source scope")
         if local:
             tree = ast.parse("\n".join(source))
             require(
@@ -1943,14 +1950,19 @@ def _load_preimport_stop_originals(config, proof):
             cut -= 1
         tail = frames[cut:]
         if tail:
+            # Native extension imports may expose just the final module-lock frame.
+            # Keep that frame for the actual interpreter source and scope check.
+            native_lock = len(tail) == 1 and tail[0][0:3:2] == _NATIVE_IMPORT_LOCK_FRAME
             require(enum_source is None and 1 <= len(tail) <= 16 and cut >= 4
-                    and tail[0][0:3:2] == ("<frozen importlib._bootstrap>", "_find_and_load")
-                    and all(number > 0 and body == [] and context in frozen[name] for name, number, context, body in tail),
+                    and (native_lock or tail[0][0:3:2] == ("<frozen importlib._bootstrap>", "_find_and_load"))
+                    and all(number > 0 and body == [] and (native_lock or context in frozen[name])
+                            for name, number, context, body in tail),
                     "bounded interpreter import discovery/lock suffix required")
             if cache_directory is not None:
-                require(Path(frames[cut-1][0]).parent.as_posix() == cache_directory,
+                require(not native_lock and Path(frames[cut-1][0]).parent.as_posix() == cache_directory,
                         "handled import-cache directory must match source-checked dependency")
-            frames = frames[:cut]
+            if not native_lock:
+                frames = frames[:cut]
         else:
             require(cache_directory is None, "handled import-cache miss requires its complete discovery suffix")
         if enum_source is not None:
