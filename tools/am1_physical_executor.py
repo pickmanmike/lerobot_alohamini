@@ -1348,7 +1348,8 @@ class PhysicalExecutor:
                         readback = receipt.get("readback") if isinstance(receipt, dict) else {}
                         camera = lifecycle.get("camera_release") or {}
                         release = camera.get("release_evidence") or {}
-                        terminal_clean = bool(
+                        reconciliation = self._reconciliation_worker
+                        terminal_bound = (
                             uuid_text(self.run_id) == self.run_id
                             and uuid_text(self.host_incarnation) == self.host_incarnation
                             and lifecycle.get("run_id") == self.run_id
@@ -1358,10 +1359,12 @@ class PhysicalExecutor:
                             and type(lifecycle.get("terminal_status")) is str
                             and lifecycle["terminal_status"] in {"stopped", "completed", "faulted", "interrupted"}
                             and lifecycle.get("uncertain") is False
-                            and lifecycle.get("cleanup") == "physical_readback_verified"
-                            and lifecycle.get("cleanup_errors") == []
                             and not (self.worker and self.worker.is_alive())
-                            and not (self._reconciliation_worker and self._reconciliation_worker.thread.is_alive())
+                            and not (reconciliation and reconciliation.thread.is_alive())
+                        )
+                        terminal_clean = terminal_bound and (
+                            lifecycle.get("cleanup") == "physical_readback_verified"
+                            and lifecycle.get("cleanup_errors") == []
                             and isinstance(receipt, dict) and type(receipt.get("version")) is int
                             and "first_cause" in lifecycle and "first_cause" in receipt
                             and (lifecycle["first_cause"] is None
@@ -1378,6 +1381,20 @@ class PhysicalExecutor:
                             and all(release.get(k) is True for k in
                                     ("backend_exited", "readers_joined", "viewer_socket_closed", "runtime_config_removed"))
                         )
+                        if terminal_bound and not terminal_clean and reconciliation and reconciliation.state == "consumed":
+                            # Reconcile verified stopped resources separately. Match its exact
+                            # original terminal snapshot without rewriting the historical result.
+                            original = reconciliation.run
+                            result = original.get("physical_result")
+                            terminal_clean = (
+                                original.get("run_id") == self.run_id
+                                and original.get("recipe") == self.recipe.name
+                                and original.get("status") == lifecycle["terminal_status"]
+                                and original.get("cleanup") == lifecycle.get("cleanup") == "physical_cleanup_unknown"
+                                and original.get("uncertain") is True
+                                and isinstance(result, dict) and result.get("uncertain") is True
+                                and lifecycle == {**result, "uncertain": False}
+                            )
                     except (AttributeError, KeyError, TypeError, ValueError):
                         terminal_clean = False  # Incomplete or foreign cleanup retains live proof validation.
                 if terminal_clean:

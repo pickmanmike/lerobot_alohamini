@@ -1609,6 +1609,81 @@ def test_thermal_terminal_cleanup_does_not_revalidate_old_raw_as_a_current_fault
     assert evidence["accepted_host_action"]["thermal_history"]["raw_sample_at_monotonic_s"] == 9.98
 
 
+@pytest.mark.parametrize("change", [None, "pending", "worker_alive", "resident_changed", "foreign_ack", "resident_fault"])
+def test_consumed_stopped_reconciliation_allows_only_a_fresh_start(tmp_path, monkeypatch, change):
+    from types import SimpleNamespace
+
+    from tools.am1_physical_reconciliation import terminal_run_hash
+
+    a, e, identity = authority_lane(tmp_path)
+    e.clock = lambda: 10.6
+    e.sample["ack"]["thermal_history"] = {
+        "version": 1, "raw_sample_at_monotonic_s": 9.98, "peaks_ready": True,
+        "deficit_started_at_monotonic_s": None, "deficit_ceiling_monotonic_s": None,
+        "hold_sample_at_monotonic_s": None, "zero_read_started_at_monotonic_s": None,
+        "zero_read_completed_at_monotonic_s": None,
+    }
+    e._lifecycle.update(
+        phase="terminal", terminal_status="stopped", backend_incarnation=e.host_incarnation,
+        cleanup="physical_cleanup_unknown", uncertain=True, first_cause=None,
+        camera_release={"session_id": e.run_id, "state": "release-incomplete"},
+    )
+    a.run.update(status="stopped", cleanup="physical_cleanup_unknown", uncertain=True,
+                 native_first_cause=None, physical_result=copy.deepcopy(e._lifecycle))
+    original = copy.deepcopy(a.run)
+    worker = SimpleNamespace(
+        run=original, state="acknowledged", error=None, close=lambda: None,
+        thread=SimpleNamespace(is_alive=lambda: change == "worker_alive"),
+    )
+
+    def request(operation_id):
+        if change == "pending":
+            return False
+        worker.state = "consumed"
+        return {
+            "version": 1, "kind": "am1-actual-stopped-reconciliation",
+            "run_id": e.run_id, "host_incarnation": e.host_incarnation,
+            "cleanup": "physical_readback_verified", "uncertain": False,
+            "original_terminal_run_sha256": terminal_run_hash(original),
+            "acknowledgment": {"version": 1, "run_id": e.run_id, "host_incarnation": e.host_incarnation,
+                               "consumed_operation_id": operation_id, "validated": True,
+                               "markers_archived": True, "proof_sha256": "f" * 64},
+        }
+
+    worker.request = request
+    e._reconciliation_worker = worker
+    monkeypatch.setattr(e, "begin", lambda recipe: True)  # Motor-free new startup boundary.
+    try:
+        reply = a.handle(dict(op="reconcile", run_id=e.run_id, operation_id=str(uuid4())), "pc")
+        assert reply["accepted"] is (change != "pending")
+        if change == "resident_changed":
+            e._lifecycle["camera_release"]["state"] = "unexpected-resource-state"
+        elif change == "foreign_ack":
+            e.sample["ack"]["host_incarnation"] = str(uuid4())
+        elif change == "resident_fault":
+            e._fault = "RuntimeError: actual resident fault"
+        stopped = a.run
+        evidence = e.evidence()
+        expected = (e._fault if change in {None, "resident_fault"}
+                    else "native thermal original RAW feedback expired/invalid")
+        assert evidence["fault"] == expected
+        assert not any(evidence[k] for k in ("feedback", "native_ack", "active_acknowledged"))
+        if change in {None, "resident_fault"}:
+            assert evidence["required_observation"] is False
+        reply = a.handle(dict(op="start", recipe="physical-live-teleop", operation_id=str(uuid4()),
+                              controller_generation=identity["controller_generation"]), "pc")
+        assert reply["accepted"] is (change is None)
+        if change is None:
+            assert reply["status"] == "starting" and reply["effect_admitted"] is False
+            assert e.run_id != original["run_id"] and e.host_incarnation != original["physical_result"]["backend_incarnation"]
+            assert e.sample is None and a.run["deadline"] is a.run["native_live_at"] is None
+        assert stopped["physical_result"] == original["physical_result"]
+        assert stopped["cleanup"] == original["cleanup"] and stopped["first_cause"] is None
+    finally:
+        a.run = None
+        a.close()
+
+
 @pytest.mark.parametrize("boundary", ["evidence", "new_start"])
 def test_real_core_terminal_thermal_ack_allows_only_new_startup_after_known_cleanup(tmp_path, boundary):
     import threading
