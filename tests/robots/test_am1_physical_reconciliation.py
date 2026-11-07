@@ -4424,3 +4424,226 @@ def test_preimport_base_module_discovery_refuses_execution_foreign_and_unqualifi
     with pytest.raises((ValueError,RuntimeError,OSError,TypeError)):
         m.load_qualified_proof(config,run)
     assert not list(state.glob("reconciliation-ack-*"))
+
+
+def stdlib_type_preimport_fixture(tmp_path, monkeypatch):
+    m, config, run, proof, state, directory = processor_preimport_fixture(tmp_path, monkeypatch)
+    run.update(status="faulted", requested_terminal="faulted", first_cause=ORDINARY_STARTUP_VIEW_CAUSE,
+               mode="interactive", intent=None, deadline=None, startup_deadline=98.,
+               operation_id=str(uuid.uuid4()), service_incarnation=str(uuid.uuid4()),
+               ordinary_arm_profile={"profile": "ordinary-am1-arms-v1", "right_elbow_p": 16})
+    run["execution"].update(fault=ORDINARY_STARTUP_VIEW_CAUSE, input_transport_trace=dict(
+        recent=[], invalid_rows=0, dropped_rows=0, first_native_expiry=None))
+    binding = dict(run_id=run["run_id"], host_incarnation=proof["host_incarnation"], role="chest", required=True,
+                   operation_id=run["operation_id"], service_incarnation=run["service_incarnation"],
+                   startup_deadline=run["startup_deadline"])
+    run["physical_result"].update(terminal_status="faulted", startup_view_failure=dict(
+        version=1, kind="am1-startup-required-view-failure", binding=binding, run_id=binding["run_id"],
+        host_incarnation=binding["host_incarnation"], startup_deadline=binding["startup_deadline"]))
+    configured = Path(config["host_python"])
+    interpreter = tmp_path / "pinned-cpython/bin/python3.12"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_bytes(b"fixture for the already pinned native interpreter")
+    resolve = Path.resolve
+    monkeypatch.setattr(Path, "resolve", lambda self, *args, **kwargs:
+                        interpreter if self == configured else resolve(self, *args, **kwargs))
+    stdlib = interpreter.parent.parent / "lib/python3.12"
+    stdlib.mkdir(parents=True)
+    typing = [""] * 1212
+    typing[1160:1162] = ["def _is_dunder(attr):", "    return attr.startswith('__')"]
+    typing[1209:1212] = ["def __getattr__(self, attr):",
+        "    if '__origin__' in self.__dict__ and not _is_dunder(attr):", "        return None"]
+    (stdlib / "typing.py").write_text("\n".join(typing) + "\n", encoding="utf-8")
+    collections = [""] * 502
+    collections[500:502] = ["def __getitem__(self, item):", "    return item"]
+    (stdlib / "_collections_abc.py").write_text("\n".join(collections) + "\n", encoding="utf-8")
+    # Model the retained cancellation's trace formatting using only local fixtures.
+    typing_name = (stdlib / "typing.py").as_posix()
+    trace_tail = (
+        '  File "<frozen _collections_abc>", line 502, in __getitem__\n'
+        f'  File "{typing_name}", line 1211, in __getattr__\n'
+        "    if '__origin__' in self.__dict__ and not _is_dunder(attr):\n"
+        "                                             ^^^^^^^^^^^^^^^^\n"
+        f'  File "{typing_name}", line 1161, in _is_dunder\n'
+        "    def _is_dunder(attr):\n    \nKeyboardInterrupt\n"
+    ).encode()
+    trace = (directory / "host-runtime.log").read_bytes().replace(b"KeyboardInterrupt\n", trace_tail)
+    launch = (directory / "host-launch.log").read_bytes().replace(b"Service runtime: 4.676s", b"Service runtime: 990ms")
+    for name, raw in (("host-runtime.log", trace), ("host-launch.log", launch)):
+        (directory / name).write_bytes(raw)
+        proof["original_host_logs"][name] = hashlib.sha256(raw).hexdigest()
+    publish_preimport_fixture(run, proof, state)
+    return m, config, run, proof, state, directory, stdlib
+
+
+def test_preimport_stdlib_type_support_requires_exact_sources_fresh_proof_and_ack(tmp_path, monkeypatch):
+    m, config, run, proof, state, directory, _ = stdlib_type_preimport_fixture(tmp_path, monkeypatch)
+    original = copy.deepcopy(run)
+    retained = {path.name: path.read_bytes() for path in directory.glob("host-*.log")}
+    actual, raw, inventory = m.load_qualified_proof(config, run)
+    operation = str(uuid.uuid4())
+    assert not m.acknowledged_receipt(actual, run, operation)
+    ack = m.archive_and_ack(config, actual, raw, inventory, operation)
+    assert m.acknowledged_receipt({**actual, "acknowledgment": {**ack, "consumed_operation_id": operation}}, run, operation)
+    assert run == original and run["physical_result"]["readback"] is None and not (directory / "cleanup.json").exists()
+    assert {path.name: path.read_bytes() for path in directory.glob("host-*.log")} == retained
+
+
+@pytest.mark.parametrize("fault", [
+    "duration-zero", "duration-unit", "duration-token", "foreign-typing", "typing-source", "typing-context",
+    "frozen-context", "frozen-body", "nonterminal-format", "stdlib-io", "camera-kill", "fresh-off", "fresh-lift",
+])
+def test_preimport_stdlib_type_support_refuses_unbound_sources_and_unqualified_proof(tmp_path, monkeypatch, fault):
+    m, config, run, proof, state, directory, stdlib = stdlib_type_preimport_fixture(tmp_path, monkeypatch)
+    trace = (directory / "host-runtime.log").read_bytes()
+    launch = (directory / "host-launch.log").read_bytes()
+    typing = stdlib / "typing.py"
+    if fault.startswith("duration-"):
+        invalid = {"duration-zero": b"0ms", "duration-unit": b"990us", "duration-token": b"1234567890ms"}
+        launch = launch.replace(b"990ms", invalid[fault])
+    elif fault == "foreign-typing":
+        foreign = tmp_path / "typing.py"
+        foreign.write_bytes(typing.read_bytes())
+        trace = trace.replace(typing.as_posix().encode(), foreign.as_posix().encode())
+    elif fault == "typing-source":
+        typing.write_bytes(typing.read_bytes().replace(b"not _is_dunder(attr)", b"False"))
+    elif fault == "typing-context":
+        trace = trace.replace(b"in _is_dunder", b"in __getattr__")
+    elif fault == "frozen-context":
+        trace = trace.replace(b"in __getitem__", b"in __setitem__")
+    elif fault == "frozen-body":
+        trace = trace.replace(b"in __getitem__\n", b"in __getitem__\n    actuate()\n")
+    elif fault == "nonterminal-format":
+        trace = trace.replace(b"                                             ^^^^^^^^^^^^^^^^", b"    ")
+    elif fault == "stdlib-io":
+        io = stdlib / "socket.py"
+        io.write_bytes(typing.read_bytes())
+        trace = trace.replace(typing.as_posix().encode(), io.as_posix().encode())
+    elif fault == "camera-kill":
+        camera = copy.deepcopy(proof["camera_release"])
+        camera.update(version=1, state="release-incomplete", errors=["backend-required-kill"],
+                      runtime_failed=False, released_at=98.5, deadline=300.)
+        camera["release_evidence"].update(backend_pid=12345, backend_returncode=0)
+        run["physical_result"]["camera_release"] = proof["camera_release"] = camera
+        camera_raw = canonical(camera)
+        (Path(config["camera_state"]) / ("release-" + run["run_id"] + ".json")).write_bytes(camera_raw)
+        proof["camera_release_sha256"] = hashlib.sha256(camera_raw).hexdigest()
+    elif fault == "fresh-off":
+        proof["readback"]["readbacks"][0]["value"] = 1
+    else:
+        proof["readback"].pop("lift_stationary")
+    for name, raw in (("host-runtime.log", trace), ("host-launch.log", launch)):
+        (directory / name).write_bytes(raw)
+        proof["original_host_logs"][name] = hashlib.sha256(raw).hexdigest()
+    publish_preimport_fixture(run, proof, state)
+    with pytest.raises((ValueError, RuntimeError, OSError, TypeError)):
+        m.load_qualified_proof(config, run)
+    assert not list(state.glob("reconciliation-ack-*"))
+
+
+def preimport_camera_completion_fixture(tmp_path, monkeypatch):
+    old_fixture = tmp_path / "camera-fixture"
+    old_fixture.mkdir()
+    _, camera_config, camera_run, camera_proof, _ = late_camera_fixture(
+        old_fixture, monkeypatch, backend_required_kill=True
+    )
+    m, config, run, proof, state, directory, _ = stdlib_type_preimport_fixture(tmp_path, monkeypatch)
+    config.update({key: camera_config[key] for key in
+                   ("camera_binary", "camera_config", "camera_repository", "camera_state", "host_head", "source_pins")})
+    run["backend_contract"] = dict(config, source_pins=camera_run["backend_contract"]["source_pins"])
+    for key in ("motor_head", "executor_head", "original_executor_head", "original_manifest_sha256", "manifest_sha256"):
+        proof["source"][key] = camera_proof["source"][key]
+    proof["source"]["backend_contract"] = copy.deepcopy(config)
+
+    camera = copy.deepcopy(camera_proof["camera_release"])
+    camera["session_id"] = run["run_id"]
+    run["physical_result"]["camera_release"] = proof["camera_release"] = camera
+    camera_raw = canonical(camera) + b"\n"
+    camera_path = Path(config["camera_state"]) / ("release-" + run["run_id"] + ".json")
+    camera_path.write_bytes(camera_raw)
+    proof["camera_release_sha256"] = hashlib.sha256(camera_raw).hexdigest()
+
+    lease_raw = canonical(dict(version=1, session_id=run["run_id"], camera_pid=12344,
+                               started_at=97., deadline=300., source_budget_seconds=203.)) + b"\n"
+    (camera_path.parent / ("lease-" + run["run_id"] + ".json")).write_bytes(lease_raw)
+    completion = proof["camera_completion"] = copy.deepcopy(camera_proof["camera_completion"])
+    completion.update(run_id=run["run_id"], host_incarnation=proof["host_incarnation"], boot_id=proof["boot_id"],
+                      original_terminal_run_sha256=m.terminal_run_hash(run), original_cleanup_sha256=None,
+                      original_camera_release_sha256=proof["camera_release_sha256"],
+                      original_camera_lease_sha256=hashlib.sha256(lease_raw).hexdigest(),
+                      backend_pid=camera["release_evidence"]["backend_pid"])
+    publish_preimport_fixture(run, proof, state)
+    return m, config, run, proof, state, directory, camera_path
+
+
+def test_preimport_camera_completion_requires_both_origins_before_durable_ack(tmp_path, monkeypatch):
+    m, config, run, proof, state, directory, camera_path = preimport_camera_completion_fixture(tmp_path, monkeypatch)
+    before = copy.deepcopy(run)
+    camera_raw = camera_path.read_bytes()
+    host_logs = {path.name: path.read_bytes() for path in directory.glob("host-*.log")}
+    actual, raw, inventory = m.load_qualified_proof(config, run)
+    operation = str(uuid.uuid4())
+    assert not m.acknowledged_receipt(actual, run, operation)
+    ack = m.archive_and_ack(config, actual, raw, inventory, operation)
+    assert m.acknowledged_receipt({**actual, "acknowledgment": {**ack, "consumed_operation_id": operation}}, run, operation)
+    assert m.load_qualified_proof(config, run)[0] == proof
+    assert run == before and camera_path.read_bytes() == camera_raw
+    assert not (directory / "cleanup.json").exists()
+    assert {path.name: path.read_bytes() for path in directory.glob("host-*.log")} == host_logs
+    assert (state / ("reconciliation-ack-" + run["run_id"] + ".json")).is_file()
+
+
+@pytest.mark.parametrize("changed", ["native-appeared", "host-log", "camera", "lease", "active-owner"])
+def test_preimport_camera_completion_rechecks_both_origins_at_ack(tmp_path, monkeypatch, changed):
+    m, config, run, proof, state, directory, camera_path = preimport_camera_completion_fixture(tmp_path, monkeypatch)
+    actual, raw, inventory = m.load_qualified_proof(config, run)
+    if changed == "native-appeared":
+        (directory / "cleanup.json").write_bytes(b"{}")
+    elif changed == "active-owner":
+        resources = copy.deepcopy(proof["camera_completion"]["resources_after"])
+        resources["backend_pid_absent"] = False
+        monkeypatch.setattr(m, "read_camera_completion_resources", lambda *_, **__: resources)
+    else:
+        path = {"host-log": directory / "host-runtime.log", "camera": camera_path,
+                "lease": camera_path.parent / ("lease-" + run["run_id"] + ".json")}[changed]
+        path.write_bytes(path.read_bytes() + b" ")
+    with pytest.raises((ValueError, RuntimeError, OSError)):
+        m.archive_and_ack(config, actual, raw, inventory, str(uuid.uuid4()))
+    assert not list(state.glob("reconciliation-ack-*.json"))
+
+
+@pytest.mark.parametrize("broken", [
+    "camera-extra-error", "camera-timeout", "camera-rc", "camera-readers", "cleanup-fabricated",
+    "foreign-boot", "before-release", "foreign-source",
+])
+def test_preimport_camera_completion_rejects_mixed_origin_or_foreign_proof(tmp_path, monkeypatch, broken):
+    m, config, run, proof, state, _, camera_path = preimport_camera_completion_fixture(tmp_path, monkeypatch)
+    completion = proof["camera_completion"]
+    if broken.startswith("camera-"):
+        release = proof["camera_release"]
+        evidence = release["release_evidence"]
+        if broken == "camera-extra-error":
+            release["errors"].append("unknown")
+        elif broken == "camera-timeout":
+            release["errors"] = ["backend-stop:TimeoutExpired", "backend-not-exited"]
+            evidence.update(backend_exited=False, backend_returncode=None)
+        elif broken == "camera-rc":
+            evidence["backend_returncode"] = False
+        else:
+            evidence["readers_joined"] = False
+        camera_raw = canonical(release) + b"\n"
+        camera_path.write_bytes(camera_raw)
+        proof["camera_release_sha256"] = completion["original_camera_release_sha256"] = hashlib.sha256(camera_raw).hexdigest()
+        completion["original_terminal_run_sha256"] = m.terminal_run_hash(run)
+    elif broken == "cleanup-fabricated":
+        proof["original_cleanup_sha256"] = completion["original_cleanup_sha256"] = "1" * 64
+    elif broken == "foreign-boot":
+        completion["boot_id"] = str(uuid.uuid4())
+    elif broken == "before-release":
+        completion["started_at_monotonic_s"] = 98.4
+    else:
+        proof["source"]["original_manifest_sha256"] = "1" * 64
+    publish_preimport_fixture(run, proof, state)
+    with pytest.raises(ValueError):
+        m.load_qualified_proof(config, run)
+    assert not list(state.glob("reconciliation-ack-*.json"))
