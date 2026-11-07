@@ -1117,7 +1117,10 @@ def open_console_browser(address: str, state_directory: Path, *, direct: bool = 
         arguments.insert(1, "--no-proxy-server")
     if software_video_decode:
         arguments.append("--disable-accelerated-video-decode")
-    arguments.append(f"--app={address}")
+    if persistent_session:
+        arguments.extend(("--new-window", address))
+    else:
+        arguments.append(f"--app={address}")
     if persistent_session:
         print(f"AM1 session browser: {mode}; profile={profile}; separate enrollment, existing trusted CA required", flush=True)
     subprocess.Popen(arguments, shell=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
