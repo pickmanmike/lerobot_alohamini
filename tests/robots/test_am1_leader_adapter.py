@@ -5158,6 +5158,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         else:
                             summary = await m.run(args)
                             assert summary["finish_qualified"] and summary["original_native_deadline"] == initial_timing[1]
+                            assert summary["terminal_qualification_budget_seconds"] == (5. if policy is not None else 2.)
                             assert len(initial_resumes) == 2 and len(inputs) == 1
                             assert initial_resumes[1]["operation_id"] != initial_resumes[0]["operation_id"]
                         rows = [json.loads(line) for line in (tmp_path / "failed/frames.jsonl").read_text().splitlines()]
@@ -7374,6 +7375,8 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     # fake Native sensing is the existing fixture's only device seam.
                     pi, lost, renewal_errors, restarts = [10.], [False], [], []
                     mode, own_receipt_returned, fenced = cause.removeprefix("bench_finish_renewal_"), [False], []
+                    late = mode == "late_unknown"
+                    pause_lookup_started = asyncio.Event()
                     a.clock = e.clock = lambda: pi[0]
                     client.record = record
                     client._renewal_ack = await original_post("claim", {"controller_generation": client.generation})
@@ -7383,6 +7386,8 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                             result = await original_call(command, device)
                             assert result["accepted"] is True
                             lost[0] = True
+                            if late:
+                                await pause_lookup_started.wait()
                             raise TimeoutError("renewal receipt lost after current owner effect")
                         if command.get("op") == "claim":
                             pi[0] = 10.25  # Exact binary Pi samples avoid artificial deadline-subtraction drift.
@@ -7395,7 +7400,12 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                             gateway_pauses.append(copy.deepcopy(command))
                             result = await original_call(command, device)
                             if cause.endswith("unknown") and len(gateway_pauses) == 1:
+                                if late:
+                                    await asyncio.sleep(1.1)
                                 raise TimeoutError("own Pause receipt lost after durable effect")
+                            if late:
+                                pause_lookup_started.set()
+                                await asyncio.sleep(.6)
                             return result
                         return await original_call(command, device)
                     gateway.call = renewal_loss
@@ -7438,6 +7448,8 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     original_get = client.get
                     async def finish_get(path):
                         if own_receipt_returned[0]:
+                            if late:
+                                await asyncio.sleep(.4)
                             if mode == "cancel":
                                 raise asyncio.CancelledError("cancelled during finishing-only presence qualification")
                             if mode == "deadline":
@@ -7457,7 +7469,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         renewal = asyncio.create_task(client.renew())
                     entered = m.time.monotonic()
                     try:
-                        if mode not in {"hold", "unknown"}:
+                        if mode not in {"hold", "unknown", "late_unknown"}:
                             expected = asyncio.CancelledError if mode == "cancel" else m.HTTPOutcomeError
                             with pytest.raises(expected) as failed:
                                 await guard.finish_owned(bench=False, wall_deadline=entered + 2,
@@ -7472,9 +7484,22 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                             assert sum(op == "resume" for op, _ in commands) == 1
                             assert a.run["native_live_at"] == 9. and a.run["deadline"] == 309.
                             return
-                        proof = await guard.finish_owned(bench=False, wall_deadline=entered + 2,
+                        terminal_budget = (m.terminal_qualification_budget_s(bench=False, ordinary_arms=True)
+                                           if late else 2.)
+                        proof = await guard.finish_owned(bench=False, wall_deadline=entered + terminal_budget,
                                                          renewal_check=healthy_renewal, renewal_reconcile=restart)
                         assert proof["native_held_qualified"] is True
+                        if late:
+                            assert terminal_budget == 5.
+                            assert 2. < m.time.monotonic() - entered < terminal_budget
+                            assert [row["event"] for row in records if row["event"] in {
+                                "normal_finish_pause_receipt_unknown", "normal_finish_pause_acknowledged",
+                                "controller_renewal_requalified", "normal_finish_hold_qualified",
+                            } or (row["event"] == "controller_renewal" and row["outcome"] == "failed")] == [
+                                "normal_finish_pause_receipt_unknown", "controller_renewal",
+                                "normal_finish_pause_acknowledged", "controller_renewal_requalified",
+                                "normal_finish_hold_qualified",
+                            ]
                         assert restarts == renewal_errors and len(restarts) == 1
                         assert len(pauses) == (2 if cause.endswith("unknown") else 1)
                         assert all(value == pauses[0] for value in pauses)
@@ -7484,7 +7509,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         qualified = [row for row in records if row["event"] == "controller_renewal_requalified"]
                         assert len(failed) == len(qualified) == 1
                         assert qualified[0]["original_outcome"] == "unknown"
-                        assert qualified[0]["original_ceiling_monotonic_s"] <= entered + 2
+                        assert qualified[0]["original_ceiling_monotonic_s"] <= entered + terminal_budget
                         assert not any(op in {"input", "grant"} for op, _ in commands)
                         assert sum(op == "connect" for op, _ in commands) == 1
                         assert sum(op == "resume" for op, _ in commands) == 1
@@ -15661,6 +15686,11 @@ def test_run_keeps_bounded_called_process_error_streams_privately_before_api(tmp
             assert retained == dict(text=raw[:4096].decode("utf-8", errors="replace"),
                 captured_bytes=len(raw), retained_bytes=4096, truncated=True)
     assert len(json.dumps(detail).encode()) < 32768
+
+
+def test_ordinary_profile_finish_keeps_late_pause_and_renewal_in_one_budget(tmp_path, monkeypatch):
+    test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit_resume(
+        tmp_path, monkeypatch, "normal_finish_renewal_late_unknown", renewal_profile_p=16)
 
 
 @pytest.mark.parametrize("right_elbow_p", [16, 32])

@@ -4914,6 +4914,14 @@ async def send_leader_sample(client, producer, body, record, *, phase, progress_
     return grant, frame, result
 
 
+def terminal_qualification_budget_s(*, bench, ordinary_arms):
+    if bench:
+        return 12.0
+    # An ordinary Finish may reconcile its own durable Pause and an overlapping
+    # renewal before checking fresh Native HOLD within the original run deadline.
+    return 5.0 if ordinary_arms else 2.0
+
+
 async def run(args):
     from examples.alohamini.am1_teleop_workload import TeleopWorkload, VirtualIntentWorkload
 
@@ -4926,7 +4934,7 @@ async def run(args):
     ordinary_input_rearm = ordinary_arms and bool(changing_input) and not left_entry and not bench and args.source == "virtual-leaders"
     segment = getattr(args, "workload_segment", "full")
     controller_gap = getattr(args, "interrupt_controller", False)
-    terminal_budget = 12. if bench else 2.
+    terminal_budget = terminal_qualification_budget_s(bench=bench, ordinary_arms=ordinary_policy is not None)
     peer = _peer_options(segment, getattr(args, "peer_side", None), getattr(args, "peer_direction", None),
                          getattr(args, "peer_raw_step", None), bench=bench, next_start=getattr(args, "next_start_seconds", None), active_p=getattr(args, "peer_active_p", None))
     if (bench or segment != "full" and ordinary_policy is None) and args.source != "virtual-leaders" or controller_gap and not bench:
