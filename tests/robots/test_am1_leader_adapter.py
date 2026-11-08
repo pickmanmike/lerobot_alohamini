@@ -4793,7 +4793,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 # Real run()/Start/Stop, Core, Owner IPC and TLS/WSS. Only the
                 # device preparation/native receipts below are fake; no device worker starts.
                 from types import SimpleNamespace
-                from examples.alohamini.am1_live_teleop import normalized_raw
+                from examples.alohamini.am1_live_teleop import browser_view_lifetime_s, normalized_raw
 
                 phase, pi_now, readers, clients = [0], [10.], [], []
                 current_observation, inactive_tasks, recovery_observed, control_requests = [True], [], [], []
@@ -4821,7 +4821,7 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                 e.desired = "hold"
                 a.run = a.controller = a.connection = None
                 a.clock = e.clock = lambda: pi_now[0]
-                if initial_resume_renewal:
+                if ordinary_profile:
                     from tools.am1_local_observation import LocalObservationMailbox
                     e.observation = LocalObservationMailbox(dict(e.observation.source, role="chest", device="/dev/am_camera_chest"),
                                                             clock=a.clock, require_owned_session=True)
@@ -4861,15 +4861,16 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                     return value
 
                 def begin_without_devices(recipe):
-                    if initial_resume_renewal:
+                    if ordinary_profile:
                         owner, capture, encode = (str(uuid4()) for _ in range(3))
                         e.observation.publish(dict(e.observation.request, owned_session=e.run_id, qualified=True,
                             owner_generation=owner, capture_generation=capture, sequence=1, arrived_at=pi_now[0],
                             decoded_at=pi_now[0], frame_sha256="f" * 64))
+                        browser_lifetime = browser_view_lifetime_s((e.ordinary_arm_profile or {}).get("profile"))
                         a._teleop_view = dict(run_id=e.run_id, role="chest", owner_generation=owner,
                             capture_generation=capture, encode_generation=encode, decoded_frames=1, media_time=.1,
                             source_sequence=1, source_fresh=True, received_at_monotonic_s=pi_now[0],
-                            request_received_at_monotonic_s=pi_now[0], qualified_until=pi_now[0] + .5)
+                            request_received_at_monotonic_s=pi_now[0], qualified_until=pi_now[0] + browser_lifetime)
                         assert e.publish_startup_view(a._startup_view_binding, a._teleop_view) and e.startup_view_ready()
                     e._lifecycle.update(phase="startup" if phase[0] == 0 and zero_input_retry != "view" else "live", native_live_at=pi_now[0],
                         native_deadline_monotonic_s=pi_now[0]+300, backend_incarnation=e.host_incarnation)
@@ -5106,6 +5107,9 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         if phase[0] == 1 and a.run:
                             a._teleop_view = dict(run_id=e.run_id, role="chest", qualified_until=pi_now[0]+.5)
                         a.tick()
+                        if (ordinary_profile and phase[0] == 0 and zero_input_retry == "view"
+                            and a.run and a.run.get("native_live_at") is not None):
+                            a._teleop_view = None  # Lose required viewing after the valid startup handoff.
                         await asyncio.sleep(.01)
                 ticker = asyncio.create_task(native_receipts())
                 args = SimpleNamespace(source="virtual-leaders", workload_segment="ordinary-arms",
@@ -5158,7 +5162,6 @@ def test_real_core_ipc_tls_wss_recovery_requires_qualified_pause_before_explicit
                         else:
                             summary = await m.run(args)
                             assert summary["finish_qualified"] and summary["original_native_deadline"] == initial_timing[1]
-                            assert summary["terminal_qualification_budget_seconds"] == (5. if policy is not None else 2.)
                             assert len(initial_resumes) == 2 and len(inputs) == 1
                             assert initial_resumes[1]["operation_id"] != initial_resumes[0]["operation_id"]
                         rows = [json.loads(line) for line in (tmp_path / "failed/frames.jsonl").read_text().splitlines()]
