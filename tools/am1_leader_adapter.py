@@ -33,6 +33,7 @@ from examples.alohamini.am1_live_teleop import (
     TELEOP_RECIPE,
     ZERO_BODY,
     map_leader_action,
+    movement_input_lifetime_s,
     normalized_raw,
     validate_body,
     validate_source,
@@ -1034,7 +1035,8 @@ class FrameProducer:
             "sent_at_monotonic_s": self.clock(),
             "grant_id": grant["grant_id"],
         }
-        validate_source(source, grant_id=grant["grant_id"], previous=self.previous)
+        profile = (self.workspace or {}).get("workspace_profile")
+        validate_source(source, grant_id=grant["grant_id"], previous=self.previous, profile=profile)
         self.previous = dict(source)
         return {
             "target": validate_target(target, workspace=self.workspace),
@@ -1043,7 +1045,8 @@ class FrameProducer:
         }
 
     def serialize(self, frame):
-        if not 0 <= self.clock() - frame["source"]["grant_received_at_monotonic_s"] < 0.25:
+        profile = (self.workspace or {}).get("workspace_profile")
+        if not 0 <= self.clock() - frame["source"]["grant_received_at_monotonic_s"] < movement_input_lifetime_s(profile):
             raise ValueError("original capture/grant expired before serialization")
         return json.loads(json.dumps(frame, allow_nan=False))
 
@@ -2079,6 +2082,8 @@ class SessionClient:
             return
         grant = result.get("next_grant")
         binding = self._next_grant_binding()
+        run = (getattr(self, "snapshot", None) or {}).get("run") or {}
+        lifetime = movement_input_lifetime_s((run.get("ordinary_arm_profile") or {}).get("profile"))
         if (command.get("request_next_grant") is not True or result.get("accepted") is not True
                 or result.get("effect_admitted") is not True or result.get("status") != "input"
                 or binding is None or any(command.get(key) != value for key, value in binding[1].items())
@@ -2086,7 +2091,7 @@ class SessionClient:
                 or grant.get("accepted") is not True or grant.get("status") != "granted"
                 or grant.get("next_grant_supported") is not True
                 or any(type(grant.get(key)) not in (int, float) or not math.isfinite(grant[key]) for key in ("issued", "expires"))
-                or abs(grant["expires"] - grant["issued"] - .25) > 1e-9):
+                or abs(grant["expires"] - grant["issued"] - lifetime) > 1e-9):
             return
         try:
             if type(grant.get("grant_id")) is not str or str(UUID(grant["grant_id"])) != grant["grant_id"]:
@@ -2095,7 +2100,7 @@ class SessionClient:
             return
         # A delayed reply cannot restart this permission's age. Request start
         # is conservative because the owner can issue it only afterward.
-        ceiling = timing["request_started_at_monotonic_s"] + .25
+        ceiling = timing["request_started_at_monotonic_s"] + lifetime
         if time.perf_counter() < ceiling:
             self._next_grant = {"binding": binding, "grant": dict(grant), "ceiling": ceiling,
                 "requested": timing["request_started_at_monotonic_s"], "received": timing["response_observed_at_monotonic_s"]}
@@ -2400,7 +2405,7 @@ class SessionClient:
                 if record is not None:
                     record(detail)
 
-    async def resume(self, *, check=None, refusal_record=None, qualification_ceiling=None):
+    async def resume(self, *, check=None, refusal_record=None, qualification_ceiling=None, deliberate_pause=None):
         if check:
             check(self.snapshot)
         identity = self.identities()
@@ -2423,10 +2428,11 @@ class SessionClient:
         if check:
             check(self.snapshot)
         await SessionClient._resume_connected(self, check=check, connect_identity=identity,
-                                              refusal_record=refusal_record, qualification_ceiling=qualification_ceiling)
+                                              refusal_record=refusal_record, qualification_ceiling=qualification_ceiling,
+                                              deliberate_pause=deliberate_pause)
 
     async def _resume_connected(self, *, check=None, connect_identity=None, qualified_check=None,
-                                refusal_record=None, qualification_ceiling=None):
+                                refusal_record=None, qualification_ceiling=None, deliberate_pause=None):
         phase_ceiling = qualification_ceiling
 
         def phase_remaining():
@@ -2653,9 +2659,17 @@ class SessionClient:
                     "release": released,
                     **({"initial_connected_phase": initial_phase} if initial_phase is not None else {}),
                 }, allow_nan=False))
+                def check_deliberate_send():
+                    phase_remaining()
+                    check(self.snapshot)
+                    if self.identities() != identity:
+                        raise RuntimeError("explicit Resume binding changed before dispatch")
+
                 try:
                     budget = phase_remaining()
-                    resumed = await asyncio.wait_for(self.command(command), budget)
+                    resumed = await asyncio.wait_for(self.command(command, **(
+                        {"check": check_deliberate_send} if deliberate_pause is not None else {}
+                    )), budget)
                     break
                 except (ConnectionError, TimeoutError) as error:
                     try:
@@ -2686,6 +2700,8 @@ class SessionClient:
                                and initial_connected_phase(sent_state))
                     if first:
                         initial_refusal = initial
+                    explicit = (reason == "current required selected view must advance before Resume"
+                                and prior_event.get("kind") == "pause" and prior_event == deliberate_pause)
                     if (
                         type(identity["intent_revision"]) is not int or identity["intent_revision"] < 0
                         or any(type(v) is not str or not v for k, v in identity.items() if k != "intent_revision")
@@ -2693,7 +2709,7 @@ class SessionClient:
                         or run.get("recovery") is not None or run.get("native_first_cause")
                         or self.snapshot.get("evidence", {}).get("fault")
                         or set(prior_event) != {"kind", "at", "run_id", "service_incarnation"}
-                        or prior_event.get("kind") not in _ordinary_pause_kinds(self) and not initial
+                        or prior_event.get("kind") not in _ordinary_pause_kinds(self) and not (initial or explicit)
                         or any(type(v) not in (int, float) or not math.isfinite(v)
                                for v in (prior_event.get("at"), pi_lower_bound))
                         or not run["native_live_at"] <= prior_event["at"] < run["deadline"]
@@ -3261,7 +3277,13 @@ class SameRunRecovery:
             renewal_check()
             self.client.snapshot = (await self.client.get("state"))["snapshot"]
             current(self.client.snapshot)
-            await self.client.resume(check=current, qualification_ceiling=wall_deadline)
+            # Only our own definitely acknowledged Pause can continue a fresh
+            # local Resume after an explicit nonadmission. External Pause and
+            # unknown send outcomes keep their existing held behavior.
+            await self.client.resume(check=current, qualification_ceiling=wall_deadline, **(
+                {"deliberate_pause": event, "refusal_record": self.record}
+                if proof["pause_operation_id"] is not None else {}
+            ))
         current(self.client.snapshot)
         return {"pause_event": dict(event), "intent_revision": self.client.snapshot["run"]["intent_revision"],
                 "connection_generation": self.client.connection}
@@ -3430,7 +3452,8 @@ class SameRunRecovery:
                         or live.get("required_view", {}).get("required") is not True
                         or context["source"].get("kind") != "virtual-leaders"):
                         raise RuntimeError("ordinary physical current-rest Input authority unavailable")
-                    validate_source(context["source"], grant_id=context["source"].get("grant_id"))
+                    validate_source(context["source"], grant_id=context["source"].get("grant_id"),
+                                    profile=(run.get("ordinary_arm_profile") or {}).get("profile"))
                     if context["source"]["sent_at_monotonic_s"] > time.perf_counter():
                         raise RuntimeError("original uncertain Input acquisition is in the future")
                     grant_context = {key: context[key] for key in ("identity", "snapshot", "requested")}

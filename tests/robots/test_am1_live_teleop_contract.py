@@ -109,6 +109,23 @@ def test_old_capture_cannot_be_made_fresh_by_a_new_grant_or_source_generation():
     assert m.validate_source(fresh, grant_id=fresh["grant_id"], previous=first) == fresh
 
 
+@pytest.mark.parametrize("profile,age,valid", [
+    (None, .375, False),
+    ("ordinary-arms-left-current-rest-1051-1164", .375, False),
+    ("ordinary-am1-arms-v1", .375, True),
+    ("ordinary-am1-arms-v1", .5, False),
+])
+def test_source_lifetime_is_scoped_to_the_admitted_ordinary_arm_profile(profile, age, valid):
+    m = contract()
+    frame = source()
+    frame["sent_at_monotonic_s"] = frame["grant_received_at_monotonic_s"] + age
+    if valid:
+        assert m.validate_source(frame, grant_id=frame["grant_id"], profile=profile) == frame
+    else:
+        with pytest.raises(ValueError, match="remain fresh"):
+            m.validate_source(frame, grant_id=frame["grant_id"], profile=profile)
+
+
 def test_body_height_has_explicit_precedence_and_never_overrides_nonzero_velocity():
     m = contract()
     zero = {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0, "lift_axis.vel": 0}

@@ -27,7 +27,8 @@ if (onboard) {
   cameraRoot.append(connection);
 }
 const diagnostics = document.querySelector("#diagnostics");
-let selected = roles[0], latest = null, reportAt = 0, statusReceivedAt = 0, stream = null;
+let selected = onboard && !identifying ? "chest" : roles[0];
+let latest = null, reportAt = 0, statusReceivedAt = 0, stream = null;
 let statusRequest = 0, acceptedStatusRequest = 0, statusUncertain = false, latestStatusBinding = null;
 const tiles = new Map(), slots = new Map(), details = new Map(), busy = new Set(), decodingRoles = new Map();
 const snapshotRequests = new Map(), reconnects = new Map(), minimumSequences = new Map();
@@ -284,7 +285,7 @@ function render() {
   connection.textContent = !statusAvailable() ? "Status unavailable — do not rely on these views" :
     (statusUncertain || sourceFor(selected).state !== "fresh") && usable(selected) ? "LAN viewer · status delayed/uncertain · decoded-frame clock remains active" :
     "LAN viewer · source status and decoded-frame progress tracked separately";
-  if(webPrimary())connection.textContent=`LAN onboard primary · WebRTC · one shared 640×480 H264 encode, up to 10 fps · ${webView?.health().fresh ? "decoded video advancing" : "decoded view unavailable; required steering holds"} · source freshness separate`;
+  if(webPrimary())connection.textContent=`LAN onboard primary · WebRTC · one shared 640×480 H264 encode, up to 10 fps · ${webView?.health().fresh ? "decoded video advancing" : "decoded view unavailable; check control state"} · source freshness separate`;
   if (document.body.dataset.console === "compact" && !webPrimary()) {
     const fresh = Number(primary.classList.contains("fresh")) +
       [...tiles.entries()].filter(([role,tile]) => role !== selected && tile.classList.contains("fresh")).length;

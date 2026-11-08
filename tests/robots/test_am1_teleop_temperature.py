@@ -1458,6 +1458,66 @@ def test_shared_current_subset_keeps_contact_hold_below_installed_hard_ceiling(c
     assert len([row for row in state.command_writes if row[1] == "Goal_Position"]) == 2
 
 
+def test_whole_arm_write_services_full_guard_once_per_motion_emission(command_cadence_boundary, monkeypatch):
+    from lerobot.robots.alohamini.alohamini_host import AM1LocalControl
+    from tests.robots.test_am1_live_teleop_native import frame, sample
+
+    state, robot = command_cadence_boundary, command_cadence_boundary.robot
+    for side, raw in (("left", 2124), ("right", 1847)):
+        bus = getattr(robot, side + "_bus")
+        for register in ("Present_Position", "Goal_Position"):
+            bus.registers[register, "arm_" + side + "_elbow_flex"] = raw
+    identity = {key: robot._am1_teleop_binding[key] for key in ("run_id", "host_incarnation")}
+    owner = {key: str(uuid4()) for key in ("service_incarnation", "controller_generation", "connection_generation")}
+    control = AM1LocalControl(**identity, live=True, live_recipe=teleop.RECIPE, clock=lambda: state.clock.now)
+    assert control.apply(robot, frame(identity, owner, 1))
+    assert control.apply(robot, frame(identity, owner, 2, mode="active", epoch=2))
+
+    original_guard = teleop.before_write
+    guarded = []
+    def observe_guard(*args):
+        original_guard(*args)
+        guarded.append(state.clock.now)
+    monkeypatch.setattr(teleop, "before_write", observe_guard)
+    state.command_writes.clear()
+    original = sample(control, expiry=state.clock.now + .25)
+    assert control.apply(robot, frame(identity, owner, 3, mode="active", epoch=2, sample=original))
+    assert [row[0] for row in state.command_writes if row[1] == "Goal_Position"] == ["left", "right"]
+    assert len(guarded) == 4  # Lift, both arm buses, and base each need one full guard.
+    assert max(guarded) < original["valid_until_monotonic_s"]
+
+
+def test_owned_stop_between_arm_writes_prevents_the_other_bus_and_fresh_replay(command_cadence_boundary):
+    from lerobot.robots.alohamini.alohamini_host import AM1LocalControl
+    from tests.robots.test_am1_live_teleop_native import frame, sample
+
+    state, robot = command_cadence_boundary, command_cadence_boundary.robot
+    for side, raw in (("left", 2124), ("right", 1847)):
+        bus = getattr(robot, side + "_bus")
+        for register in ("Present_Position", "Goal_Position"):
+            bus.registers[register, "arm_" + side + "_elbow_flex"] = raw
+    identity = {key: robot._am1_teleop_binding[key] for key in ("run_id", "host_incarnation")}
+    owner = {key: str(uuid4()) for key in ("service_incarnation", "controller_generation", "connection_generation")}
+    control = AM1LocalControl(**identity, live=True, live_recipe=teleop.RECIPE, clock=lambda: state.clock.now)
+    assert control.apply(robot, frame(identity, owner, 1))
+    assert control.apply(robot, frame(identity, owner, 2, mode="active", epoch=2))
+    original = sample(control, expiry=state.clock.now + .25)
+
+    def interrupt(side, register, _values):
+        if side == "left" and register == "Goal_Position":
+            state.after_write = None
+            assert control.apply(robot, {"x.vel": 0, "y.vel": 0, "theta.vel": 0, "lift_axis.vel": 0})
+    state.command_writes.clear()
+    state.after_write = interrupt
+    assert not control.apply(robot, frame(identity, owner, 3, mode="active", epoch=2, sample=original))
+    assert control.state == "stopped"
+    assert state.clock.now < original["valid_until_monotonic_s"]
+    fresh = sample(control, seq=2, expiry=state.clock.now + .25,
+                   source_id=original["source"]["source_id"], acquired=1.04)
+    assert not control.apply(robot, frame(identity, owner, 4, mode="active", epoch=2, sample=fresh))
+    assert [row[0] for row in state.command_writes if row[1] == "Goal_Position"] == ["left"]
+
+
 @pytest.mark.parametrize("boundary", ["before_left", "after_left"])
 def test_shared_servicing_preserves_real_native_expiry_without_partial_cursor_commit(command_cadence_boundary, boundary):
     from lerobot.robots.alohamini.alohamini_host import AM1LocalControl

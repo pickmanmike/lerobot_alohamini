@@ -4129,7 +4129,7 @@ def startup_required_view_case(readiness_gate_case, monkeypatch):
         value=dict(op="view_progress", run_id=e.run_id, role="chest", owner_generation=owner,
                    capture_generation=capture, encode_generation=encode, decoded_frames=sequence, media_time=.1*sequence,
                    source_sequence=sequence, source_fresh=True, received_at_monotonic_s=case.now,
-                   request_received_at_monotonic_s=case.now, qualified_until=case.now+.5)
+                   request_received_at_monotonic_s=case.now, qualified_until=case.now+1.)
         value.update(changes)
         return value
 
@@ -4209,9 +4209,27 @@ def test_startup_required_view_original_browser_expiry_cannot_be_retimed(startup
     case.local(2)
     assert case.box.evidence()["qualified"]
     case.e.publish_startup_view(dict(case.binding,controller_expires=2.),original)
-    assert original["qualified_until"]==.5
+    assert original["qualified_until"]==1.
+    assert case.e.startup_view_ready() is True
+    case.now=1.001
+    case.local(3)
     with pytest.raises(RuntimeError,match="view expired"):
         case.e.startup_view_ready()
+
+
+def test_startup_required_view_fresh_browser_never_extends_local_feedback(startup_required_view_case):
+    case=startup_required_view_case
+    case.local()
+    original=case.view()
+    case.e.publish_startup_view(case.binding,original)
+    permits=[]
+    assert case.e.startup_view_ready(permit=permits.append) is True
+    assert permits==[.5]
+    case.now=.501
+    assert case.now < original["qualified_until"]
+    with pytest.raises(RuntimeError,match="view expired"):
+        case.e.startup_view_ready()
+    assert case.e._lifecycle["startup_view_failure"]["reason"]=="local_qualified"
 
 
 def test_startup_required_view_renewal_can_cover_real_warmup_without_extending_startup(startup_required_view_case):
@@ -4271,7 +4289,7 @@ def test_startup_required_view_gap_during_nonactuating_host_preparation(startup_
         assert case.host is not None and not case.clients and not permission.exists()
         sleep(seconds)
         if case.steps == 1:
-            case.now = .501  # Original receipt expires during imports.
+            case.now = 1.001  # Original browser receipt expires during imports.
             case.local(2)
             (case.logpath.parent / "startup-view-ready").touch(mode=0o600)
         else:
@@ -4284,7 +4302,8 @@ def test_startup_required_view_gap_during_nonactuating_host_preparation(startup_
     monkeypatch.setattr(module().time, "sleep", warmup)
     case.start()
     assert case.steps == 2 and len(case.clients) == 1
-    assert case.e._startup_view_armed and float(permission.read_text()) == pytest.approx(case.now + .5)
+    assert case.e._startup_view_armed
+    assert float(permission.read_text()) == pytest.approx(min(case.now + .5, case.binding["controller_expires"]))
 
 
 def test_startup_required_view_loss_after_host_launch_cancels_before_client(startup_required_view_case,monkeypatch):
@@ -4300,7 +4319,7 @@ def test_startup_required_view_loss_after_host_launch_cancels_before_client(star
         assert len(losses)<=3, "view loss did not cancel host startup"
         assert case.host is not None
         sleep(seconds)
-        case.now=.501
+        case.now=1.001
         case.local(2)
     monkeypatch.setattr(module().time,"sleep",lose_view)
     with pytest.raises(RuntimeError):
@@ -4421,7 +4440,7 @@ def test_startup_view_failure_retains_exact_first_predicate_and_consumed_proofs(
     case=startup_required_view_case
     case.local();original=case.view();assert case.e.publish_startup_view(case.binding,original)
     assert case.e.startup_view_ready()
-    case.now=.501 if fault=="browser-expired" else .1
+    case.now=1.001 if fault=="browser-expired" else .1
     case.local(2)
     if fault=="local-unqualified":
         case.box.publish(dict(case.box.request,owned_session=case.e.run_id,qualified=False,reason="fixture local receipt unavailable"))
@@ -4444,7 +4463,7 @@ def test_startup_view_failure_retains_exact_first_predicate_and_consumed_proofs(
     assert record["checked_at"]["browser"]==(case.now if fault=="browser-expired" else None)
     assert record["current_authority"]==dict(case.identity)
     assert len(json.dumps(record,allow_nan=False).encode())<=4096
-    frozen=copy.deepcopy(record);case.now=.7
+    frozen=copy.deepcopy(record);case.now=1.2
     with pytest.raises(RuntimeError):case.e._check_startup_view()
     assert case.e._lifecycle["startup_view_failure"]==frozen
     case.e._lifecycle.update(phase="terminal",backend_incarnation=case.e.host_incarnation,cleanup="physical_cleanup_unknown",uncertain=True,terminal_status="faulted")
@@ -4466,7 +4485,7 @@ def test_startup_view_failure_existing_core_terminal_copy_persists_diagnostic(st
     from tools.am1_session_core import SessionAuthority
     case=startup_required_view_case
     case.local();assert case.e.publish_startup_view(case.binding,case.view());assert case.e.startup_view_ready()
-    case.now=.501;case.local(2)
+    case.now=1.001;case.local(2)
     with pytest.raises(RuntimeError):case.e._check_startup_view()
     diagnostic=copy.deepcopy(case.e._lifecycle.get("startup_view_failure"))
     assert isinstance(diagnostic,dict),"actual guard result must be retained before lifecycle cleanup"

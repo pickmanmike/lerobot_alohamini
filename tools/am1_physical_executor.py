@@ -13,6 +13,8 @@ from examples.alohamini.am1_live_teleop import (
     TELEOP_ARM_KEYS,
     TELEOP_RECIPE,
     TELEOP_SPEC,
+    browser_view_lifetime_s,
+    movement_input_lifetime_s,
     validate_body,
     validate_source,
     validate_target,
@@ -960,6 +962,7 @@ class PhysicalExecutor:
             if local is None:
                 local = self.observation.evidence()
             floor, expiry = view.get("received_at_monotonic_s"), view.get("qualified_until")
+            browser_lifetime = browser_view_lifetime_s((self.ordinary_arm_profile or {}).get("profile"))
             matched = bool(checked("local_qualified", local["qualified"])
                 and checked("owned_session", local.get("owned_session") == self.run_id)
                 and checked("request_generation", local.get("generation") == self._startup_observation_generation)
@@ -972,7 +975,7 @@ class PhysicalExecutor:
                 and checked("browser_encode_generation", type(view.get("encode_generation")) is str and bool(view["encode_generation"]))
                 and checked("browser_clock_types", all(type(x) in (int, float) and math.isfinite(x) for x in (floor, expiry)))
                 and checked("browser_receipt_range", floor <= (browser_checked_at := self.clock()) < expiry)
-                and checked("browser_original_interval", abs(expiry - floor - .5) < 1e-9))
+                and checked("browser_original_interval", abs(expiry - floor - browser_lifetime) < 1e-9))
         if not matched and failure_context is not None and "startup_view_failure" not in self._lifecycle:
             # One fixed, original proof snapshot; later finishing reads cannot replace it.
             self._lifecycle["startup_view_failure"] = dict(
@@ -1145,8 +1148,9 @@ class PhysicalExecutor:
         if not thermal_ready or (_thermal is not None and _thermal["deficit_started_at_monotonic_s"] is not None):
             return False  # Only a new actual active ACK can close the held history episode.
         checked_at = self.clock()
+        profile = (self.ordinary_arm_profile or {}).get("profile")
         if (type(checked_at) not in (int, float) or not math.isfinite(checked_at)
-                or valid_until_monotonic_s > checked_at + .25 + 1e-9):
+                or valid_until_monotonic_s > checked_at + movement_input_lifetime_s(profile) + 1e-9):
             return False
         try:
             workspace = validate_workspace((self.sample or {}).get("ack", {}).get("live_input", {}).get("workspace"))
@@ -1155,7 +1159,7 @@ class PhysicalExecutor:
             if self.ordinary_arm_profile is not None and (
                     workspace.get("workspace_profile") != self.ordinary_arm_profile["profile"] or body != ZERO_BODY):
                 return False
-            source = validate_source(source, grant_id=grant_id, previous=self._teleop_source)
+            source = validate_source(source, grant_id=grant_id, previous=self._teleop_source, profile=profile)
         except (KeyError, TypeError, ValueError):
             return False
         # Core's earlier grant check can precede evidence work or this mutex.

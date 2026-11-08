@@ -1916,6 +1916,12 @@ class AlohaMini(Robot):
         """
         action_start_t = time.perf_counter()
         live_before_write = getattr(self, "_am1_live_before_write", lambda: None)
+
+        def guard_motion_write():
+            live_before_write()
+            if not getattr(live_before_write, "services_feedback", False):
+                self._service_am1_live_feedback()
+                live_before_write()
         # arm_goal_pos = {k: v for k, v in action.items() if k.endswith(".pos")}
         left_pos  = {k: v for k, v in action.items() if k.endswith(".pos") and k.startswith("arm_left_") and k.replace(".pos", "") in self.left_bus.motors}
         right_pos = {k: v for k, v in action.items() if k.endswith(".pos") and k.startswith("arm_right_") and self.right_bus is not None and k.replace(".pos", "") in self.right_bus.motors}
@@ -2026,9 +2032,7 @@ class AlohaMini(Robot):
             if observed:
                 self._am1_selected_joint_action["write_started_at_monotonic_s"] = time.monotonic()
             try:
-                live_before_write()
-                self._service_am1_live_feedback()
-                live_before_write()
+                guard_motion_write()
                 if arm_goal_guard is not None:
                     arm_goal_guard(bus, raw_goals)
                 if raw_goals is not None:
@@ -2053,9 +2057,7 @@ class AlohaMini(Robot):
         if self.right_bus:
             write_arm_goals(self.right_bus, right_pos, right_raw_goals)
         right_write_done_t = time.perf_counter()
-        live_before_write()
-        self._service_am1_live_feedback()
-        live_before_write()
+        guard_motion_write()
         self.left_bus.sync_write("Goal_Velocity", base_wheel_goal_vel)
         base_write_done_t = time.perf_counter()
 

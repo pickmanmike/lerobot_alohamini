@@ -17,6 +17,8 @@ from pathlib import Path
 from examples.alohamini.am1_live_teleop import (
     TELEOP_RECIPE,
     TELEOP_SPEC,
+    browser_view_lifetime_s,
+    movement_input_lifetime_s,
     number as teleop_number,
     validate_body,
     validate_source,
@@ -1111,7 +1113,7 @@ class SessionAuthority:
                     and self.run.get("bench_continuity") is True)
 
     def _controller_lease_seconds(self):
-        # Session presence is separate from the unchanged 250 ms movement expiry.
+        # Session presence is separate from the movement input lifetime.
         # Ordinary teleop tolerates the observed 1.64 s renewal-dispatch stall;
         # selected bench control retains its six-second receipt-delivery margin.
         if self._physical_interactive() and self.run["recipe"] == TELEOP_RECIPE and self.run["status"] not in TERMINAL:
@@ -1433,7 +1435,9 @@ class SessionAuthority:
         if changed or not command["source_fresh"] or command["decoded_frames"] == 0:
             self._teleop_view = dict(command, qualified_until=0.)
         if advancing and command["source_fresh"] and command["decoded_frames"] > 0:
-            self._teleop_view = dict(command, qualified_until=command["received_at_monotonic_s"] + .5)
+            profile = (self.run.get("ordinary_arm_profile") or {}).get("profile")
+            expires = command["received_at_monotonic_s"] + browser_view_lifetime_s(profile)
+            self._teleop_view = dict(command, qualified_until=expires)
         if (not self._bench_continuity() and not self._teleop_view_qualified()
                 and self.run["status"] in {"running", "resuming"}):
             self._pause_live_input("required_view_expired")
@@ -2944,13 +2948,15 @@ class SessionAuthority:
                     return self._refuse("stale physical intent identity")
             else:
                 self._clear_input()  # Fake compatibility: a new grant intentionally clears fake output.
-            self.grant = {"id": str(uuid.uuid4()), "issued": now, "expires": now + 0.25}
+            profile = (self.run.get("ordinary_arm_profile") or {}).get("profile")
+            expires = now + movement_input_lifetime_s(profile)
+            self.grant = {"id": str(uuid.uuid4()), "issued": now, "expires": expires}
             return {
                 "accepted": True,
                 "status": "granted",
                 "grant_id": self.grant["id"],
                 "issued": now,
-                "expires": now + 0.25,
+                "expires": expires,
                 **({"next_grant_supported": True} if self._physical_interactive() and self.run["recipe"] == TELEOP_RECIPE else {}),
             }
         if op == "input":
@@ -2983,7 +2989,10 @@ class SessionAuthority:
                         workspace = validate_workspace(e.get("live_input", {}).get("workspace"))
                         target = validate_target(target, workspace=workspace)
                         body = validate_body(c.get("body"))
-                        source = validate_source(c.get("source"), grant_id=self.grant["id"], previous=self.run.get("input_source"))
+                        profile = (self.run.get("ordinary_arm_profile") or {}).get("profile")
+                        source = validate_source(
+                            c.get("source"), grant_id=self.grant["id"], previous=self.run.get("input_source"), profile=profile,
+                        )
                     except (ValueError, KeyError, TypeError):
                         return self._refuse("invalid or stale whole-frame source/target/body")
                     if self._bench_continuity() and source["kind"] != "virtual-leaders":

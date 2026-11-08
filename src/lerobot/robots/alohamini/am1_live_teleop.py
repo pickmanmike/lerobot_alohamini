@@ -1628,6 +1628,7 @@ def apply_frame(control, robot, command, marker_key):
         LEFT_ENTRY_WORKSPACE_PROFILE,
         TELEOP_ARM_KEYS,
         ZERO_BODY,
+        movement_input_lifetime_s,
         validate_body,
         validate_source,
         validate_target,
@@ -1698,6 +1699,11 @@ def apply_frame(control, robot, command, marker_key):
     if history is not None and history["deficit_started_at_monotonic_s"] is not None and original is not None:
         raise ThermalHistoryHoldRequiredError("AM1 thermal history revokes pending input before admission")
     if original is not None:
+        admitted_workspace = control._live_summary.get("workspace")
+        if not isinstance(admitted_workspace, dict):
+            return False
+        profile = admitted_workspace.get("workspace_profile")
+        now = control.clock()
         if (
             not isinstance(original, dict)
             or set(original) != {"target", "body", "source", "grant_id", "seq", "valid_until_monotonic_s"}
@@ -1705,20 +1711,20 @@ def apply_frame(control, robot, command, marker_key):
             or original["seq"] < 0
             or type(original["valid_until_monotonic_s"]) not in (int, float)
             or not math.isfinite(original["valid_until_monotonic_s"])
-            or not control.clock() < original["valid_until_monotonic_s"] <= control.clock() + 0.25 + 1e-9
+            or not now < original["valid_until_monotonic_s"] <= now + movement_input_lifetime_s(profile) + 1e-9
             or original["seq"] < control._live_summary["last_input_seq"]
             or original["seq"] == control._live_summary["last_input_seq"]
             and original != control.live_sample
         ):
             return False
         try:
-            validate_target(original["target"], workspace=control._live_summary["workspace"])
+            validate_target(original["target"], workspace=admitted_workspace)
             validate_body(original["body"])
             if not _left_response_target_valid(robot, control, original):
                 return False
             if original != control.live_sample:
                 validate_source(
-                    original["source"], grant_id=original["grant_id"], previous=control._teleop_source
+                    original["source"], grant_id=original["grant_id"], previous=control._teleop_source, profile=profile,
                 )
         except (ValueError, KeyError):
             return False
@@ -1835,7 +1841,13 @@ def apply_frame(control, robot, command, marker_key):
     for key in ZERO_BODY:
         action.pop(key, None)
     action.update(original["body"])
-    robot._am1_live_before_write = lambda: before_write(control, robot)
+    def motion_write_guard():
+        before_write(control, robot)
+
+    # This guard already collects due real feedback between its two original
+    # expiry checks. The serial path need not run a second whole-owner pass.
+    motion_write_guard.services_feedback = getattr(robot, "_am1_thermal_history_enabled", False)
+    robot._am1_live_before_write = motion_write_guard
     robot._am1_live_arm_goal_guard = (
         (lambda bus, raw: _entry_encoded_goals(control, robot, bus, raw)) if entry else None)
     accepted = control._apply_standard(robot, action)

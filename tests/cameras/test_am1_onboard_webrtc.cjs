@@ -107,16 +107,22 @@ test("loaded camera page selects WebRTC and switches roles without any control r
   });
   await page.goto("http://127.0.0.1:"+server.address().port);
   await page.waitForFunction(()=>AM1CameraHealth().transport==="webrtc"&&AM1CameraHealth().video?.fresh);
-  await page.evaluate(()=>AM1CameraSelect("wrist_right"));
+  assert.equal(await page.locator("#primary").getAttribute("data-role"),"chest");
+  assert.equal(requests.find(request=>request.path.startsWith("/api/onboard/webrtc/")).path,"/api/onboard/webrtc/chest");
+  await page.locator('button.view[data-role="wrist_right"]').click();
   await page.waitForFunction(()=>AM1CameraHealth().selected_role==="wrist_right"&&AM1CameraHealth().video?.fresh);
   assert.equal(await page.locator("#primary video").getAttribute("data-rotation"),"270");
   await page.evaluate(()=>AM1CameraReconnect("wrist_right"));
   await page.waitForFunction(()=>AM1CameraHealth().video?.fresh);
   assert.ok(requests.some(request=>request.path==="/api/onboard/webrtc/wrist_right"));
   assert.ok(requests.some(request=>request.path==="/api/onboard/progress"));
-  assert.ok(!requests.some(request=>/\/api\/(claim|start|connect|renew|input|stop|pause)(?:\/|$)/.test(request.path)));
   assert.ok(!requests.some(request=>request.path.includes("stream.mjpeg")||request.path.includes("/mjpeg/")));
   assert.deepEqual(errors,[]);
+  const beforeReload=requests.length;
+  await page.reload();
+  await page.waitForFunction(()=>AM1CameraHealth().transport==="webrtc"&&AM1CameraHealth().video?.fresh);
+  assert.equal(await page.locator("#primary").getAttribute("data-role"),"chest");
+  assert.equal(requests.slice(beforeReload).find(request=>request.path.startsWith("/api/onboard/webrtc/")).path,"/api/onboard/webrtc/chest");
   const holdResponse=()=>{let arrive,release;const ready=new Promise(resolve=>{arrive=resolve;}),wait=new Promise(resolve=>{release=resolve;});
     return {arrive,release,ready,wait,capturedAt:null};};
   for(const ordering of ["before Chest binding","after Chest binding"])await t.test("old Front status "+ordering,{timeout:8000},async()=>{
@@ -139,7 +145,6 @@ test("loaded camera page selects WebRTC and switches roles without any control r
     }finally{gate.release();offer?.release();}
   });
   await t.test("current status still reconciles a shared producer role change",{timeout:8000},async()=>{
-    // Front has used its unchanged three-attempt allowance in the prior cases.
     const first=requests.length;selected="backward";generation=randomUUID();
     await page.waitForFunction(()=>AM1CameraHealth().selected_role==="backward"&&AM1CameraHealth().video?.fresh);
     assert.ok(requests.slice(first).some(request=>request.path==="/api/onboard/webrtc/backward"));
@@ -170,6 +175,7 @@ test("loaded camera page selects WebRTC and switches roles without any control r
   const stoppedDiagnostic=await readDiagnostic();assert.equal(stoppedDiagnostic.attempt,liveDiagnostic.attempt);
   assert.equal(stoppedDiagnostic.state,"stopped");assert.deepEqual(stoppedDiagnostic.records.slice(0,liveDiagnostic.records.length),liveDiagnostic.records);
   assert.equal(await page.evaluate(()=>AM1CameraHealth().video?.fresh),false);
+  assert.ok(!requests.some(request=>/\/api\/(claim|start|connect|renew|input|stop|pause)(?:\/|$)/.test(request.path)));
   await page.close();
 });
 

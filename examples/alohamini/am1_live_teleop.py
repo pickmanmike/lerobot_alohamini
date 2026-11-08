@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from uuid import UUID
 
 TELEOP_RECIPE = "physical-live-teleop"
+ORDINARY_AM1_ARMS_PROFILE = "ordinary-am1-arms-v1"
 TELEOP_ARM_KEYS = tuple(
     f"arm_{side}_{joint}.pos"
     for side in ("left", "right")
@@ -90,7 +91,15 @@ def validate_body(body):
     return dict(body)
 
 
-def validate_source(source, *, grant_id, previous=None):
+def movement_input_lifetime_s(profile: str | None) -> float:
+    return 0.5 if profile == ORDINARY_AM1_ARMS_PROFILE else 0.25
+
+
+def browser_view_lifetime_s(profile: str | None) -> float:
+    return 1.0 if profile == ORDINARY_AM1_ARMS_PROFILE else 0.5
+
+
+def validate_source(source, *, grant_id, previous=None, profile=None):
     fields = {
         "kind",
         "source_id",
@@ -114,7 +123,7 @@ def validate_source(source, *, grant_id, previous=None):
     if (
         not all(number(v) for v in (acquired, received, sent))
         or not 0 <= received <= acquired <= sent
-        or sent - received >= 0.25
+        or sent - received >= movement_input_lifetime_s(profile)
     ):
         raise ValueError("acquisition must follow original grant receipt and remain fresh")
     if previous is not None and (
@@ -155,7 +164,6 @@ CURRENT_REST_WORKSPACE_PROFILES = {
 # Fixed initial ordinary region, expressed in each installed calibrated encoder.
 # The non-elbow arm rows include a declared three-count normal rest margin;
 # endpoints at calibration limits remain literal limits, never runtime clipping.
-ORDINARY_AM1_ARMS_PROFILE = "ordinary-am1-arms-v1"
 ORDINARY_AM1_ARM_CALIBRATION = {
     "arm_left_shoulder_pan": (1, 0, -1761, 731, 3438),
     "arm_left_shoulder_lift": (2, 0, 515, 848, 3223),

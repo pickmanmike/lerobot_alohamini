@@ -6,7 +6,7 @@ from uuid import uuid4
 import pytest
 
 from examples.alohamini.am1_session_contract import RECIPES, Recipe
-from tests.robots.test_am1_live_teleop_contract import KEYS, source, workspace
+from tests.robots.test_am1_live_teleop_contract import KEYS, ordinary_start_workspace, source, workspace
 from tests.robots.test_am1_physical_executor import ControlledHost, executor
 
 
@@ -315,6 +315,62 @@ def test_authority_accepts_exact_frame_and_retains_source_history_when_input_cle
         assert e._live_target["source"] == src
         a._clear_input()
         assert a.run["input_source"] == src
+    finally:
+        a.run = None
+        a.close()
+
+
+@pytest.mark.parametrize("profile,lifetime", [(None, .25), ("ordinary-am1-arms-v1", .5)])
+def test_profile_scoped_grant_and_view_preserve_original_clocks(tmp_path, profile, lifetime):
+    a, e, ids = authority_lane(tmp_path)
+    now = [10.]
+    a.clock = lambda: now[0]
+    if profile is not None:
+        a.run["ordinary_arm_profile"] = {"profile": profile, "right_elbow_p": 16}
+    progress = dict(op="view_progress", run_id=e.run_id, role="chest", owner_generation="owner",
+                    capture_generation="capture", encode_generation="encode", decoded_frames=1,
+                    media_time=.1, source_sequence=1, source_fresh=True, received_at_monotonic_s=9.875,
+                    request_received_at_monotonic_s=10.)
+    try:
+        assert a._handle(progress, "gateway-view")["accepted"]
+        assert a._handle(dict(op="grant", **ids), "pc")["expires"] == 10. + lifetime
+        now[0] = 10.125
+        assert a._handle(dict(progress, request_received_at_monotonic_s=now[0]), "gateway-view")["accepted"]
+        assert a._teleop_view["received_at_monotonic_s"] == 9.875
+        now[0] = 10.625
+        assert a._teleop_view_qualified() is (profile is not None)
+        stale = dict(progress, decoded_frames=2, media_time=.2, request_received_at_monotonic_s=10.25)
+        assert a._handle(stale, "gateway-view")["accepted"] is False
+        now[0] = 10.875
+        assert not a._teleop_view_qualified()
+    finally:
+        a.run = None
+        a.close()
+
+
+def test_ordinary_input_mailbox_preserves_the_issuing_grant_expiry(tmp_path):
+    a, e, ids = authority_lane(tmp_path)
+    now = [10.]
+    a.clock = e.clock = lambda: now[0]
+    a.run["ordinary_arm_profile"] = e.ordinary_arm_profile = {"profile": "ordinary-am1-arms-v1", "right_elbow_p": 16}
+    geometry = ordinary_start_workspace()
+    e.sample["ack"]["live_input"]["workspace"] = geometry
+    try:
+        a._teleop_view = {"run_id": e.run_id, "qualified_until": 11.}
+        grant = a._handle(dict(op="grant", **ids), "pc")
+        src = source(grant=grant["grant_id"])
+        src["sent_at_monotonic_s"] = src["grant_received_at_monotonic_s"] + .375
+        now[0] = 10.375
+        e.sample["at"] = now[0]
+        frame = dict(op="input", **ids, grant_id=grant["grant_id"], seq=1, source=src,
+                     target=geometry["startup_acquisition"]["command_reference"],
+                     body={"x.vel": 0., "y.vel": 0., "theta.vel": 0., "lift_axis.vel": 0})
+        result = a._handle(frame, "pc")
+        assert result["accepted"], result
+        assert grant["expires"] == e._live_target["valid_until_monotonic_s"] == 10.5
+        assert a._handle(dict(op="grant", **ids), "pc")["expires"] == 10.875
+        assert e._live_target["valid_until_monotonic_s"] == 10.5
+        assert a.applied_input["expires"] == 10.5
     finally:
         a.run = None
         a.close()
@@ -3801,7 +3857,7 @@ def test_ordinary_startup_view_requirement_is_bound_before_worker(tmp_path, monk
                 assert e._startup_view_progress["qualified_until"]==original
                 return  # Only normal subsequent Core lifecycle admission may promote NativeLive.
             assert e._startup_view_requirement["controller_expires"]==a.controller["expires"]
-            assert e._startup_view_progress["qualified_until"]==original==10.5
+            assert e._startup_view_progress["qualified_until"]==original==11.
             assert e._lifecycle["startup_deadline"]==requirement["startup_deadline"]
             paused=a._handle({"op":"pause","run_id":a.run["run_id"],"operation_id":str(uuid4())},"pc")
             assert paused["accepted"] and a.run["status"]=="finishing"

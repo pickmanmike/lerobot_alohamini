@@ -415,6 +415,93 @@ def test_explicit_pause_reuses_current_hold_then_generic_fresh_resume_without_in
     assert client.snapshot["run"]["status"] == "running" and guard.original == original
 
 
+@pytest.mark.parametrize("fault", [None, "new_pause", "stop", "takeover", "expired", "pre_send_pause", "unknown", "external_pause"])
+def test_explicit_resume_retries_only_a_definite_view_refusal_from_its_own_pause(fault):
+    import asyncio
+
+    m = adapter()
+    client, commands, change = ordinary_paused_control_client()
+    records = []
+    guard = m.SameRunRecovery(client, records.append)
+    original = guard.original.copy()
+    send, read = client.command, client.get
+    refused = False
+    owner_read = False
+    newer_local_pause = False
+
+    async def command(value, **kwargs):
+        nonlocal refused, newer_local_pause
+        if value["op"] != "resume":
+            return await send(value, **kwargs)
+        if refused:
+            assert owner_read, "the new operation must follow a fresh authenticated state read"
+            if fault == "pre_send_pause":
+                newer_local_pause = True  # Local input arriving during the wire ACK wait.
+            kwargs["check"]()
+            result = await send(value, **kwargs)
+            client.snapshot = (await read("state"))["snapshot"]  # Deliver the real-method active ACK.
+            return result
+        refused = True
+        commands.append(dict(value))
+        if fault == "unknown":
+            raise ConnectionError("Resume result unavailable")
+        raise m.CommandRefusedError(
+            dict(accepted=False, status="refused", effect_admitted=False,
+                 reason="current required selected view must advance before Resume")
+        )
+
+    async def get(path):
+        nonlocal owner_read
+        if refused:
+            owner_read = True
+            state = client.fixture_state
+            run = state["run"]
+            run["remaining_s"] -= .001
+            state["evidence"]["accepted_host_action"]["acquired_at_monotonic_s"] = run["deadline"] - run["remaining_s"]
+            if fault == "new_pause":
+                change("pause")
+            elif fault == "stop":
+                run["status"] = "stopped"
+            elif fault == "takeover":
+                state["controller"]["controller_generation"] = str(uuid4())
+        return await read(path)
+
+    def control():
+        if refused and fault == "expired":
+            raise ValueError("local control original acquisition expired")
+        if newer_local_pause:
+            raise ValueError("explicit Resume superseded by newer local Pause")
+
+    client.command, client.get = command, get
+    async def check():
+        proof = await guard.finish_owned(
+            bench=False, wall_deadline=m.time.monotonic() + 2, renewal_check=lambda: None,
+            deliberate=True, observed_pause=client.snapshot["events"][-1] if fault == "external_pause" else None,
+        )
+        assert (proof["pause_operation_id"] is not None) is (fault != "external_pause")
+        if fault is None:
+            await guard.resume_paused(proof, wall_deadline=m.time.monotonic() + 2,
+                                      renewal_check=lambda: None, control_check=control)
+            assert client.snapshot["run"]["status"] == "running"
+        else:
+            with pytest.raises((m.CommandRefusedError, ConnectionError, RuntimeError, ValueError)):
+                await guard.resume_paused(proof, wall_deadline=m.time.monotonic() + 2,
+                                          renewal_check=lambda: None, control_check=control)
+
+    asyncio.run(check())
+    resumed = [value for value in commands if value["op"] == "resume"]
+    assert len(resumed) == (2 if fault is None else 1)
+    if fault is None:
+        first, later = resumed
+        assert first["operation_id"] != later["operation_id"]
+        assert {k: v for k, v in first.items() if k != "operation_id"} == {
+            k: v for k, v in later.items() if k != "operation_id"
+        }
+        assert next(row for row in records if row["event"] == "resume_view_refused")["operation_id"] == first["operation_id"]
+    assert all(value["op"] in {"pause", "connect", "release_input", "resume"} for value in commands)
+    assert guard.original == original
+
+
 def test_deliberate_pause_unknown_receipt_replays_only_same_operation_and_keeps_hold():
     import asyncio
     m = adapter()
@@ -2348,8 +2435,10 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                             host_incarnation="host", intent_revision=self.snapshot["run"]["intent_revision"])
             return {"run_id": self.snapshot["run"]["run_id"] if foreign_boundary else owned_id}
 
-        async def resume(self, *, check=None, refusal_record=None, qualification_ceiling=None):
+        async def resume(self, *, check=None, refusal_record=None, qualification_ceiling=None, deliberate_pause=None):
             assert self.snapshot["run"]["run_id"] == owned_id
+            if deliberate_pause is not None:
+                assert control_case and deliberate_pause == self.snapshot["events"][-1]
             if failure in {"bench_renewal_during_resume", "bench_renewal_attach_ceiling"} and self.resumes == 0:
                 self.resumes += 1
                 self.snapshot["controller"] = None
@@ -15695,10 +15784,11 @@ def test_optional_next_grant_uses_real_core_ipc_tls_and_original_input_deadline(
         tmp_path, monkeypatch, "next_grant_" + mode)
 
 
+@pytest.mark.parametrize("ordinary", [False, True])
 @pytest.mark.parametrize("change", [None,"service","run","host","controller","connection","revision","deadline",
     "operation","pause","stop","feedback","view","transport","late","newer_control","malformed",
     "missing_operation","missing_live","missing_deadline","invalid_operation","boolean_live","infinite_deadline","boolean_revision","null_host","opaque_host"])
-def test_optional_next_grant_cache_is_one_use_original_age_and_full_identity(monkeypatch, change):
+def test_optional_next_grant_cache_is_one_use_original_age_and_full_identity(monkeypatch, change, ordinary):
     from types import SimpleNamespace
     m = adapter()
     client = object.__new__(m.SessionClient)
@@ -15711,6 +15801,9 @@ def test_optional_next_grant_cache_is_one_use_original_age_and_full_identity(mon
         "run":{"run_id":str(uuid4()),"backend_incarnation":str(uuid4()),"intent_revision":3,"operation_id":str(uuid4()),
                "status":"running","uncertain":False,"recovery":None,"native_live_at":9.,"deadline":309.},
         "evidence":{"feedback":True,"required_observation":True}}
+    if ordinary:
+        client.snapshot["run"]["ordinary_arm_profile"] = {"profile":"ordinary-am1-arms-v1","right_elbow_p":16}
+    lifetime = .5 if ordinary else .25
     now = [100.1]
     monkeypatch.setattr(m.time, "perf_counter", lambda:now[0])
     unqualified = change in {"missing_operation","missing_live","missing_deadline","invalid_operation",
@@ -15725,7 +15818,7 @@ def test_optional_next_grant_cache_is_one_use_original_age_and_full_identity(mon
     elif change == "opaque_host":client.snapshot["run"]["backend_incarnation"] = "opaque-host-identity"
     identity = client.identities()
     command = {"op":"input",**identity,"request_next_grant":True}
-    grant = {"accepted":True,"status":"granted","grant_id":str(uuid4()),"issued":10.,"expires":10.25,"next_grant_supported":True}
+    grant = {"accepted":True,"status":"granted","grant_id":str(uuid4()),"issued":10.,"expires":10.+lifetime,"next_grant_supported":True}
     result = {"accepted":True,"status":"input","effect_admitted":True,"next_grant":grant}
     timing = {"request_started_at_monotonic_s":100.,"response_observed_at_monotonic_s":100.1}
     if change == "newer_control":
@@ -15746,10 +15839,10 @@ def test_optional_next_grant_cache_is_one_use_original_age_and_full_identity(mon
     elif change in {"pause","stop"}:client.snapshot["run"]["status"] = "paused" if change=="pause" else "stopped"
     elif change in {"feedback","view"}:client.snapshot["evidence"]["feedback" if change=="feedback" else "required_observation"] = False
     elif change == "transport":client.transport_error = "lost reporting"
-    elif change == "late":now[0] = 100.25
+    elif change == "late":now[0] = 100.+lifetime
     retained = client._take_next_grant(identity)
     if change in {None,"opaque_host"}:
-        assert retained["grant"] == grant and retained["received"] == 100.1 and retained["ceiling"] == 100.25
+        assert retained["grant"] == grant and retained["received"] == 100.1 and retained["ceiling"] == 100.+lifetime
     else:assert retained is None
     assert client._take_next_grant(identity) is None
 

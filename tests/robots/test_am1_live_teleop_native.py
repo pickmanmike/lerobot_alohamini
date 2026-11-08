@@ -236,6 +236,29 @@ def test_bad_complete_frames_cannot_change_native_targets(mutation):
     assert robot.events == events
 
 
+def test_ordinary_native_admission_and_write_use_the_original_half_second_grant(monkeypatch):
+    from tests.robots.test_am1_live_teleop_contract import ordinary_start_workspace
+
+    now, identity, binding, robot, control = lane()
+    assert control.apply(robot, frame(identity, binding, 1))
+    workspace = ordinary_start_workspace()
+    control._live_summary["workspace"] = workspace
+    monkeypatch.setattr(robot, "_am1_activation_calibration", lambda bus, name: workspace["calibration"][name])
+    original = sample(control, expiry=10.5)
+    original["target"] = workspace["startup_acquisition"]["command_reference"]
+    original["source"]["sent_at_monotonic_s"] = original["source"]["grant_received_at_monotonic_s"] + .375
+    assert control.apply(robot, frame(identity, binding, 2, mode="active", epoch=2, sample=original))
+    now[0] = 10.375
+    assert control.apply(robot, frame(identity, binding, 3, mode="active", epoch=2, sample=original))
+    snapshot = control.live_snapshot()
+    assert snapshot["valid_until_monotonic_s"] == 10.5
+    assert snapshot["last_grant_age_at_write_s"] == .375
+    now[0] = 10.5
+    assert control.check_live(robot)
+    assert control.live_sample is None and control.state == "paused"
+    assert not control.apply(robot, frame(identity, binding, 4, mode="active", epoch=2, sample=original))
+
+
 def test_actual_observation_keeps_unclipped_raw_and_original_bus_read_interval(monkeypatch):
     from lerobot.robots.alohamini import alohamini as owner, am1_live_teleop as native
     from tests.robots.test_am1_left_shoulder_evidence import SHOULDER, action_robot

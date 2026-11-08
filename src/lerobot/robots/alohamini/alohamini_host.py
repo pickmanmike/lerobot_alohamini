@@ -253,8 +253,14 @@ class AM1LocalControl:
             raise AM1LiveInputExpired()
         if self.live_sample is not None:
             now = self.clock()
+            lifetime = .25
+            if self.teleop:
+                from examples.alohamini.am1_live_teleop import movement_input_lifetime_s
+
+                profile = (self._live_summary.get("workspace") or {}).get("workspace_profile")
+                lifetime = movement_input_lifetime_s(profile)
             self._live_summary.update(last_write_checked_at_monotonic_s=now,
-                last_grant_age_at_write_s=max(0, now - (self.live_sample["valid_until_monotonic_s"] - .25)))
+                last_grant_age_at_write_s=max(0, now - (self.live_sample["valid_until_monotonic_s"] - lifetime)))
 
     def _refresh_live_cursor(self, robot: AlohaMini) -> None:
         # The motor projection carries native model definitions and the shared
