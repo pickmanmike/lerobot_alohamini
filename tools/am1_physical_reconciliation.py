@@ -15,6 +15,8 @@ import time
 import uuid
 from pathlib import Path
 
+from examples.alohamini.am1_live_teleop import ORDINARY_MAX_ACTIVITY_SECONDS, ordinary_camera_source_s
+
 MARKERS = ("cleanup-uncertain.json", "physical-in-progress.json")
 CACHE_S = 5.0
 INCOMPLETE_PREACTIVATION_ORIGIN = "preactivation-lift-unqualified"
@@ -1497,7 +1499,7 @@ def _recheck_camera_completion(config, proof):
     require(lease.get("session_id") == run_id and type(lease.get("camera_pid")) is int
             and lease["camera_pid"] == completion["camera_pid"]
             and all(number(lease.get(key)) for key in ("started_at", "deadline", "source_budget_seconds"))
-            and 1 <= lease["source_budget_seconds"] <= 900
+            and 1 <= lease["source_budget_seconds"] <= ordinary_camera_source_s(ORDINARY_MAX_ACTIVITY_SECONDS)
             and lease["deadline"] == release.get("deadline")
             and lease["deadline"] == lease["started_at"] + lease["source_budget_seconds"]
             and lease["started_at"] <= release["released_at"], "immutable original finite camera lease required")

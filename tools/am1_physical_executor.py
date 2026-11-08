@@ -15,6 +15,10 @@ from examples.alohamini.am1_live_teleop import (
     TELEOP_SPEC,
     browser_view_lifetime_s,
     movement_input_lifetime_s,
+    ordinary_camera_source_s,
+    ordinary_host_runtime_s,
+    ordinary_live_s,
+    validate_ordinary_activity_s,
     validate_body,
     validate_source,
     validate_target,
@@ -504,6 +508,7 @@ class PhysicalExecutor:
         self.positive_prerequisite = None
         self.selected_experiment = None
         self.ordinary_arm_profile = None
+        self.ordinary_activity_seconds = None
         self._lifecycle = {
             "run_id": None,
             "phase": "idle",
@@ -677,6 +682,14 @@ class PhysicalExecutor:
                 raise RuntimeError("Ordinary settings cannot change during an active owner")
             self.ordinary_arm_profile = validate_ordinary_arm_profile(policy) if policy is not None else None
 
+    def set_ordinary_activity_seconds(self, activity):
+        with self.mutex:
+            if self.worker and self.worker.is_alive():
+                raise RuntimeError("Ordinary duration cannot change during an active owner")
+            if activity is not None and self.ordinary_arm_profile is None:
+                raise ValueError("Ordinary activity budget requires an ordinary arm profile")
+            self.ordinary_activity_seconds = validate_ordinary_activity_s(activity) if activity is not None else None
+
     def set_selected_experiment(self, definition):
         """Freeze only an authority-validated descriptor before native admission."""
         with self.mutex:
@@ -689,6 +702,8 @@ class PhysicalExecutor:
             )
 
     def _live_ceiling(self):
+        if self.ordinary_activity_seconds is not None:
+            return ordinary_live_s(self.ordinary_activity_seconds)
         return (
             self.selected_experiment.live_s
             if self.recipe.name == SelectedElbowExperiment.recipe_name and self.selected_experiment is not None
@@ -1596,6 +1611,8 @@ class PhysicalExecutor:
                    if self.recipe.name == SelectedElbowExperiment.recipe_name else {}),
                 **({"ordinary_arm_profile": copy.deepcopy(self.ordinary_arm_profile)}
                    if self.ordinary_arm_profile is not None else {}),
+                **({"ordinary_activity_seconds": self.ordinary_activity_seconds}
+                   if self.ordinary_activity_seconds is not None else {}),
             )
             while True:
                 with self.mutex:
@@ -2120,11 +2137,18 @@ class ProtectedHostRun:
             if hashlib.sha256(Path(path).read_bytes()).hexdigest() != digest:
                 raise RuntimeError("preserved calibration content changed")
 
-    def start(self, run_id, incarnation, recipe, cancel, *, selected_experiment=None, ordinary_arm_profile=None):
+    def start(self, run_id, incarnation, recipe, cancel, *, selected_experiment=None, ordinary_arm_profile=None,
+              ordinary_activity_seconds=None):
         from examples.alohamini.am1_live_teleop import validate_ordinary_arm_profile
         ordinary = validate_ordinary_arm_profile(ordinary_arm_profile) if ordinary_arm_profile is not None else None
         if ordinary is not None and (recipe.name != TELEOP_RECIPE or selected_experiment is not None):
             raise ValueError("Ordinary arms require the existing whole-frame recipe without an experiment")
+        if ordinary_activity_seconds is not None and ordinary is None:
+            raise ValueError("Ordinary activity budget requires an ordinary arm profile")
+        camera_source_s = (180 + recipe.live_s + 60 + 30 if ordinary_activity_seconds is None
+                           else ordinary_camera_source_s(ordinary_activity_seconds))
+        host_runtime_s = (None if ordinary_activity_seconds is None
+                          else ordinary_host_runtime_s(ordinary_activity_seconds))
         definition = None
         if recipe.name == SelectedElbowExperiment.recipe_name:
             if selected_experiment is None:
@@ -2211,7 +2235,7 @@ class ProtectedHostRun:
             "--owned-session",
             run_id,
             "--source-budget-seconds",
-            str(180 + recipe.live_s + 60 + 30),
+            str(camera_source_s),
         ]
         camera_environment = {
             k: env[k] for k in ("PYTHONDONTWRITEBYTECODE", "AM1_CAMERA_PYTHON", "AM1_CAMERA_LOG_DIRECTORY")
@@ -2221,7 +2245,7 @@ class ProtectedHostRun:
             self.config["camera_repository"],
             camera_command,
             camera_environment,
-            180 + recipe.live_s + 60 + 50,
+            camera_source_s + 20,
             20,
             signal_name="SIGTERM",
             log=self.camera_log,
@@ -2292,6 +2316,9 @@ class ProtectedHostRun:
         if ordinary is not None:
             host_command.extend(["--am1-ordinary-arm-profile", ordinary["profile"],
                                  "--am1-ordinary-right-elbow-p", str(ordinary["right_elbow_p"])])
+        if host_runtime_s is not None:
+            host_command.extend(["--am1-ordinary-activity-seconds", str(ordinary_activity_seconds),
+                                 "--am1-host-runtime-s", str(host_runtime_s)])
         if guarded_startup:
             host_command.extend(["--am1-startup-view-deadline", str(self.startup_view_deadline)])
         if experiment_file is not None:
@@ -2329,7 +2356,7 @@ class ProtectedHostRun:
             self.config["host_repository"],
             host_command,
             host_environment,
-            720,
+            720 if host_runtime_s is None else host_runtime_s + 80,
             80,
             signal_name="SIGINT",
             log=self.host_log,

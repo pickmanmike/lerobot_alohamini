@@ -3719,6 +3719,124 @@ def test_ordinary_profile_start_freezes_policy_without_experiment_or_advisory_vi
         a.close()
 
 
+@pytest.mark.parametrize("native_live_seconds", [915, 300, None])
+def test_ordinary_session_keeps_declared_live_deadline_across_late_resume(tmp_path, monkeypatch, native_live_seconds):
+    from tools.am1_local_observation import LocalObservationMailbox
+    from tools.am1_session_core import SessionAuthority
+
+    clock = [10.0]
+    e, _ = admitted_executor()
+    e.clock = lambda: clock[0]
+    e.observation = LocalObservationMailbox(e.observation.source, clock=e.clock, require_owned_session=True)
+    a = SessionAuthority(tmp_path, clock=e.clock, executor=e)
+    monkeypatch.setattr(e, "begin", lambda recipe: True)  # Only the device worker is simulated below.
+    geometry = ordinary_start_workspace()
+    target = geometry["startup_acquisition"]["command_reference"]
+    owner, capture, encode = (str(uuid4()) for _ in range(3))
+    sequence = 0
+
+    def feedback(state, epoch):
+        nonlocal sequence
+        sequence += 1
+        e._epoch, e._epoch_mode = epoch, "pause" if state == "paused" else "active"
+        e._epoch_revision = e.revision
+        e._dispatch_ack = state == "active"
+        e._aligned = [clock[0] - .25, clock[0] - .125, clock[0]] if state == "paused" else []
+        e.sample = {
+            "at": clock[0], "sequence": sequence, "positions": target,
+            "ack": dict(run_id=e.run_id, host_incarnation=e.host_incarnation, intent_revision=e.revision,
+                        state=state, epoch=epoch, live_input=dict(
+                            state="held" if state == "paused" else "active", reference=geometry["reference"],
+                            workspace=geometry, cursor=target, cursor_intent_revision=e.revision)),
+        }
+        e.observation.publish(dict(e.observation.request, owned_session=e.run_id, qualified=True,
+                                   owner_generation=owner, capture_generation=capture, sequence=sequence,
+                                   arrived_at=clock[0], decoded_at=clock[0], frame_sha256="a" * 64))
+
+    def view():
+        receipt = a.handle(dict(op="view_progress", run_id=e.run_id, role="chest", owner_generation=owner,
+                                capture_generation=capture, encode_generation=encode, decoded_frames=sequence,
+                                media_time=sequence / 10, source_sequence=sequence, source_fresh=True,
+                                received_at_monotonic_s=clock[0], request_received_at_monotonic_s=clock[0]),
+                           "gateway-view")
+        assert receipt["accepted"], receipt
+
+    def control_identity():
+        return dict(run_id=e.run_id, host_incarnation=e.host_incarnation,
+                    service_incarnation=a.service_incarnation, controller_generation=a.controller["generation"],
+                    intent_revision=a.run["intent_revision"],
+                    **({"connection_generation": a.connection["generation"]} if a.connection else {}))
+
+    try:
+        claim = a.handle({"op": "claim"}, "pc")
+        request = dict(op="start", operation_id=str(uuid4()), recipe="physical-live-teleop",
+                       controller_generation=claim["controller_generation"],
+                       ordinary_arm_profile={"profile": "ordinary-am1-arms-v1", "right_elbow_p": 16},
+                       ordinary_activity_seconds=900)
+        unbound = dict(request)
+        del unbound["ordinary_arm_profile"]
+        assert not a.handle(unbound, "pc")["accepted"]
+        started = a.handle(request, "pc")
+        assert started["accepted"], started
+        assert a.handle(request, "pc") == started
+        assert a.handle(dict(request, ordinary_activity_seconds=901), "pc")["reason"] == "operation conflict"
+        assert a.snapshot()["run"]["ordinary_activity_seconds"] == e.ordinary_activity_seconds == 900
+        assert a.run["startup_deadline"] == 190.0 and a.run["deadline"] is None
+        assert e._live_ceiling() == 915
+
+        clock[0] = 11.0
+        feedback("paused", 0)
+        view()
+        e._lifecycle.update(phase="live", native_live_at=11.0, backend_incarnation=e.host_incarnation)
+        if native_live_seconds is not None:
+            e._lifecycle["native_deadline_monotonic_s"] = 11.0 + native_live_seconds
+        a.tick()
+        if native_live_seconds != 915:
+            assert a.run["first_cause"] == "physical_live_deadline_mismatch"
+            assert e.finish_status == "faulted"
+            return
+        original_deadline = 926.0
+        assert a.run["status"] == "paused" and a.run["deadline"] == original_deadline
+        assert a.handle(dict(op="pause", run_id=e.run_id, operation_id=str(uuid4())), "pc")["accepted"]
+
+        # The deliberately paused run persists across the earlier 300-second
+        # ceiling. A new presence lease and fresh proofs cannot extend it.
+        clock[0] = 11.0 + 899.0
+        a.tick()
+        assert a.run["status"] == "paused" and a.controller is None
+        assert a.handle({"op": "claim"}, "pc")["accepted"]
+        assert a.handle(dict(op="connect", **control_identity()), "pc")["accepted"]
+        assert a.handle(dict(op="release_input", **control_identity()), "pc")["accepted"]
+        feedback("paused", 1)
+        view()
+        resume = a.handle(dict(op="resume", operation_id=str(uuid4()),
+                               expected_intent_revision=a.run["intent_revision"], **control_identity()), "pc")
+        assert resume["accepted"], resume
+        feedback("paused", 1)  # Native acknowledgment under the new revision.
+        a.tick()
+        feedback("active", 2)
+        grant = a.handle(dict(op="grant", **control_identity()), "pc")
+        assert grant["accepted"] and grant["expires"] == 910.5
+        received = a.handle(dict(op="input", **control_identity(), grant_id=grant["grant_id"], seq=1,
+                                 target=target, source=source(grant=grant["grant_id"]),
+                                 body={"x.vel": 0., "y.vel": 0., "theta.vel": 0., "lift_axis.vel": 0}), "pc")
+        assert received["accepted"], received
+        assert a.run["deadline"] == original_deadline and a.run["native_live_at"] == 11.0
+        assert e._live_target["valid_until_monotonic_s"] == 910.5
+
+        clock[0] = original_deadline - .125
+        a.tick()
+        assert a.run["status"] == "paused" and e.finish_status is None
+        clock[0] = original_deadline
+        a.tick()
+        assert a.run["first_cause"] == "live_deadline"
+        assert a.run["deadline"] == original_deadline and e.finish_status == "stopped"
+        assert a.applied_input is e._live_target is None
+    finally:
+        a.run = None
+        a.close()
+
+
 @pytest.mark.parametrize("policy", [None, {}, {"profile": "ordinary-am1-arms-v1", "right_elbow_p": True},
     {"profile": "ordinary-am1-arms-v1", "right_elbow_p": 24},
     {"profile": "ordinary-am1-arms-v1", "right_elbow_p": 16, "left_elbow_p": 64},

@@ -15,6 +15,13 @@ from uuid import UUID
 
 TELEOP_RECIPE = "physical-live-teleop"
 ORDINARY_AM1_ARMS_PROFILE = "ordinary-am1-arms-v1"
+ORDINARY_STARTUP_SECONDS = 180
+ORDINARY_FINISH_SECONDS = 5
+ORDINARY_FIRST_INPUT_SECONDS = 10
+# Keep a supervised session and its camera/host resources bounded to one hour.
+ORDINARY_MAX_ACTIVITY_SECONDS = 60 * 60
+ORDINARY_TEARDOWN_SECONDS = 60
+ORDINARY_CAMERA_MARGIN_SECONDS = 30
 TELEOP_ARM_KEYS = tuple(
     f"arm_{side}_{joint}.pos"
     for side in ("left", "right")
@@ -194,6 +201,39 @@ ORDINARY_AM1_RAW_BOUNDS = {
     # This is not a claim that every closure or combined pose has been qualified.
     "arm_right_gripper.pos": (2118, 3005),
 }
+
+
+def validate_ordinary_activity_s(value):
+    """Finite, whole seconds of operator activity selected before Start."""
+    if type(value) is not int or not 1 <= value <= ORDINARY_MAX_ACTIVITY_SECONDS:
+        raise ValueError("ordinary activity must be 1–3600 whole seconds")
+    return value
+
+
+def ordinary_live_s(activity_s):
+    return validate_ordinary_activity_s(activity_s) + ORDINARY_FIRST_INPUT_SECONDS + ORDINARY_FINISH_SECONDS
+
+
+def ordinary_host_runtime_s(activity_s):
+    return ORDINARY_STARTUP_SECONDS + ordinary_live_s(activity_s) + ORDINARY_TEARDOWN_SECONDS
+
+
+def ordinary_camera_source_s(activity_s):
+    return ordinary_host_runtime_s(activity_s) + ORDINARY_CAMERA_MARGIN_SECONDS
+
+
+def teleop_live_window_matches(run):
+    """Keep legacy proofs bounded, and match new runs to their declared budget."""
+    try:
+        live_at, deadline = run["native_live_at"], run["deadline"]
+        if not number(live_at) or not number(deadline):
+            return False
+        if "ordinary_activity_seconds" not in run:
+            return 0 < deadline - live_at <= TELEOP_SPEC.live_s
+        validate_ordinary_arm_profile(run.get("ordinary_arm_profile"))
+        return abs(deadline - (live_at + ordinary_live_s(run["ordinary_activity_seconds"]))) <= 1e-6
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 def validate_ordinary_arm_profile(value):

@@ -208,6 +208,14 @@ def fresh_target(ready, admitted, *, degrees, direction, ramp_seconds, side="lef
     return dict(q0=q0, target=target, targets=targets, origin=dict(commands), calibration=list(cal), workspace=workspace, side=side)
 
 
+def _is_admitted_shoulder_measurement(key, point, workspace):
+    # Normal-start acquisition can admit this measured reference above the legal Goal.
+    return (key == "arm_left_shoulder_lift.pos" and type(point["raw"]) is int
+            and point["raw"] > workspace["calibration"][key[:-4]][4]
+            and workspace.get("startup_acquisition") is not None
+            and point["normalized"] == workspace["reference"][key])
+
+
 def fresh_ordinary_targets(ready, admitted, *, ramp_seconds, gripper_direction, short=False, right_wrist_flex_degrees=3.):
     """Qualify all12 joints; plan full amplitudes for the declared composition."""
     if type(short) is not bool or short and gripper_direction != "closing":
@@ -239,11 +247,8 @@ def fresh_ordinary_targets(ready, admitted, *, ramp_seconds, gripper_direction, 
         point, cal = points[key], workspace["calibration"][key[:-4]]
         grip = key.endswith("gripper.pos")
         calibrated = type(point["raw"]) is int and cal[3] <= point["raw"] <= cal[4]
-        acquisition = workspace.get("startup_acquisition")
-        if (not calibrated and key == "arm_left_shoulder_lift.pos" and type(point["raw"]) is int
-            and point["raw"] > cal[4] and acquisition is not None
-            and acquisition["command_reference"] == origin and point["normalized"] == workspace["reference"][key]):
-            calibrated = True  # validate_workspace already binds this exact normal-start reference/Goal envelope.
+        if not calibrated and _is_admitted_shoulder_measurement(key, point, workspace):
+            calibrated = workspace["startup_acquisition"]["command_reference"] == origin
         if (not calibrated
             or not math.isfinite(point["normalized"])
             or abs(normalized_raw(point["raw"], cal, gripper=grip)-point["normalized"]) > 1e-7):
@@ -661,8 +666,13 @@ def phase_feedback(frame, *, run_id, accepted, now, workspace, targets):
         points = ack["arm_feedback"]["positions"]
         for key in TELEOP_ARM_KEYS:
             point, cal = points[key], workspace["calibration"][key[:-4]]
-            if (type(point["raw"]) is not int or not cal[3] <= point["raw"] <= cal[4]
-                or not math.isfinite(point["normalized"])
+            calibrated = type(point["raw"]) is int and cal[3] <= point["raw"] <= cal[4]
+            if not calibrated and _is_admitted_shoulder_measurement(key, point, workspace):
+                validate_workspace(workspace)
+                policy = validate_ordinary_arm_profile(run.get("ordinary_arm_profile"))
+                calibrated = (policy["profile"] == workspace["workspace_profile"]
+                              and point["read_started_at_monotonic_s"] >= max(run["native_live_at"], pi_now - .5))
+            if (not calibrated or not math.isfinite(point["normalized"])
                 or abs(normalized_raw(point["raw"], cal, gripper=key.endswith("gripper.pos"))-point["normalized"]) > 1e-7
                 or not point["read_started_at_monotonic_s"] <= point["read_completed_at_monotonic_s"] <= ack["acquired_at_monotonic_s"]):
                 raise ValueError("current measured endpoint mapping/read interval differs")

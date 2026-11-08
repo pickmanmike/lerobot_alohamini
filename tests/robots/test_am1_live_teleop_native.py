@@ -72,7 +72,7 @@ class Bus:
             self.on_write(register, values)
 
 
-def lane():
+def lane(**control_options):
     now = [10.0]
     identity = {"run_id": str(uuid4()), "host_incarnation": str(uuid4())}
     binding = {
@@ -107,7 +107,7 @@ def lane():
 
     robot.send_action = send
     control = host.AM1LocalControl(
-        **identity, live=True, live_recipe="physical-live-teleop", clock=lambda: now[0]
+        **identity, live=True, live_recipe="physical-live-teleop", clock=lambda: now[0], **control_options
     )
     return now, identity, binding, robot, control
 
@@ -169,6 +169,37 @@ def test_complete_native_frame_ramps_both_sides_and_grippers_with_original_deadl
     assert summary["live_deadline_monotonic_s"] == 310
     assert summary["valid_until_monotonic_s"] == 10.25
     assert summary["source"] == original["source"]
+
+
+def test_ordinary_native_activity_keeps_one_live_deadline_beyond_former_limit(monkeypatch):
+    from lerobot.robots.alohamini import am1_live_teleop as native
+    from tests.robots.test_am1_live_teleop_contract import ordinary_start_workspace
+
+    now, identity, binding, robot, control = lane(ordinary_activity_seconds=900)
+    workspace = ordinary_start_workspace()
+    monkeypatch.setattr(native, "workspace", lambda *args, **kwargs: workspace)
+    monkeypatch.setattr(robot, "_am1_activation_calibration", lambda bus, name: workspace["calibration"][name])
+    assert control.apply(robot, frame(identity, binding, 1))
+    deadline = control.live_snapshot()["live_deadline_monotonic_s"]
+    assert deadline == 925.
+
+    now[0] = 311.
+    move = sample(control, expiry=311.5)
+    move["target"] = workspace["startup_acquisition"]["command_reference"]
+    assert control.apply(robot, frame(identity, binding, 2, mode="active", epoch=2, sample=move))
+    assert control.live_snapshot()["valid_until_monotonic_s"] == 311.5
+    now[0] = 311.5
+    assert control.check_live(robot)
+    assert control.live_sample is None and control.state == "paused"
+
+    now[0] = 600.
+    assert control.apply(robot, frame(identity, binding, 3, mode="pause", epoch=3, revision=1))
+    assert control.live_snapshot()["live_deadline_monotonic_s"] == deadline
+    now[0] = deadline
+    assert not control.check_live(robot)
+    assert control.live_snapshot()["state"] == "budget_expired"
+    assert not control.apply(robot, frame(identity, binding, 4, mode="pause", epoch=5, revision=2))
+    assert control.live_snapshot()["live_deadline_monotonic_s"] == deadline
 
 
 def test_tiny_increments_accumulate_without_reseeding_static_measured_pose():

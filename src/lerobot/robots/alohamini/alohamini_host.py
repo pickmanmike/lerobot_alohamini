@@ -164,6 +164,7 @@ class AM1LocalControl:
     def __init__(self, *, run_id: str | None = None, host_incarnation: str | None = None,
                  selected_evidence: AM1SelectedJointEvidence | None = None,
                  live: bool = False, live_recipe: str = AM1_LIVE_RECIPE, practical_config=None,
+                 ordinary_activity_seconds: int | None = None,
                  clock: Callable[[], float] = time.monotonic) -> None:
         if (run_id is None) != (host_incarnation is None):
             raise ValueError("AM1 protected control requires both run and host identity")
@@ -179,11 +180,16 @@ class AM1LocalControl:
         self.selected_evidence = selected_evidence
         self.live = live
         self.teleop = live and live_recipe == "physical-live-teleop"
+        if ordinary_activity_seconds is not None and (not self.teleop or self.binding is None):
+            raise ValueError("ordinary activity duration requires its protected WholeRobot control")
         self._teleop_source = None
         self.practical_config = live_elbow_config(live_recipe, practical_config) if live and not self.teleop else practical_config
         if self.teleop:
-            from examples.alohamini.am1_live_teleop import TELEOP_SPEC
+            from examples.alohamini.am1_live_teleop import TELEOP_SPEC, ordinary_live_s
+
             self.live_spec = TELEOP_SPEC
+            self._teleop_live_s = (TELEOP_SPEC.live_s if ordinary_activity_seconds is None
+                                   else ordinary_live_s(ordinary_activity_seconds))
         else:
             self.live_spec = live_elbow_spec(live_recipe, self.practical_config) if live else None
         if live and self.live_spec is None:
@@ -1683,6 +1689,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--am1-right-response-p-trial-file")
     parser.add_argument("--am1-ordinary-arm-profile")
     parser.add_argument("--am1-ordinary-right-elbow-p", type=int)
+    parser.add_argument("--am1-ordinary-activity-seconds", type=int)
     parser.add_argument("--am1-admission-fd", type=int)
     parser.add_argument("--am1-startup-view-deadline", type=float)
     parser.add_argument("--am1-host-runtime-s", type=int, default=480)
@@ -1805,7 +1812,8 @@ def ordinary_arm_profile_binding(args, teleop_binding):
     """Select an ordinary session policy only inside the existing protected owner."""
     profile = getattr(args, "am1_ordinary_arm_profile", None)
     proportional = getattr(args, "am1_ordinary_right_elbow_p", None)
-    if profile is None and proportional is None:
+    activity = getattr(args, "am1_ordinary_activity_seconds", None)
+    if profile is None and proportional is None and activity is None:
         return None
     from .am1_elbow_integral import validate_ordinary_arm_profile_binding
 
@@ -1821,8 +1829,15 @@ def ordinary_arm_profile_binding(args, teleop_binding):
                 "am1_selected_experiment_file", "am1_right_p20_trial_file",
                 "am1_left_response_p_trial_file", "am1_right_response_p_trial_file"))):
         raise ValueError("ordinary arm profile requires its exact protected WholeRobot owner without an experiment")
-    return validate_ordinary_arm_profile_binding(dict(expected, version=1, profile=profile,
+    binding = validate_ordinary_arm_profile_binding(dict(expected, version=1, profile=profile,
         workload_segment="ordinary-arms", right_elbow_p=proportional))
+    if activity is not None:
+        from examples.alohamini.am1_live_teleop import ordinary_host_runtime_s
+
+        if (getattr(args, "am1_startup_view_deadline", None) is None
+                or args.am1_host_runtime_s != ordinary_host_runtime_s(activity)):
+            raise ValueError("ordinary activity requires its matched host runtime and startup view deadline")
+    return binding
 
 
 def left_response_p_trial_binding(args, teleop_binding):
@@ -2080,6 +2095,7 @@ def _run_host(args):
             live=teleop or visible_binding is not None and live_elbow_spec(visible_binding["recipe"]) is not None,
             live_recipe=AM1_LIVE_RECIPE if visible_binding is None else visible_binding["recipe"],
             practical_config=practical_config,
+            ordinary_activity_seconds=getattr(args, "am1_ordinary_activity_seconds", None),
         )
         if args.robot_model == "alohamini1" and not args.no_follower
         else None
@@ -2506,8 +2522,10 @@ def _read_startup_view_permit(directory: Path, deadline: float) -> float | None:
 
 def _await_startup_view(directory: Path, deadline: float) -> float:
     """Finish host imports before waiting for a fresh run-owned activation permission."""
+    from examples.alohamini.am1_live_teleop import ORDINARY_STARTUP_SECONDS
+
     now = time.monotonic()
-    if not now < deadline <= now + 180:
+    if not now < deadline <= now + ORDINARY_STARTUP_SECONDS:
         raise RuntimeError("invalid protected startup view deadline")
     descriptor = os.open(directory / "startup-view-ready", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     os.close(descriptor)
@@ -2529,11 +2547,17 @@ def main():
         not protected and any(value is not None for value in protected_fields)
     ):
         parser.error("AM1 protected transport requires run ID, host incarnation and cleanup receipt together")
+    if args.am1_ordinary_activity_seconds is not None:
+        try:
+            ordinary_arm_profile_binding(args, visible_control_binding(args))
+        except ValueError as error:
+            parser.error(str(error))
     if protected:
         if (args.robot_model != "alohamini1" or args.no_follower or not args.no_cameras
             or args.skip_lift_home or args.lift_relief or args.lift_readback
             or args.max_relative_target is None or not 0 < args.max_relative_target <= 20
-            or not 0 < args.max_loop_freq_hz <= 30 or not 0 < args.am1_host_runtime_s <= 480):
+            or not 0 < args.max_loop_freq_hz <= 30
+            or args.am1_ordinary_activity_seconds is None and not 0 < args.am1_host_runtime_s <= 480):
             parser.error("AM1 protected backend requires the reviewed AM1 Local camera-free bounded host")
         directory = Path(args.am1_protected_run_directory)
         if not directory.is_absolute():

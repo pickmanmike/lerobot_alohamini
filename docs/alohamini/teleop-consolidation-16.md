@@ -834,6 +834,25 @@ One stopped format inventory found all five roles advertise MJPEG/YUYV, includin
 ## Verification and ordinary use
 
 
+### Ordinary AM1 launcher
+
+Open a PowerShell 7 terminal. Run the launcher from the existing AM1 worktree. It opens the enrolled Edge viewer with the established software decoder and prompts for Start. Confirm Chest is visible, return to the terminal, and press Enter. Typing anything at the prompt cancels.
+
+```powershell
+Set-Location 'C:/Users/pickm/.codex/worktrees/am1-reliability-01/lerobot_alohamini_client'
+.\tools\run_am1_ordinary.ps1 -SessionMinutes 15
+```
+
+Fifteen minutes is the default. Select a different duration before Start, in whole seconds expressed as minutes (for example, `-SessionMinutes 0.5` gives 30 seconds). The launcher supports up to one hour of supervised activity to bound the dedicated host, camera, and recording resources. It uses the existing private ordinary configuration and matched component binding. The legacy short duration in that file remains available to the diagnostic coordinator.
+
+The original native deadline is set at qualified Live. It includes the selected activity duration, ten seconds to establish interactive input, and the existing five seconds for Finish. The 180-second startup budget is separate. The activity clock includes pauses and temporary holds. The PC reserves time for Finish inside the native deadline. Each native input still has its own original 500 ms validity, and local observation, browser view, ownership, and device checks still have their own clocks.
+
+The terminal displays Ready with the current target reference and legal ranges for each joint. Use small changes inside those ranges. An example is `move 3 10 right_elbow_flex=1.5` when that value lies in the displayed range. Gripper values are opening percentages. Use `hold 10` to maintain the current target, `pause 10` to pause, `resume 10` to request qualified control, then type a fresh movement command. `return 3 10` targets the original command reference. Type `finish` for ordinary shutdown, or use **Stop** in the viewer for immediate cancellation. Watch the terminal and the working view during motion.
+
+The launcher defaults to the private profile's established RIGHT elbow setting. The optional `-RightElbowP 32` selects the existing temporary comparison for that joint. The native transaction verifies the active value and restores the original P16/I0/D32 on shutdown. Keep actual target, measured motion and restoration results separate.
+
+The manual adapter invocation below remains a short diagnostic entry point. Use the launcher above for the selectable ordinary session.
+
 ### Ordinary two-arm profile and input boundary
 
 The [canonical current-state record](current-state.md#current-operation-and-installation) identifies the actual installed profile, component bindings, rollback and physical qualification. The `ordinary-am1-arms-v1` procedure below has demonstrated useful wider movement, normal Finish and a separate useful fresh Start with normal finishing. The intervening short run's PC Finish failure remains recorded above. Use the existing enrolled viewer. Earlier relit source/display evidence supports coarse Chest awareness at its recorded scope; the canonical current-state record tracks installed startup gating and the latest viewing/access qualification. Do not infer movement from software/staging checks. Earlier LEFT response-experiment invocations below are historical; their nonce is not the normal profile's permission token.
@@ -880,6 +899,8 @@ The declared initial qualification envelope is below. Positioning values use `no
 Positioning rate is at most5 encoder degrees/s, converted into each calibration's normalized units; grippers are at most20 opening points/s. The actual workspace publishes the exact rates. LEFT uses tested temporary P32/I0/D32/Acceleration254, RIGHT explicitly P16 or the scoped temporary P32 comparison with I0/D32/Acceleration0, and other joints retain baseline. Both elbow originals are captured and restored; there is no permanent EEPROM default change. Body/lift movement intent stays zero. The original300s native ceiling and prospective configured input window remain fixed within each operation; the Stage120 ordinary arm trial uses 500 ms original movement expiry and a one-second browser allowance, while actual local sensing and new view evidence admission keep their 500 ms checks. These clocks are independent of controller lifetime.
 
 ### Quest handoff boundary
+
+The launcher is the desktop operator entry point. A Quest producer should enter through the existing live intention acquisition boundary. The adapter's existing JSONL mode is suitable for a producer that shares its monotonic clock domain. A remote Quest client needs an explicit clock mapping and a transport that preserves when each source sample was acquired. Qualify the headset's current useful view before granting control. Map the two controllers to the twelve normalized joint targets, including the two opening-percentage grippers, and send fresh bounded intents. Implement deliberate clutch/Pause, qualified Resume with fresh input, Finish and cancellation through the same ownership helpers. Keep the Pi's native deadline, command expiry and stop enforcement authoritative.
 
 Quest should supply genuinely acquired, expiring intentions at the existing producer boundary before mapping, clutch, FrameProducer, grant/transport and sole-owner execution. Each arm has five positioning joints plus one opening-percentage gripper. Headset/controller pose needs a later calibrated pose/IK mapping into these normalized targets; the current bounds are not an anatomical or URDF joint model. Preserve actual headset sample time through transport, reject replay, and qualify the actual headset's useful view. A cached pose or healthy desktop video cannot stand in for current headset input or viewing. A next permission piggybacked on Input authorizes fresh acquisition; it neither renews the prior pose nor carries authority through Pause, takeover, expiry or owner reboot. No Quest app, autonomy stack, THETA dependency or new GPU environment is implemented by this continuation.
 

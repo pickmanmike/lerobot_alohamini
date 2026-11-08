@@ -173,3 +173,24 @@ def test_config_refuses_an_explicit_output_destination_before_ownership(tmp_path
     monkeypatch.setattr(adapter,"run",lambda args:pytest.fail("conflicting output reached ownership"))
     with pytest.raises(SystemExit):
         adapter.main(["--ordinary-config",str(path),"--output",str(tmp_path/"selected-output")])
+
+
+@pytest.mark.parametrize("minutes,seconds", [(15, 900), (0.5, 30), (60, 3600)])
+def test_ordinary_duration_uses_one_declared_budget(tmp_path, minutes, seconds):
+    from examples.alohamini.am1_live_teleop import ordinary_live_s
+
+    path, _ = configuration(tmp_path)
+    args = SimpleNamespace(ordinary_config=str(path), session_minutes=minutes, virtual_input="interactive")
+    adapter.resolve_ordinary_config(args)
+    assert args.duration_seconds == args.ordinary_activity_seconds == seconds
+    body = adapter._start_body(args, "controller")
+    assert body["ordinary_activity_seconds"] == seconds
+    assert ordinary_live_s(seconds) == seconds + 15
+
+
+@pytest.mark.parametrize("value", [True, 0, 1.1, 3601, float("inf"), "900"])
+def test_ordinary_activity_refuses_invalid_seconds(value):
+    from examples.alohamini.am1_live_teleop import validate_ordinary_activity_s
+
+    with pytest.raises(ValueError, match="activity"):
+        validate_ordinary_activity_s(value)
