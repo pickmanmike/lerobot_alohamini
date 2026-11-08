@@ -6,6 +6,7 @@ param(
     [string]$OrdinaryConfig,
     [string]$ConsoleConfig,
     [ValidateSet(16, 32)][int]$RightElbowP,
+    [switch]$UseOpenViewer,
     [switch]$Start
 )
 
@@ -20,6 +21,7 @@ function Invoke-Am1Ordinary {
         [string]$OrdinaryConfig,
         [string]$ConsoleConfig,
         [ValidateSet(16, 32)][int]$RightElbowP,
+        [switch]$UseOpenViewer,
         [switch]$Start
     )
 
@@ -50,8 +52,14 @@ function Invoke-Am1Ordinary {
     $uv = Get-Command uv -CommandType Application
     $minutes = $SessionMinutes.ToString('R', [System.Globalization.CultureInfo]::InvariantCulture)
 
-    $viewerExit = Invoke-Am1Console -ConfigPath $consolePath -SessionUrl $ordinary.url -SoftwareVideoDecode
-    if ($viewerExit -ne 0) { return $viewerExit }
+    $sessionUrl = [string]$ordinary.url
+    if ($sessionUrl -match '^https://[^/?#]+$') { $sessionUrl += '/' }
+    if ($UseOpenViewer) {
+        Write-Host 'Using the open enrolled AM1 viewer.'
+    } else {
+        $viewerExit = Invoke-Am1Console -ConfigPath $consolePath -SessionUrl $sessionUrl -SoftwareVideoDecode
+        if ($viewerExit -ne 0) { return $viewerExit }
+    }
 
     if (-not $Start) {
         $choice = Read-Host "With Chest visible, press Enter to start the $minutes-minute session or type q to cancel"

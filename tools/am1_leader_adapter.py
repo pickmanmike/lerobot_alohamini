@@ -5012,7 +5012,7 @@ async def run(args):
                 bound = ready_geometry["bounds"][key]
                 low, high = bound["min"], bound["max"]
                 print(f"  {key[4:-4]:25s} {origin:8.2f}  [{low:.2f}, {high:.2f}]", flush=True)
-        elif event in {"cause_specific_hold", "inactive_native_recovery_held"}:
+        elif event in {"cause_specific_hold", "inactive_native_recovery_held", "native_recovery_wait"}:
             run = (value.get("snapshot") or {}).get("run") or {}
             reason = value.get("cause") or run.get("first_cause") or "waiting for current required proof"
             show_status(f"Temporary hold: {reason.replace('_', ' ')}.")
