@@ -19,6 +19,28 @@ def contract():
     return importlib.import_module(name)
 
 
+@pytest.mark.parametrize("value", [
+    {}, {"profile": "ordinary-am1-arms-v1", "right_elbow_p": True},
+    {"profile": "ordinary-am1-arms-v1", "right_elbow_p": 20},
+    {"profile": "other", "right_elbow_p": 16},
+    {"profile": "ordinary-am1-arms-v1", "right_elbow_p": 16, "extra": 1},
+])
+def test_ordinary_arm_policy_rejects_open_or_unsupported_settings(value):
+    validate = getattr(contract(), "validate_ordinary_arm_profile", None)
+    assert callable(validate), "ordinary profile must validate before authority or native settings"
+    with pytest.raises(ValueError):
+        validate(value)
+
+
+@pytest.mark.parametrize("proportional", [16, 32])
+def test_ordinary_arm_policy_is_closed_and_copied(proportional):
+    validate = getattr(contract(), "validate_ordinary_arm_profile", None)
+    assert callable(validate), "ordinary profile must validate before authority or native settings"
+    value = {"profile": "ordinary-am1-arms-v1", "right_elbow_p": proportional}
+    result = validate(value)
+    assert result == value and result is not value
+
+
 def source(seq=1, grant=None):
     return {
         "kind": "virtual-leaders",
@@ -85,6 +107,23 @@ def test_old_capture_cannot_be_made_fresh_by_a_new_grant_or_source_generation():
             m.validate_source(bad, grant_id=bad["grant_id"], previous=first)
     fresh = source(2)
     assert m.validate_source(fresh, grant_id=fresh["grant_id"], previous=first) == fresh
+
+
+@pytest.mark.parametrize("profile,age,valid", [
+    (None, .375, False),
+    ("ordinary-arms-left-current-rest-1051-1164", .375, False),
+    ("ordinary-am1-arms-v1", .375, True),
+    ("ordinary-am1-arms-v1", .5, False),
+])
+def test_source_lifetime_is_scoped_to_the_admitted_ordinary_arm_profile(profile, age, valid):
+    m = contract()
+    frame = source()
+    frame["sent_at_monotonic_s"] = frame["grant_received_at_monotonic_s"] + age
+    if valid:
+        assert m.validate_source(frame, grant_id=frame["grant_id"], profile=profile) == frame
+    else:
+        with pytest.raises(ValueError, match="remain fresh"):
+            m.validate_source(frame, grant_id=frame["grant_id"], profile=profile)
 
 
 def test_body_height_has_explicit_precedence_and_never_overrides_nonzero_velocity():
@@ -252,3 +291,61 @@ def test_current_entry_descriptor_and_endpoint_constants_do_not_reinterpret_lega
     assert m.LEFT_ENTRY_WORKSPACE_PROFILE == "ordinary-arms-left-entry-p16-1108-1268"
     assert (m.LEFT_ENTRY_ENDPOINT_RAW,m.LEFT_ENTRY_START_MIN_RAW,m.LEFT_ENTRY_START_MAX_RAW) == (1108,1165,1268)
     assert m.LEFT_ENTRY_START_MAX_RAW-m.LEFT_ENTRY_ENDPOINT_RAW == 160
+
+
+def ordinary_start_workspace():
+    m = contract()
+    value = dict(version=1, workspace_profile=m.ORDINARY_AM1_ARMS_PROFILE,
+        calibration={k:list(v) for k,v in m.ORDINARY_AM1_ARM_CALIBRATION.items()},
+        units={}, bounds={}, raw_bounds={}, reference={})
+    commands = {}
+    for key,(low,high) in m.ORDINARY_AM1_RAW_BOUNDS.items():
+        cal=value["calibration"][key[:-4]]; grip=key.endswith("gripper.pos")
+        raw=(low+high)//2
+        if key == "arm_left_shoulder_lift.pos": raw=3229
+        elif key == "arm_left_wrist_flex.pos": raw=2760
+        elif key == "arm_right_wrist_flex.pos": raw=3126
+        goal=3223 if key == "arm_left_shoulder_lift.pos" else 2762 if key == "arm_left_wrist_flex.pos" else 3127 if key == "arm_right_wrist_flex.pos" else raw
+        value["units"][key]="gripper_opening_percent" if grip else "normalized_arm"
+        value["raw_bounds"][key]=[low,high]
+        value["bounds"][key]=dict(min=m.normalized_raw(low,cal,gripper=grip),max=m.normalized_raw(high,cal,gripper=grip),rate_per_s=1.)
+        value["reference"][key]=m.normalized_raw(raw,cal,gripper=grip)
+        commands[key]=m.normalized_raw(goal,cal,gripper=grip)
+    value["startup_acquisition"]=dict(version=1,displacement_bound_degrees=1.,measured_reference=dict(value["reference"]),command_reference=commands)
+    return value
+
+
+def test_ordinary_start_reference_allowance_never_widens_task_command_bounds():
+    m,value=contract(),ordinary_start_workspace()
+    assert m.validate_workspace(value)==value
+    commands=value["startup_acquisition"]["command_reference"]
+    assert m.validate_target(commands,workspace=value)==commands
+    for key in ("arm_left_shoulder_lift.pos","arm_left_wrist_flex.pos","arm_right_wrist_flex.pos"):
+        with pytest.raises(ValueError): m.validate_target(dict(commands,**{key:value["reference"][key]}),workspace=value)
+
+
+@pytest.mark.parametrize("fault",["degree","bool","extra","command","far-reference","elbow-reference","foreign-profile","mapping","task-bounds","missing","arbitrary-shift"])
+def test_ordinary_start_reference_allowance_is_exact_and_role_bound(fault):
+    m,value=contract(),ordinary_start_workspace(); key="arm_right_wrist_flex.pos"
+    a=value["startup_acquisition"]
+    if fault == "degree": a["displacement_bound_degrees"]=2.
+    elif fault == "bool": a["version"]=True
+    elif fault == "extra": a["extra"]=True
+    elif fault == "command": a["command_reference"][key]=value["reference"][key]
+    elif fault == "far-reference": value["reference"][key]-=10.
+    elif fault == "elbow-reference": value["reference"]["arm_left_elbow_flex.pos"]=100.
+    elif fault == "foreign-profile": value["workspace_profile"]="ordinary-arms-left-current-rest-1051-1164"
+    elif fault == "mapping": value["calibration"][key[:-4]][0]=5
+    elif fault == "task-bounds": value["raw_bounds"][key][0]-=1
+    elif fault == "arbitrary-shift": a["command_reference"]["arm_right_shoulder_pan.pos"]+=.01
+    else: value.pop("startup_acquisition")
+    with pytest.raises(ValueError): m.validate_workspace(value)
+
+
+def test_ordinary_start_keeps_original_seed_maps_when_powered_measurement_has_residual():
+    m,value=contract(),ordinary_start_workspace()
+    original=copy.deepcopy(value["startup_acquisition"])
+    value["reference"]["arm_left_shoulder_lift.pos"]=99.9
+    value["reference"]["arm_right_shoulder_pan.pos"]+=.1
+    assert m.validate_workspace(value)==value
+    assert value["startup_acquisition"]==original

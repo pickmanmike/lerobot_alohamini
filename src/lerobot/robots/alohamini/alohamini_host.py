@@ -253,8 +253,14 @@ class AM1LocalControl:
             raise AM1LiveInputExpired()
         if self.live_sample is not None:
             now = self.clock()
+            lifetime = .25
+            if self.teleop:
+                from examples.alohamini.am1_live_teleop import movement_input_lifetime_s
+
+                profile = (self._live_summary.get("workspace") or {}).get("workspace_profile")
+                lifetime = movement_input_lifetime_s(profile)
             self._live_summary.update(last_write_checked_at_monotonic_s=now,
-                last_grant_age_at_write_s=max(0, now - (self.live_sample["valid_until_monotonic_s"] - .25)))
+                last_grant_age_at_write_s=max(0, now - (self.live_sample["valid_until_monotonic_s"] - lifetime)))
 
     def _refresh_live_cursor(self, robot: AlohaMini) -> None:
         # The motor projection carries native model definitions and the shared
@@ -1675,7 +1681,10 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--am1-right-p20-trial-file")
     parser.add_argument("--am1-left-response-p-trial-file")
     parser.add_argument("--am1-right-response-p-trial-file")
+    parser.add_argument("--am1-ordinary-arm-profile")
+    parser.add_argument("--am1-ordinary-right-elbow-p", type=int)
     parser.add_argument("--am1-admission-fd", type=int)
+    parser.add_argument("--am1-startup-view-deadline", type=float)
     parser.add_argument("--am1-host-runtime-s", type=int, default=480)
     parser.add_argument("--am1-physical-state-directory", default=str(Path.home() / ".local/state/am1-session"))
     return parser
@@ -1790,6 +1799,30 @@ def visible_control_binding(args):
         raise ValueError("Selected experiment file must contain its exact canonical finite JSON")
     args._am1_selected_elbow_experiment = definition
     return dict(binding, experiment_sha256=definition.sha256)
+
+
+def ordinary_arm_profile_binding(args, teleop_binding):
+    """Select an ordinary session policy only inside the existing protected owner."""
+    profile = getattr(args, "am1_ordinary_arm_profile", None)
+    proportional = getattr(args, "am1_ordinary_right_elbow_p", None)
+    if profile is None and proportional is None:
+        return None
+    from .am1_elbow_integral import validate_ordinary_arm_profile_binding
+
+    expected = {"run_id": args.am1_run_id, "host_incarnation": args.am1_host_incarnation, "recipe": "physical-live-teleop"}
+    if (teleop_binding != expected or args.robot_model != "alohamini1" or args.no_follower or not args.no_cameras
+            or not getattr(args, "am1_protected_run_directory", None)
+            or os.environ.get("AM1_VISIBLE_CONTROL_RECIPE") != "physical-live-teleop"
+            or os.environ.get("AM1_SCRIPTED_PREPARE") != "1"
+            or os.environ.get("AM1_SELECTED_JOINT_EVIDENCE") == "1"
+            or os.environ.get("AM1_SHOULDER_INTEGRAL_TEST") == "1"
+            or any(os.environ.get(key) is not None for key in ("AM1_ELBOW_RECOVERY", "AM1_ELBOW_RECOVERY_RECIPE", "AM1_ELBOW_INTEGRAL"))
+            or any(getattr(args, key, None) is not None for key in (
+                "am1_selected_experiment_file", "am1_right_p20_trial_file",
+                "am1_left_response_p_trial_file", "am1_right_response_p_trial_file"))):
+        raise ValueError("ordinary arm profile requires its exact protected WholeRobot owner without an experiment")
+    return validate_ordinary_arm_profile_binding(dict(expected, version=1, profile=profile,
+        workload_segment="ordinary-arms", right_elbow_p=proportional))
 
 
 def left_response_p_trial_binding(args, teleop_binding):
@@ -1911,6 +1944,7 @@ def _run_host(args):
     right_p20_binding = right_p20_trial_binding(args, visible_binding)
     left_response_binding = left_response_p_trial_binding(args, visible_binding)
     right_response_binding = right_response_p_trial_binding(args, visible_binding)
+    ordinary_binding = ordinary_arm_profile_binding(args, visible_binding)
     practical_config = live_elbow_config(None if visible_binding is None else visible_binding["recipe"])
     if right_p20_binding is not None and right_p20_binding["kind"] == "practical13-right":
         from examples.alohamini.am1_session_contract import PracticalElbowConfig
@@ -1947,6 +1981,9 @@ def _run_host(args):
         robot._am1_elbow_recovery_binding = recovery_binding
     if teleop:
         robot._am1_teleop_binding = visible_binding
+        if ordinary_binding is not None:
+            robot._am1_ordinary_arm_profile_binding = ordinary_binding
+            robot._am1_ordinary_arm_profile_directory = args.am1_protected_run_directory
         if left_response_binding is not None:
             robot._am1_left_response_p_binding = left_response_binding
             robot._am1_left_response_p_trial_directory = args.am1_protected_run_directory
@@ -1985,6 +2022,10 @@ def _run_host(args):
             robot._am1_routine_report = routine_report
             robot._am1_lift_record_writer = routine_writer
         logging.info("Connecting AlohaMini")
+        if (startup_permit := getattr(args, "_am1_startup_view_permit", None)) is not None:
+            current = _read_startup_view_permit(Path(args.am1_protected_run_directory), args.am1_startup_view_deadline)
+            if current != startup_permit or time.monotonic() >= startup_permit:
+                raise RuntimeError("protected startup view permission revoked before motor connection")
         connect_robot(robot, skip_lift_home=args.skip_lift_home)
         if routine_writer is not None:
             routine_writer.raise_if_failed()
@@ -2081,10 +2122,14 @@ def _run_host(args):
                            if getattr(robot, "_am1_left_response_p_trial", None) is not None else {}),
                         **({"right_response_p_trial": robot._am1_right_response_p_trial.receipt}
                            if getattr(robot, "_am1_right_response_p_trial", None) is not None else {}),
+                        **({"ordinary_arm_profile": robot._am1_ordinary_arm_profile.receipt}
+                           if getattr(robot, "_am1_ordinary_arm_profile", None) is not None else {}),
                     })
                 routine_writer.submit("[AM1 TELEOP REST] ", {
                     "binding": robot._am1_teleop_binding,
                     "acquisitions": robot._am1_teleop_rest_evidence,
+                    **({"ordinary_startup_acquisition": robot._am1_ordinary_arm_profile._snapshot["normal_activation"]["startup_acquisition"]}
+                       if getattr(robot, "_am1_ordinary_arm_profile", None) is not None else {}),
                 })
         # One final same-owner startup boundary before ordinary loop timing.
         # Only a due genuine read can refresh the retained original thermal slots.
@@ -2431,6 +2476,49 @@ def _run_host(args):
             raise error
 
     logging.info("Finished AlohaMini cleanly")
+def _read_startup_view_permit(directory: Path, deadline: float) -> float | None:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    path = directory / "startup-view-permit"
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(descriptor, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= 64
+                or os.name != "nt" and (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600)):
+            raise RuntimeError("invalid protected startup view permission file")
+        raw = stream.read(65)
+        if len(raw) != info.st_size:
+            raise RuntimeError("protected startup view permission changed during read")
+        expires = float(raw)
+    try:
+        current = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+        raise RuntimeError("protected startup view permission was replaced")
+    now = time.monotonic()
+    if not now < expires <= min(deadline, now + .5):
+        raise RuntimeError("protected startup view permission expired or invalid")
+    return expires
+
+
+def _await_startup_view(directory: Path, deadline: float) -> float:
+    """Finish host imports before waiting for a fresh run-owned activation permission."""
+    now = time.monotonic()
+    if not now < deadline <= now + 180:
+        raise RuntimeError("invalid protected startup view deadline")
+    descriptor = os.open(directory / "startup-view-ready", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(descriptor)
+    while time.monotonic() < deadline:
+        expires = _read_startup_view_permit(directory, deadline)
+        if expires is not None:
+            return expires
+        time.sleep(.02)
+    raise RuntimeError("protected startup view deadline expired")
+
+
 def main():
     parser = make_parser()
     args = parser.parse_args()
@@ -2460,6 +2548,11 @@ def main():
             args.am1_host_incarnation = str(UUID(args.am1_host_incarnation))
         except ValueError:
             parser.error("AM1 protected run/host identities must be UUIDs")
+    if args.am1_startup_view_deadline is not None:
+        if not protected or args.am1_ordinary_arm_profile is None:
+            parser.error("AM1 startup view permission requires a protected ordinary run")
+        args._am1_startup_view_permit = _await_startup_view(directory, args.am1_startup_view_deadline)
+
     admission = None
     first_error = None
     original_handlers = {}

@@ -236,6 +236,29 @@ def test_bad_complete_frames_cannot_change_native_targets(mutation):
     assert robot.events == events
 
 
+def test_ordinary_native_admission_and_write_use_the_original_half_second_grant(monkeypatch):
+    from tests.robots.test_am1_live_teleop_contract import ordinary_start_workspace
+
+    now, identity, binding, robot, control = lane()
+    assert control.apply(robot, frame(identity, binding, 1))
+    workspace = ordinary_start_workspace()
+    control._live_summary["workspace"] = workspace
+    monkeypatch.setattr(robot, "_am1_activation_calibration", lambda bus, name: workspace["calibration"][name])
+    original = sample(control, expiry=10.5)
+    original["target"] = workspace["startup_acquisition"]["command_reference"]
+    original["source"]["sent_at_monotonic_s"] = original["source"]["grant_received_at_monotonic_s"] + .375
+    assert control.apply(robot, frame(identity, binding, 2, mode="active", epoch=2, sample=original))
+    now[0] = 10.375
+    assert control.apply(robot, frame(identity, binding, 3, mode="active", epoch=2, sample=original))
+    snapshot = control.live_snapshot()
+    assert snapshot["valid_until_monotonic_s"] == 10.5
+    assert snapshot["last_grant_age_at_write_s"] == .375
+    now[0] = 10.5
+    assert control.check_live(robot)
+    assert control.live_sample is None and control.state == "paused"
+    assert not control.apply(robot, frame(identity, binding, 4, mode="active", epoch=2, sample=original))
+
+
 def test_actual_observation_keeps_unclipped_raw_and_original_bus_read_interval(monkeypatch):
     from lerobot.robots.alohamini import alohamini as owner, am1_live_teleop as native
     from tests.robots.test_am1_left_shoulder_evidence import SHOULDER, action_robot
@@ -772,6 +795,23 @@ def test_left_response_cli_binding_is_opt_in_and_exact_protected_teleop(monkeypa
     with pytest.raises(ValueError, match="left.*response|Left.*response"):
         host.left_response_p_trial_binding(args, identity)
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize("proportional", [16, 32])
+def test_ordinary_profile_cli_uses_protected_run_without_an_experiment(monkeypatch, proportional):
+    args = SimpleNamespace(robot_model="alohamini1", no_follower=False, no_cameras=True,
+        am1_run_id=str(uuid4()), am1_host_incarnation=str(uuid4()), am1_protected_run_directory="/private/run",
+        am1_ordinary_arm_profile="ordinary-am1-arms-v1", am1_ordinary_right_elbow_p=proportional)
+    identity = {"run_id": args.am1_run_id, "host_incarnation": args.am1_host_incarnation, "recipe": "physical-live-teleop"}
+    monkeypatch.setenv("AM1_VISIBLE_CONTROL_RECIPE", "physical-live-teleop")
+    monkeypatch.setenv("AM1_SCRIPTED_PREPARE", "1")
+    monkeypatch.delenv("AM1_SELECTED_JOINT_EVIDENCE", raising=False)
+    actual = host.ordinary_arm_profile_binding(args, identity)
+    assert actual == dict(identity, version=1, profile="ordinary-am1-arms-v1",
+                          workload_segment="ordinary-arms", right_elbow_p=proportional)
+    args.am1_left_response_p_trial_file = "/private/run/left-response-p.json"
+    with pytest.raises(ValueError, match="without an experiment"):
+        host.ordinary_arm_profile_binding(args, identity)
 
 
 @pytest.mark.parametrize("workload", ["left-maintained", "left-reach"])

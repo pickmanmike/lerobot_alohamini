@@ -10,6 +10,7 @@ import pytest
 
 from examples.alohamini.am1_finite_task import JOINT_KEYS
 from tests.robots import test_alohamini_lift_operational as operational_tests
+from tests.robots.test_am1_pre_activation import activation as activation
 
 # Reuse the actual protected operation and grouped fake-bus fixture unchanged.
 operating_robot = operational_tests.operating_robot
@@ -3581,6 +3582,8 @@ def readiness_gate_case(tmp_path, monkeypatch):
         if "-host-" in name:
             state.host=result
             logpath.write_bytes(state.initial_log)
+            if provider.startup_view is not None and getattr(state, "gate_ready_at_start", True):
+                (run_directory / "startup-view-ready").touch(mode=0o600)
             if state.socket_at_start:
                 socketpath.touch()
         else:
@@ -3982,3 +3985,522 @@ def test_supported_gripper_interval_preparer_freezes_selection_before_stopped_gu
     receipt = m.prepare_left_response_p_request(str(path), workload_segment="ordinary-arms",
         workspace_profile="ordinary-arms-left-current-rest-1051-1164", left_gripper_raw_interval=interval)
     assert interval == [0, 3102] and receipt["request"]["left_gripper_raw_interval"] == selected
+
+
+@pytest.mark.parametrize("right_p", [16, 32])
+def test_ordinary_profile_native_host_launch_has_no_experiment_request_dependency(tmp_path, monkeypatch, right_p):
+    from uuid import uuid4
+    from examples.alohamini.am1_session_contract import RECIPES
+    from lerobot.robots.alohamini import am1_elbow_integral as integral
+    m = module()
+    state, root = tmp_path/"state", tmp_path/"runs"
+    state.mkdir(mode=0o700); root.mkdir(mode=0o700)
+    provider = object.__new__(m.ProtectedHostRun)
+    provider.config = {"physical_state_directory":str(state), "run_root":str(root), "host_head":"a"*40,
+        "host_repository":str(tmp_path), "host_python":"unused-python", "camera_python":"unused-python",
+        "camera_repository":str(tmp_path), "camera_config":str(tmp_path/"config"),
+        "camera_credentials":str(tmp_path/"credentials"), "camera_binary":str(tmp_path/"binary"),
+        "camera_state":str(tmp_path/"camera")}
+    provider.observation = SimpleNamespace()
+    monkeypatch.setattr(provider,"_validate_source",lambda:None)
+    monkeypatch.setattr(m,"wait_required_camera",lambda *args:None)
+    for name in ("consume_left_response_p_request", "consume_right_response_p_request", "consume_right_p20_request"):
+        monkeypatch.setattr(integral,name,lambda *a,**k:pytest.fail("ordinary settings cannot consume an experiment nonce"))
+    owned=[]
+    def unit(name,*args,**kwargs):
+        owned.append((name,args))
+        if "host" in name:raise OSError("fixture stops before native device process")
+        return SimpleNamespace()
+    monkeypatch.setattr(m,"OwnedUnit",unit)
+    run, host = str(uuid4()), str(uuid4())
+    policy={"profile":"ordinary-am1-arms-v1", "right_elbow_p":right_p}
+    with pytest.raises(OSError,match="before native device"):
+        provider.start(run,host,RECIPES["physical-live-teleop"],lambda:None,ordinary_arm_profile=policy)
+    command=owned[-1][1][1]
+    assert command[command.index("--am1-ordinary-arm-profile")+1] == policy["profile"]
+    assert command[command.index("--am1-ordinary-right-elbow-p")+1] == str(right_p)
+    assert command[command.index("--am1-run-id")+1] == run
+    assert command[command.index("--am1-host-incarnation")+1] == host
+    assert not any("trial-file" in arg or "experiment-file" in arg for arg in command)
+    assert not list(state.iterdir()) and not list((root/run[:8]).glob("*response*.json"))
+
+
+
+
+@pytest.mark.parametrize("fault", [None,"partial_startup","dedicated_false","missing","wrong_policy","host",
+    "foreign_run","restoration","obligation","proof_obligation","missing_aggregate","aggregate_none",
+    "aggregate_true","aggregate_zero","dedicated_none","dedicated_zero","body_off","missing_off","bool_off"])
+def test_ordinary_profile_cleanup_requires_exact_settings_restoration_in_addition_to_all_off(
+    activation,tmp_path,fault,
+):
+    from tests.robots.test_am1_teleop_settings import ordinary_configured_robot
+    right_p=16 if fault=="partial_startup" else 32
+    robot=ordinary_configured_robot(activation,tmp_path,right_p=right_p)
+    if fault=="partial_startup":
+        # This real fixture configures settings without entering native activation.
+        assert robot._am1_ordinary_arm_profile.receipt["active_registers"] is None
+        assert robot._am1_ordinary_arm_profile.receipt["configured_at_monotonic_s"] is not None
+    ordinary=robot._am1_ordinary_arm_profile
+    ordinary.restore(robot)
+    binding=robot._am1_teleop_binding;run,host=binding["run_id"],binding["host_incarnation"]
+    proof=ordinary.receipt
+    policy={"profile":"ordinary-am1-arms-v1","right_elbow_p":right_p}
+    m=module()
+    readbacks=[{"bus":"left" if "_left_" in key else "right","motor":key[:-4],
+                "register":"Torque_Enable","value":0} for key in JOINT_KEYS]
+    readbacks += [{"bus":"left","motor":key,"register":reg,"value":0}
+                  for key in m.BODY_MOTORS for reg in ("Torque_Enable","Goal_Velocity")]
+    receipt={"version":1,"run_id":run,"host_incarnation":host,"cleanup":"physical_readback_verified",
+             "uncertain":False,"cleanup_errors":[],"readback":{"verified":True,"lift_readback":"qualified",
+             "selected_gain_restore_required":False,"readbacks":readbacks,
+             "ordinary_arm_profile":proof}}
+    # Native cleanup emits the aggregate flag and full receipt, without a dedicated flag.
+    if fault=="missing":receipt["readback"].pop("ordinary_arm_profile")
+    elif fault=="wrong_policy":policy["right_elbow_p"]=16
+    elif fault=="host":proof["binding"]["host_incarnation"]=str(__import__("uuid").uuid4())
+    elif fault=="foreign_run":proof["binding"]["run_id"]=str(__import__("uuid").uuid4())
+    elif fault=="restoration":proof["restored_registers"]["right"]["P_Coefficient"]=32
+    elif fault=="obligation":receipt["readback"]["ordinary_arm_profile_restore_required"]=True
+    elif fault=="dedicated_false":receipt["readback"]["ordinary_arm_profile_restore_required"]=False
+    elif fault=="dedicated_none":receipt["readback"]["ordinary_arm_profile_restore_required"]=None
+    elif fault=="dedicated_zero":receipt["readback"]["ordinary_arm_profile_restore_required"]=0
+    elif fault=="proof_obligation":proof["restore_required"]=True
+    elif fault=="missing_aggregate":receipt["readback"].pop("selected_gain_restore_required")
+    elif fault=="aggregate_none":receipt["readback"]["selected_gain_restore_required"]=None
+    elif fault=="aggregate_true":receipt["readback"]["selected_gain_restore_required"]=True
+    elif fault=="aggregate_zero":receipt["readback"]["selected_gain_restore_required"]=0
+    elif fault=="body_off":readbacks[-1]["value"]=1
+    elif fault=="missing_off":readbacks.pop()
+    elif fault=="bool_off":readbacks[-1]["value"]=False
+    assert m.qualified_cleanup_receipt(receipt,run,host,ordinary_arm_profile=policy) is (
+        fault in (None,"partial_startup","dedicated_false")
+    )
+
+def test_startup_required_view_has_explicit_binding_and_original_progress_api():
+    e = executor(ControlledHost())
+    assert callable(getattr(e, "configure_startup_view", None)), "startup view requirement must be configured explicitly"
+    assert callable(getattr(e, "publish_startup_view", None)), "validated original view progress needs its own publication API"
+    assert callable(getattr(e, "startup_view_ready", None)), "the prehost camera wait needs the current same-run guard"
+
+@pytest.fixture
+def startup_required_view_case(readiness_gate_case, monkeypatch):
+    """Use the existing inert host-start fixture and actual owned local mailbox."""
+    import uuid
+    from examples.alohamini.am1_session_contract import RECIPES
+    from tools.am1_local_observation import LocalObservationMailbox, TIMING_BASIS
+
+    case = readiness_gate_case
+    case.deadline = 10.
+    m = module()
+    required_wait = m.wait_required_camera
+    # Its default sleep was captured before the existing fixture's fake clock.
+    # Exercise the real helper with that same explicit sleep injection as1119.
+    def wait_camera(camera, observation, cancel, *, required_view=None):
+        return required_wait(camera, observation, cancel, required_view=required_view,
+                             sleep=lambda seconds: m.time.sleep(seconds))
+    monkeypatch.setattr(m, "wait_required_camera", wait_camera)
+    source = {"machine": "fixture-pi", "source": "am1-camera-viewer", "device": "/dev/am_camera_chest",
+              "framing_revision": "native-chest-v1", "role": "chest"}
+    box = LocalObservationMailbox(source, clock=lambda: case.now, require_owned_session=True)
+    e = m.PhysicalExecutor(case.provider.config, box, io_factory=lambda *_: case.provider, clock=lambda: case.now)
+    policy = {"profile": "ordinary-am1-arms-v1", "right_elbow_p": 16}
+    e.set_ordinary_arm_profile(policy)
+    recipe = RECIPES["physical-live-teleop"]
+    e.bind_run("28122793-8395-4d47-9491-29a6cfc00d9a", recipe)
+    identity = dict(run_id=e.run_id, host_incarnation=e.host_incarnation, service_incarnation=str(uuid.uuid4()),
+                    controller_generation=str(uuid.uuid4()), connection_generation=str(uuid.uuid4()), intent_revision=0)
+    assert e.bind_control(**identity)
+    binding = {key:identity[key] for key in ("run_id", "host_incarnation", "service_incarnation", "controller_generation", "intent_revision")}
+    binding.update(operation_id=str(uuid.uuid4()), role="chest", startup_deadline=case.deadline,
+                   controller_expires=1.5, required=True)
+    e.configure_startup_view(binding)
+    case.provider.observation = box
+    case.provider.startup_view = e.startup_view_ready
+    case.provider.startup_view_deadline = case.deadline
+    owner, capture, encode = (str(uuid.uuid4()) for _ in range(3))
+
+    def local(sequence=1, *, owned_session=None, new_owner=None, new_capture=None):
+        box.publish(dict(box.request, owner_generation=new_owner or owner, capture_generation=new_capture or capture,
+                         owned_session=e.run_id if owned_session is None else owned_session, sequence=sequence,
+                         timing_basis=TIMING_BASIS, arrived_at=case.now, decoded_at=case.now,
+                         frame_sha256="a"*64, qualified=True))
+
+    def view(sequence=1, **changes):
+        value=dict(op="view_progress", run_id=e.run_id, role="chest", owner_generation=owner,
+                   capture_generation=capture, encode_generation=encode, decoded_frames=sequence, media_time=.1*sequence,
+                   source_sequence=sequence, source_fresh=True, received_at_monotonic_s=case.now,
+                   request_received_at_monotonic_s=case.now, qualified_until=case.now+1.)
+        value.update(changes)
+        return value
+
+    def cancel():
+        e._check_startup_view()
+        if case.fault == "stop" and case.steps >= case.fault_step:
+            raise m.StartupCancelledError("physical startup cancelled by Stop")
+        if case.now >= case.deadline:
+            raise RuntimeError("physical startup deadline expired")
+
+    case.start = lambda: case.provider.start(e.run_id,e.host_incarnation,recipe,cancel,ordinary_arm_profile=policy)
+    case.e, case.box, case.binding, case.identity, case.local, case.view = e, box, binding, identity, local, view
+    case.initial_log = b'[LIFT OPERATIONAL] {"phase":"operational_ready"}\n'
+    case.socket_at_start = True
+    return case
+
+
+def test_startup_required_view_normal_begin_refuses_missing_configuration():
+    import uuid
+    from examples.alohamini.am1_session_contract import RECIPES
+    host = ControlledHost()
+    e = executor(host)
+    e.set_ordinary_arm_profile({"profile":"ordinary-am1-arms-v1", "right_elbow_p":16})
+    recipe=RECIPES["physical-live-teleop"]
+    e.bind_run(str(uuid.uuid4()),recipe)
+    assert e.begin(recipe) is False
+    assert host.started == 0 and e.worker is None
+
+
+def test_startup_required_view_camera_alone_waits_before_any_host_or_lift(startup_required_view_case, monkeypatch):
+    case=startup_required_view_case
+    case.local()
+    assert case.box.evidence()["qualified"]
+    sleep=module().time.sleep
+    observed=[]
+    def wait(seconds):
+        observed.append(case.host)
+        assert len(observed)<=3, "matching source/view never released the prehost gate"
+        assert case.host is None and not case.clients
+        sleep(seconds)
+        if len(observed)==2:
+            case.e.publish_startup_view(case.binding,case.view())
+    monkeypatch.setattr(module().time,"sleep",wait)
+    case.start()
+    assert len(observed)==2 and case.camera is not None and case.host is not None
+    assert len(case.clients)==1 and case.clients[0].connected
+
+
+@pytest.mark.parametrize("wrong",["run", "owner", "capture", "role", "owned-session", "request"])
+def test_startup_required_view_rejects_foreign_source_context(startup_required_view_case, monkeypatch, wrong):
+    import uuid
+    case=startup_required_view_case
+    case.local()
+    view=case.view()
+    if wrong in {"run","owner","capture"}:
+        view[{"run":"run_id","owner":"owner_generation","capture":"capture_generation"}[wrong]]="77777777-7777-4777-8777-777777777777"
+    elif wrong=="role":
+        view["role"]="wrist_left"
+    elif wrong=="owned-session":
+        case.local(2,owned_session="")
+    case.e.publish_startup_view(case.binding,view)
+    if wrong=="request":
+        monkeypatch.setattr(uuid,"uuid4",lambda:uuid.UUID("77777777-7777-4777-8777-777777777777"))
+        case.box.begin(case.e.run_id,300)
+        case.local()
+    assert case.e.startup_view_ready() is False
+    assert case.host is None and not case.clients
+
+
+def test_startup_required_view_original_browser_expiry_cannot_be_retimed(startup_required_view_case):
+    case=startup_required_view_case
+    case.local()
+    original=case.view()
+    case.e.publish_startup_view(case.binding,original)
+    assert case.e.startup_view_ready() is True
+    case.now=.501
+    case.local(2)
+    assert case.box.evidence()["qualified"]
+    case.e.publish_startup_view(dict(case.binding,controller_expires=2.),original)
+    assert original["qualified_until"]==1.
+    assert case.e.startup_view_ready() is True
+    case.now=1.001
+    case.local(3)
+    with pytest.raises(RuntimeError,match="view expired"):
+        case.e.startup_view_ready()
+
+
+def test_startup_required_view_fresh_browser_never_extends_local_feedback(startup_required_view_case):
+    case=startup_required_view_case
+    case.local()
+    original=case.view()
+    case.e.publish_startup_view(case.binding,original)
+    permits=[]
+    assert case.e.startup_view_ready(permit=permits.append) is True
+    assert permits==[.5]
+    case.now=.501
+    assert case.now < original["qualified_until"]
+    with pytest.raises(RuntimeError,match="view expired"):
+        case.e.startup_view_ready()
+    assert case.e._lifecycle["startup_view_failure"]["reason"]=="local_qualified"
+
+
+def test_startup_required_view_renewal_can_cover_real_warmup_without_extending_startup(startup_required_view_case):
+    case=startup_required_view_case
+    case.now=1.
+    renewed=dict(case.binding,controller_expires=2.5)
+    case.e.publish_startup_view(renewed,None)
+    case.now=1.6
+    case.local()
+    case.e.publish_startup_view(renewed,case.view())
+    assert case.e.startup_view_ready() is True
+    assert renewed["startup_deadline"]==case.binding["startup_deadline"]==10.
+
+
+def test_startup_required_view_expired_authority_cannot_be_revived_by_renewal(startup_required_view_case):
+    case=startup_required_view_case
+    case.now=1.501
+    with pytest.raises(RuntimeError):
+        case.e._check_startup_view()
+    case.local()
+    case.e.publish_startup_view(dict(case.binding,controller_expires=3.),case.view())
+    with pytest.raises(RuntimeError):
+        case.e.startup_view_ready()
+    assert case.host is None
+
+
+@pytest.mark.parametrize("control",["revision","takeover","stop"])
+def test_startup_required_view_control_cancellation_cannot_be_unblocked(startup_required_view_case,control):
+    case=startup_required_view_case
+    if control=="revision":
+        case.e.set_intent_revision(1)
+    elif control=="takeover":
+        assert case.e.bind_control(**dict(case.identity,controller_generation="77777777-7777-4777-8777-777777777777"))
+    else:
+        case.e.finish("stopped")
+    with pytest.raises(RuntimeError):
+        case.e._check_startup_view()
+    case.local()
+    case.e.publish_startup_view(case.binding,case.view())
+    with pytest.raises(RuntimeError):
+        case.e.startup_view_ready()
+    assert case.host is None and not case.clients
+
+
+def test_startup_required_view_gap_during_nonactuating_host_preparation(startup_required_view_case, monkeypatch):
+    case = startup_required_view_case
+    case.local()
+    case.e.publish_startup_view(case.binding, case.view())
+    case.gate_ready_at_start = False
+    case.initial_log = b""
+    case.socket_at_start = False
+    sleep = module().time.sleep
+    permission = case.logpath.parent / "startup-view-permit"
+
+    def warmup(seconds):
+        assert case.steps < 3, "fresh view did not release prepared host"
+        assert case.host is not None and not case.clients and not permission.exists()
+        sleep(seconds)
+        if case.steps == 1:
+            case.now = 1.001  # Original browser receipt expires during imports.
+            case.local(2)
+            (case.logpath.parent / "startup-view-ready").touch(mode=0o600)
+        else:
+            assert not case.e._startup_view_armed
+            case.local(3)
+            case.e.publish_startup_view(case.binding, case.view(3))
+            case.logpath.write_bytes(b'{"phase":"operational_ready"}')
+            case.socketpath.touch()
+
+    monkeypatch.setattr(module().time, "sleep", warmup)
+    case.start()
+    assert case.steps == 2 and len(case.clients) == 1
+    assert case.e._startup_view_armed
+    assert float(permission.read_text()) == pytest.approx(min(case.now + .5, case.binding["controller_expires"]))
+
+
+def test_startup_required_view_loss_after_host_launch_cancels_before_client(startup_required_view_case,monkeypatch):
+    case=startup_required_view_case
+    case.local()
+    case.e.publish_startup_view(case.binding,case.view())
+    case.initial_log=b'waiting for lift operational readiness\n'
+    case.socket_at_start=False
+    sleep=module().time.sleep
+    losses=[]
+    def lose_view(seconds):
+        losses.append(True)
+        assert len(losses)<=3, "view loss did not cancel host startup"
+        assert case.host is not None
+        sleep(seconds)
+        case.now=1.001
+        case.local(2)
+    monkeypatch.setattr(module().time,"sleep",lose_view)
+    with pytest.raises(RuntimeError):
+        case.start()
+    assert case.camera is not None and case.host is not None and not case.clients
+
+
+@pytest.mark.parametrize("contrast", ["clean", "unconfirmed", "issued", "foreign_cause", "bad_camera", "live"])
+def test_startup_required_view_prepermission_exit_allows_fresh_start_without_readback(
+    startup_required_view_case, contrast,
+):
+    import json
+    from pathlib import Path
+
+    case = startup_required_view_case
+    case.local()
+    case.e.publish_startup_view(case.binding, case.view())
+    case.gate_ready_at_start = False
+    case.fault = "stop"
+    case.fault_step = 1
+    with pytest.raises(module().StartupCancelledError):
+        case.start()
+    assert not (case.logpath.parent / "startup-view-permit").exists()
+    exited = contrast != "unconfirmed"
+    case.host.actual_exited = lambda: exited
+    case.host.stop = lambda: None
+    def wait_actual_exit(**_):
+        raise TimeoutError("inert host exit unconfirmed")
+    case.host.wait_actual_exit = wait_actual_exit
+    case.camera.actual_exited = lambda: True
+    camera_state = Path(case.provider.config["camera_state"])
+    camera_state.mkdir(exist_ok=True)
+    (camera_state / ("release-" + case.e.run_id + ".json")).write_text(json.dumps({
+        "version": 1, "state": "released", "session_id": case.e.run_id, "errors": [], "runtime_failed": False,
+        "release_evidence": dict(
+            backend_exited=True, readers_joined=True, viewer_socket_closed=True, runtime_config_removed=True,
+            backend_returncode=1 if contrast == "bad_camera" else 0,
+        ),
+    }))
+    result = case.provider.finish("faulted")
+    assert result["readback"] is None and not case.clients
+    certain = exited and contrast != "bad_camera"
+    assert result["uncertain"] is not certain
+    assert result["cleanup"] == ("no_physical_device_effects" if certain else "physical_cleanup_unknown")
+    e = case.e
+    e._fault = "RuntimeError: prepermission startup fault"
+    e._lifecycle.update(result, phase="terminal", run_id=e.run_id)
+    e._startup_view_armed = contrast == "issued"
+    run = {
+        "run_id": e.run_id, "status": "faulted", "cleanup": result["cleanup"],
+        "uncertain": result["uncertain"], "physical_result": copy.deepcopy(e._lifecycle),
+        "first_cause": "foreign cause" if contrast == "foreign_cause" else e._fault,
+        "native_first_cause": None, "native_live_at": case.now if contrast == "live" else None,
+    }
+    assert e.can_start_after_fault(run, observed_fault=e._fault) is (contrast == "clean")
+
+
+@pytest.mark.parametrize("control", ["stop", "pause", "revision", "takeover", "view_superseded"])
+def test_startup_required_view_revocation_removes_granted_permission(startup_required_view_case, control):
+    case = startup_required_view_case
+    case.local()
+    case.e.publish_startup_view(case.binding, case.view())
+    case.start()
+    permission = case.logpath.parent / "startup-view-permit"
+    assert permission.is_file()
+    if control == "stop":
+        case.e.finish("stopped")
+    elif control == "pause":
+        case.e.invalidate_startup_view("Pause")
+    elif control == "revision":
+        case.e.set_intent_revision(1)
+    elif control == "view_superseded":
+        assert case.e.publish_startup_view(case.binding, case.view(qualified_until=0))
+    else:
+        assert case.e.bind_control(**dict(case.identity, controller_generation="new-controller"))
+    assert not permission.exists()
+    assert not case.provider._startup_permission_pending  # Publication remains possible actuation.
+
+
+def test_startup_required_view_legacy_keeps_the_normal_requirement_absent():
+    import uuid
+    from examples.alohamini.am1_session_contract import RECIPES
+    e=executor(ControlledHost())  # Legacy/no ordinary policy; no new normal-bench support.
+    e.bind_run(str(uuid.uuid4()),RECIPES["physical-live-teleop"])
+    binding=dict(run_id=e.run_id,operation_id=str(uuid.uuid4()),service_incarnation=str(uuid.uuid4()),
+                 host_incarnation=e.host_incarnation,controller_generation=str(uuid.uuid4()),intent_revision=0,
+                 role="chest",startup_deadline=e.clock()+10.,controller_expires=e.clock()+1.5,required=False)
+    with pytest.raises((ValueError,RuntimeError)):
+        e.configure_startup_view(binding)
+    assert e.ordinary_arm_profile is None and e._startup_view_requirement is None
+    # Existing legacy/advisory Core runs leave the normal-only requirement absent.
+    assert e.startup_view_ready() is True
+
+
+def test_startup_required_view_legacy_wait_without_callback_keeps_camera_gate():
+    seen=[]
+    observation=SimpleNamespace(evidence=lambda:{"qualified":len(seen)>=2})
+    camera=SimpleNamespace(poll=lambda:None)
+    module().wait_required_camera(camera,observation,lambda:seen.append("check"),sleep=lambda _:None)
+    assert seen==["check","check"]
+
+def test_startup_required_view_renewals_never_extend_original_startup_deadline(startup_required_view_case):
+    case=startup_required_view_case
+    for tick in range(1,10):
+        case.now=float(tick)
+        assert case.e.publish_startup_view(dict(case.binding,controller_expires=tick+1.5),None) is True
+    case.now=10.001
+    case.local()
+    case.e.publish_startup_view(dict(case.binding,controller_expires=10.5),case.view())
+    with pytest.raises(RuntimeError):
+        case.e.startup_view_ready()
+    assert case.binding["startup_deadline"]==10. and case.host is None and not case.clients
+
+
+@pytest.mark.parametrize("fault,reason",[("browser-expired","browser_receipt_range"),("local-unqualified","local_qualified"),("capture-mismatch","capture_generation")])
+def test_startup_view_failure_retains_exact_first_predicate_and_consumed_proofs(startup_required_view_case,monkeypatch,fault,reason):
+    import copy,json
+    case=startup_required_view_case
+    case.local();original=case.view();assert case.e.publish_startup_view(case.binding,original)
+    assert case.e.startup_view_ready()
+    case.now=1.001 if fault=="browser-expired" else .1
+    case.local(2)
+    if fault=="local-unqualified":
+        case.box.publish(dict(case.box.request,owned_session=case.e.run_id,qualified=False,reason="fixture local receipt unavailable"))
+    elif fault=="capture-mismatch":
+        original=dict(original,capture_generation="77777777-7777-4777-8777-777777777777")
+        assert case.e.publish_startup_view(case.binding,original)
+    consumed=case.box.evidence();reads=[];read=case.box.evidence
+    def once():
+        reads.append(True);value=read();case.box.stop();return value
+    monkeypatch.setattr(case.box,"evidence",once)
+    with pytest.raises(RuntimeError,match="required owned local/browser view expired during physical startup"):
+        case.e._check_startup_view()
+    record=case.e._lifecycle.get("startup_view_failure")
+    assert isinstance(record,dict),"first failed startup view predicate and original proof clocks must survive cleanup"
+    assert len(reads)==1 and record["reason"]==reason
+    assert record["run_id"]==case.e.run_id and record["host_incarnation"]==case.e.host_incarnation
+    assert record["binding"]==case.e._startup_view_requirement and record["startup_deadline"]==case.e._lifecycle["startup_deadline"]
+    assert record["local"]==consumed and record["browser"]==original
+    assert record["checked_at"]["startup"]==record["checked_at"]["authority"]==case.now
+    assert record["checked_at"]["browser"]==(case.now if fault=="browser-expired" else None)
+    assert record["current_authority"]==dict(case.identity)
+    assert len(json.dumps(record,allow_nan=False).encode())<=4096
+    frozen=copy.deepcopy(record);case.now=1.2
+    with pytest.raises(RuntimeError):case.e._check_startup_view()
+    assert case.e._lifecycle["startup_view_failure"]==frozen
+    case.e._lifecycle.update(phase="terminal",backend_incarnation=case.e.host_incarnation,cleanup="physical_cleanup_unknown",uncertain=True,terminal_status="faulted")
+    assert case.e.evidence()["lifecycle"]["startup_view_failure"]==frozen
+
+
+def test_startup_view_failure_is_absent_before_armed_and_newer_stop_wins(startup_required_view_case):
+    case=startup_required_view_case
+    case.local();assert case.e.startup_view_ready() is False
+    assert "startup_view_failure" not in case.e._lifecycle
+    assert case.e.publish_startup_view(case.binding,case.view());assert case.e.startup_view_ready()
+    case.e.finish("stopped")
+    with pytest.raises(RuntimeError,match="cancelled by Stop"):case.e._check_startup_view()
+    assert "startup_view_failure" not in case.e._lifecycle
+
+
+def test_startup_view_failure_existing_core_terminal_copy_persists_diagnostic(startup_required_view_case,tmp_path):
+    import copy,json
+    from tools.am1_session_core import SessionAuthority
+    case=startup_required_view_case
+    case.local();assert case.e.publish_startup_view(case.binding,case.view());assert case.e.startup_view_ready()
+    case.now=1.001;case.local(2)
+    with pytest.raises(RuntimeError):case.e._check_startup_view()
+    diagnostic=copy.deepcopy(case.e._lifecycle.get("startup_view_failure"))
+    assert isinstance(diagnostic,dict),"actual guard result must be retained before lifecycle cleanup"
+    case.e._lifecycle.update(phase="terminal",backend_incarnation=case.e.host_incarnation,cleanup="physical_cleanup_unknown",uncertain=True,terminal_status="faulted",first_cause=None)
+    authority=SessionAuthority(tmp_path/"authority",executor=case.e,clock=lambda:case.now)
+    try:
+        cause="RuntimeError: required owned local/browser view expired during physical startup"
+        authority.run=dict(run_id=case.e.run_id,operation_id=case.binding["operation_id"],dispatch="acknowledged",source="protected-physical-provider",status="finishing",requested_terminal="faulted",uncertain=True,first_cause=cause,finish_ceiling=10.)
+        assert authority._physical_lifecycle(case.e.evidence(),case.now)
+        assert authority.run["physical_result"]["startup_view_failure"]==diagnostic
+        saved=json.loads(authority.db.execute("SELECT data FROM state WHERE id=1").fetchone()[0])
+        assert saved["physical_result"]["startup_view_failure"]==diagnostic
+        assert saved["first_cause"]==cause and saved["status"]=="faulted" and saved["uncertain"] is True
+        archives=list((authority.directory/"run-results"/case.e.run_id).glob("*.json"))
+        assert len(archives)==1
+        assert json.loads(archives[0].read_text(encoding="utf-8"))["physical_result"]["startup_view_failure"]==diagnostic
+    finally:
+        authority.close()

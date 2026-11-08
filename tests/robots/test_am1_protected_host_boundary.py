@@ -288,6 +288,79 @@ def test_launcher_print_command_forwards_protected_scope_without_effects():
     assert "--no_cameras" in result.stdout
 
 
+@pytest.mark.parametrize("outcome", ["deadline", "stop", "stale", "revoked", "delayed", "fresh"])
+def test_ordinary_startup_view_gate_fences_actual_motor_connection(tmp_path, monkeypatch, outcome):
+    import sys
+
+    identity = binding()
+    state = tmp_path / ".local/state/am1-session"
+    state.mkdir(parents=True, mode=0o700)
+    run = tmp_path / "run"
+    run.mkdir(mode=0o700)
+    now = [10.0]
+    events = []
+    permit = run / "startup-view-permit"
+    monkeypatch.setattr(host.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(host.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setenv("AM1_VISIBLE_CONTROL_RECIPE", "physical-live-teleop")
+    monkeypatch.setenv("AM1_SCRIPTED_PREPARE", "1")
+    monkeypatch.setattr(sys, "argv", [
+        "host", "--robot_model", "alohamini1", "--no_cameras",
+        "--max_relative_target", "20", "--max_loop_freq_hz", "30",
+        "--am1-physical-state-directory", str(state),
+        "--am1-protected-run-directory", str(run),
+        "--am1-run-id", identity["run_id"], "--am1-host-incarnation", identity["host_incarnation"],
+        "--am1-cleanup-receipt", str(run / "cleanup.json"),
+        "--am1-ordinary-arm-profile", "ordinary-am1-arms-v1", "--am1-ordinary-right-elbow-p", "16",
+        "--am1-startup-view-deadline", "11",
+    ])
+
+    def parent_tick(_):
+        assert (run / "startup-view-ready").is_file() and events == []
+        if outcome == "stop":
+            raise KeyboardInterrupt
+        if outcome == "deadline":
+            now[0] = 11.0
+            return
+        now[0] += .1
+        descriptor = os.open(permit, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w") as stream:
+            stream.write(str(10.05 if outcome == "stale" else 10.5))
+
+    def construct(_):
+        events.append("construct")
+        if outcome == "revoked":
+            permit.unlink()
+        if outcome == "delayed":
+            now[0] = 10.501
+        return SimpleNamespace(is_connected=False, _safe_shutdown=lambda **_: [])
+
+    def connect(*_, **__):
+        events.append("connect")
+        raise RuntimeError("mock connection boundary")
+
+    monkeypatch.setattr(host.time, "sleep", parent_tick)
+    monkeypatch.setattr(host, "AM1PhysicalAdmission", lambda *_, **__: SimpleNamespace(
+        claim_run=lambda **_: events.append("claim"), close=lambda: None, finish_run=lambda _: None,
+    ))
+    monkeypatch.setattr(host, "AlohaMini", construct)
+    monkeypatch.setattr(host, "connect_robot", connect)
+    monkeypatch.setattr(host, "write_am1_cleanup_receipt", lambda *_, **__: {})
+    if outcome == "stop":
+        with pytest.raises(KeyboardInterrupt):
+            host.main()
+    else:
+        expected = "mock connection boundary" if outcome == "fresh" else "startup view"
+        with pytest.raises(RuntimeError, match=expected):
+            host.main()
+    if outcome in {"deadline", "stop", "stale"}:
+        assert events == []
+    elif outcome == "fresh":
+        assert events == ["claim", "construct", "connect"]
+    else:
+        assert events == ["claim", "construct"]
+
+
 def test_host_arbitration_refuses_before_robot_construction(monkeypatch):
     import sys
 

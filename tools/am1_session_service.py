@@ -170,6 +170,21 @@ class AuthStore:
             db.execute("UPDATE devices SET revoked=1 WHERE id=?", (device,))
 
 
+class ReportingWebSocketResponse(web.WebSocketResponse):
+    """Negotiate standard compression without carrying context across messages."""
+
+    def _handshake(self, request):
+        headers, protocol, compress, notakeover = super()._handshake(request)
+        if compress:
+            extension = headers["Sec-WebSocket-Extensions"]
+            for parameter in ("server_no_context_takeover", "client_no_context_takeover"):
+                if parameter not in extension:
+                    extension += "; " + parameter
+            headers["Sec-WebSocket-Extensions"] = extension
+            notakeover = True
+        return headers, protocol, compress, notakeover
+
+
 class Peer:
     """At most one queued snapshot plus bounded responses, accounting for in-flight frame."""
 
@@ -808,8 +823,8 @@ class Gateway:
             raise web.HTTPTooManyRequests()
         self.pending_ws += 1
         pending = True
-        ws = web.WebSocketResponse(
-            timeout=0.5, max_msg_size=CONTROL_LIMIT, heartbeat=6, compress=False, writer_limit=4096
+        ws = ReportingWebSocketResponse(
+            timeout=0.5, max_msg_size=CONTROL_LIMIT, heartbeat=6, compress=True, writer_limit=4096
         )
         peer = None
         stage = "transport_setup"

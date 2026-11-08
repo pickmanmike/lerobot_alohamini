@@ -1052,3 +1052,547 @@ def test_right_admitted_span_refuses_expansion_rates_and_changed_fresh_origin_wi
     with pytest.raises((ValueError, RuntimeError)):
         span_planned(ready, admitted, span_options("--gripper-cycle"))
     assert (ready, admitted) == original
+
+# Fresh ordinary region; no hardware setup or old raw references.
+def ordinary_admission():
+    from examples.alohamini.am1_live_teleop import (ORDINARY_AM1_ARMS_PROFILE, ORDINARY_AM1_ARM_CALIBRATION,
+        ORDINARY_AM1_RAW_BOUNDS, TELEOP_ARM_KEYS)
+    ready, admitted = admission()
+    native = admitted["snapshot"]["run"]["live_input"]["workspace"]
+    native["workspace_profile"] = ORDINARY_AM1_ARMS_PROFILE
+    points = {}
+    for key in TELEOP_ARM_KEYS:
+        cal = list(ORDINARY_AM1_ARM_CALIBRATION[key[:-4]])
+        low, high = ORDINARY_AM1_RAW_BOUNDS[key]
+        grip = key.endswith("gripper.pos")
+        raw = high-10 if grip else low+2 if "wrist_flex" in key else (low+high)//2
+        q = normalized_raw(raw, cal, gripper=grip)
+        bounds = sorted(normalized_raw(v, cal, gripper=grip) for v in (low, high))
+        native["calibration"][key[:-4]] = cal
+        native["raw_bounds"][key] = [low, high]
+        native["reference"][key] = q
+        native["bounds"][key] = dict(min=bounds[0], max=bounds[1], rate_per_s=20. if grip else 5*4096/360*200/(cal[4]-cal[3]))
+        points[key] = dict(raw=raw, normalized=q)
+    admitted["snapshot"]["run"].update(source="protected-physical-provider", bench_continuity=False, recovery_episodes=0, first_cause=None, native_first_cause=None,
+        ordinary_arm_profile={"profile": ORDINARY_AM1_ARMS_PROFILE, "right_elbow_p": 16})
+    admitted["snapshot"]["evidence"]["source"] = "protected-physical-provider"
+    current = admitted["snapshot"]["run"]["live_input"]
+    current["required_view"].update(required=True, role="chest")
+    current.update(reference=copy.deepcopy(native["reference"]), cursor=dict(native["reference"]), accepted_target=dict(native["reference"]))
+    admitted["snapshot"]["evidence"]["accepted_host_action"]["arm_feedback"]["positions"] = points
+    ready.update(command_reference=dict(native["reference"]), bounds=copy.deepcopy(native["bounds"]), units=dict(native["units"]))
+    return ready, admitted
+
+
+def ordinary_options(*extra):
+    from examples.alohamini.am1_live_teleop import ORDINARY_AM1_ARMS_PROFILE
+    return coordinator.parse_args(["--plan", "ordinary-arms", "--operating-profile", ORDINARY_AM1_ARMS_PROFILE,
+                                   "--bindings", "unused-current.json", *extra])
+
+
+def test_ordinary_control_plan_declares_pause_resume_then_new_movement():
+    ready, admitted = ordinary_admission()
+    options = ordinary_options()
+    plan = coordinator.fresh_ordinary_targets(ready, admitted, ramp_seconds=options.ramp_seconds,
+                                              gripper_direction=options.gripper_direction)
+    phases = coordinator.phases_for(plan, options, admitted=admitted)
+    index = next(i for i, phase in enumerate(phases) if phase["op"] == "pause")
+    assert phases[index+1]["op"] == "resume" and phases[index+2]["op"] == "move"
+    assert phases[index]["dwell"] == 2.
+    assert phases[index+2]["targets"] == phases[index-1]["targets"]
+
+
+def test_control_phase_commands_and_held_pacing_wait_for_explicit_ack():
+    phases = [dict(op="pause", dwell=2.), dict(op="resume"), dict(op="move", ramp=3., dwell=2.), dict(op="finish")]
+    assert coordinator.phase_command(phases[0], 10.) == "pause 10.0"
+    assert coordinator.phase_command(phases[1], 10.) == "resume 10.0"
+    status = dict(input_state="waiting", window_remaining_s=60., current_accepted_intent_seq=None,
+                  ramp_progress_active_s=0.)
+    for elapsed, expected in ((None, None), (1., None), (2., 1)):
+        assert coordinator.next_phase(status, phases=phases, index=0, pending=None, accepted=2,
+                                      supported=True, control_elapsed_s=elapsed) == expected
+
+
+@pytest.mark.parametrize("external", [False, True])
+@pytest.mark.parametrize("plan_name", ["ordinary-arms", "ordinary-short"])
+def test_ordinary_coordinator_real_relay_waits_for_pause_ack_and_fresh_resume_before_new_move(tmp_path, monkeypatch, external, plan_name, _right_wrist_degrees=None):
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    from examples.alohamini.am1_teleop_workload import VirtualIntentWorkload
+    from tools.am1_leader_adapter import FrameProducer, ZERO_BODY
+
+    ready, admitted = ordinary_wrist_midpoint_admission() if _right_wrist_degrees is not None else ordinary_admission()
+    native = admitted["snapshot"]["run"]["live_input"]["workspace"]
+    extra=[] if _right_wrist_degrees is None else ["--right-wrist-flex-degrees",str(_right_wrist_degrees)]
+    options = ordinary_options(*extra) if plan_name == "ordinary-arms" else ordinary_short_options()
+    plan = coordinator.fresh_ordinary_targets(ready, admitted, ramp_seconds=3., gripper_direction="closing", short=plan_name == "ordinary-short",
+        right_wrist_flex_degrees=options.right_wrist_flex_degrees or 3.)
+    phases = coordinator.phases_for(plan, options, admitted=admitted)
+    root, trial = tmp_path/"repo", tmp_path/"repo/trial"
+    trial.mkdir(parents=True)
+    (root/".cache/am1-knowledge-reuse-18").mkdir(parents=True)
+    (trial/"frames.jsonl").write_text(json.dumps(admitted)+"\n", encoding="utf-8")
+    now, commands, frames = [100.], [], []
+    reader = VirtualIntentReader("interactive", clock=lambda: now[0], intent_channel=str(uuid4()), allow_controls=True)
+    source = VirtualIntentWorkload(native, command_reference=plan["origin"], clock=lambda: now[0], intent_channel=reader.intent_channel)
+    producer = FrameProducer(source, clock=lambda: now[0], source_id=reader.intent_channel)
+    producer.workspace, producer.native_cursor = native, dict(plan["origin"])
+    def status(seq=None, progress=0., state="waiting"):
+        return dict(event="virtual_input_status", window_elapsed_s=now[0]-100., window_remaining_s=190.-now[0],
+                    current_accepted_intent_seq=seq, input_state=state, ramp_progress_active_s=progress)
+    class Input:
+        def write(self, command): commands.append(command); reader.receive_line(command)
+        def flush(self): pass
+        def close(self): pass
+    class Process:
+        def __init__(self, *args, **kwargs): self.stdin, self.stdout, self.returncode = Input(), self.output(), None
+        def output(self):
+            yield json.dumps(dict(event="virtual_input_opened", output=str(trial)))+"\n"
+            yield json.dumps(ready)+"\n"
+            yield json.dumps(status())+"\n"
+            for index, phase in enumerate(phases):
+                intent = reader.take()
+                assert intent["op"] == phase["op"] and intent["seq"] == index+1
+                if phase["op"] == "pause":
+                    source.invalidate()
+                    yield json.dumps(dict(event="virtual_control_paused", op="pause", seq=None if external else intent["seq"]))+"\n"
+                    now[0] += 1.
+                    yield json.dumps(status())+"\n"
+                    assert len(commands) == index+1
+                    now[0] += 1.
+                    yield json.dumps(status())+"\n"
+                    if external:
+                        assert reader.take() is None, "an external Pause cannot trigger scheduled Resume/Finish"
+                        self.returncode = 0
+                        return
+                elif phase["op"] == "resume":
+                    assert source.command is None
+                    reader.discard_motion()
+                    producer.native_cursor, producer.reacquire = dict(source.cursor), True
+                    yield json.dumps(dict(event="virtual_control_resumed", op="resume", seq=intent["seq"]))+"\n"
+                else:
+                    assert source.submit(intent)
+                    yield json.dumps(dict(event="virtual_intent_accepted", op=intent["op"], seq=intent["seq"]))+"\n"
+                    if phase["op"] == "finish":
+                        assert source.complete
+                        break
+                    duration = phase["ramp"]+phase["dwell"]
+                    source.admit(now[0])
+                    for _ in range(round(duration*10)):
+                        now[0] += .1; source.advance(now[0])
+                    frame = producer.serialize(producer.capture({"grant_id": str(uuid4())}))
+                    frames.append(frame)
+                    source.accepted(frame["target"])
+                    yield json.dumps(status(intent["seq"], duration, "current"))+"\n"
+            self.returncode = 0
+        def poll(self): return self.returncode
+        def wait(self): return 0
+    monkeypatch.setattr(coordinator, "ROOT", root)
+    monkeypatch.setattr(coordinator, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr(coordinator.subprocess, "Popen", Process)
+    assert coordinator.main(["--plan", plan_name, "--operating-profile", "ordinary-am1-arms-v1",
+                             "--bindings", str(root/"bindings.json"), "--window-seconds", "90",*extra]) == 0
+    assert all(frame["body"] == ZERO_BODY and set(frame["target"]) == set(plan["origin"]) for frame in frames)
+    if not external:
+        assert [command.split()[0] for command in commands] == (["move", "move", "pause", "resume", "return", "finish"] if plan_name == "ordinary-short" else
+            ["move", "return", "move", "return", "move", "pause", "resume", "move", "move", "move", "return", "finish"])
+        assert frames[-1]["target"] == pytest.approx(plan["origin"])
+
+
+def test_ordinary_plan_declares_two_arm_legal_full_amplitudes_and_original_returns():
+    from examples.alohamini.am1_live_teleop import validate_target
+    ready, admitted = ordinary_admission()
+    original = copy.deepcopy((ready, admitted))
+    options = ordinary_options()
+    plan = coordinator.fresh_ordinary_targets(ready, admitted, ramp_seconds=options.ramp_seconds,
+                                              gripper_direction=options.gripper_direction)
+    phases = coordinator.phases_for(plan, options, admitted=admitted)
+    assert [p["name"] for p in phases] == ["left_elbow", "left_return_original", "right_elbow", "right_return_original",
+        "ordinary_both_arms", "ordinary_pause", "ordinary_resume", "ordinary_reengaged_arms",
+        "ordinary_both_grippers", "ordinary_grippers_return", "return_original", "finish"]
+    assert sum(p.get("ramp", 0)+p.get("dwell", 0) for p in phases if p["op"] not in {"pause", "resume"}) == 45.
+    assert set(plan["excursions"]) == set(ready["command_reference"])
+    previous = dict(plan["origin"])
+    for phase in phases[:-1]:
+        if phase["op"] in {"pause", "resume"}: continue
+        target = plan["origin"] if phase["op"] == "return" else phase["targets"]
+        validate_target(target, workspace=plan["workspace"])
+        for key, value in target.items():
+            assert abs(value-previous[key])/phase["ramp"] <= plan["workspace"]["bounds"][key]["rate_per_s"]+1e-9
+        assert phase["complete_before_advance"] is True
+        previous = dict(target)
+    assert previous == ready["command_reference"]
+    assert (ready, admitted) == original
+
+
+@pytest.mark.parametrize("fault", ["reference", "owner", "ack", "units", "profile", "feedback", "deadline", "rate", "grip"])
+def test_ordinary_plan_refuses_unqualified_or_insufficient_full_amplitude(fault):
+    ready, admitted = ordinary_admission()
+    state = admitted["snapshot"]; native = state["run"]["live_input"]["workspace"]
+    if fault == "reference": state["run"]["live_input"]["reference"][KEY] += .01
+    elif fault == "owner": state["controller"]["device_id"] = None
+    elif fault == "ack": state["evidence"]["native_ack"] = False
+    elif fault == "units": ready["units"][KEY] = "wrong"
+    elif fault == "profile": native["workspace_profile"] = CURRENT_REST_WORKSPACE_PROFILES["ordinary-arms"]
+    elif fault == "feedback": state["evidence"]["accepted_host_action"]["arm_feedback"]["positions"][KEY]["normalized"] += .1
+    elif fault == "deadline": state["run"]["deadline"] += 301
+    elif fault == "rate": native["bounds"][KEY]["rate_per_s"] = .0001
+    else:
+        # Explicit full opening cannot fit from this midpoint in the narrow RIGHT gripper interval.
+        pass
+    with pytest.raises((ValueError, RuntimeError)):
+        coordinator.fresh_ordinary_targets(ready, admitted, ramp_seconds=3., gripper_direction="opening" if fault == "grip" else "closing")
+
+
+def test_coordinator_ordinary_config_uses_same_loader_and_preserves_selected_window(tmp_path):
+    from tests.robots.test_am1_ordinary_launch import configuration
+    path, value = configuration(tmp_path)
+    args = coordinator.parse_args(["--ordinary-config", str(path), "--plan", "ordinary-arms", "--window-seconds", "60"])
+    assert args.bindings == tmp_path / "bindings.json" and args.window_seconds == 60.
+    assert args.ordinary_arm_profile == value["ordinary_arm_profile"]
+    command = coordinator.adapter_command(args)
+    assert command[command.index("--ordinary-config")+1] == str(path)
+    assert "--prepare-current-rest" not in command
+    assert command[command.index("--duration-seconds")+1] == "60.0"
+
+
+def test_ordinary_profile_preserves_relative_and_admitted_span_right_paths():
+    ready, admitted = ordinary_admission()
+    for workpose in ("relative", "admitted-span"):
+        options = coordinator.parse_args(["--side", "right", "--workpose", workpose,
+            "--bindings", "unused-current.json", "--ramp-seconds", "3", "--direction", "increasing"] if workpose == "relative" else
+            ["--side", "right", "--workpose", workpose, "--bindings", "unused-current.json", "--ramp-seconds", "3"])
+        plan = coordinator.fresh_target(ready, admitted, degrees=options.degrees, direction=options.direction,
+            ramp_seconds=options.ramp_seconds, side="right", workpose=workpose)
+        assert coordinator.phases_for(plan, options, admitted=admitted)[-1]["op"] == "finish"
+
+
+def ordinary_active_frame():
+    ready, admitted = ordinary_admission()
+    state = admitted["snapshot"]
+    run, evidence = state["run"], state["evidence"]
+    current = run["live_input"]; ack = evidence["accepted_host_action"]
+    pi_now = run["deadline"]-run["remaining_s"]
+    run.update(status="running", uncertain=False, recovery=None)
+    current.update(state="active", valid_until_monotonic_s=pi_now+.2,
+                   source=dict(source_id="channel", acquired_at_monotonic_s=10.1))
+    current["required_view"].update(required=True, qualified=True, role="chest")
+    evidence.update(active_acknowledged=True, required_observation=True)
+    ack.update(state="active", acquired_at_monotonic_s=pi_now-.01)
+    for point in ack["arm_feedback"]["positions"].values():
+        point.update(read_started_at_monotonic_s=pi_now-.03, read_completed_at_monotonic_s=pi_now-.02)
+    frame=dict(event="leader_frame", native=state, receipt=dict(accepted=True, effect_admitted=True),
+               local_monotonic_s=20., virtual_intent=dict(seq=1, intent_channel="channel",
+                   issued_at_perf_counter_s=10., expires_at_perf_counter_s=11.))
+    return ready, admitted, frame
+
+
+def test_ordinary_phase_feedback_reports_actual_residual_without_arrival_credit():
+    ready, admitted, frame = ordinary_active_frame()
+    workspace = admitted["snapshot"]["run"]["live_input"]["workspace"]
+    targets=dict(ready["command_reference"], **{KEY: ready["command_reference"][KEY]+1.})
+    actual = coordinator.phase_feedback(frame, run_id=ready["run_id"], accepted=1, now=20.1,
+                                        workspace=workspace, targets=targets)
+    assert actual[KEY]["normalized"] == ready["command_reference"][KEY]
+    assert actual[KEY]["target_error"] == pytest.approx(-1.)
+    assert actual[KEY]["raw"] == frame["native"]["evidence"]["accepted_host_action"]["arm_feedback"]["positions"][KEY]["raw"]
+
+
+@pytest.mark.parametrize("fault", ["old", "seq", "view", "ack", "source", "expired", "read", "mapping", "body"])
+def test_ordinary_phase_feedback_refuses_stale_or_unqualified_actuals(fault):
+    ready, admitted, frame = ordinary_active_frame()
+    workspace = admitted["snapshot"]["run"]["live_input"]["workspace"]
+    if fault == "old": frame["local_monotonic_s"] = 19.
+    elif fault == "seq": frame["virtual_intent"]["seq"] = 2
+    elif fault == "view": frame["native"]["run"]["live_input"]["required_view"]["qualified"] = False
+    elif fault == "ack": frame["native"]["evidence"]["active_acknowledged"] = False
+    elif fault == "source": frame["native"]["run"]["live_input"]["source"]["source_id"] = "other"
+    elif fault == "expired": frame["native"]["run"]["live_input"]["valid_until_monotonic_s"] = 0.
+    elif fault == "read": frame["native"]["evidence"]["accepted_host_action"]["arm_feedback"]["positions"][KEY]["read_started_at_monotonic_s"] = 99999.
+    elif fault == "mapping": frame["native"]["evidence"]["accepted_host_action"]["arm_feedback"]["positions"][KEY]["normalized"] += 1.
+    else: frame["native"]["run"]["live_input"]["body"]["x.vel"] = 1.
+    with pytest.raises(ValueError):
+        coordinator.phase_feedback(frame, run_id=ready["run_id"], accepted=1, now=20.1,
+                                   workspace=workspace, targets=ready["command_reference"])
+
+
+def test_ordinary_full_vectors_use_existing_structured_intent_reader():
+    ready, admitted=ordinary_admission(); options=ordinary_options()
+    plan=coordinator.fresh_ordinary_targets(ready, admitted, ramp_seconds=3., gripper_direction="closing")
+    phases=coordinator.phases_for(plan, options, admitted=admitted)
+    reader=VirtualIntentReader("interactive", clock=lambda: 1., allow_controls=True)
+    for phase in phases:
+        reader.receive_line(coordinator.phase_command(phase, 60.))
+        intent=reader.take()
+        assert intent["op"] == phase["op"]
+        if phase["op"] == "move": assert intent["targets"] == phase["targets"]
+
+
+def test_ordinary_plan_keeps_original_reference_without_exact_measured_reset_gate():
+    ready, admitted = ordinary_admission()
+    native=admitted["snapshot"]["run"]["live_input"]["workspace"]
+    point=admitted["snapshot"]["evidence"]["accepted_host_action"]["arm_feedback"]["positions"][KEY]
+    point["raw"] += 1
+    point["normalized"] = normalized_raw(point["raw"], native["calibration"][KEY[:-4]])
+    plan=coordinator.fresh_ordinary_targets(ready, admitted, ramp_seconds=3., gripper_direction="closing")
+    assert plan["origin"] == ready["command_reference"]
+    assert plan["initial_feedback"][KEY] == point
+    assert plan["initial_feedback"][KEY]["normalized"] != plan["origin"][KEY]
+
+
+@pytest.mark.parametrize("fault", ["source", "bench", "view", "policy"])
+def test_ordinary_plan_requires_normal_native_policy_authority(fault):
+    ready, admitted=ordinary_admission(); state=admitted["snapshot"]
+    if fault == "source": state["evidence"]["source"] = "fake"
+    elif fault == "bench": state["run"]["bench_continuity"] = True
+    elif fault == "view": state["run"]["live_input"]["required_view"]["required"] = False
+    else: state["run"]["ordinary_arm_profile"]["right_elbow_p"] = 31
+    with pytest.raises(ValueError):
+        coordinator.fresh_ordinary_targets(ready, admitted, ramp_seconds=3., gripper_direction="closing")
+
+
+def test_ordinary_plan_preserves_distinct_qualified_goal_and_measured_reference():
+    ready, admitted=ordinary_admission()
+    native=admitted["snapshot"]["run"]["live_input"]
+    key="arm_left_shoulder_lift.pos"
+    measured=dict(native["workspace"]["reference"])
+    command=dict(ready["command_reference"]); command[key] += .01
+    native.update(cursor=dict(command), accepted_target=dict(command))
+    ready["command_reference"]=dict(command)
+    plan=coordinator.fresh_ordinary_targets(ready, admitted, ramp_seconds=3., gripper_direction="closing")
+    assert plan["origin"] == command and plan["workspace"]["reference"] == measured
+    assert plan["origin"][key] != plan["workspace"]["reference"][key]
+    assert coordinator.phases_for(plan, ordinary_options(), admitted=admitted)[-2]["op"] == "return"
+
+
+@pytest.mark.parametrize("fault",[None,"metadata-absent","raw-identity","wrong-key","foreign-meta"])
+def test_ordinary_normal_start_first_move_uses_only_exact_qualified_legal_origin(fault):
+    from tests.robots.test_am1_live_teleop_contract import ordinary_start_workspace
+    ready,admitted=ordinary_admission();state=admitted["snapshot"]
+    workspace=ordinary_start_workspace();current=state["run"]["live_input"]
+    commands=dict(workspace["startup_acquisition"]["command_reference"])
+    current.update(workspace=workspace,reference=dict(workspace["reference"]),cursor=dict(commands),accepted_target=dict(commands))
+    points={}
+    for key,q in workspace["reference"].items():
+        cal=workspace["calibration"][key[:-4]];grip=key.endswith("gripper.pos")
+        raw=round(cal[3]+(q+(0 if grip else 100))*(cal[4]-cal[3])/(100 if grip else 200))
+        points[key]=dict(raw=raw,normalized=q)
+        workspace["bounds"][key]["rate_per_s"]=20. if grip else 5*4096/360*200/(cal[4]-cal[3])
+    state["evidence"]["accepted_host_action"]["arm_feedback"]["positions"]=points
+    ready.update(command_reference=commands,bounds=copy.deepcopy(workspace["bounds"]),units=dict(workspace["units"]))
+    if fault == "metadata-absent":workspace.pop("startup_acquisition")
+    elif fault == "raw-identity":points["arm_left_shoulder_lift.pos"]["raw"]+=1
+    elif fault == "wrong-key":points["arm_right_shoulder_lift.pos"]["raw"]=3265
+    elif fault == "foreign-meta":workspace["startup_acquisition"]["extra"]=True
+    original=copy.deepcopy((ready,admitted))
+    if fault:
+        with pytest.raises((ValueError,RuntimeError)):coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing")
+    else:
+        plan=coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing")
+        assert plan["origin"]==commands and plan["workspace"]["reference"]["arm_left_shoulder_lift.pos"]>100
+        assert coordinator.phases_for(plan,ordinary_options())[0]["targets"]["arm_left_shoulder_lift.pos"]==100.
+    assert (ready,admitted)==original
+
+
+
+SHORT_KEYS={"arm_left_elbow_flex.pos","arm_right_elbow_flex.pos","arm_left_gripper.pos","arm_right_gripper.pos"}
+
+
+def ordinary_short_options(*extra):
+    return coordinator.parse_args(["--plan","ordinary-short","--operating-profile","ordinary-am1-arms-v1",
+        "--bindings","unused-current.json",*extra])
+
+
+def ordinary_wrist_midpoint_admission():
+    ready,admitted=ordinary_admission();state=admitted["snapshot"];current=state["run"]["live_input"]
+    key="arm_right_wrist_flex.pos";q=normalized_raw(3134,current["workspace"]["calibration"][key[:-4]])
+    for values in (current["reference"],current["workspace"]["reference"],current["cursor"],current["accepted_target"],ready["command_reference"]):values[key]=q
+    state["evidence"]["accepted_host_action"]["arm_feedback"]["positions"][key].update(raw=3134,normalized=q)
+    return ready,admitted
+
+
+def test_ordinary_short_cli_defaults_are_explicit_existing_profile_and_no_native_mode():
+    options=ordinary_short_options()
+    assert options.ramp_seconds==3. and options.dwell_seconds==2. and options.window_seconds==90.
+    assert options.ordinary_arm_profile=={"profile":"ordinary-am1-arms-v1","right_elbow_p":16}
+    command=coordinator.adapter_command(options)
+    assert "--plan" not in command and "--prepare-current-rest" not in command
+    assert command[command.index("--operating-profile")+1]=="ordinary-am1-arms-v1"
+
+
+def test_ordinary_short_keeps_all12_validation_but_only_four_full_excursions():
+    ready,admitted=ordinary_wrist_midpoint_admission();before=copy.deepcopy((ready,admitted))
+    with pytest.raises(ValueError):coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing")
+    plan=coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing",short=True)
+    assert set(plan["initial_feedback"])==set(plan["origin"]) and len(plan["origin"])==12
+    assert set(plan["excursions"])==SHORT_KEYS
+    for key in plan["origin"]:
+        if key in SHORT_KEYS:
+            assert plan["excursions"][key]["amount"]==(20. if "gripper" in key else 4.)
+        else:assert plan["targets"][key]==plan["origin"][key]
+    assert (ready,admitted)==before
+
+
+def test_ordinary_short_declares_15active_2paused_original_return_after_fresh_resume():
+    ready,admitted=ordinary_wrist_midpoint_admission();options=ordinary_short_options()
+    plan=coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing",short=True)
+    phases=coordinator.phases_for(plan,options,admitted=admitted)
+    assert [p["op"] for p in phases]==["move","move","pause","resume","return","finish"]
+    assert sum(p.get("ramp",0)+p.get("dwell",0) for p in phases if p["op"] not in {"pause","resume"})==15.
+    assert phases[2]["dwell"]==2.
+    for key in plan["origin"]:
+        assert phases[0]["targets"][key]==(plan["targets"][key] if "elbow_flex" in key else plan["origin"][key])
+        assert phases[1]["targets"][key]==plan["targets"][key]
+    assert all(p.get("complete_before_advance") is True for p in phases if p["op"] in {"move","return"})
+    reader=VirtualIntentReader("interactive",clock=lambda:1.,allow_controls=True)
+    for phase in phases:
+        reader.receive_line(coordinator.phase_command(phase,60.));command=reader.take()
+        assert command["op"]==phase["op"]
+        if command["op"]=="move":assert set(command["targets"])==set(plan["origin"])
+
+
+@pytest.mark.parametrize("fault",["unselected_mapping","unselected_identity","source","owner","hold","view","deadline","elbow_rate","gripper_rate","gripper_fit"])
+def test_ordinary_short_preserves_all_joint_feedback_and_normal_authority_guards(fault):
+    ready,admitted=ordinary_wrist_midpoint_admission();state=admitted["snapshot"];native=state["run"]["live_input"]["workspace"]
+    points=state["evidence"]["accepted_host_action"]["arm_feedback"]["positions"]
+    if fault=="unselected_mapping":points["arm_right_wrist_flex.pos"]["normalized"]+=.1
+    elif fault=="unselected_identity":points["arm_right_wrist_flex.pos"]["raw"]=True
+    elif fault=="source":state["evidence"]["source"]="foreign"
+    elif fault=="owner":state["controller"]["device_id"]=None
+    elif fault=="hold":state["evidence"]["hold_acknowledged"]=False
+    elif fault=="view":state["run"]["live_input"]["required_view"]["required"]=False
+    elif fault=="deadline":state["run"]["deadline"]+=301.
+    elif fault=="elbow_rate":native["bounds"]["arm_right_elbow_flex.pos"]["rate_per_s"]=.0001
+    elif fault=="gripper_rate":native["bounds"]["arm_right_gripper.pos"]["rate_per_s"]=.0001
+    else:
+        key="arm_right_gripper.pos";q=native["bounds"][key]["min"]
+        for values in (native["reference"],state["run"]["live_input"]["reference"],state["run"]["live_input"]["cursor"],state["run"]["live_input"]["accepted_target"],ready["command_reference"]):values[key]=q
+        points[key].update(raw=2118,normalized=q)
+    with pytest.raises((ValueError,RuntimeError)):
+        coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing",short=True)
+
+
+@pytest.mark.parametrize("extra",[["--side","right"],["--workpose","admitted-span"],["--degrees","3"],["--gripper-cycle"],["--gripper-direction","opening"],["--approach-from-below"]])
+def test_ordinary_short_rejects_legacy_selectors_and_nonclosing_task(extra):
+    with pytest.raises(SystemExit):ordinary_short_options(*extra)
+
+
+def test_ordinary_short_preserves_distinct_measured_reference_and_legal_held_goals():
+    ready,admitted=ordinary_wrist_midpoint_admission();current=admitted["snapshot"]["run"]["live_input"]
+    key="arm_left_shoulder_lift.pos";commands=dict(ready["command_reference"]);commands[key]+=.01
+    current.update(cursor=dict(commands),accepted_target=dict(commands));ready["command_reference"]=commands
+    original=copy.deepcopy(current["workspace"]["reference"])
+    plan=coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing",short=True)
+    assert plan["origin"]==commands and plan["workspace"]["reference"]==original
+    assert plan["targets"][key]==commands[key]
+
+
+@pytest.mark.parametrize("short",[True,False])
+def test_ordinary_short_and_full_composition_cannot_be_mixed(short):
+    ready,admitted=ordinary_admission()
+    plan=coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing",short=short)
+    options=ordinary_options() if short else ordinary_short_options()
+    with pytest.raises(ValueError):coordinator.phases_for(plan,options,admitted=admitted)
+
+
+
+def test_ordinary_short_requires_ordinary_profile_and_a_closed_boolean_composition():
+    with pytest.raises(SystemExit):coordinator.parse_args(["--plan","ordinary-short","--bindings","unused.json"])
+    ready,admitted=ordinary_admission()
+    with pytest.raises(ValueError):coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing",short=1)
+
+
+
+def test_explicit_right_wrist_cli_declares_bounded_full_ordinary_option():
+    options=ordinary_options("--right-wrist-flex-degrees","1.5")
+    assert options.right_wrist_flex_degrees==1.5
+    assert ordinary_options().right_wrist_flex_degrees==3.
+    assert ordinary_short_options().right_wrist_flex_degrees is None
+
+
+def test_explicit_right_wrist_plan_fits_retained_midpoint_without_changing_reference():
+    ready,admitted=ordinary_wrist_midpoint_admission();before=copy.deepcopy((ready,admitted))
+    with pytest.raises(ValueError):coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing")
+    plan=coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing",right_wrist_flex_degrees=1.5)
+    key="arm_right_wrist_flex.pos";cal=plan["workspace"]["calibration"][key[:-4]]
+    assert plan["excursions"][key]["amount"]==1.5
+    assert plan["targets"][key]-plan["origin"][key]==pytest.approx(1.5*4096/360*200/(cal[4]-cal[3]))
+    assert (ready,admitted)==before
+
+
+
+@pytest.mark.parametrize("raw",[3127,3134,3147,3150,3167])
+def test_explicit_right_wrist_fixed_corridor_admits_whole_1p5_degree_excursion(raw):
+    ready,admitted=ordinary_wrist_midpoint_admission();state=admitted["snapshot"];current=state["run"]["live_input"]
+    key="arm_right_wrist_flex.pos";cal=current["workspace"]["calibration"][key[:-4]];q=normalized_raw(raw,cal)
+    for values in (current["reference"],current["workspace"]["reference"],current["cursor"],current["accepted_target"],ready["command_reference"]):values[key]=q
+    state["evidence"]["accepted_host_action"]["arm_feedback"]["positions"][key].update(raw=raw,normalized=q)
+    before=copy.deepcopy((ready,admitted))
+    plan=coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing",right_wrist_flex_degrees=1.5)
+    target=cal[3]+(plan["targets"][key]+100)/200*(cal[4]-cal[3])
+    assert 3127<=target<=3167 and abs(target-raw)==pytest.approx(17.0666666667)
+    assert plan["right_wrist_flex_degrees"]==1.5
+    for joint,item in plan["excursions"].items():
+        expected=1.5 if joint==key else 20. if "gripper" in joint else 3. if "wrist_flex" in joint else 4.
+        assert item["amount"]==expected
+    assert (ready,admitted)==before
+
+
+@pytest.mark.parametrize("plan",["ordinary-short","out-return","grasp-return"])
+def test_explicit_right_wrist_cli_refuses_all_other_compositions(plan):
+    with pytest.raises(SystemExit):coordinator.parse_args(["--plan",plan,"--bindings","unused.json","--right-wrist-flex-degrees","1.5"])
+
+
+@pytest.mark.parametrize("value",["0","2","nan","inf"])
+def test_explicit_right_wrist_cli_refuses_unsupported_or_nonfinite_choice(value):
+    with pytest.raises(SystemExit):ordinary_options("--right-wrist-flex-degrees",value)
+
+
+@pytest.mark.parametrize("value",[True,False,float("nan"),float("inf"),2.,None])
+def test_explicit_right_wrist_planner_requires_typed_bounded_value(value):
+    ready,admitted=ordinary_wrist_midpoint_admission()
+    with pytest.raises(ValueError):coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing",right_wrist_flex_degrees=value)
+
+
+def test_explicit_right_wrist_short_cannot_select_wrist_even_through_planner_api():
+    ready,admitted=ordinary_wrist_midpoint_admission()
+    with pytest.raises(ValueError):coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing",short=True,right_wrist_flex_degrees=1.5)
+
+
+@pytest.mark.parametrize("fault",["default_options","selected_options","metadata","target"])
+def test_explicit_right_wrist_plan_and_options_must_match(fault):
+    ready,admitted=ordinary_admission()
+    amount=3. if fault=="selected_options" else 1.5
+    plan=coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing",right_wrist_flex_degrees=amount)
+    options=ordinary_options() if fault in ("default_options","metadata") else ordinary_options("--right-wrist-flex-degrees","1.5")
+    if fault=="metadata":plan["right_wrist_flex_degrees"]=3.
+    elif fault=="target":
+        key="arm_right_wrist_flex.pos";cal=plan["workspace"]["calibration"][key[:-4]]
+        plan["targets"][key]=plan["origin"][key]+3.*4096/360*200/(cal[4]-cal[3])
+    with pytest.raises(ValueError):coordinator.phases_for(plan,options,admitted=admitted)
+
+
+@pytest.mark.parametrize("fault",["bounds","rate","reference"])
+def test_explicit_right_wrist_keeps_existing_workspace_rate_and_original_reference_guards(fault):
+    ready,admitted=ordinary_wrist_midpoint_admission();current=admitted["snapshot"]["run"]["live_input"];key="arm_right_wrist_flex.pos"
+    if fault=="bounds":current["workspace"]["raw_bounds"][key][0]+=1
+    elif fault=="rate":
+        current["workspace"]["bounds"][key]["rate_per_s"]=.0001
+        ready["bounds"][key]["rate_per_s"]=.0001
+    else:ready["command_reference"][key]+=.01
+    with pytest.raises((ValueError,RuntimeError)):coordinator.fresh_ordinary_targets(ready,admitted,ramp_seconds=3.,gripper_direction="closing",right_wrist_flex_degrees=1.5)
+
+
+@pytest.mark.parametrize("external",[False,True])
+def test_explicit_right_wrist_main_declares_before_start_and_uses_existing_pause_resume_relay(tmp_path,monkeypatch,external):
+    test_ordinary_coordinator_real_relay_waits_for_pause_ack_and_fresh_resume_before_new_move(tmp_path,monkeypatch,external,"ordinary-arms",_right_wrist_degrees=1.5)
+    console=next((tmp_path/"repo/.cache/am1-knowledge-reuse-18").glob("*.console.jsonl"))
+    records=[json.loads(line) for line in console.read_text().splitlines()]
+    declared=next(row for row in records if row["event"]=="local_activity_declared")
+    assert declared["right_wrist_flex_degrees"]==1.5 and declared["view"]=="normal required Chest"
+    assert records.index(declared)<next(i for i,row in enumerate(records) if row["event"]=="virtual_input_opened")
+    fresh=next(row for row in records if row["event"]=="local_fresh_targets")
+    assert fresh["right_wrist_flex_degrees"]==1.5 and fresh["ordinary_excursions"]["arm_right_wrist_flex.pos"]["amount"]==1.5
+    assert fresh["planned_active_seconds"]==45. and fresh["planned_paused_seconds"]==2.
+    assert "--right-wrist-flex-degrees" not in coordinator.adapter_command(ordinary_options("--right-wrist-flex-degrees","1.5"))

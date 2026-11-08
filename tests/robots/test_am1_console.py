@@ -1422,7 +1422,7 @@ def test_session_browser_uses_stable_mode_profiles_and_exact_decoder_flag(tmp_pa
         assert argv[0] == str(edge)
         assert f"--user-data-dir={profile}" in argv and profile.is_dir()
         assert ("--disable-accelerated-video-decode" in argv) is software
-        assert argv[-1] == f"--app={url}"
+        assert argv[-2:] == ["--new-window", url]
         assert options["shell"] is False
         assert not any("proxy" in arg or "ignore-certificate" in arg or "disable-web-security" in arg for arg in argv)
     output = capsys.readouterr().out
@@ -1443,7 +1443,7 @@ def test_session_url_admits_only_explicit_supported_https_targets(url, tmp_path,
     commands = []
     monkeypatch.setattr(console.subprocess, "Popen", lambda argv, **kw: commands.append(argv))
     console.open_console_browser(url, tmp_path / "state", persistent_session=True)
-    assert len(commands) == 1 and commands[0][-1] == f"--app={url}"
+    assert len(commands) == 1 and commands[0][-2:] == ["--new-window", url]
 
 
 @pytest.mark.parametrize("url", [

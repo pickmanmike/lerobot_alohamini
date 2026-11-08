@@ -13,6 +13,8 @@ from examples.alohamini.am1_live_teleop import (
     TELEOP_ARM_KEYS,
     TELEOP_RECIPE,
     TELEOP_SPEC,
+    browser_view_lifetime_s,
+    movement_input_lifetime_s,
     validate_body,
     validate_source,
     validate_target,
@@ -501,6 +503,7 @@ class PhysicalExecutor:
         self._completion_returns = []
         self.positive_prerequisite = None
         self.selected_experiment = None
+        self.ordinary_arm_profile = None
         self._lifecycle = {
             "run_id": None,
             "phase": "idle",
@@ -518,6 +521,11 @@ class PhysicalExecutor:
         self._live_admission_requested = False
         self._live_expired = None
         self._teleop_source = None
+        self._startup_view_requirement = self._startup_view_progress = None
+        self._startup_view_armed = False
+        self._startup_view_permit = None
+        self._startup_view_invalid = None
+        self._startup_observation_generation = None
         self._reset_input_transport_trace()
 
     def _reset_input_transport_trace(self):
@@ -661,6 +669,14 @@ class PhysicalExecutor:
                 raise RuntimeError("Positive prerequisite cannot change during an active owner")
             self.positive_prerequisite = copy.deepcopy(proof)
 
+    def set_ordinary_arm_profile(self, policy):
+        """Freeze a closed ordinary operating policy before fresh native ownership."""
+        from examples.alohamini.am1_live_teleop import validate_ordinary_arm_profile
+        with self.mutex:
+            if self.worker and self.worker.is_alive():
+                raise RuntimeError("Ordinary settings cannot change during an active owner")
+            self.ordinary_arm_profile = validate_ordinary_arm_profile(policy) if policy is not None else None
+
     def set_selected_experiment(self, definition):
         """Freeze only an authority-validated descriptor before native admission."""
         with self.mutex:
@@ -724,11 +740,13 @@ class PhysicalExecutor:
         """
         with self.mutex:
             lifecycle = self._lifecycle
+            cleanup = lifecycle.get("cleanup")
             if not (
                 isinstance(run, dict)
                 and run.get("status") == "faulted"
                 and run.get("uncertain") is False
-                and run.get("cleanup") == "physical_readback_verified"
+                and cleanup in ("physical_readback_verified", "no_physical_device_effects")
+                and run.get("cleanup") == cleanup
                 and run.get("run_id") == self.run_id
                 and isinstance(self._fault, str)
                 and self._fault
@@ -742,7 +760,6 @@ class PhysicalExecutor:
                 and lifecycle.get("phase") == "terminal"
                 and lifecycle.get("terminal_status") == "faulted"
                 and lifecycle.get("uncertain") is False
-                and lifecycle.get("cleanup") == "physical_readback_verified"
                 and lifecycle.get("cleanup_errors") == []
                 and run.get("physical_result") == lifecycle
                 and not (self.worker and self.worker.is_alive())
@@ -764,7 +781,23 @@ class PhysicalExecutor:
                 if not (
                     "native_first_cause" in run
                     and "first_cause" in lifecycle
-                    and isinstance(receipt, dict)
+                    and qualified_camera_release(camera, self.run_id)
+                ):
+                    return False
+                if cleanup == "no_physical_device_effects":
+                    return (
+                        lifecycle.get("startup_view_prepermission_exit") is True
+                        and self.ordinary_arm_profile is not None
+                        and (self._startup_view_requirement or {}).get("required") is True
+                        and not self._startup_view_armed
+                        and "native_live_at" in lifecycle and lifecycle["native_live_at"] is None
+                        and "native_live_at" in run and run["native_live_at"] is None
+                        and run["first_cause"] == observed_fault
+                        and native_cause is None and run["native_first_cause"] is None
+                        and "readback" in lifecycle and receipt is None
+                    )
+                return (
+                    isinstance(receipt, dict)
                     and "first_cause" in receipt
                     and (native_cause is None or type(native_cause) is str and bool(native_cause))
                     and run["native_first_cause"] == native_cause == receipt["first_cause"]
@@ -775,35 +808,14 @@ class PhysicalExecutor:
                     and readback.get("cleanup_errors") == []
                     and readback.get("selected_gain_restore_required") is False
                     and qualified_cleanup_receipt(receipt, self.run_id, self.host_incarnation)
-                    and isinstance(camera, dict)
-                    and type(camera.get("version")) is int
-                    and camera["version"] == 1
-                    and camera.get("session_id") == self.run_id
-                    and camera.get("state") == "released"
-                    and camera.get("errors") == []
-                    and camera.get("runtime_failed") is False
-                ):
-                    return False
-                release = camera.get("release_evidence")
-                return bool(
-                    isinstance(release, dict)
-                    and type(release.get("backend_returncode")) is int
-                    and release["backend_returncode"] == 0
-                    and all(
-                        release.get(k) is True
-                        for k in (
-                            "backend_exited",
-                            "readers_joined",
-                            "viewer_socket_closed",
-                            "runtime_config_removed",
-                        )
-                    )
                 )
             except (AttributeError, KeyError, TypeError, ValueError):
                 return False  # Malformed cached cleanup never becomes permission to start.
 
     def bind_run(self, run_id, recipe):
         with self.mutex:
+            if self.ordinary_arm_profile is not None and recipe.name != TELEOP_RECIPE:
+                raise ValueError("Ordinary arms policy requires the whole-frame teleop recipe")
             if recipe.name == SelectedElbowExperiment.recipe_name and self.selected_experiment is None:
                 raise RuntimeError("Selected experiment definition required before binding")
             if (
@@ -849,11 +861,187 @@ class PhysicalExecutor:
                 "uncertain": False,
                 "terminal_status": None,
             }
+            self._startup_view_requirement = self._startup_view_progress = None
+            self._startup_view_armed, self._startup_view_invalid = False, None
+            self._startup_view_permit = None
+            self._startup_observation_generation = None
             self.observation.begin(run_id, self._live_ceiling())
+
+    def configure_startup_view(self, binding, *, advisory_bench=False):
+        """Trusted Core policy, fixed to this Start before any host can launch."""
+        keys = {"run_id", "operation_id", "service_incarnation", "host_incarnation", "controller_generation",
+                "intent_revision", "role", "startup_deadline", "controller_expires", "required"}
+        with self.mutex:
+            if (self.ordinary_arm_profile is None or self.recipe.name != TELEOP_RECIPE
+                    or self._startup_view_requirement is not None or self.worker and self.worker.is_alive()
+                    or type(binding) is not dict or set(binding) != keys or type(advisory_bench) is not bool
+                    or type(binding["required"]) is not bool or binding["required"] == advisory_bench
+                    or binding["run_id"] != self.run_id or binding["host_incarnation"] != self.host_incarnation
+                    or type(binding["intent_revision"]) is not int or binding["intent_revision"] != self.revision
+                    or binding["role"] != "chest"
+                    or any(type(binding[k]) is not str or not binding[k] for k in
+                           ("run_id", "operation_id", "service_incarnation", "host_incarnation", "controller_generation"))
+                    or any(type(binding[k]) not in (int, float) or not math.isfinite(binding[k])
+                           or self.clock() >= binding[k] for k in ("startup_deadline", "controller_expires"))):
+                raise ValueError("exact current ordinary startup view policy required")
+            request = self.observation.request
+            if (not request or request["run_id"] != self.run_id or not request["active"]
+                    or binding["required"] and self.observation.source["role"] != binding["role"]):
+                raise ValueError("ordinary startup view requires its own Chest observation request")
+            self._startup_view_requirement = copy.deepcopy(binding)
+            self._startup_observation_generation = request["generation"]
+            self._lifecycle["startup_deadline"] = min(self._lifecycle["startup_deadline"], binding["startup_deadline"])
+
+    def _revoke_startup_view_permit(self):
+        if self._startup_view_permit is not None:
+            try:
+                self._startup_view_permit.unlink(missing_ok=True)
+                self._startup_view_permit = None
+            except OSError as error:
+                # Keep the owned Stop path and the original finite permission.
+                self._lifecycle.setdefault("startup_view_revocation_error", str(error))
+
+    def invalidate_startup_view(self, reason):
+        with self.mutex:
+            required = self._startup_view_requirement
+            if required and required["required"] and self._lifecycle["phase"] == "startup":
+                self._startup_view_invalid = self._startup_view_invalid or str(reason)
+                self._revoke_startup_view_permit()
+                self._wake.set()
+
+    def publish_startup_view(self, binding, view):
+        """Copy actual authority expiry and original browser clocks; never renew on read."""
+        with self.mutex:
+            required = self._startup_view_requirement
+            if required is None or not required["required"] or self._lifecycle["phase"] not in {"startup", "live"}:
+                return False
+            immutable = set(required) - {"controller_expires"}
+            if (self._startup_view_invalid or self.finish_status or type(binding) is not dict
+                    or set(binding) != set(required) or any(binding[k] != required[k] for k in immutable)
+                    or type(binding["controller_expires"]) not in (int, float)
+                    or not math.isfinite(binding["controller_expires"])
+                    or self.clock() >= required["controller_expires"]
+                    or binding["controller_expires"] < required["controller_expires"]):
+                self._startup_view_invalid = self._startup_view_invalid or "startup authority changed or expired"
+                self._revoke_startup_view_permit()
+                return False
+            required["controller_expires"] = binding["controller_expires"]
+            self._startup_view_progress = copy.deepcopy(view) if isinstance(view, dict) else None
+            if (self._lifecycle["phase"] == "startup" and self._startup_view_permit is not None
+                    and not self._startup_view_matches()):
+                self._revoke_startup_view_permit()
+            self._wake.set()
+            if self._lifecycle["phase"] == "live":
+                # Exact worker handoff may precede Core's next lifecycle tick.
+                # Acknowledging the mailbox never promotes Core NativeLive.
+                live = self._lifecycle.get("native_live_at")
+                request = self.observation.request or {}
+                owner = self._live_binding or {}
+                return bool(self._startup_view_armed and self.run_id == required["run_id"]
+                    and self.host_incarnation == required["host_incarnation"] and self.revision == required["intent_revision"]
+                    and all(owner.get(k) == required[k] for k in ("service_incarnation", "controller_generation"))
+                    and self._lifecycle.get("run_id") == self.run_id
+                    and type(live) in (int, float) and math.isfinite(live)
+                    and request.get("started_at", float("inf")) <= live < required["startup_deadline"]
+                    and self._startup_view_matches())
+            return True  # Delivery accepted; qualification is checked against current local evidence below.
+
+    def _startup_view_matches(self, *, failure_context=None, local=None):
+        required, view = self._startup_view_requirement, self._startup_view_progress
+        browser_checked_at, reason = None, None
+
+        def checked(name, value):
+            nonlocal reason
+            if not value:
+                reason = name
+            return value
+
+        if not required or not view:
+            matched, reason = False, "browser_descriptor_absent" if required else "startup_requirement_absent"
+        else:
+            if local is None:
+                local = self.observation.evidence()
+            floor, expiry = view.get("received_at_monotonic_s"), view.get("qualified_until")
+            browser_lifetime = browser_view_lifetime_s((self.ordinary_arm_profile or {}).get("profile"))
+            matched = bool(checked("local_qualified", local["qualified"])
+                and checked("owned_session", local.get("owned_session") == self.run_id)
+                and checked("request_generation", local.get("generation") == self._startup_observation_generation)
+                and checked("role", local.get("role") == required["role"] == view.get("role"))
+                and checked("owner_generation", local.get("owner_generation") == view.get("owner_generation"))
+                and checked("capture_generation", local.get("capture_generation") == view.get("capture_generation"))
+                and checked("browser_run", view.get("run_id") == self.run_id)
+                and checked("browser_source_qualified", view.get("source_fresh") is True)
+                and checked("browser_decoded_frames", type(view.get("decoded_frames")) is int and view["decoded_frames"] > 0)
+                and checked("browser_encode_generation", type(view.get("encode_generation")) is str and bool(view["encode_generation"]))
+                and checked("browser_clock_types", all(type(x) in (int, float) and math.isfinite(x) for x in (floor, expiry)))
+                and checked("browser_receipt_range", floor <= (browser_checked_at := self.clock()) < expiry)
+                and checked("browser_original_interval", abs(expiry - floor - browser_lifetime) < 1e-9))
+        if not matched and failure_context is not None and "startup_view_failure" not in self._lifecycle:
+            # One fixed, original proof snapshot; later finishing reads cannot replace it.
+            self._lifecycle["startup_view_failure"] = dict(
+                version=1, kind="am1-startup-required-view-failure", reason=reason,
+                run_id=self.run_id, host_incarnation=self.host_incarnation,
+                binding=copy.deepcopy(required), current_authority=copy.deepcopy(failure_context["current_authority"]),
+                startup_deadline=failure_context["startup_deadline"],
+                checked_at=dict(startup=failure_context["startup"], authority=failure_context["authority"], browser=browser_checked_at),
+                local=copy.deepcopy(local), browser=copy.deepcopy(view))
+        return matched
+
+    def _check_startup_view(self):
+        with self.mutex:
+            required = self._startup_view_requirement
+            if not required or not required["required"]:
+                return
+            if self.finish_status:
+                raise StartupCancelledError("physical startup cancelled by Stop")
+            if self._lifecycle["phase"] != "startup":
+                return
+            if (startup_checked_at := self.clock()) >= (startup_deadline := self._lifecycle["startup_deadline"]):
+                self._revoke_startup_view_permit()
+                raise RuntimeError("physical startup deadline expired")
+            owner = self._live_binding or {}
+            if (self._startup_view_invalid or self.revision != required["intent_revision"]
+                    or self.run_id != required["run_id"] or self.host_incarnation != required["host_incarnation"]
+                    or any(owner.get(k) != required[k] for k in ("service_incarnation", "controller_generation"))
+                    or (authority_checked_at := self.clock()) >= required["controller_expires"]):
+                self._startup_view_invalid = self._startup_view_invalid or "startup authority changed or expired"
+                self.finish_status = self.finish_status or "stopped"
+                self._revoke_startup_view_permit()
+                raise StartupCancelledError("physical startup cancelled: " + self._startup_view_invalid)
+            if self._startup_view_armed and not self._startup_view_matches(failure_context=dict(
+                    startup=startup_checked_at, authority=authority_checked_at, startup_deadline=startup_deadline,
+                    current_authority=dict(run_id=self.run_id,host_incarnation=self.host_incarnation,
+                                           intent_revision=self.revision,**owner))):
+                self._revoke_startup_view_permit()
+                raise RuntimeError("required owned local/browser view expired during physical startup")
+
+    def startup_view_ready(self, *, arm=True, permit=None):
+        with self.mutex:
+            self._check_startup_view()
+            required = self._startup_view_requirement
+            if required is None:
+                return self.ordinary_arm_profile is None
+            if not required["required"]:
+                return True
+            if self._lifecycle["phase"] != "startup":
+                return False
+            local = self.observation.evidence()
+            if not self._startup_view_matches(local=local):
+                return False
+            if arm:
+                expires = min(required["controller_expires"], self._lifecycle["startup_deadline"],
+                              self._startup_view_progress["qualified_until"], local["arrived_at"] + .5)
+                if self.clock() >= expires:
+                    return False
+                self._startup_view_armed = True
+                if permit is not None:
+                    self._startup_view_permit = permit(expires)
+            return True
 
     def begin(self, recipe):
         with self.mutex:
-            if self.recipe != recipe or self.worker and self.worker.is_alive():
+            if (self.recipe != recipe or self.worker and self.worker.is_alive()
+                    or self.ordinary_arm_profile is not None and self._startup_view_requirement is None):
                 return False
             self.worker = threading.Thread(target=self._run, name="am1-protected-native", daemon=False)
             self.worker.start()
@@ -864,6 +1052,7 @@ class PhysicalExecutor:
             if type(revision) is not int or revision < self.revision:
                 raise ValueError("physical intent revision must not regress")
             if revision != self.revision:
+                self._revoke_startup_view_permit()
                 self._live_target = None
                 self._live_expired = None
                 self.revision = revision
@@ -888,6 +1077,10 @@ class PhysicalExecutor:
             owner = {"service_incarnation": service_incarnation, "controller_generation": controller_generation,
                      "connection_generation": connection_generation}
             if owner != self._live_binding or intent_revision != self.revision:
+                previous = self._live_binding or {}
+                if intent_revision != self.revision or any(owner[key] != previous.get(key)
+                        for key in ("service_incarnation", "controller_generation")):
+                    self._revoke_startup_view_permit()
                 self._live_expired = None
                 if owner != self._live_binding:
                     self._live_last_seq = -1
@@ -955,14 +1148,18 @@ class PhysicalExecutor:
         if not thermal_ready or (_thermal is not None and _thermal["deficit_started_at_monotonic_s"] is not None):
             return False  # Only a new actual active ACK can close the held history episode.
         checked_at = self.clock()
+        profile = (self.ordinary_arm_profile or {}).get("profile")
         if (type(checked_at) not in (int, float) or not math.isfinite(checked_at)
-                or valid_until_monotonic_s > checked_at + .25 + 1e-9):
+                or valid_until_monotonic_s > checked_at + movement_input_lifetime_s(profile) + 1e-9):
             return False
         try:
             workspace = validate_workspace((self.sample or {}).get("ack", {}).get("live_input", {}).get("workspace"))
             target = validate_target(target, workspace=workspace)
             body = validate_body(body)
-            source = validate_source(source, grant_id=grant_id, previous=self._teleop_source)
+            if self.ordinary_arm_profile is not None and (
+                    workspace.get("workspace_profile") != self.ordinary_arm_profile["profile"] or body != ZERO_BODY):
+                return False
+            source = validate_source(source, grant_id=grant_id, previous=self._teleop_source, profile=profile)
         except (KeyError, TypeError, ValueError):
             return False
         # Core's earlier grant check can precede evidence work or this mutex.
@@ -1155,7 +1352,8 @@ class PhysicalExecutor:
                         readback = receipt.get("readback") if isinstance(receipt, dict) else {}
                         camera = lifecycle.get("camera_release") or {}
                         release = camera.get("release_evidence") or {}
-                        terminal_clean = bool(
+                        reconciliation = self._reconciliation_worker
+                        terminal_bound = (
                             uuid_text(self.run_id) == self.run_id
                             and uuid_text(self.host_incarnation) == self.host_incarnation
                             and lifecycle.get("run_id") == self.run_id
@@ -1165,10 +1363,12 @@ class PhysicalExecutor:
                             and type(lifecycle.get("terminal_status")) is str
                             and lifecycle["terminal_status"] in {"stopped", "completed", "faulted", "interrupted"}
                             and lifecycle.get("uncertain") is False
-                            and lifecycle.get("cleanup") == "physical_readback_verified"
-                            and lifecycle.get("cleanup_errors") == []
                             and not (self.worker and self.worker.is_alive())
-                            and not (self._reconciliation_worker and self._reconciliation_worker.thread.is_alive())
+                            and not (reconciliation and reconciliation.thread.is_alive())
+                        )
+                        terminal_clean = terminal_bound and (
+                            lifecycle.get("cleanup") == "physical_readback_verified"
+                            and lifecycle.get("cleanup_errors") == []
                             and isinstance(receipt, dict) and type(receipt.get("version")) is int
                             and "first_cause" in lifecycle and "first_cause" in receipt
                             and (lifecycle["first_cause"] is None
@@ -1185,6 +1385,20 @@ class PhysicalExecutor:
                             and all(release.get(k) is True for k in
                                     ("backend_exited", "readers_joined", "viewer_socket_closed", "runtime_config_removed"))
                         )
+                        if terminal_bound and not terminal_clean and reconciliation and reconciliation.state == "consumed":
+                            # Reconcile verified stopped resources separately. Match its exact
+                            # original terminal snapshot without rewriting the historical result.
+                            original = reconciliation.run
+                            result = original.get("physical_result")
+                            terminal_clean = (
+                                original.get("run_id") == self.run_id
+                                and original.get("recipe") == self.recipe.name
+                                and original.get("status") == lifecycle["terminal_status"]
+                                and original.get("cleanup") == lifecycle.get("cleanup") == "physical_cleanup_unknown"
+                                and original.get("uncertain") is True
+                                and isinstance(result, dict) and result.get("uncertain") is True
+                                and lifecycle == {**result, "uncertain": False}
+                            )
                     except (AttributeError, KeyError, TypeError, ValueError):
                         terminal_clean = False  # Incomplete or foreign cleanup retains live proof validation.
                 if terminal_clean:
@@ -1310,6 +1524,7 @@ class PhysicalExecutor:
                 return copy.deepcopy(self._lifecycle)
             if not self.finish_status or status in ("stopped", "faulted", "interrupted"):
                 self.finish_status = status
+            self._revoke_startup_view_permit()
             self.desired = "hold"
             self._dispatch_ack = False
             self._wake.set()
@@ -1369,12 +1584,18 @@ class PhysicalExecutor:
                     raise StartupCancelledError("physical startup cancelled by Stop")
                 if self.clock() >= self._lifecycle["startup_deadline"]:
                     raise RuntimeError("physical startup deadline expired")
+                self._check_startup_view()
 
             io.observation = self.observation
+            if self._startup_view_requirement and self._startup_view_requirement["required"]:
+                io.startup_view = self.startup_view_ready
+                io.startup_view_deadline = self._lifecycle["startup_deadline"]
             io.start(
                 self.run_id, self.host_incarnation, self.recipe, cancel,
                 **({"selected_experiment": self.selected_experiment.payload}
                    if self.recipe.name == SelectedElbowExperiment.recipe_name else {}),
+                **({"ordinary_arm_profile": copy.deepcopy(self.ordinary_arm_profile)}
+                   if self.ordinary_arm_profile is not None else {}),
             )
             while True:
                 with self.mutex:
@@ -1510,6 +1731,7 @@ class PhysicalExecutor:
                             self._live_admission_requested = True
                             admitted = ack.get("live_input", {})
                             if self._lifecycle["phase"] == "startup" and admitted.get("live_admitted_at_monotonic_s") is not None:
+                                self._check_startup_view()
                                 self._lifecycle.update(phase="live", native_live_at=admitted["live_admitted_at_monotonic_s"],
                                     native_deadline_monotonic_s=admitted["live_deadline_monotonic_s"],
                                     backend_incarnation=self.host_incarnation)
@@ -1704,6 +1926,7 @@ class PhysicalExecutor:
                 self._execution = dict(self._execution, fault=self._fault)
         finally:
             with self.mutex:
+                self._revoke_startup_view_permit()
                 self._lifecycle["phase"] = "finishing"
                 status = self.finish_status or "faulted"
                 if self.task:
@@ -1735,7 +1958,29 @@ class PhysicalExecutor:
 BODY_MOTORS = ("base_left_wheel", "base_back_wheel", "base_right_wheel", "lift_axis")
 
 
-def qualified_cleanup_receipt(receipt, run_id, incarnation):
+def qualified_camera_release(camera, run_id):
+    if not (
+        isinstance(camera, dict)
+        and type(camera.get("version")) is int
+        and camera["version"] == 1
+        and camera.get("session_id") == run_id
+        and camera.get("state") == "released"
+        and camera.get("errors") == []
+        and camera.get("runtime_failed") is False
+    ):
+        return False
+    release = camera.get("release_evidence")
+    return (
+        isinstance(release, dict)
+        and type(release.get("backend_returncode")) is int
+        and release["backend_returncode"] == 0
+        and all(release.get(key) is True for key in (
+            "backend_exited", "readers_joined", "viewer_socket_closed", "runtime_config_removed",
+        ))
+    )
+
+
+def qualified_cleanup_receipt(receipt, run_id, incarnation, *, ordinary_arm_profile=None):
     if (
         not isinstance(receipt, dict)
         or receipt.get("version") != 1
@@ -1757,6 +2002,24 @@ def qualified_cleanup_receipt(receipt, run_id, incarnation):
         or readback.get("selected_gain_restore_required")
     ):
         return False
+    ordinary = readback.get("ordinary_arm_profile")
+    if ordinary_arm_profile is not None or ordinary is not None or "ordinary_arm_profile_restore_required" in readback:
+        try:
+            from examples.alohamini.am1_live_teleop import validate_ordinary_arm_profile
+            from examples.alohamini.am1_live_teleop import validate_ordinary_arm_profile_receipt
+            if readback.get("selected_gain_restore_required") is not False or (
+                "ordinary_arm_profile_restore_required" in readback
+                and readback["ordinary_arm_profile_restore_required"] is not False
+            ):
+                return False
+            proof = validate_ordinary_arm_profile_receipt(ordinary, run_id=run_id,
+                                                        host_incarnation=incarnation, restored=True)
+            if ordinary_arm_profile is not None and {
+                    key: proof["binding"][key] for key in ("profile", "right_elbow_p")
+            } != validate_ordinary_arm_profile(ordinary_arm_profile):
+                return False
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return False
     expected = {
         ("left" if "_left_" in k else "right", k.removesuffix(".pos"), "Torque_Enable") for k in JOINT_KEYS
     }
@@ -1781,6 +2044,9 @@ class ProtectedHostRun:
         self.config = config
         self.host = self.camera = self.client = None
         self.observation = None
+        self.startup_view = None
+        self.startup_view_deadline = None
+        self._startup_permission_pending = False
         self.host_log = self.camera_log = None
         self.run_id = self.incarnation = None
         self.recipe = None
@@ -1854,7 +2120,11 @@ class ProtectedHostRun:
             if hashlib.sha256(Path(path).read_bytes()).hexdigest() != digest:
                 raise RuntimeError("preserved calibration content changed")
 
-    def start(self, run_id, incarnation, recipe, cancel, *, selected_experiment=None):
+    def start(self, run_id, incarnation, recipe, cancel, *, selected_experiment=None, ordinary_arm_profile=None):
+        from examples.alohamini.am1_live_teleop import validate_ordinary_arm_profile
+        ordinary = validate_ordinary_arm_profile(ordinary_arm_profile) if ordinary_arm_profile is not None else None
+        if ordinary is not None and (recipe.name != TELEOP_RECIPE or selected_experiment is not None):
+            raise ValueError("Ordinary arms require the existing whole-frame recipe without an experiment")
         definition = None
         if recipe.name == SelectedElbowExperiment.recipe_name:
             if selected_experiment is None:
@@ -1867,6 +2137,7 @@ class ProtectedHostRun:
         elif recipe.name in ELBOW_RECOVERY_DEFINITIONS:
             load_elbow_return_reference(self.config, definition=ELBOW_RECOVERY_DEFINITIONS[recipe.name])
         import os
+        import stat
         from pathlib import Path
 
         from lerobot.robots.alohamini.alohamini_client import AlohaMiniClient
@@ -1874,12 +2145,15 @@ class ProtectedHostRun:
 
         self.run_id, self.incarnation = run_id, incarnation
         self.recipe = recipe
+        self.ordinary_arm_profile = copy.deepcopy(ordinary)
         self._validate_source()
         cancel()
         state = Path(self.config["physical_state_directory"])
         if (state / "cleanup-uncertain.json").exists() or (state / "physical-in-progress.json").exists():
             raise RuntimeError("previous physical cleanup requires actual stopped reconciliation")
         pending_response = [state / (side + "-response-p-request.json") for side in ("left", "right")]
+        if ordinary is not None and any(path.exists() or path.is_symlink() for path in pending_response):
+            raise ValueError("Ordinary arms cannot consume a pending legacy response experiment")
         if all(path.exists() or path.is_symlink() for path in pending_response):
             raise ValueError("response P admission requires one selected elbow request")
         # The isolated hardware host unit acquires canonical + serial admission before robot construction.
@@ -1895,18 +2169,19 @@ class ProtectedHostRun:
             consume_right_p20_request,
             consume_right_response_p_request,
         )
-        left_response_p_file = consume_left_response_p_request(
-            state, self.run_directory, recipe.name, run_id, incarnation, self.config["host_head"]
-        )
-        right_response_p_file = None
-        if left_response_p_file is None:
-            right_response_p_file = consume_right_response_p_request(
+        left_response_p_file = right_response_p_file = None
+        if ordinary is None:
+            left_response_p_file = consume_left_response_p_request(
                 state, self.run_directory, recipe.name, run_id, incarnation, self.config["host_head"]
             )
+            if left_response_p_file is None:
+                right_response_p_file = consume_right_response_p_request(
+                    state, self.run_directory, recipe.name, run_id, incarnation, self.config["host_head"]
+                )
         # Named baseline presets derive fixed native settings from the authenticated
         # recipe and this fresh run identity; experimental nonces are unrelated.
         right_p20_file = None
-        if recipe.name not in PRACTICAL_ELBOW_PRESETS:
+        if ordinary is None and recipe.name not in PRACTICAL_ELBOW_PRESETS:
             right_p20_file = consume_right_p20_request(state, self.run_directory, recipe.name,
                                                      run_id, incarnation, self.config["host_head"])
         experiment_file = None
@@ -1952,7 +2227,9 @@ class ProtectedHostRun:
             log=self.camera_log,
             camera_route_discovery=True,
         )
-        wait_required_camera(self.camera, self.observation, cancel)
+        guarded_startup = self.startup_view is not None
+        wait_required_camera(self.camera, self.observation, cancel,
+                             **({"required_view": lambda: self.startup_view(arm=False)} if guarded_startup else {}))
         cancel()
         env["AM1_MOTOR_PYTHON"] = self.config["host_python"]
         env["AM1_LOG_DIRECTORY"] = str(self.run_directory)
@@ -2012,6 +2289,11 @@ class ProtectedHostRun:
             "--am1-physical-state-directory",
             str(state),
         ]
+        if ordinary is not None:
+            host_command.extend(["--am1-ordinary-arm-profile", ordinary["profile"],
+                                 "--am1-ordinary-right-elbow-p", str(ordinary["right_elbow_p"])])
+        if guarded_startup:
+            host_command.extend(["--am1-startup-view-deadline", str(self.startup_view_deadline)])
         if experiment_file is not None:
             host_command.extend(["--am1-selected-experiment-file", str(experiment_file)])
         if right_p20_file is not None:
@@ -2040,6 +2322,8 @@ class ProtectedHostRun:
             PYTHONDONTWRITEBYTECODE="1",
             PYTHONUNBUFFERED="1",
         )
+        cancel()
+        self._startup_permission_pending = guarded_startup
         self.host = OwnedUnit(
             "am1-pa01-host-" + run_id,
             self.config["host_repository"],
@@ -2050,6 +2334,36 @@ class ProtectedHostRun:
             signal_name="SIGINT",
             log=self.host_log,
         )
+        if guarded_startup:
+            ready_path = self.run_directory / "startup-view-ready"
+            permit_path = self.run_directory / "startup-view-permit"
+
+            def publish_permission(expires):
+                # Count any attempted publication as possible physical entry.
+                self._startup_permission_pending = False
+                temporary = permit_path.with_suffix(".pending")
+                descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+                    stream.write(str(expires))
+                os.replace(temporary, permit_path)
+                return permit_path
+
+            while True:
+                cancel()
+                if self.host.poll() is not None or self.camera.poll() is not None:
+                    raise RuntimeError("owned host or camera exited before startup view permission")
+                try:
+                    info = ready_path.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    if (not stat.S_ISREG(info.st_mode) or info.st_size != 0
+                            or os.name != "nt" and
+                            (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600)):
+                        raise RuntimeError("invalid protected host startup readiness marker")
+                    if self.startup_view(permit=publish_permission):
+                        break
+                time.sleep(.05)
         # This fresh run directory cannot borrow another run's readiness. Retain
         # its post-home marker while activation finishes and the socket binds;
         # startup receipts and routine lift output may exceed the old log tail.
@@ -2143,11 +2457,19 @@ class ProtectedHostRun:
                 self.client.disconnect()
             except Exception as exc:
                 errors.append("local client close: " + str(exc))
-        motors = qualified_cleanup_receipt(receipt, self.run_id, self.incarnation)
-        no_device_effects = self.host is None
+        motors = qualified_cleanup_receipt(receipt, self.run_id, self.incarnation,
+                                            ordinary_arm_profile=getattr(self, "ordinary_arm_profile", None))
         # Required camera remains through host finishing. Release main process once; it cleans its child.
         camera_receipt = None
         host_exited = self.host is None or self.host.actual_exited()
+        no_device_effects = self.host is None
+        if host_exited and getattr(self, "_startup_permission_pending", False):
+            state = Path(self.config["physical_state_directory"])
+            possible_effects = (
+                self.run_directory / "startup-view-permit", self.receipt,
+                state / "physical-in-progress.json", state / "cleanup-uncertain.json",
+            )
+            no_device_effects = not any(path.exists() or path.is_symlink() for path in possible_effects)
         if self.camera is not None and not self.camera.actual_exited() and host_exited:
             try:
                 self.camera.stop()
@@ -2176,6 +2498,9 @@ class ProtectedHostRun:
                 )
             )
         )
+        prepermission_exit = self.host is not None and no_device_effects
+        if prepermission_exit:
+            camera_clean = qualified_camera_release(camera_receipt, self.run_id)
         clean = (motors or no_device_effects) and camera_clean and not errors
         # Release canonical only when host has actually exited; unknown cleanup remains persistently latched.
         for stream in (self.host_log, self.camera_log):
@@ -2192,6 +2517,8 @@ class ProtectedHostRun:
             "readback": receipt,
             "camera_release": camera_receipt,
             "cleanup_errors": errors,
+            **({"startup_view_prepermission_exit": True}
+               if clean and prepermission_exit else {}),
             "backend_incarnation": self.incarnation,
             "run_directory": str(self.run_directory),
         }
@@ -2374,14 +2701,14 @@ class OwnedUnit:
             raise RuntimeError("owned unit cooperative stop refused")
 
 
-def wait_required_camera(camera, observation, cancel, *, sleep=time.sleep):
+def wait_required_camera(camera, observation, cancel, *, sleep=time.sleep, required_view=None):
     if observation is None:
         raise ValueError("actual required local-camera mailbox unavailable")
     while True:
         cancel()
         if camera.poll() is not None:
             raise RuntimeError("required owned camera exited before physical host launch")
-        if observation.evidence()["qualified"]:
+        if observation.evidence()["qualified"] and (required_view is None or required_view()):
             return
         sleep(0.05)
 
@@ -2648,6 +2975,8 @@ def main(argv=None):
                         help="Explicit temporary 1-degree inward LEFT shoulder startup allowance for current-rest only")
     args = parser.parse_args(argv)
     profile = CURRENT_REST_WORKSPACE_PROFILES[args.left_response_workload] if args.left_response_workspace is not None else None
+    if args.left_shoulder_startup_degrees is not None and profile is None:
+        parser.error("Left shoulder startup allowance requires the explicit current-rest workspace")
     receipt = prepare_left_response_p_remote(args.config, ssh=args.ssh, ttl_seconds=args.ttl_seconds,
         workspace_profile=profile, left_shoulder_startup_degrees=args.left_shoulder_startup_degrees,
         workload_segment=args.left_response_workload)
