@@ -361,6 +361,48 @@ def test_ordinary_startup_view_gate_fences_actual_motor_connection(tmp_path, mon
         assert events == ["claim", "construct"]
 
 
+@pytest.mark.parametrize("fault", [None, "runtime", "profile", "permit", "duration", "legacy"])
+def test_selectable_host_runtime_requires_exact_protected_ordinary_scope(tmp_path, monkeypatch, capsys, fault):
+    import sys
+
+    identity = binding()
+    argv = [
+        "--robot_model", "alohamini1", "--no_cameras",
+        "--max_relative_target", "20", "--max_loop_freq_hz", "30",
+        "--am1-ordinary-activity-seconds", "0" if fault == "duration" else "900",
+        "--am1-host-runtime-s", "1154" if fault == "runtime" else "1155",
+    ]
+    if fault != "legacy":
+        argv += ["--am1-protected-run-directory", str(tmp_path),
+                 "--am1-run-id", identity["run_id"], "--am1-host-incarnation", identity["host_incarnation"],
+                 "--am1-cleanup-receipt", str(tmp_path / "cleanup.json")]
+    if fault != "profile":
+        argv += ["--am1-ordinary-arm-profile", "ordinary-am1-arms-v1", "--am1-ordinary-right-elbow-p", "16"]
+    if fault != "permit":
+        argv += ["--am1-startup-view-deadline", "11"]
+
+    monkeypatch.setenv("AM1_VISIBLE_CONTROL_RECIPE", "physical-live-teleop")
+    monkeypatch.setenv("AM1_SCRIPTED_PREPARE", "1")
+    monkeypatch.setattr(sys, "argv", ["host", *argv])
+    visited = []
+
+    def startup(directory, deadline):
+        visited.append((directory, deadline))
+        raise RuntimeError("mock startup boundary")
+
+    monkeypatch.setattr(host, "_await_startup_view", startup)
+    if fault is None:
+        with pytest.raises(RuntimeError, match="mock startup boundary"):
+            host.main()
+        assert visited == [(tmp_path, 11)]
+        assert host.make_host_config(host.make_parser().parse_args(argv)).connection_time_s == 1155
+    else:
+        with pytest.raises(SystemExit):
+            host.main()
+        assert "ordinary" in capsys.readouterr().err
+        assert not visited
+
+
 def test_host_arbitration_refuses_before_robot_construction(monkeypatch):
     import sys
 

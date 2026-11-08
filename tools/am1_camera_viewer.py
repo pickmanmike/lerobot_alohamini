@@ -41,6 +41,9 @@ ROLES = ("forward", "backward", "chest", "wrist_left", "wrist_right")
 PREVIEW_ROLES = ("preview_1", "preview_2", "preview_3", "preview_4", "preview_5")
 MAX_JPEG = 1_000_000
 FRESH_SECONDS = 0.5
+# One hour of ordinary activity, plus 180 s startup, 15 s Finish,
+# 60 s cleanup, and 30 s capture process margin.
+MAX_OWNED_SOURCE_BUDGET_SECONDS = 3885
 BINARY_SHA256 = "359fabade8a7a51e81a55fe6df6b0ef81764a5e1d63179577534eaaa71904b50"
 _LOG_LOCK = threading.Lock()
 
@@ -82,8 +85,9 @@ class OwnedCameraLease:
             raise ValueError("Owned camera session requires a canonical UUID") from exc
         if valid_id != session_id:
             raise ValueError("Owned camera session requires a canonical UUID")
-        if type(budget) not in (int, float) or not math.isfinite(budget) or not 1 <= budget <= 900:
-            raise ValueError("Owned camera source budget must be finite and within 1–900 seconds")
+        if (type(budget) not in (int, float) or not math.isfinite(budget)
+                or not 1 <= budget <= MAX_OWNED_SOURCE_BUDGET_SECONDS):
+            raise ValueError(f"Owned camera source budget must be finite and within 1–{MAX_OWNED_SOURCE_BUDGET_SECONDS} seconds")
         self.clock = clock
         self._used = False
         self._claim_lock = threading.Lock()
@@ -851,7 +855,7 @@ def main(argv=None):
     parser.add_argument("--duration", type=float, help="Optional bounded camera-only check, 1–120 seconds")
     parser.add_argument("--owned-session", help="Fresh owned-session UUID; one-use finite source lease")
     parser.add_argument("--source-budget-seconds", type=float,
-                        help="Owned source lifetime including startup and finishing, 1–900 seconds")
+                        help=f"Owned source lifetime including startup and finishing, 1–{MAX_OWNED_SOURCE_BUDGET_SECONDS} seconds")
     args = parser.parse_args(argv)
     if (args.owned_session is None) != (args.source_budget_seconds is None):
         parser.error("--owned-session and --source-budget-seconds must be supplied together")

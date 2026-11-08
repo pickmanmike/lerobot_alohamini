@@ -1763,7 +1763,7 @@ def apply_frame(control, robot, command, marker_key):
         if marker["live_admitted"] and "live_admitted_at_monotonic_s" not in control._live_summary:
             now = control.clock()
             control._live_summary.update(
-                live_admitted_at_monotonic_s=now, live_deadline_monotonic_s=now + 300
+                live_admitted_at_monotonic_s=now, live_deadline_monotonic_s=now + control._teleop_live_s
             )
         control._live_summary.update(
             state="held",

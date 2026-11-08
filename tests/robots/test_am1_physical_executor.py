@@ -3987,8 +3987,8 @@ def test_supported_gripper_interval_preparer_freezes_selection_before_stopped_gu
     assert interval == [0, 3102] and receipt["request"]["left_gripper_raw_interval"] == selected
 
 
-@pytest.mark.parametrize("right_p", [16, 32])
-def test_ordinary_profile_native_host_launch_has_no_experiment_request_dependency(tmp_path, monkeypatch, right_p):
+@pytest.mark.parametrize(("right_p", "activity"), [(16, None), (32, None), (16, 900)])
+def test_ordinary_profile_native_host_launch_has_no_experiment_request_dependency(tmp_path, monkeypatch, right_p, activity):
     from uuid import uuid4
     from examples.alohamini.am1_session_contract import RECIPES
     from lerobot.robots.alohamini import am1_elbow_integral as integral
@@ -4002,8 +4002,10 @@ def test_ordinary_profile_native_host_launch_has_no_experiment_request_dependenc
         "camera_credentials":str(tmp_path/"credentials"), "camera_binary":str(tmp_path/"binary"),
         "camera_state":str(tmp_path/"camera")}
     provider.observation = SimpleNamespace()
+    provider.startup_view = (lambda **kwargs: True) if activity is not None else None
+    provider.startup_view_deadline = 190.0 if activity is not None else None
     monkeypatch.setattr(provider,"_validate_source",lambda:None)
-    monkeypatch.setattr(m,"wait_required_camera",lambda *args:None)
+    monkeypatch.setattr(m,"wait_required_camera",lambda *args,**kwargs:None)
     for name in ("consume_left_response_p_request", "consume_right_response_p_request", "consume_right_p20_request"):
         monkeypatch.setattr(integral,name,lambda *a,**k:pytest.fail("ordinary settings cannot consume an experiment nonce"))
     owned=[]
@@ -4015,9 +4017,21 @@ def test_ordinary_profile_native_host_launch_has_no_experiment_request_dependenc
     run, host = str(uuid4()), str(uuid4())
     policy={"profile":"ordinary-am1-arms-v1", "right_elbow_p":right_p}
     with pytest.raises(OSError,match="before native device"):
-        provider.start(run,host,RECIPES["physical-live-teleop"],lambda:None,ordinary_arm_profile=policy)
-    command=owned[-1][1][1]
+        provider.start(run,host,RECIPES["physical-live-teleop"],lambda:None,
+                       ordinary_arm_profile=policy, ordinary_activity_seconds=activity)
+    camera, native = (args for _, args in owned)
+    camera_command, command = camera[1], native[1]
     assert command[command.index("--am1-ordinary-arm-profile")+1] == policy["profile"]
+    if activity is None:
+        assert camera_command[camera_command.index("--source-budget-seconds")+1] == "570.0"
+        assert native[3] == 720 and "--am1-ordinary-activity-seconds" not in command
+    else:
+        assert camera_command[camera_command.index("--source-budget-seconds")+1] == "1185"
+        assert camera[3] == 1205
+        assert command[command.index("--am1-ordinary-activity-seconds")+1] == "900"
+        assert command[command.index("--am1-host-runtime-s")+1] == "1155"
+        assert command[command.index("--am1-startup-view-deadline")+1] == "190.0"
+        assert native[3] == 1235
     assert command[command.index("--am1-ordinary-right-elbow-p")+1] == str(right_p)
     assert command[command.index("--am1-run-id")+1] == run
     assert command[command.index("--am1-host-incarnation")+1] == host

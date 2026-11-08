@@ -104,27 +104,28 @@ def test_duplicate_sigterm_during_owned_cleanup_cannot_interrupt_release():
         assert not list(state.glob("backend-*.json"))
 
 
-def test_owned_uuid_is_single_use_and_deadline_cannot_be_renewed():
+@pytest.mark.parametrize("budget", [30, 1185, 3885])
+def test_owned_uuid_is_single_use_and_deadline_cannot_be_renewed(budget):
     viewer = load_viewer()
     now = [10.0]
     with tempfile.TemporaryDirectory() as directory:
         state = Path(directory)
         session_id = str(uuid.uuid4())
-        lease = viewer.OwnedCameraLease(state, session_id, 30, clock=lambda: now[0])
+        lease = viewer.OwnedCameraLease(state, session_id, budget, clock=lambda: now[0])
         before = lease.path.read_bytes()
-        assert lease.deadline == 40.0
-        now[0] = 39.9
+        assert lease.deadline == 10.0 + budget
+        now[0] = lease.deadline - 0.1
         assert not lease.expired()
-        now[0] = 40.0
+        now[0] = lease.deadline
         assert lease.expired()
         with pytest.raises(FileExistsError):
             viewer.OwnedCameraLease(state, session_id, 900, clock=lambda: now[0])
         assert lease.path.read_bytes() == before
         fresh = viewer.OwnedCameraLease(state, str(uuid.uuid4()), 30, clock=lambda: now[0])
-        assert fresh.deadline == 70.0
+        assert fresh.deadline == lease.deadline + 30.0
 
 
-@pytest.mark.parametrize("budget", [0, -1, 900.001, float("inf"), float("nan"), True])
+@pytest.mark.parametrize("budget", [0, -1, 3885.001, 3886, float("inf"), float("nan"), True])
 def test_owned_lease_rejects_unbounded_budget_before_preflight(budget):
     viewer = load_viewer()
     with tempfile.TemporaryDirectory() as directory, pytest.raises(ValueError):

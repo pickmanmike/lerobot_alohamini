@@ -1299,6 +1299,51 @@ def test_ordinary_phase_feedback_reports_actual_residual_without_arrival_credit(
     assert actual[KEY]["raw"] == frame["native"]["evidence"]["accepted_host_action"]["arm_feedback"]["positions"][KEY]["raw"]
 
 
+@pytest.mark.parametrize("fault", [None, "different-measurement", "missing-acquisition", "invalid-seal", "stale-read", "wrong-policy"])
+def test_ordinary_phase_feedback_reports_only_exact_admitted_shoulder_over_calibration(fault):
+    from tests.robots.test_am1_live_teleop_contract import ordinary_start_workspace
+
+    ready, _, frame = ordinary_active_frame()
+    run = frame["native"]["run"]
+    live = run["live_input"]
+    workspace = ordinary_start_workspace()
+    shoulder = "arm_left_shoulder_lift.pos"
+    calibration = workspace["calibration"][shoulder[:-4]]
+    measured = normalized_raw(3226, calibration)
+    workspace["startup_acquisition"]["measured_reference"][shoulder] = measured
+    workspace["reference"][shoulder] = measured
+    targets = dict(workspace["startup_acquisition"]["command_reference"])
+    live.update(workspace=workspace, reference=dict(workspace["reference"]))
+    point = frame["native"]["evidence"]["accepted_host_action"]["arm_feedback"]["positions"][shoulder]
+    point.update(raw=3226, normalized=measured)
+    if fault == "different-measurement":
+        point.update(raw=3227, normalized=normalized_raw(3227, calibration))
+    elif fault == "missing-acquisition":
+        workspace.pop("startup_acquisition")
+    elif fault == "invalid-seal":
+        workspace["startup_acquisition"]["displacement_bound_degrees"] = 2.
+    elif fault == "stale-read":
+        point["read_started_at_monotonic_s"] = run["deadline"] - run["remaining_s"] - .501
+    elif fault == "wrong-policy":
+        run["ordinary_arm_profile"]["right_elbow_p"] = 64
+
+    if fault is not None:
+        with pytest.raises(ValueError):
+            coordinator.phase_feedback(frame, run_id=ready["run_id"], accepted=1, now=20.1,
+                                       workspace=workspace, targets=targets)
+    else:
+        original = copy.deepcopy((frame, targets))
+        actual = coordinator.phase_feedback(frame, run_id=ready["run_id"], accepted=1, now=20.1,
+                                            workspace=workspace, targets=targets)
+        assert actual[shoulder]["raw"] == 3226
+        assert actual[shoulder]["normalized"] == measured
+        assert actual[shoulder]["requested_target"] == 100.
+        assert actual[shoulder]["target_error"] == pytest.approx(.252631578947)
+        with pytest.raises(ValueError):
+            coordinator.validate_target(dict(targets, **{shoulder: measured}), workspace=workspace)
+        assert (frame, targets) == original
+
+
 @pytest.mark.parametrize("fault", ["old", "seq", "view", "ack", "source", "expired", "read", "mapping", "body"])
 def test_ordinary_phase_feedback_refuses_stale_or_unqualified_actuals(fault):
     ready, admitted, frame = ordinary_active_frame()

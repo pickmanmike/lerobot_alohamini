@@ -1923,7 +1923,7 @@ def test_real_wss_clean_close_ends_qualified_wait_before_timeout(tmp_path):
     ],
 )
 def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
-    tmp_path, monkeypatch, failure, preserve_cadence=False, cleanup_record_fault=None
+    tmp_path, monkeypatch, failure, preserve_cadence=False, cleanup_record_fault=None, operator_status=False
 ):
     import asyncio
     import copy
@@ -2929,6 +2929,7 @@ def test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id
                 from examples.alohamini import am1_teleop_workload
                 assert hasattr(m, "VirtualIntentReader"), "production runner has no changing-input reader"
                 args.virtual_input = "interactive"
+                args.operator_status = operator_status
                 if failure.endswith("duration"):
                     args.duration_seconds = .15
                 source_clock = [10.]
@@ -14801,6 +14802,16 @@ def test_virtual_input_progress_original_window_and_expiry_survive_wait_recovery
                                     now_monotonic=196., now_perf_counter=156.)
     assert later["current_accepted_intent_seq"] == 2 and later["intent_remaining_s"] == 69.
     assert later["window_deadline_monotonic_s"] == 190. and later["window_remaining_s"] == 0.
+
+
+def test_ordinary_interactive_operator_sees_ready_bounds_and_verified_stop(tmp_path, monkeypatch, capsys):
+    test_real_runner_waits_for_exact_start_from_idle_null_run_and_stops_owned_id(
+        tmp_path, monkeypatch, "normal_program_finish_ordinary_arms_intents", operator_status=True
+    )
+    output = capsys.readouterr().out
+    assert output.index("Starting.") < output.index("Ready.") < output.index("left_shoulder_lift")
+    assert output.index("left_shoulder_lift") < output.index("Finishing.") < output.index("Stopped. Motor shutdown verified.")
+    assert '"event": "virtual_input_ready"' not in output
 
 
 def test_virtual_input_progress_waiting_and_finish_do_not_change_control():

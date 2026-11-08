@@ -19,6 +19,8 @@ from examples.alohamini.am1_live_teleop import (
     TELEOP_SPEC,
     browser_view_lifetime_s,
     movement_input_lifetime_s,
+    ordinary_live_s,
+    validate_ordinary_activity_s,
     number as teleop_number,
     validate_body,
     validate_source,
@@ -765,7 +767,14 @@ class SessionAuthority:
         if run["recipe"] == SelectedElbowExperiment.recipe_name and definition is None:
             self._finish("faulted", "selected experiment durable descriptor is unavailable")
             return True
-        run["deadline"] = native_live_at + (definition.live_s if definition else RECIPES[run["recipe"]].live_s)
+        try:
+            live_s = (ordinary_live_s(run["ordinary_activity_seconds"])
+                      if "ordinary_activity_seconds" in run
+                      else definition.live_s if definition else RECIPES[run["recipe"]].live_s)
+        except ValueError:
+            self._finish("faulted", "ordinary activity budget unavailable")
+            return True
+        run["deadline"] = native_live_at + live_s
         if self._physical_interactive():
             live = evidence.get("live_input", {})
             if (run["recipe"] == TELEOP_RECIPE and not self._teleop_geometry_valid(live)
@@ -776,7 +785,7 @@ class SessionAuthority:
                 self._finish("faulted", "physical_live_preset_geometry_mismatch")
                 return True
             native_deadline = lifecycle.get("native_deadline_monotonic_s", live.get("live_deadline_monotonic_s"))
-            if native_deadline is not None:
+            if native_deadline is not None or "ordinary_activity_seconds" in run:
                 if (type(native_deadline) not in (int, float) or not math.isfinite(native_deadline)
                         or abs(native_deadline - run["deadline"]) > 1e-6):
                     self._finish("faulted", "physical_live_deadline_mismatch")
@@ -2441,9 +2450,9 @@ class SessionAuthority:
             if not recipe or not self.executor.supports(recipe):
                 return self._refuse("unknown fake recipe")
             allowed = {"op", "operation_id", "recipe", "controller_generation"}
-            ordinary_profile = None
+            ordinary_profile = ordinary_activity = None
             if recipe.name == TELEOP_RECIPE:
-                allowed.update(("bench_continuity", "ordinary_arm_profile"))
+                allowed.update(("bench_continuity", "ordinary_arm_profile", "ordinary_activity_seconds"))
                 if "ordinary_arm_profile" in c:
                     from examples.alohamini.am1_live_teleop import validate_ordinary_arm_profile
                     if self.executor.source != "protected-physical-provider" or c.get("bench_continuity") is True:
@@ -2451,6 +2460,13 @@ class SessionAuthority:
                     try:
                         ordinary_profile = validate_ordinary_arm_profile(c["ordinary_arm_profile"])
                     except (TypeError, ValueError) as error:
+                        return self._refuse(str(error))
+                if "ordinary_activity_seconds" in c:
+                    if ordinary_profile is None:
+                        return self._refuse("ordinary activity requires the protected ordinary profile")
+                    try:
+                        ordinary_activity = validate_ordinary_activity_s(c["ordinary_activity_seconds"])
+                    except ValueError as error:
                         return self._refuse(str(error))
                 if ("bench_continuity" in c and type(c["bench_continuity"]) is not bool
                         or c.get("bench_continuity") is True and self.executor.source != "protected-physical-provider"):
@@ -2479,6 +2495,7 @@ class SessionAuthority:
                 {"recipe": recipe.name, "device_id": d, **({"confirmation_of":confirmation_of} if confirmation_of else {}),
                  **({"selected_experiment":selected_definition.payload} if selected_definition else {}),
                  **({"ordinary_arm_profile":ordinary_profile} if ordinary_profile is not None else {}),
+                 **({"ordinary_activity_seconds":ordinary_activity} if ordinary_activity is not None else {}),
                  **({"bench_continuity": c["bench_continuity"]} if "bench_continuity" in c else {})},
                 sort_keys=True, separators=(",", ":")
             )
@@ -2539,6 +2556,14 @@ class SessionAuthority:
                     return self._refuse(str(error))
             elif ordinary_profile is not None:
                 return self._refuse("ordinary arms require the protected executor")
+            duration_setter = getattr(self.executor, "set_ordinary_activity_seconds", None)
+            if callable(duration_setter):
+                try:
+                    duration_setter(ordinary_activity)
+                except (RuntimeError, ValueError) as error:
+                    return self._refuse(str(error))
+            elif ordinary_activity is not None:
+                return self._refuse("ordinary activity budget requires the protected executor")
             positive_prerequisite = None
             selected_setter = getattr(self.executor, "set_selected_experiment", None)
             if callable(selected_setter):
@@ -2618,6 +2643,8 @@ class SessionAuthority:
                 self.run["bench_continuity"] = c.get("bench_continuity", False)
                 if ordinary_profile is not None:
                     self.run["ordinary_arm_profile"] = copy.deepcopy(ordinary_profile)
+                if ordinary_activity is not None:
+                    self.run["ordinary_activity_seconds"] = ordinary_activity
                 if self.run["bench_continuity"]:
                     self.run["control_intent"] = {
                         "eligible": True, "device_id": d,
@@ -3535,6 +3562,7 @@ class SessionAuthority:
                 "live_input",
                 "bench_continuity",
                 "ordinary_arm_profile",
+                "ordinary_activity_seconds",
                 "control_intent",
             }
             public = _status_small(run, keys)

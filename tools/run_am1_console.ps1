@@ -59,6 +59,14 @@ function Invoke-Am1Console {
                            DirectBrowser = $DirectBrowser; SoftwareVideoDecode = $SoftwareVideoDecode }
     if ($PSBoundParameters.ContainsKey('SessionUrl')) { $commandArguments.SessionUrl = $SessionUrl }
     $command = New-Am1ConsoleCommand @commandArguments
+    Invoke-Am1ConsoleProcess -Command $command
+}
+
+function Invoke-Am1ConsoleProcess {
+    param([Parameter(Mandatory)][psobject]$Command, [hashtable]$Environment = @{},
+          [string]$ProcessName = 'Configured Windows Python')
+
+    # The interactive child needs the real console handles for typing and echo.
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $command.executable
     $startInfo.WorkingDirectory = $command.directory
@@ -66,13 +74,16 @@ function Invoke-Am1Console {
     $startInfo.RedirectStandardInput = $false
     $startInfo.RedirectStandardOutput = $false
     $startInfo.RedirectStandardError = $false
+    foreach ($entry in $Environment.GetEnumerator()) {
+        $startInfo.Environment[$entry.Key] = [string]$entry.Value
+    }
     foreach ($argument in $command.arguments) {
         $null = $startInfo.ArgumentList.Add([string]$argument)
     }
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
     try {
-        if (-not $process.Start()) { throw 'Configured Windows Python did not start.' }
+        if (-not $process.Start()) { throw "$ProcessName did not start." }
         $process.WaitForExit()
         $exitCode = [int]$process.ExitCode
     }

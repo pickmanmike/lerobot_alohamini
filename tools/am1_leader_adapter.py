@@ -28,6 +28,10 @@ from examples.alohamini.am1_live_teleop import (
     LEFT_ENTRY_ENDPOINT_RAW,
     LEFT_ENTRY_WORKSPACE_PROFILE,
     ORDINARY_AM1_ARMS_PROFILE,
+    ORDINARY_FINISH_SECONDS,
+    ordinary_live_s,
+    teleop_live_window_matches,
+    validate_ordinary_activity_s,
     validate_ordinary_arm_profile,
     TELEOP_ARM_KEYS,
     TELEOP_RECIPE,
@@ -254,6 +258,7 @@ class VirtualIntentReader:
                         import msvcrt
 
                         line, extended = "", False
+                        echo = self.mode == "interactive" and sys.stdout.isatty()
                         while not self.closed:
                             if not msvcrt.kbhit():
                                 time.sleep(.01)
@@ -267,13 +272,19 @@ class VirtualIntentReader:
                                 deliver("")
                                 return
                             elif char in {"\r", "\n"}:
+                                if echo:
+                                    print(flush=True)
                                 if deliver(line+"\n"):
                                     return
                                 line = ""
                             elif char in {"\b", "\x7f"}:
+                                if line and echo:
+                                    print("\b \b", end="", flush=True)
                                 line = line[:-1]
-                            else:
+                            elif char.isprintable():
                                 line += char
+                                if echo:
+                                    print(char, end="", flush=True)
                                 if len(line.encode("utf-8")) > 4096:
                                     raise ValueError("virtual input line exceeds4096UTF8bytes")
                         return
@@ -352,7 +363,10 @@ def resolve_ordinary_config(args):
     from tools.am1_session_ipc import strict_json
 
     name = getattr(args, "ordinary_config", None)
+    minutes = getattr(args, "session_minutes", None)
     if name is None:
+        if minutes is not None:
+            raise ValueError("session minutes require the matched ordinary configuration")
         args.ordinary_arm_profile = _ordinary_policy(args)
         return
     if getattr(args, "output", None) is not None:
@@ -406,10 +420,19 @@ def resolve_ordinary_config(args):
             raise ValueError("ordinary config conflicts with explicit " + key)
         setattr(args, key, selected)
     duration = getattr(args, "duration_seconds", None)
-    if duration is not None and (type(duration) not in (int, float) or not math.isfinite(duration)
-                                 or not 0 < duration <= value["duration_seconds"]):
-        raise ValueError("ordinary input window may only be chosen prospectively shorter")
-    args.duration_seconds = value["duration_seconds"] if duration is None else duration
+    if minutes is not None:
+        if (duration is not None or getattr(args, "virtual_input", None) not in {"interactive", "jsonl"}
+                or type(minutes) not in (int, float) or not math.isfinite(minutes)):
+            raise ValueError("session minutes require interactive ordinary input without a diagnostic duration")
+        seconds = minutes * 60
+        if not math.isfinite(seconds) or seconds != int(seconds):
+            raise ValueError("ordinary activity must be selected in whole seconds")
+        args.ordinary_activity_seconds = args.duration_seconds = validate_ordinary_activity_s(int(seconds))
+    else:
+        if duration is not None and (type(duration) not in (int, float) or not math.isfinite(duration)
+                                     or not 0 < duration <= value["duration_seconds"]):
+            raise ValueError("diagnostic input window may only be chosen prospectively shorter")
+        args.duration_seconds = value["duration_seconds"] if duration is None else duration
     profile, p = getattr(args, "operating_profile", None), getattr(args, "right_elbow_p", None)
     if profile is not None and profile != policy["profile"]:
         raise ValueError("ordinary config conflicts with explicit operating profile")
@@ -425,6 +448,11 @@ def _start_body(args, generation):
     policy = _ordinary_policy(args)
     if policy is not None:
         body["ordinary_arm_profile"] = policy
+    activity = getattr(args, "ordinary_activity_seconds", None)
+    if activity is not None:
+        if policy is None:
+            raise ValueError("ordinary activity requires the validated ordinary profile")
+        body["ordinary_activity_seconds"] = validate_ordinary_activity_s(activity)
     if getattr(args, "bench_continuity", False):
         body["bench_continuity"] = True
     return body
@@ -516,6 +544,9 @@ def prepare_current_rest_invocation(args, output):
         receipt = {"version": 1, "status": "native-pending", "hardware_qualified": False,
                    "ordinary_arm_profile": policy, "native_max_seconds": 300,
                    "input_duration_seconds": args.duration_seconds}
+        activity = getattr(args, "ordinary_activity_seconds", None)
+        if activity is not None:
+            receipt.update(ordinary_activity_seconds=activity, native_max_seconds=ordinary_live_s(activity))
         if getattr(args, "_ordinary_config_bytes", None) is not None:
             with (output / "ordinary-config.private.json").open("xb") as stream:
                 stream.write(args._ordinary_config_bytes)
@@ -1275,6 +1306,10 @@ def _immutable_recovery_run(state):
         value["operation_id"] = run["operation_id"]
     if _live(state)["workspace"].get("workspace_profile") == ORDINARY_AM1_ARMS_PROFILE:
         value["ordinary_arm_profile"] = validate_ordinary_arm_profile(run.get("ordinary_arm_profile"))
+    if "ordinary_activity_seconds" in run:
+        if not teleop_live_window_matches(run):
+            raise ValueError("ordinary run original activity and native deadline differ")
+        value["ordinary_activity_seconds"] = run["ordinary_activity_seconds"]
     return json.loads(json.dumps(value, allow_nan=False))
 
 
@@ -1693,7 +1728,9 @@ def _initial_connected_phase(snapshot, proof):
             and all(type(v) in (int, float) and math.isfinite(v) for v in
                 (*stamps, current.get("native_live_at"), current.get("deadline"), remaining, old.get("remaining_s"), expiry))
             and stamps[0] <= current["native_live_at"] <= stamps[1] <= stamps[2] < current["deadline"]
-            and 0 < remaining <= old["remaining_s"] <= current["deadline"] - current["native_live_at"] <= 300.
+            and current.get("ordinary_activity_seconds") == old.get("ordinary_activity_seconds")
+            and teleop_live_window_matches(current)
+            and 0 < remaining <= old["remaining_s"] <= current["deadline"] - current["native_live_at"]
             and stamps[2] + remaining <= current["deadline"] < expiry + remaining
             and all(type((snapshot.get("controller") or {}).get(k)) is type(v)
                     and (snapshot.get("controller") or {}).get(k) == v
@@ -2927,7 +2964,7 @@ def _qualified_command_reference(client, workspace):
         or event.get("kind") in {"pause", "stop", "handoff", "released", "revoked"}
         or any(type(value) not in (int, float) or not math.isfinite(value)
                for value in (start, deadline, remaining, stamp))
-        or not 0 < remaining <= deadline-start <= 300.
+        or not teleop_live_window_matches(run) or not 0 < remaining <= deadline-start
         or not start <= stamp <= deadline-remaining or deadline-remaining-stamp >= 1.):
         raise RuntimeError("current same-owner qualified native held command unavailable")
     return validate_target(live.get("cursor"), workspace=workspace)
@@ -4919,7 +4956,7 @@ def terminal_qualification_budget_s(*, bench, ordinary_arms):
         return 12.0
     # An ordinary Finish may reconcile its own durable Pause and an overlapping
     # renewal before checking fresh Native HOLD within the original run deadline.
-    return 5.0 if ordinary_arms else 2.0
+    return float(ORDINARY_FINISH_SECONDS) if ordinary_arms else 2.0
 
 
 async def run(args):
@@ -4943,6 +4980,15 @@ async def run(args):
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
     log = (output / "frames.jsonl").open("x", encoding="utf-8")
+    operator_status = getattr(args, "operator_status", False)
+    ready_geometry = None
+    last_operator_status = None
+
+    def show_status(message):
+        nonlocal last_operator_status
+        if message != last_operator_status:
+            print(message, flush=True)
+            last_operator_status = message
 
     def record(value):
         log.write(
@@ -4950,8 +4996,36 @@ async def run(args):
             + "\n"
         )
         log.flush()
-        if changing_input and value.get("event", "").startswith("virtual_"):
-            print(json.dumps(value, sort_keys=True, allow_nan=False), flush=True)
+        event = value.get("event", "")
+        if not operator_status:
+            if changing_input and event.startswith("virtual_"):
+                print(json.dumps(value, sort_keys=True, allow_nan=False), flush=True)
+            return
+        nonlocal ready_geometry
+        if event == "start_requested":
+            show_status("Starting. Waiting for Chest viewing and motor checks.")
+        elif event == "virtual_input_ready":
+            ready_geometry = value
+        elif event == "operator_ready" and ready_geometry is not None:
+            show_status("Ready. Enter a movement command.")
+            for key, origin in ready_geometry["command_reference"].items():
+                bound = ready_geometry["bounds"][key]
+                low, high = bound["min"], bound["max"]
+                print(f"  {key[4:-4]:25s} {origin:8.2f}  [{low:.2f}, {high:.2f}]", flush=True)
+        elif event in {"cause_specific_hold", "inactive_native_recovery_held", "native_recovery_wait"}:
+            run = (value.get("snapshot") or {}).get("run") or {}
+            reason = value.get("cause") or run.get("first_cause") or "waiting for current required proof"
+            show_status(f"Temporary hold: {reason.replace('_', ' ')}.")
+        elif event in {"qualified_hold_recovery", "qualified_native_recovery"}:
+            show_status("Ready. Automatic recovery qualified.")
+        elif event == "virtual_control_paused":
+            show_status("Paused. Enter resume when ready.")
+        elif event == "virtual_control_resumed":
+            show_status("Ready. Enter a fresh movement command.")
+        elif event in {"virtual_intent_rejected", "virtual_control_rejected"}:
+            show_status(f"Input refused: {value.get('reason') or value.get('message') or 'check command syntax'}")
+        elif event == "terminal_qualification_started":
+            show_status("Finishing. Checking held position and motor shutdown.")
 
     client = None
     source = producer = workload = renewal = keyboard = intent_reader = None
@@ -5070,6 +5144,9 @@ async def run(args):
              "terminal_completion_policy": summary["terminal_completion_policy"],
              "program_active_seconds": {"full": 172.5, "combined": 12., "ordinary-arms": 12., "body": 4.5, "continuity": 24., "combined-body": 64.5, **SelectedLeftWorkload.DURATIONS}[segment] * left_reach_cycles if args.source == "virtual-leaders" and not changing_input else None,
              "input_duration_seconds": args.duration_seconds,
+             **({"ordinary_activity_seconds": start_body["ordinary_activity_seconds"],
+                 "native_live_budget_seconds": ordinary_live_s(start_body["ordinary_activity_seconds"])}
+                if "ordinary_activity_seconds" in start_body else {}),
              "controller_interruption": controller_gap, "interruption_at_seconds": getattr(args, "interrupt_at_seconds", None),
              "interruption_seconds": getattr(args, "interruption_seconds", .65)}
         )
@@ -5322,8 +5399,15 @@ async def run(args):
             or client.snapshot["run"].get("bench_continuity") is not False
             or (_live(client.snapshot).get("required_view") or {}).get("required") is not True):
             raise RuntimeError("native admitted ordinary policy/profile differs from requested normal authority")
-        run_id, deadline = client.snapshot["run"]["run_id"], client.snapshot["run"]["deadline"]
+        native_run = client.snapshot["run"]
+        activity = start_body.get("ordinary_activity_seconds")
+        if native_run.get("ordinary_activity_seconds") != activity or (
+                activity is not None and not teleop_live_window_matches(native_run)):
+            raise RuntimeError("native admitted activity duration differs from requested ordinary Start")
+        run_id, deadline = native_run["run_id"], native_run["deadline"]
         summary.update(run_id=run_id, original_native_deadline=deadline, workspace=workspace)
+        if activity is not None:
+            summary.update(ordinary_activity_seconds=activity, native_live_budget_seconds=ordinary_live_s(activity))
         record({"event": "native_admitted", "snapshot": client.snapshot})
         entry_wall_deadline = None
         if left_entry:
@@ -5450,10 +5534,16 @@ async def run(args):
             if workload and not args.next_start_seconds:
                 workload.admit(time.monotonic())
         active_at, interrupted, frame_count = (None if bench else time.monotonic()), False, 0
-        activity_ceiling = (active_at + min(args.duration_seconds, client.snapshot["run"]["remaining_s"])
-                            if changing_input else None)
+        remaining = client.snapshot["run"]["remaining_s"] if changing_input else None
+        if activity is not None:
+            remaining -= ORDINARY_FINISH_SECONDS
+            if remaining <= 0:
+                raise TimeoutError("ordinary activity has no time left before its Finish allowance")
+        activity_ceiling = active_at + min(args.duration_seconds, remaining) if changing_input else None
         if left_entry:
             activity_ceiling = min(activity_ceiling, entry_wall_deadline)
+        if operator_status:
+            record({"event": "operator_ready", "activity_deadline_monotonic_s": activity_ceiling})
 
         def wall_deadline():
             if changing_input:
@@ -6345,6 +6435,14 @@ async def run(args):
         (output / "summary.json").write_text(
             json.dumps(summary, indent=2, sort_keys=True, allow_nan=False), encoding="utf-8"
         )
+        if operator_status:
+            if summary.get("physical_register_off_readback_verified") is True:
+                show_status("Stopped. Motor shutdown verified.")
+            elif summary.get("native_cleanup_uncertain") is True:
+                show_status("Shutdown proof unavailable. Check the AM1 console.")
+            else:
+                show_status("Session ended. See the AM1 console for its current state.")
+            print(f"Session record: {output.resolve()}", flush=True)
     if first_error is not None:
         raise first_error
     if cleanup_errors:
@@ -6377,7 +6475,9 @@ def main(argv=None):
                         help="live stdin intentions instead of the optional fixed12second ordinary-arms preset")
     for name in ("left-port", "right-port", "leader-id", "calibration-dir"):
         parser.add_argument("--" + name)
-    parser.add_argument("--duration-seconds", type=float, default=None)
+    parser.add_argument("--duration-seconds", type=float, help="legacy short diagnostic window")
+    parser.add_argument("--session-minutes", type=float, help="ordinary interactive duration, up to one supervised hour")
+    parser.add_argument("--operator-status", action="store_true", help="concise console states and live input prompts")
     parser.add_argument("--next-start-seconds", type=float)
     parser.add_argument("--interrupt-at-seconds", type=float)
     parser.add_argument("--interruption-seconds", type=float, default=0.65)
@@ -6432,8 +6532,11 @@ def main(argv=None):
     if ((args.bench_continuity or args.workload_segment != "full" and policy is None) and args.source != "virtual-leaders"
         or args.interrupt_controller and not args.bench_continuity):
         parser.error("bench continuity/controller gap requires predetermined virtual source")
-    if not 0 < args.duration_seconds <= 180 or not 0.3 <= args.interruption_seconds <= (12 if args.interrupt_controller else 2):
-        parser.error("bounded duration <=180s and selected finite interruption required")
+    if (getattr(args, "ordinary_activity_seconds", None) is None and not 0 < args.duration_seconds <= 180
+            or not 0.3 <= args.interruption_seconds <= (12 if args.interrupt_controller else 2)):
+        parser.error("bounded legacy diagnostic duration and finite interruption required")
+    if args.operator_status and args.virtual_input != "interactive":
+        parser.error("operator status requires interactive input")
     if args.next_start_seconds is not None and not 0 < args.next_start_seconds <= 5:
         parser.error("next Start check must be greater than zero through5s")
     summary = asyncio.run(run(args))
@@ -6456,7 +6559,8 @@ def main(argv=None):
                   "cleanup_error_count": len(summary.get("cleanup_errors", []))}
     else:
         result = summary
-    print(json.dumps(result, sort_keys=True))
+    if not args.operator_status:
+        print(json.dumps(result, sort_keys=True))
 
 
 if __name__ == "__main__":
